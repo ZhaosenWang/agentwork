@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eushing/agentwork/internal/acp"
@@ -51,6 +52,18 @@ const workerQueueDepth = 64
 
 // defaultListenAddr is used when no addr is configured.
 const defaultListenAddr = ":7373"
+
+// idleWindow is the no-activity budget after which the idle watchdog cancels
+// a hung Prompt. An agent that emits nothing — no message, no tool call, no
+// plan update — for this long is presumed stuck (deadlocked subprocess, silent
+// infinite loop) and force-stopped. A task that keeps streaming is never
+// killed regardless of total runtime (MUL-3064 principle).
+const idleWindow = 2 * time.Minute
+
+// idleToolWindow extends the budget while a tool is in flight. A long-running
+// tool (npm install, docker build, test suite) is legitimately silent between
+// tool_call and tool_result, so it gets a larger window than pure idle.
+const idleToolWindow = 10 * time.Minute
 
 // Daemon owns per-agent workers and the task dispatch loop.
 type Daemon struct {
@@ -555,17 +568,30 @@ func (d *Daemon) runTask(ctx context.Context, q *queuedRow) {
 	}
 
 	// Stream events into chat_message + WS.
-	h := &runHandler{daemon: d, taskID: q.TaskID, bus: d.bus, ctx: ctx}
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	h := &runHandler{daemon: d, taskID: q.TaskID, bus: d.bus, ctx: ctx, lastActivityAt: &lastActivity}
 	sess.SetEventHandler(h)
 
+	// Idle watchdog: if the agent emits nothing for idleWindow (or
+	// idleToolWindow while a tool is in flight), cancel the Prompt. Without
+	// this, a hung subprocess (no end_turn, no exit) blocks forever.
+	promptCtx, promptCancel := context.WithCancel(ctx)
+	defer promptCancel()
+	go d.runIdleWatchdog(ctx, &lastActivity, promptCancel, q.TaskID)
+
 	prompt := buildPrompt(title, desc, handoff)
-	if _, err := sess.Prompt(ctx, acp.PromptRequest{
+	if _, err := sess.Prompt(promptCtx, acp.PromptRequest{
 		SessionID: newResp.SessionID,
 		Prompt:    []acp.ContentBlock{{Type: "text", Text: prompt}},
 	}); err != nil {
 		// Mark this session closed (run ended, unsuccessfully).
 		d.closeSession(ctx, string(newResp.SessionID), q.AgentID)
-		d.failOrRequeue(ctx, q, fmt.Sprintf("prompt: %v", err))
+		if promptCtx.Err() != nil && ctx.Err() == nil {
+			d.failOrRequeue(ctx, q, "idle watchdog: agent stopped emitting events")
+		} else {
+			d.failOrRequeue(ctx, q, fmt.Sprintf("prompt: %v", err))
+		}
 		return
 	}
 
@@ -661,34 +687,48 @@ func (d *Daemon) finishTask(ctx context.Context, q *queuedRow, status, summary s
 func buildPrompt(title, desc, handoff string) string {
 	s := fmt.Sprintf("Task: %s\n\n%s", title, desc)
 	if handoff != "" {
-		s += "\n\nHandoff note:\n" + handoff
+		// Frame the handoff note as a scoping instruction, not a comment to
+		// reply to — without this prefix agents often treat the note as
+		// conversational content and respond to it instead of executing it.
+		s += "\n\nYou were handed this task with a handoff note. Treat it as the assigner's scoping instruction for this run; follow it before doing anything broader, and do not reply to it as if it were a comment:\n\n> " + handoff + "\n"
 	}
 	return s
 }
 
 // runHandler implements acp.EventHandler for one task run, streaming events
-// into chat_message and the WS bus.
+// into chat_message and the WS bus. It also tracks lastActivityAt so the
+// idle watchdog can detect a hung agent (no events for > idleWindow).
 type runHandler struct {
-	daemon *Daemon
-	taskID string
-	bus    *events.Bus
-	ctx    context.Context // runTask's ctx, so events stop when the task/daemon stops
+	daemon        *Daemon
+	taskID        string
+	bus           *events.Bus
+	ctx           context.Context // runTask's ctx, so events stop when the task/daemon stops
+	lastActivityAt *atomic.Int64  // unix nanos of last event; updated by every callback
+}
+
+func (h *runHandler) touch() {
+	if h.lastActivityAt != nil {
+		h.lastActivityAt.Store(time.Now().UnixNano())
+	}
 }
 
 func (h *runHandler) OnAgentMessage(text string) {
+	h.touch()
 	h.persist("assistant", text)
 	h.bus.Publish(h.ctx, events.Event{Topic: "task:message", Payload: map[string]any{
 		"task_id": h.taskID, "role": "assistant", "text": text,
 	}})
 }
 func (h *runHandler) OnAgentThought(text string) {
+	h.touch()
 	h.persist("thought", text)
 	h.bus.Publish(h.ctx, events.Event{Topic: "task:thought", Payload: map[string]any{
 		"task_id": h.taskID, "text": text,
 	}})
 }
-func (h *runHandler) OnUserMessage(text string) {}
+func (h *runHandler) OnUserMessage(text string) { h.touch() }
 func (h *runHandler) OnToolCall(tc acp.ToolCallUpdate) {
+	h.touch()
 	b, _ := json.Marshal(tc)
 	// Persist tool calls so the task detail view can reconstruct the full
 	// history after a refresh, not just the live WS stream. role="tool",
@@ -698,12 +738,12 @@ func (h *runHandler) OnToolCall(tc acp.ToolCallUpdate) {
 		"task_id": h.taskID, "tool": string(b),
 	}})
 }
-func (h *runHandler) OnPlan(acp.Plan)                                 {}
-func (h *runHandler) OnAvailableCommandsUpdate([]acp.AvailableCommand) {}
-func (h *runHandler) OnModeUpdate(acp.SessionModeId)                   {}
-func (h *runHandler) OnConfigOptionUpdate([]acp.SessionConfigOption)   {}
-func (h *runHandler) OnUsageUpdate(int, int, *acp.Cost)                {}
-func (h *runHandler) OnSessionInfo(string, map[string]any)             {}
+func (h *runHandler) OnPlan(acp.Plan)                                 { h.touch() }
+func (h *runHandler) OnAvailableCommandsUpdate([]acp.AvailableCommand) { h.touch() }
+func (h *runHandler) OnModeUpdate(acp.SessionModeId)                   { h.touch() }
+func (h *runHandler) OnConfigOptionUpdate([]acp.SessionConfigOption)   { h.touch() }
+func (h *runHandler) OnUsageUpdate(int, int, *acp.Cost)                { h.touch() }
+func (h *runHandler) OnSessionInfo(string, map[string]any)             { h.touch() }
 
 func (h *runHandler) persist(role, content string) {
 	if _, err := h.daemon.st.DB().ExecContext(h.ctx,
@@ -721,6 +761,35 @@ func (h *runHandler) persistTool(toolCallsJSON string) {
 		`INSERT INTO chat_message (id, task_id, role, content, tool_calls, created_at) VALUES (?,?,'tool','',?,?)`,
 		uuid.NewString(), h.taskID, toolCallsJSON, now()); err != nil {
 		log.Printf("daemon: persist tool call for task %s: %v", h.taskID, err)
+	}
+}
+
+// runIdleWatchdog cancels a Prompt if the agent emits no events for idleWindow.
+// It ticks at idleWindow/2 and checks lastActivityAt; if the silence exceeds
+// the budget, it calls cancel to unblock sess.Prompt. The parent ctx is
+// separate from the Prompt's ctx so cancelling the Prompt does not cancel the
+// daemon. Exits when parent ctx is cancelled (task finished or daemon stopping).
+func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.Int64, cancel context.CancelFunc, taskID string) {
+	interval := idleWindow / 2
+	if interval <= 0 {
+		interval = idleWindow
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-parent.Done():
+			return
+		case <-ticker.C:
+			last := time.Unix(0, lastActivity.Load())
+			idleFor := time.Since(last)
+			if idleFor < idleWindow {
+				continue
+			}
+			log.Printf("daemon: idle watchdog firing for task %s (silent for %s), force-stopping", taskID, idleFor.Round(time.Second))
+			cancel()
+			return
+		}
 	}
 }
 
