@@ -27,6 +27,14 @@ go.work.sum
 # env file
 .env
 
+# Build output (local binaries, not committed)
+build/
+
+# Local runtime data (SQLite db, workdirs)
+*.db
+*.db-*
+.agentwork/
+
 # Editor/IDE
 # .idea/
 # .vscode/
