@@ -1,8 +1,8 @@
 // agentwork-cli is the agent-side tool. daemon injects it into the agent
-// subprocess's PATH plus AGENTWORK_SERVER_URL / AGENTWORK_TASK_ID /
-// AGENTWORK_AGENT_ID env vars, so the agent can call it to produce structured
-// side effects (handoff, create sub-task, list tasks, append messages) against
-// the agentwork HTTP API. CLI-as-tool, like multica §4.
+// subprocess's PATH plus AGENTWORK_SERVER_URL / AGENTWORK_GOAL_ID /
+// AGENTWORK_RUN_ID / AGENTWORK_AGENT_ID env vars, so the agent can call it to
+// produce structured side effects (assign/handoff, create sub-goal, comment,
+// wait-children) against the agentwork HTTP API. CLI-as-tool, like multica §4.
 package main
 
 import (
@@ -17,15 +17,11 @@ import (
 )
 
 const (
-	// defaultServerURL is used when AGENTWORK_SERVER_URL is not set. Matches
-	// the agentwork default listen addr.
+	// defaultServerURL matches the agentwork default listen addr.
 	defaultServerURL = "http://127.0.0.1:7373"
-	// httpTimeout bounds a single CLI→server round trip so an unresponsive
-	// daemon can't hang the agent's tool call indefinitely.
-	httpTimeout = 10 * time.Second
+	httpTimeout     = 10 * time.Second
 )
 
-// httpClient is shared across all subcommands.
 var httpClient = &http.Client{Timeout: httpTimeout}
 
 func main() {
@@ -37,14 +33,16 @@ func main() {
 	if serverURL == "" {
 		serverURL = defaultServerURL
 	}
-	taskID := os.Getenv("AGENTWORK_TASK_ID")
+	goalID := os.Getenv("AGENTWORK_GOAL_ID")
 	agentID := os.Getenv("AGENTWORK_AGENT_ID")
 
 	switch os.Args[1] {
-	case "task":
-		taskCmd(serverURL, taskID, agentID, os.Args[2:])
+	case "goal":
+		goalCmd(serverURL, goalID, agentID, os.Args[2:])
 	case "agent":
 		agentCmd(serverURL, os.Args[2:])
+	case "squad":
+		squadCmd(serverURL, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -58,46 +56,118 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `agentwork-cli — agent-side tool (called by agents during task execution)
 
 Subcommands:
-  task list                              list all tasks (JSON)
-  task handoff <to-agent-id> [--note N]  hand off the current task to another agent
-  task create --title T [--assignee A] [--parent P] [--status S]
-                                          create a sub-task (parent defaults to current task)
-  task message [--role R] --text T        append a chat_message to the current task
-  task wait                               mark the current task as waiting for its sub-tasks;
-                                          the daemon re-runs it once all children finish
-  agent list                              list all agents (JSON)
+  goal list                                 list all goals (JSON)
+  goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
+  goal create --title T [--assignee A] [--parent P] [--status S]
+                                             create a sub-goal (parent defaults to current goal)
+  goal comment --text T [--role R]           post a comment on the current goal; --text may
+                                             contain a structured mention [@Name](mention://agent/<id>)
+                                             to enqueue a run on that agent
+  goal wait                                  mark the current goal as waiting for its sub-goals;
+                                             the daemon re-runs it once all children finish
+  agent list                                 list all agents (JSON)
+  squad list                                 list all squads (JSON)
 
 Environment (injected by daemon):
   AGENTWORK_SERVER_URL   server base URL (default http://127.0.0.1:7373)
-  AGENTWORK_TASK_ID      current task id
+  AGENTWORK_GOAL_ID      current goal id (product plane)
+  AGENTWORK_RUN_ID       current run id (execution plane)
   AGENTWORK_AGENT_ID     current agent id`)
 }
 
-// ── task subcommand ──
+// ── goal ──
 
-func taskCmd(serverURL, taskID, agentID string, args []string) {
+func goalCmd(serverURL, goalID, agentID string, args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork-cli task <list|handoff|create|message|wait>")
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli goal <list|assign|create|comment|wait>")
 		os.Exit(2)
 	}
 	switch args[0] {
 	case "list":
-		get(serverURL + "/tasks")
-	case "handoff":
-		taskHandoff(serverURL, taskID, args[1:])
+		get(serverURL + "/goals")
+	case "assign":
+		goalAssign(serverURL, goalID, args[1:])
 	case "create":
-		taskCreate(serverURL, taskID, agentID, args[1:])
-	case "message":
-		taskMessage(serverURL, taskID, args[1:])
+		goalCreate(serverURL, goalID, agentID, args[1:])
+	case "comment":
+		goalComment(serverURL, goalID, args[1:])
 	case "wait":
-		taskWait(serverURL, taskID, args[1:])
+		goalWait(serverURL, goalID, args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "unknown task subcommand %q\n", args[0])
+		fmt.Fprintf(os.Stderr, "unknown goal subcommand %q\n", args[0])
 		os.Exit(2)
 	}
 }
 
-// ── agent subcommand ──
+func goalAssign(serverURL, goalID string, args []string) {
+	fs := flag.NewFlagSet("goal assign", flag.ExitOnError)
+	note := fs.String("note", "", "handoff note for the next agent")
+	fs.Parse(args)
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli goal assign <to-agent-id> [--note N]")
+		os.Exit(2)
+	}
+	if goalID == "" {
+		fail("AGENTWORK_GOAL_ID not set")
+	}
+	body := map[string]string{"assignee_type": "agent", "assignee_id": fs.Arg(0), "handoff_note": *note}
+	post(serverURL+"/goals/"+goalID+"/assign", body)
+}
+
+func goalCreate(serverURL, goalID, agentID string, args []string) {
+	fs := flag.NewFlagSet("goal create", flag.ExitOnError)
+	title := fs.String("title", "", "goal title (required)")
+	assignee := fs.String("assignee", "", "assignee agent id (defaults to current agent)")
+	parent := fs.String("parent", "", "parent goal id (defaults to current goal)")
+	status := fs.String("status", "active", "goal status")
+	fs.Parse(args)
+	if *title == "" {
+		fail("--title is required")
+	}
+	if *assignee == "" {
+		*assignee = agentID
+	}
+	if *assignee == "" {
+		fail("--assignee is required (or AGENTWORK_AGENT_ID must be set)")
+	}
+	if *parent == "" {
+		*parent = goalID
+	}
+	body := map[string]string{
+		"title":           *title,
+		"assignee_type":   "agent",
+		"assignee_id":     *assignee,
+		"parent_id":       *parent,
+		"status":          *status,
+		"created_by_type": "agent",
+		"created_by_id":   agentID,
+	}
+	post(serverURL+"/goals", body)
+}
+
+func goalComment(serverURL, goalID string, args []string) {
+	fs := flag.NewFlagSet("goal comment", flag.ExitOnError)
+	role := fs.String("role", "agent", "author role (agent|human|system)")
+	text := fs.String("text", "", "comment text (required; may contain a structured mention)")
+	fs.Parse(args)
+	if *text == "" {
+		fail("--text is required")
+	}
+	if goalID == "" {
+		fail("AGENTWORK_GOAL_ID not set")
+	}
+	body := map[string]string{"author_type": *role, "author_id": os.Getenv("AGENTWORK_AGENT_ID"), "content": *text}
+	post(serverURL+"/goals/"+goalID+"/comments", body)
+}
+
+func goalWait(serverURL, goalID string, args []string) {
+	if goalID == "" {
+		fail("AGENTWORK_GOAL_ID not set")
+	}
+	postNoBody(serverURL+"/goals/"+goalID+"/wait", nil)
+}
+
+// ── agent / squad ──
 
 func agentCmd(serverURL string, args []string) {
 	if len(args) < 1 {
@@ -113,72 +183,18 @@ func agentCmd(serverURL string, args []string) {
 	}
 }
 
-func taskHandoff(serverURL, taskID string, args []string) {
-	fs := flag.NewFlagSet("task handoff", flag.ExitOnError)
-	note := fs.String("note", "", "handoff note for the next agent")
-	fs.Parse(args)
-	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork-cli task handoff <to-agent-id> [--note N]")
+func squadCmd(serverURL string, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli squad <list>")
 		os.Exit(2)
 	}
-	if taskID == "" {
-		fail("AGENTWORK_TASK_ID not set")
+	switch args[0] {
+	case "list":
+		get(serverURL + "/squads")
+	default:
+		fmt.Fprintf(os.Stderr, "unknown squad subcommand %q\n", args[0])
+		os.Exit(2)
 	}
-	body := map[string]string{"assignee_type": "agent", "assignee_id": fs.Arg(0), "handoff_note": *note}
-	post(serverURL+"/tasks/"+taskID+"/assign", body)
-}
-
-func taskCreate(serverURL, taskID, agentID string, args []string) {
-	fs := flag.NewFlagSet("task create", flag.ExitOnError)
-	title := fs.String("title", "", "task title (required)")
-	assignee := fs.String("assignee", "", "assignee agent id (defaults to current agent)")
-	parent := fs.String("parent", "", "parent task id (defaults to current task)")
-	status := fs.String("status", "queued", "task status")
-	fs.Parse(args)
-	if *title == "" {
-		fail("--title is required")
-	}
-	if *assignee == "" {
-		*assignee = agentID
-	}
-	if *assignee == "" {
-		fail("--assignee is required (or AGENTWORK_AGENT_ID must be set)")
-	}
-	if *parent == "" {
-		*parent = taskID // default: sub-task of current task
-	}
-	body := map[string]string{
-		"title":          *title,
-		"assignee_type":  "agent",
-		"assignee_id":    *assignee,
-		"parent_id":      *parent,
-		"status":         *status,
-		"created_by_type": "agent",
-		"created_by_id":   agentID,
-	}
-	post(serverURL+"/tasks", body)
-}
-
-func taskMessage(serverURL, taskID string, args []string) {
-	fs := flag.NewFlagSet("task message", flag.ExitOnError)
-	role := fs.String("role", "assistant", "message role")
-	text := fs.String("text", "", "message text (required)")
-	fs.Parse(args)
-	if *text == "" {
-		fail("--text is required")
-	}
-	if taskID == "" {
-		fail("AGENTWORK_TASK_ID not set")
-	}
-	body := map[string]string{"role": *role, "text": *text}
-	postNoBody(serverURL+"/tasks/"+taskID+"/messages", body)
-}
-
-func taskWait(serverURL, taskID string, args []string) {
-	if taskID == "" {
-		fail("AGENTWORK_TASK_ID not set")
-	}
-	postNoBody(serverURL+"/tasks/"+taskID+"/wait", nil)
 }
 
 // ── HTTP helpers ──
@@ -197,14 +213,6 @@ func get(url string) {
 }
 
 func post(url string, body any) {
-	doPost(url, body, true)
-}
-
-func postNoBody(url string, body any) {
-	doPost(url, body, false)
-}
-
-func doPost(url string, body any, printResp bool) {
 	b, err := json.Marshal(body)
 	if err != nil {
 		fail("marshal: %v", err)
@@ -218,8 +226,22 @@ func doPost(url string, body any, printResp bool) {
 		rb, _ := io.ReadAll(resp.Body)
 		fail("POST %s: HTTP %d: %s", url, resp.StatusCode, rb)
 	}
-	if printResp {
-		io.Copy(os.Stdout, resp.Body)
+	io.Copy(os.Stdout, resp.Body)
+}
+
+func postNoBody(url string, body any) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		fail("marshal: %v", err)
+	}
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		fail("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		rb, _ := io.ReadAll(resp.Body)
+		fail("POST %s: HTTP %d: %s", url, resp.StatusCode, rb)
 	}
 }
 

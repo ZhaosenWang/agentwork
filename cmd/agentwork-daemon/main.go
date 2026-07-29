@@ -1,10 +1,9 @@
 // agentwork-daemon — task-driven multi-runtime agent management platform.
 //
 // Single binary: HTTP server + embedded daemon. MVP runs everything in one
-// process; the daemon can be split out later without changing the store or
-// runtime abstractions. The agent-side CLI is a separate binary,
-// agentwork-cli; the daemon injects its directory into the agent subprocess
-// PATH so the agent can call back.
+// process. The agent-side CLI (agentwork-cli) is a separate binary; the daemon
+// injects its directory into the agent subprocess PATH so the agent can call
+// back.
 package main
 
 import (
@@ -17,6 +16,10 @@ import (
 
 	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/proto"
+	"github.com/eushing/agentwork/internal/proto/acpbackend"
+	"github.com/eushing/agentwork/internal/proto/jsonlbackend"
+	"github.com/eushing/agentwork/internal/proto/jsonrpcbackend"
 	"github.com/eushing/agentwork/internal/server"
 	"github.com/eushing/agentwork/internal/service"
 	"github.com/eushing/agentwork/internal/store"
@@ -38,18 +41,34 @@ func main() {
 
 	bus := events.NewBus()
 
-	taskSvc := service.NewTaskService(st, bus)
+	// Services. wired together explicitly to avoid a constructor-order cycle:
+	// GoalService <-> RunService hold cross-references (reconcile enqueues
+	// retries/wakes; run finish delegates to reconcile).
+	goalSvc := service.NewGoalService(st, bus)
+	runSvc := service.NewRunService(st, bus)
+	commentSvc := service.NewCommentService(st, bus)
+	goalSvc.SetRunService(runSvc)
+	runSvc.SetGoalService(goalSvc)
+	commentSvc.SetRunService(runSvc)
+	commentSvc.SetGoalService(goalSvc)
 
-	// Daemon manages long-lived ACP server subprocesses per agent and
-	// claims task_queue rows. Embedded in this process for MVP.
-	d := daemon.New(st, bus, *addr, taskSvc)
+	squadSvc := service.NewSquadService(st, bus)
+	schedSvc := service.NewScheduleService(st, bus)
+
+	// Protocol backends registered by provider name (runtime.provider selects).
+	protoReg := proto.NewRegistry()
+	protoReg.Register("acp", acpbackend.New())
+	protoReg.Register("jsonl", jsonlbackend.New())
+	protoReg.Register("jsonrpc", jsonrpcbackend.New())
+
+	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, squadSvc, schedSvc)
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("daemon: %v", err)
 		}
 	}()
 
-	srv := server.New(st, bus, d)
+	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc)
 	if err := srv.ListenAndServe(ctx, *addr); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("server: %v", err)
 	}

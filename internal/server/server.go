@@ -17,14 +17,19 @@ import (
 )
 
 type Server struct {
-	st  *store.Store
-	bus *events.Bus
-	d   *daemon.Daemon
-	hub *ws.Hub
+	st         *store.Store
+	bus        *events.Bus
+	d          *daemon.Daemon
+	hub        *ws.Hub
+	goalSvc    *service.GoalService
+	runSvc     *service.RunService
+	commentSvc *service.CommentService
+	squadSvc   *service.SquadService
+	schedSvc   *service.ScheduleService
 }
 
-func New(st *store.Store, bus *events.Bus, d *daemon.Daemon) *Server {
-	return &Server{st: st, bus: bus, d: d, hub: ws.NewHub(bus)}
+func New(st *store.Store, bus *events.Bus, d *daemon.Daemon, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService) *Server {
+	return &Server{st: st, bus: bus, d: d, hub: ws.NewHub(bus), goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, squadSvc: squadSvc, schedSvc: schedSvc}
 }
 
 // ListenAndServe mounts routes and serves until ctx is cancelled.
@@ -32,8 +37,11 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	h := &handler.Handlers{
 		Runtime:  service.NewRuntimeService(s.st),
 		Agent:    service.NewAgentService(s.st, s.bus),
-		Task:     service.NewTaskService(s.st, s.bus),
-		Schedule: service.NewScheduleService(s.st, s.bus),
+		Goal:     s.goalSvc,
+		Run:      s.runSvc,
+		Comment:  s.commentSvc,
+		Squad:    s.squadSvc,
+		Schedule: s.schedSvc,
 	}
 
 	mux := http.NewServeMux()

@@ -1,21 +1,21 @@
-// Package daemon dispatches task_queue rows to agent runtimes. MVP uses the
-// per-task subprocess model (like multica): each task run spawns a fresh ACP
-// agent process via acp.ConnectStdio, runs one Prompt, then tears it down.
-// There is no long-lived per-agent server process. The agent.status/pid and
-// session table columns are retained for a future ws/tcp long-lived model but
-// are weakly used under this model.
+// Package daemon dispatches queued runs to agent runtimes. MVP uses the
+// per-run subprocess model: each run opens a fresh transport connection via
+// runtime.Open, hands it to the protocol Backend for one Prompt, and tears
+// it down when the turn ends. There is no long-lived per-agent server.
 //
-// Concurrency is per-agent: each agent has a worker goroutine with a semaphore
-// sized to agent.max_concurrent, so one agent's tasks run in parallel up to its
-// limit while different agents are independent. The daemon is embedded in the
-// agentwork-daemon binary for MVP.
+// Concurrency is per-agent: each agent has a worker goroutine with a
+// semaphore sized to agent.max_concurrent, so one agent's runs run in parallel
+// up to its limit while different agents are independent.
+//
+// State authority is NOT here: when a run reaches a terminal status the daemon
+// calls RunService.Finish, which stamps the run row then hands the outcome to
+// GoalService.ReconcileOnRunEnd — the sole place that advances goal.status.
+// See DESIGN.zh.md §7.
 package daemon
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -26,72 +26,77 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/runtime"
 	"github.com/eushing/agentwork/internal/service"
 	"github.com/eushing/agentwork/internal/store"
 	"github.com/google/uuid"
 )
 
-// maxAttempts bounds per-task retries. A task that fails this many times is
-// left in task_queue status='failed' for human inspection.
-const maxAttempts = 3
-
-// dispatchTickInterval is how often the daemon scans task_queue for claimable
-// rows. Sub-second keeps perceived latency low without hot-looping.
+// dispatchTickInterval is how often the daemon claims queued runs. Claims are
+// per-agent (only within the set of agents with free worker slots), so this
+// bounds perceived latency without hot-looping.
 const dispatchTickInterval = 500 * time.Millisecond
 
 // scheduleTickInterval is how often the daemon scans schedule for due firings.
-// Schedule precision to the second is enough; this only bounds how late a
-// firing can be relative to its next_run_at.
 const scheduleTickInterval = 5 * time.Second
 
-// workerQueueDepth bounds how many task_queue rows one agent's worker holds
-// before back-pressuring the dispatcher. Generous for local single-user use.
+// workerQueueDepth bounds how many queued runs one agent's worker holds before
+// back-pressuring the dispatcher.
 const workerQueueDepth = 64
 
 // defaultListenAddr is used when no addr is configured.
 const defaultListenAddr = ":7373"
 
 // idleWindow is the no-activity budget after which the idle watchdog cancels
-// a hung Prompt. An agent that emits nothing — no message, no tool call, no
-// plan update — for this long is presumed stuck (deadlocked subprocess, silent
-// infinite loop) and force-stopped. A task that keeps streaming is never
-// killed regardless of total runtime (MUL-3064 principle).
+// a hung turn. An agent that emits nothing for this long is presumed stuck.
 const idleWindow = 2 * time.Minute
 
-// idleToolWindow extends the budget while a tool is in flight. A long-running
-// tool (npm install, docker build, test suite) is legitimately silent between
-// tool_call and tool_result, so it gets a larger window than pure idle.
+// idleToolWindow extends the budget while a tool is in flight (a long-running
+// tool is legitimately silent between tool_use and tool_result).
 const idleToolWindow = 10 * time.Minute
 
-// Daemon owns per-agent workers and the task dispatch loop.
+// maxAttempts bounds per-run retries; mirrored from service. A run that fails
+// this many times leaves the goal failed for human inspection.
+const maxAttempts = 3
+
+// Daemon owns per-agent workers and the run dispatch loop.
 type Daemon struct {
-	st      *store.Store
-	bus     *events.Bus
-	addr    string // HTTP listen address, injected into agent env so agentwork-cli can reach the server
-	taskSvc *service.TaskService
+	st        *store.Store
+	bus       *events.Bus
+	addr      string
+	protoReg  *proto.Registry
+	goalSvc   *service.GoalService
+	runSvc    *service.RunService
+	squadSvc  *service.SquadService
+	schedSvc  *service.ScheduleService
 
 	mu      sync.Mutex
 	workers map[string]*agentWorker // agentID → per-agent scheduler
 	stopped bool
-	ctx     context.Context // long-lived daemon context (set in Run)
+	ctx     context.Context
 }
 
-// agentWorker schedules one agent's tasks with a concurrency semaphore.
+// agentWorker schedules one agent's runs with a concurrency semaphore.
 type agentWorker struct {
-	agentID   string
-	sem       chan struct{}    // capacity = max_concurrent
-	queue     chan *queuedRow  // buffered pending tasks
-	ctx       context.Context
-	cancel    context.CancelFunc // cancels this worker when the agent is deleted
-	daemonCtx context.Context     // daemon lifetime; passed to runTask so agent delete doesn't interrupt in-flight tasks
-	run       func(context.Context, *queuedRow) // bound to Daemon.runTask
+	agentID    string
+	sem        chan struct{}    // capacity = max_concurrent
+	queue      chan *service.ClaimedRow
+	ctx        context.Context
+	cancel     context.CancelFunc
+	daemonCtx  context.Context
+	run        func(context.Context, *service.ClaimedRow)
+	maxConc    int
 }
 
-func New(st *store.Store, bus *events.Bus, addr string, taskSvc *service.TaskService) *Daemon {
-	d := &Daemon{st: st, bus: bus, addr: addr, taskSvc: taskSvc, workers: make(map[string]*agentWorker)}
+func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, squadSvc *service.SquadService, schedSvc *service.ScheduleService) *Daemon {
+	d := &Daemon{
+		st: st, bus: bus, addr: addr,
+		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
+		squadSvc: squadSvc, schedSvc: schedSvc,
+		workers: make(map[string]*agentWorker),
+	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
 	return d
@@ -101,7 +106,11 @@ func New(st *store.Store, bus *events.Bus, addr string, taskSvc *service.TaskSer
 func (d *Daemon) Run(ctx context.Context) error {
 	d.ctx = ctx
 	d.recoverWorkers(ctx)
-	d.recoverStuckRunning(ctx)
+	if n, err := d.runSvc.RecoverStuckRunning(ctx); err != nil {
+		log.Printf("daemon: recover stuck running: %v", err)
+	} else if n > 0 {
+		log.Printf("daemon: recovered %d stuck running run(s)", n)
+	}
 	dispatchTick := time.NewTicker(dispatchTickInterval)
 	scheduleTick := time.NewTicker(scheduleTickInterval)
 	defer dispatchTick.Stop()
@@ -120,11 +129,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
-// recoverWorkers rebuilds per-agent workers for every agent already in the DB.
-// Without this, a daemon restart has no workers for pre-existing agents, so any
-// queued task assigned to them loops on "agent not registered" forever. Workers
-// are normally created reactively by the agent:created event, but that only
-// fires for agents created during this process's lifetime.
+// recoverWorkers rebuilds per-agent workers for every agent in the DB —
+// otherwise a daemon restart has no workers for pre-existing agents.
 func (d *Daemon) recoverWorkers(ctx context.Context) {
 	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, max_concurrent FROM agent`)
 	if err != nil {
@@ -147,44 +153,8 @@ func (d *Daemon) recoverWorkers(ctx context.Context) {
 	}
 }
 
-// recoverStuckRunning reclaims task_queue rows left in status='running' by a
-// previous daemon process that died without finishing them. Without this, a
-// kill/restart orphans every in-flight task forever — claimQueued only picks
-// status='queued'. We reset both task_queue and task back to queued so the
-// dispatch loop re-claims them. started_at is cleared so the next claim
-// stamps a fresh one.
-func (d *Daemon) recoverStuckRunning(ctx context.Context) {
-	tx, err := d.st.DB().BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("daemon: recover stuck running: %v", err)
-		return
-	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx,
-		`UPDATE task_queue SET status='queued', started_at='' WHERE status='running'`)
-	if err != nil {
-		log.Printf("daemon: recover stuck running: %v", err)
-		return
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE task SET status='queued' WHERE id IN (SELECT task_id FROM task_queue WHERE status='queued' AND started_at='') AND status='running'`); err != nil {
-			log.Printf("daemon: recover stuck running (task): %v", err)
-			return
-		}
-		log.Printf("daemon: recovered %d stuck running task(s)", n)
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("daemon: recover stuck running commit: %v", err)
-	}
-}
-
 // ── agent worker lifecycle ──
 
-// onAgentCreated registers a per-agent worker. Under the per-task subprocess
-// model, creating an agent does NOT launch a process; the process is spawned
-// per task at run time. The payload is the full service.Agent published by
-// AgentService.Create.
 func (d *Daemon) onAgentCreated(ctx context.Context, e events.Event) {
 	a, ok := e.Payload.(service.Agent)
 	if !ok {
@@ -192,63 +162,6 @@ func (d *Daemon) onAgentCreated(ctx context.Context, e events.Event) {
 	}
 	d.ensureWorker(a.ID, a.MaxConcurrent)
 	log.Printf("daemon: worker ready for agent %s", a.ID)
-}
-
-// ensureWorker creates the per-agent worker if it doesn't exist yet. The
-// worker binds to the daemon's long-lived context, not any request context.
-func (d *Daemon) ensureWorker(agentID string, maxConcurrent int) *agentWorker {
-	if maxConcurrent < 1 {
-		maxConcurrent = 1
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if w, ok := d.workers[agentID]; ok {
-		return w
-	}
-	w := &agentWorker{
-		agentID:   agentID,
-		sem:       make(chan struct{}, maxConcurrent),
-		queue:     make(chan *queuedRow, workerQueueDepth),
-		daemonCtx: d.ctx,
-		run:       d.runTask,
-	}
-	w.ctx, w.cancel = context.WithCancel(d.ctx)
-	d.workers[agentID] = w
-	go w.loop()
-	return w
-}
-
-// loop drains the worker's queue, running each task under the concurrency
-// semaphore. Tasks run in their own goroutine so the loop stays free to accept
-// the next queued item.
-//
-// w.ctx is cancelled when the agent is deleted (stops the drain) or the daemon
-// shuts down. But runTask receives the daemon's long-lived context, not w.ctx:
-// deleting an agent should not interrupt a task that is already running — it
-// should only prevent new tasks from starting on this agent. The running task
-// finishes, and its finishTask/failOrRequeue will then find no worker and
-// requeue onto another agent (or leave it queued for manual reassignment).
-func (w *agentWorker) loop() {
-	for {
-		select {
-		case <-w.ctx.Done():
-			return
-		case q, ok := <-w.queue:
-			if !ok {
-				return
-			}
-			w.sem <- struct{}{} // acquire concurrency slot
-			go func(q *queuedRow) {
-				defer func() { <-w.sem }()
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("daemon: panic in runTask for task %s: %v", q.TaskID, r)
-					}
-				}()
-				w.run(w.daemonCtx, q)
-			}(q)
-		}
-	}
 }
 
 func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
@@ -264,314 +177,231 @@ func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
 	}
 	d.mu.Unlock()
 	if w != nil {
-		// Stop the drain so no new tasks start on this agent. In-flight tasks
-		// keep running on w.daemonCtx and finish normally; their finishTask
-		// will find no worker and leave the task in its terminal status.
-		w.cancel()
+		w.cancel() // stop the drain; in-flight runs finish on daemonCtx
 	}
 	log.Printf("daemon: worker removed for agent %s", id)
+}
+
+func (d *Daemon) ensureWorker(agentID string, maxConcurrent int) *agentWorker {
+	if maxConcurrent < 1 {
+		maxConcurrent = 1
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if w, ok := d.workers[agentID]; ok {
+		return w
+	}
+	w := &agentWorker{
+		agentID:   agentID,
+		sem:       make(chan struct{}, maxConcurrent),
+		queue:     make(chan *service.ClaimedRow, workerQueueDepth),
+		daemonCtx: d.ctx,
+		maxConc:   maxConcurrent,
+		run:       d.runTask,
+	}
+	w.ctx, w.cancel = context.WithCancel(d.ctx)
+	d.workers[agentID] = w
+	go w.loop()
+	return w
+}
+
+func (w *agentWorker) loop() {
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case q, ok := <-w.queue:
+			if !ok {
+				return
+			}
+			w.sem <- struct{}{}
+			go func(q *service.ClaimedRow) {
+				defer func() { <-w.sem }()
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("daemon: panic in runTask for run %s: %v", q.RunID, r)
+					}
+				}()
+				w.run(w.daemonCtx, q)
+			}(q)
+		}
+	}
 }
 
 func (d *Daemon) stopAll() {
 	d.mu.Lock()
 	d.stopped = true
 	d.mu.Unlock()
-	// Worker loops exit via ctx cancellation from Run. Nothing else to tear
-	// down: per-task subprocesses are owned by their runTask goroutines.
 }
 
-// ── task dispatch ──
+// ── run dispatch ──
 
-// dispatchOnce claims one queued task_queue row and routes it to the agent's
-// worker.
+// dispatchOnce claims queued runs only for agents whose worker has free
+// concurrency slots, then routes each to its agent's worker. This is the fix
+// for the old global head-of-line blocking: a saturated agent can no longer
+// stall other agents' dispatch (DESIGN.zh.md §7).
 func (d *Daemon) dispatchOnce(ctx context.Context) {
 	d.mu.Lock()
 	if d.stopped {
 		d.mu.Unlock()
 		return
 	}
+	// ready = agents with at least one free slot right now.
+	var ready []string
+	type wc struct{ id string; free, queued int }
+	var dump []wc
+	for id, w := range d.workers {
+		free := cap(w.sem) - len(w.sem)
+		queued := len(w.queue)
+		if free > 0 && queued < workerQueueDepth {
+			ready = append(ready, id)
+		}
+		dump = append(dump, wc{id, free, queued})
+	}
 	d.mu.Unlock()
+	_ = dump
 
-	q, err := d.claimQueued(ctx)
-	if err != nil || q == nil {
+	if len(ready) == 0 {
+		return
+	}
+	// Claim as many runs as we have free slots in total, capped per tick.
+	totalFree := 0
+	for _, id := range ready {
+		d.mu.Lock()
+		w := d.workers[id]
+		d.mu.Unlock()
+		if w != nil {
+			totalFree += cap(w.sem) - len(w.sem)
+		}
+	}
+	if totalFree == 0 {
 		return
 	}
 
-	d.mu.Lock()
-	w, ok := d.workers[q.AgentID]
-	d.mu.Unlock()
-	if !ok {
-		// Agent has no worker (not created or deleted). Requeue and retry later.
-		d.requeue(ctx, q, "agent not registered")
-		return
-	}
-	select {
-	case w.queue <- q:
-	default:
-		// Worker queue full; requeue and let the next tick retry.
-		d.requeue(ctx, q, "worker queue full")
-	}
-}
-
-// ── schedule dispatch ──
-
-// dispatchSchedules fires every enabled schedule whose next_run_at is due,
-// cloning a fresh task from the template and enqueueing it. Idempotent via the
-// uq_schedule_run_planned unique index: the same (schedule_id, planned_at)
-// can never fire twice, even across restarts or overlapping ticks.
-func (d *Daemon) dispatchSchedules(ctx context.Context) {
-	nowStr := now()
-	rows, err := d.st.DB().QueryContext(ctx,
-		`SELECT id, title_template, description, assignee_id, cron_expression, timezone, next_run_at
-		 FROM schedule
-		 WHERE enabled=1 AND next_run_at != '' AND next_run_at <= ?`, nowStr)
-	if err != nil {
-		log.Printf("daemon: schedule query: %v", err)
-		return
-	}
-	var due []scheduleDueRow
-	for rows.Next() {
-		var r scheduleDueRow
-		if err := rows.Scan(&r.ScheduleID, &r.TitleTemplate, &r.Description, &r.AssigneeID, &r.CronExpression, &r.Timezone, &r.NextRunAt); err != nil {
-			rows.Close()
-			log.Printf("daemon: schedule scan: %v", err)
+	claimed := 0
+	for claimed < totalFree {
+		q, err := d.runSvc.Claim(ctx, ready)
+		if err != nil {
+			log.Printf("daemon: claim: %v", err)
 			return
 		}
-		due = append(due, r)
-	}
-	rows.Close()
-
-	for _, r := range due {
-		d.fireSchedule(ctx, r)
-	}
-}
-
-type scheduleDueRow struct {
-	ScheduleID, TitleTemplate, Description, AssigneeID, CronExpression, Timezone, NextRunAt string
-}
-
-// fireSchedule handles one due schedule: clone task, record run, advance
-// next_run_at. Idempotency is enforced by the uq_schedule_run_planned unique
-// index inside the transaction — if a concurrent tick already inserted this
-// planned_at, the schedule_run insert fails, the whole tx rolls back (no orphan
-// task), and we just advance next_run_at. Errors are logged but do not stop the
-// tick.
-func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
-	plannedAt := r.NextRunAt
-
-	taskID := uuid.NewString()
-	ts := now()
-	tx, err := d.st.DB().BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("daemon: schedule %s begin tx: %v", r.ScheduleID, err)
-		return
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO task (id,title,description,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
-		 VALUES (?,?,'','agent',?,'queued','','system',?,?)`,
-		taskID, r.TitleTemplate, r.AssigneeID, r.ScheduleID, ts); err != nil {
-		log.Printf("daemon: schedule %s insert task: %v", r.ScheduleID, err)
-		return
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO task_queue (id,task_id,agent_id,status,attempt,queued_at) VALUES (?,?,?,'queued',1,?)`,
-		uuid.NewString(), taskID, r.AssigneeID, ts); err != nil {
-		log.Printf("daemon: schedule %s insert task_queue: %v", r.ScheduleID, err)
-		return
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO schedule_run (id,schedule_id,task_id,planned_at,status,created_at) VALUES (?,?,?,?,'dispatched',?)`,
-		uuid.NewString(), r.ScheduleID, taskID, plannedAt, ts); err != nil {
-		// Unique index violation → a concurrent tick@tick already fired this
-		// planned_at. Roll back the task/task_queue inserts (defer does this)
-		// and just advance next_run_at so we don't loop on the same slot.
-		log.Printf("daemon: schedule %s already fired at %s, skipping", r.ScheduleID, plannedAt)
-		d.advanceScheduleNextRun(ctx, r, plannedAt)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("daemon: schedule %s commit: %v", r.ScheduleID, err)
-		return
-	}
-
-	// Advance next_run_at anchored at plannedAt (not now) so a lagging clock
-	// can't re-point at the slot that just fired.
-	d.advanceScheduleNextRun(ctx, r, plannedAt)
-
-	d.bus.Publish(ctx, events.Event{Topic: "schedule:fired", Payload: map[string]any{
-		"schedule_id": r.ScheduleID, "task_id": taskID, "planned_at": plannedAt,
-	}})
-	log.Printf("daemon: schedule %s fired, created task %s", r.ScheduleID, taskID)
-}
-
-// advanceScheduleNextRun recomputes next_run_at from plannedAt and updates the
-// schedule row. Anchoring at plannedAt (not now) keeps the cron on its grid.
-func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, plannedAt string) {
-	anchor, err := time.Parse(time.RFC3339Nano, plannedAt)
-	if err != nil {
-		// Fall back to now if the stored timestamp is unparseable.
-		anchor = time.Now().UTC()
-	}
-	next, err := service.ComputeNextRun(r.CronExpression, r.Timezone, anchor)
-	if err != nil {
-		log.Printf("daemon: schedule %s advance cron: %v", r.ScheduleID, err)
-		return
-	}
-	if _, err := d.st.DB().ExecContext(ctx,
-		`UPDATE schedule SET next_run_at=?, last_run_at=? WHERE id=?`,
-		next.Format(time.RFC3339Nano), now(), r.ScheduleID); err != nil {
-		log.Printf("daemon: schedule %s advance next_run_at: %v", r.ScheduleID, err)
+		if q == nil {
+			return // nothing left to claim
+		}
+		d.mu.Lock()
+		w, ok := d.workers[q.AgentID]
+		d.mu.Unlock()
+		if !ok {
+			// Agent lost its worker mid-dispatch; requeue by finishing as
+			// failed+retry is wrong here — just leave queued for next tick.
+			log.Printf("daemon: no worker for agent %s (run %s)", q.AgentID, q.RunID)
+			return
+		}
+		select {
+		case w.queue <- q:
+			claimed++
+		default:
+			// Worker queue full; the claim is already 'running'. Bail and let
+			// the next tick re-evaluate. (Rare; bounded by queueDepth.)
+			log.Printf("daemon: worker queue full for agent %s", q.AgentID)
+			return
+		}
 	}
 }
 
-// queuedRow is a claimed task_queue row.
-type queuedRow struct {
-	QueueID string
-	TaskID  string
-	AgentID string
-	Attempt int
-}
+// ── run execution ──
 
-// claimQueued atomically claims the oldest queued row whose agent is not
-// crashed. The claim and the status flip happen in a single UPDATE … RETURNING
-// so two concurrent ticks can never both grab the same row.
-func (d *Daemon) claimQueued(ctx context.Context) (*queuedRow, error) {
-	tx, err := d.st.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-
-	var q queuedRow
-	err = tx.QueryRowContext(ctx,
-		`UPDATE task_queue
-		 SET status='running', started_at=?
-		 WHERE id = (
-		   SELECT tq.id
-		   FROM task_queue tq
-		   JOIN agent a ON a.id = tq.agent_id
-		   WHERE tq.status='queued' AND a.status != 'crashed'
-		   ORDER BY tq.queued_at
-		   LIMIT 1
-		 )
-		 RETURNING id, task_id, agent_id, attempt`, now()).
-		Scan(&q.QueueID, &q.TaskID, &q.AgentID, &q.Attempt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE task SET status='running' WHERE id=?`, q.TaskID); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return &q, nil
-}
-
-// requeue returns a claimed row to queued status for later retry.
-func (d *Daemon) requeue(ctx context.Context, q *queuedRow, reason string) {
-	if _, err := d.st.DB().ExecContext(ctx,
-		`UPDATE task_queue SET status='queued', started_at='' WHERE id=?`, q.QueueID); err != nil {
-		log.Printf("daemon: requeue task %s: %v", q.TaskID, err)
-	}
-	log.Printf("daemon: requeued task %s (%s)", q.TaskID, reason)
-}
-
-// runTask spawns a fresh ACP subprocess for this task, runs one Prompt, drains
-// events, and records the outcome.
-func (d *Daemon) runTask(ctx context.Context, q *queuedRow) {
-	// Load task + agent + runtime config.
-	var title, desc, handoff, workdirBase, systemPrompt, transport, execPath, argsJSON, endpoint, envJSON string
+// runTask opens a transport, hands it to the protocol backend for one Prompt,
+// drains events into chat_message + WS, and finishes the run (which triggers
+// goal-layer reconciliation).
+func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
+	var title, desc, handoff, workdirBase, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
 	var maxConcurrent int
+	var isLeaderRun bool
+	var squadID string
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT t.title, t.description, t.handoff_note, a.workdir_base, a.system_prompt,
-		        r.transport, r.executable, r.args, r.endpoint, r.env, a.max_concurrent
-		 FROM task t
-		 JOIN agent a ON a.id = t.assignee_id
+		`SELECT g.title, g.description, g.handoff_note, a.workdir_base, a.system_prompt,
+		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent,
+		        r2.is_leader_run, r2.squad_id
+		 FROM run r2
+		 JOIN goal g ON g.id = r2.goal_id
+		 JOIN agent a ON a.id = r2.agent_id
 		 JOIN runtime r ON r.id = a.runtime_id
-		 WHERE t.id = ?`, q.TaskID).
-		Scan(&title, &desc, &handoff, &workdirBase, &systemPrompt, &transport, &execPath, &argsJSON, &endpoint, &envJSON, &maxConcurrent)
+		 WHERE r2.id = ?`, q.RunID).
+		Scan(&title, &desc, &handoff, &workdirBase, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &isLeaderRun, &squadID)
 	if err != nil {
-		d.failOrRequeue(ctx, q, fmt.Sprintf("load config: %v", err))
+		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
 	}
 
-	// Ensure the per-agent worker exists (in case the agent:created event
-	// hasn't been processed yet).
 	d.ensureWorker(q.AgentID, maxConcurrent)
 
-	// Compute and create workdir.
-	workdir := filepath.Join(workdirBase, q.TaskID)
+	// Per-run working directory.
+	runRowWorkdir := filepath.Join(workdirBase, q.RunID)
 	if workdirBase == "" {
-		workdir = filepath.Join(os.TempDir(), "agentwork", q.TaskID)
+		runRowWorkdir = filepath.Join(os.TempDir(), "agentwork", q.RunID)
 	}
-	if err := os.MkdirAll(workdir, 0o755); err != nil {
-		d.failOrRequeue(ctx, q, fmt.Sprintf("mkdir workdir: %v", err))
+	if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
+		d.failRun(ctx, q, fmt.Sprintf("mkdir workdir: %v", err))
 		return
 	}
 
-	// Inject the agent's system prompt + team roster into the workdir so the
-	// agent subprocess discovers its identity and teammates via its native
-	// config file (AGENTS.md for openagent-cli). Without this the agent has
-	// no idea who it is or who it can hand off to.
+	// Inject the agent's identity + team roster / squad briefing into the
+	// workdir so the agent subprocess discovers who it is and who it can hand
+	// off to (AGENTS.md).
 	roster := d.buildTeamRoster(ctx, q.AgentID)
-	if err := d.injectAgentProfile(workdir, systemPrompt, roster); err != nil {
-		log.Printf("daemon: inject agent profile for task %s: %v", q.TaskID, err)
+	briefing := ""
+	if isLeaderRun && squadID != "" {
+		owns := d.goalOwnsSquadStatus(ctx, q.GoalID, squadID)
+		if b, err := d.squadSvc.BuildLeaderBriefing(ctx, squadID, owns); err == nil {
+			briefing = b
+		}
+	}
+	if err := d.injectAgentProfile(runRowWorkdir, systemPrompt, roster, briefing); err != nil {
+		log.Printf("daemon: inject agent profile for run %s: %v", q.RunID, err)
 	}
 
 	// Parse runtime args + env.
 	var args []string
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		d.failOrRequeue(ctx, q, fmt.Sprintf("parse args: %v", err))
+		d.failRun(ctx, q, fmt.Sprintf("parse args: %v", err))
 		return
 	}
 	var rtEnv map[string]string
-	_ = json.Unmarshal([]byte(envJSON), &rtEnv)
+	_ = json.Unmarshal([]byte(rtEnvJSON), &rtEnv)
 	agentEnv, _ := d.loadAgentEnv(ctx, q.AgentID)
 
-	// Build the task environment: inherit parent, layer agent env, then inject
-	// agentwork-cli context so the agent can call back into the server. Runtime
-	// env is layered by runtime.Launch (stdio branch), not here.
+	// Build the task environment: inherit parent, layer agent env, inject
+	// agentwork-cli context so the agent can call back into the server.
 	taskEnv := os.Environ()
 	for k, v := range agentEnv {
 		taskEnv = append(taskEnv, k+"="+v)
 	}
 	selfBin, _ := os.Executable()
 	binDir := filepath.Dir(selfBin)
-	// agentwork-cli must sit next to the daemon binary; the agent subprocess
-	// finds it via PATH. Warn once per task if missing — the agent's tool
-	// calls will fail with "command not found", and this log explains why.
 	cliPath := filepath.Join(binDir, "agentwork-cli")
 	if _, err := os.Stat(cliPath); err != nil {
-		log.Printf("daemon: agentwork-cli not found at %s; agent tool calls will fail (build it and place it next to agentwork-daemon)", cliPath)
+		log.Printf("daemon: agentwork-cli not found at %s; agent tool calls will fail", cliPath)
 	}
-	// Build the callback URL from the listen address. net.SplitHostPort
-	// handles ":port", "host:port", and "[::1]:port" uniformly; the agent
-	// always calls back over loopback, so force the host to 127.0.0.1.
 	addr := d.addr
 	if addr == "" {
 		addr = defaultListenAddr
 	}
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		d.failOrRequeue(ctx, q, fmt.Sprintf("parse listen addr %q: %v", addr, err))
+		d.failRun(ctx, q, fmt.Sprintf("parse listen addr %q: %v", addr, err))
 		return
 	}
 	serverURL := "http://" + net.JoinHostPort("127.0.0.1", port)
 	taskEnv = append(taskEnv,
 		"AGENTWORK_SERVER_URL="+serverURL,
-		"AGENTWORK_TASK_ID="+q.TaskID,
+		"AGENTWORK_GOAL_ID="+q.GoalID,   // product-plane id (CLI comments/handoff)
+		"AGENTWORK_RUN_ID="+q.RunID,     // execution-plane id
 		"AGENTWORK_AGENT_ID="+q.AgentID,
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
 
-	// Launch the runtime connection (stdio spawn, ws dial, or tcp dial) and
-	// get an ACP session over it. "定义即运行": the runtime row is the spec.
+	// Open the transport (stdio/ws/tcp); the backend speaks the protocol.
 	spec := runtime.Spec{
 		Transport:  transport,
 		Executable: execPath,
@@ -579,85 +409,104 @@ func (d *Daemon) runTask(ctx context.Context, q *queuedRow) {
 		Endpoint:   endpoint,
 		Env:        rtEnv,
 	}
-	sess, err := runtime.Launch(ctx, spec, taskEnv)
+	conn, err := runtime.Open(ctx, spec, taskEnv)
 	if err != nil {
-		d.failOrRequeue(ctx, q, fmt.Sprintf("launch: %v", err))
-		return
-	}
-	defer sess.Close()
-
-	// withStderr appends the agent's captured stderr to a failure summary,
-	// so a subprocess that exits with a usage error (bad args, missing
-	// config, …) surfaces its message instead of a generic "transport closed".
-	withStderr := func(summary string) string {
-		if e := sess.Stderr(); e != "" {
-			return summary + "\nstderr: " + e
-		}
-		return summary
-	}
-
-	if _, err := sess.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
-		d.failOrRequeue(ctx, q, withStderr(fmt.Sprintf("initialize: %v", err)))
+		d.failRun(ctx, q, fmt.Sprintf("open transport: %v", err))
 		return
 	}
 
-	newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{Cwd: workdir})
+	// Prompt the run: title + description + handoff/wakeup note.
+	prompt := buildPrompt(title, desc, handoff)
+
+	backend, err := d.protoReg.Get(provider)
 	if err != nil {
-		d.failOrRequeue(ctx, q, withStderr(fmt.Sprintf("new session: %v", err)))
+		conn.Close()
+		d.failRun(ctx, q, fmt.Sprintf("provider %q: %v", provider, err))
 		return
 	}
-
-	// Record the session row (history/replay; status active until the run ends).
-	if _, err := d.st.DB().ExecContext(ctx,
-		`INSERT INTO session (session_id, agent_id, task_id, workdir, status, created_at)
-		 VALUES (?,?,?,?,'active',?)`,
-		string(newResp.SessionID), q.AgentID, q.TaskID, workdir, now()); err != nil {
-		log.Printf("daemon: insert session for task %s: %v", q.TaskID, err)
-	}
-
-	// Stream events into chat_message + WS.
+	// The idle watchdog cancels promptCtx to interrupt a hung turn; backend
+	// Execute must run under promptCtx (not the bare ctx) so the cancel takes.
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
-	h := &runHandler{daemon: d, taskID: q.TaskID, bus: d.bus, ctx: ctx, lastActivityAt: &lastActivity}
-	sess.SetEventHandler(h)
-
-	// Idle watchdog: if the agent emits nothing for idleWindow (or
-	// idleToolWindow while a tool is in flight), cancel the Prompt. Without
-	// this, a hung subprocess (no end_turn, no exit) blocks forever.
+	var inFlightTools atomic.Int32
 	promptCtx, promptCancel := context.WithCancel(ctx)
 	defer promptCancel()
-	go d.runIdleWatchdog(ctx, &lastActivity, promptCancel, q.TaskID)
+	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID)
 
-	prompt := buildPrompt(title, desc, handoff)
-	if _, err := sess.Prompt(promptCtx, acp.PromptRequest{
-		SessionID: newResp.SessionID,
-		Prompt:    []acp.ContentBlock{{Type: "text", Text: prompt}},
-	}); err != nil {
-		// Mark this session closed (run ended, unsuccessfully).
-		d.closeSession(ctx, string(newResp.SessionID), q.AgentID)
-		if promptCtx.Err() != nil && ctx.Err() == nil {
-			d.failOrRequeue(ctx, q, withStderr("idle watchdog: agent stopped emitting events"))
-		} else {
-			d.failOrRequeue(ctx, q, withStderr(fmt.Sprintf("prompt: %v", err)))
-		}
+	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{Conn: conn, Cwd: runRowWorkdir, Prompt: prompt})
+	if err != nil {
+		conn.Close()
+		d.failRun(ctx, q, fmt.Sprintf("execute: %v", err))
 		return
 	}
 
-	// The handoff/wakeup note was consumed by this prompt. Clear it only after
-	// the turn succeeded — if Prompt failed and failOrRequeue requeues, the
-	// retry needs the note to rebuild the same prompt.
-	if handoff != "" {
-		if _, err := d.st.DB().ExecContext(ctx, `UPDATE task SET handoff_note='' WHERE id=?`, q.TaskID); err != nil {
-			log.Printf("daemon: clear handoff_note for task %s: %v", q.TaskID, err)
-		}
+	// Record workdir once the session is live (best-effort; the backend may not
+	// return a session id until Result).
+	_ = d.runSvc.MarkSession(ctx, q.RunID, "", runRowWorkdir)
+
+	for ev := range run.Events {
+		lastActivity.Store(time.Now().UnixNano())
+		d.persistEvent(ctx, q.RunID, ev)
+		d.trackToolInflight(&inFlightTools, ev)
+		d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
+			"run_id": q.RunID, "event": ev,
+		}})
 	}
 
-	// Mark session closed (run ended normally) and finish the task.
-	d.closeSession(ctx, string(newResp.SessionID), q.AgentID)
-	d.finishTask(ctx, q, "completed", "")
+	result, ok := <-run.Result
+	conn.Close()
+	if !ok {
+		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
+	}
+	switch result.Status {
+	case proto.StatusCompleted:
+		// The handoff/wakeup note is consumed by the goal layer (ReconcileOnRunEnd
+		// clears it only after confirming this run owns the goal and the goal
+		// promotes to done). The daemon must NOT clear it here: on a handoff this
+		// run no longer owns the goal, and clearing would wipe the new owner's
+		// note (see P2 in the bug review).
+		_ = d.runSvc.MarkSession(ctx, q.RunID, result.SessionID, runRowWorkdir)
+		d.finishRunOK(ctx, q, result.Output)
+	case proto.StatusCancelled:
+		d.finishRun(ctx, q, "cancelled", "idle watchdog: "+result.Output)
+	case proto.StatusFailed, proto.StatusAborted:
+		d.finishRun(ctx, q, "failed", result.Output)
+	}
 }
 
-// loadAgentEnv reads the agent-level env JSON from the DB.
+// trackToolInflight maintains the in-flight-tool counter the idle watchdog
+// reads to decide whether to use idleWindow or the larger idleToolWindow.
+func (d *Daemon) trackToolInflight(n *atomic.Int32, ev proto.Event) {
+	switch ev.Type {
+	case proto.EventToolUse:
+		n.Add(1)
+	case proto.EventToolResult:
+		n.Add(-1)
+		if v := n.Load(); v < 0 {
+			n.Store(0)
+		}
+	}
+}
+
+func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event) {
+	role := "assistant"
+	content := ev.Text
+	toolCalls := "[]"
+	if ev.Type == proto.EventThought {
+		role = "thought"
+	} else if ev.Type == proto.EventToolUse || ev.Type == proto.EventToolResult {
+		role = "tool"
+		content = ""
+		tc, _ := json.Marshal(ev)
+		toolCalls = string(tc)
+	}
+	if _, err := d.st.DB().ExecContext(ctx,
+		`INSERT INTO chat_message (id, run_id, role, content, tool_calls, created_at) VALUES (?,?,?,?,?,?)`,
+		uuid.NewString(), runID, role, content, toolCalls, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		log.Printf("daemon: persist event for run %s: %v", runID, err)
+	}
+}
+
 func (d *Daemon) loadAgentEnv(ctx context.Context, agentID string) (map[string]string, error) {
 	var envJSON string
 	err := d.st.DB().QueryRowContext(ctx, `SELECT env FROM agent WHERE id=?`, agentID).Scan(&envJSON)
@@ -669,101 +518,69 @@ func (d *Daemon) loadAgentEnv(ctx context.Context, agentID string) (map[string]s
 	return m, nil
 }
 
-// closeSession marks a session row closed (run ended).
-func (d *Daemon) closeSession(ctx context.Context, sessionID, agentID string) {
-	if _, err := d.st.DB().ExecContext(ctx,
-		`UPDATE session SET status='closed' WHERE session_id=? AND agent_id=?`, sessionID, agentID); err != nil {
-		log.Printf("daemon: close session %s: %v", sessionID, err)
+// failRun records a launch-time failure (before any backend ran). Failed runs
+// still flow through Finish → reconcile so the goal layer can retry/fail the
+// goal authoritatively.
+func (d *Daemon) failRun(ctx context.Context, q *service.ClaimedRow, summary string) {
+	log.Printf("daemon: run %s failed at launch: %s", q.RunID, summary)
+	d.finishRun(ctx, q, "failed", summary)
+}
+
+// finishRunOK ends a successful run.
+func (d *Daemon) finishRunOK(ctx context.Context, q *service.ClaimedRow, output string) {
+	d.finishRun(ctx, q, "completed", output)
+}
+
+// finishRun writes the run's terminal status + hands the outcome to the goal
+// layer. The goal layer (ReconcileOnRunEnd) is the SOLE authority over
+// goal.status; the daemon never writes goal.status directly.
+func (d *Daemon) finishRun(ctx context.Context, q *service.ClaimedRow, status, summary string) {
+	if err := d.runSvc.Finish(ctx, q.RunID, status, summary); err != nil {
+		log.Printf("daemon: finish run %s: %v", q.RunID, err)
+	}
+	// If this run was for a sub-goal, notify the goal layer to consider waking
+	// the parent. (The parent's wakeup is owned by GoalService.NotifyChildDone,
+	// guarded by status='blocked' + all-children-terminal inside its tx.)
+	if q.GoalID != "" {
+		d.runSvc.NotifyChildDone(ctx, q.GoalID)
 	}
 }
 
-// failOrRequeue records a failure. If the task has been attempted fewer than
-// maxAttempts times, it is requeued for retry; otherwise it is left as failed.
-func (d *Daemon) failOrRequeue(ctx context.Context, q *queuedRow, summary string) {
-	log.Printf("daemon: task %s failed (attempt %d): %s", q.TaskID, q.Attempt, summary)
-	if q.Attempt < maxAttempts {
-		if _, err := d.st.DB().ExecContext(ctx,
-			`UPDATE task_queue SET status='queued', attempt=attempt+1, started_at='', result_summary=? WHERE id=?`,
-			summary, q.QueueID); err != nil {
-			log.Printf("daemon: requeue task %s: %v", q.TaskID, err)
-		}
-		if _, err := d.st.DB().ExecContext(ctx, `UPDATE task SET status='queued' WHERE id=?`, q.TaskID); err != nil {
-			log.Printf("daemon: set task %s queued: %v", q.TaskID, err)
-		}
-		d.bus.Publish(ctx, events.Event{Topic: "task:retrying", Payload: map[string]any{
-			"task_id": q.TaskID, "attempt": q.Attempt + 1, "summary": summary,
-		}})
-		return
-	}
-	d.finishTask(ctx, q, "failed", summary)
-}
-
-// finishTask updates task_queue + task status and publishes a finished event.
-// It will not clobber a task that transitioned to waiting_children during the
-// run (the agent called wait-children mid-Prompt); the task stays waiting for
-// its sub-tasks and the finished event reflects that.
-func (d *Daemon) finishTask(ctx context.Context, q *queuedRow, status, summary string) {
-	if _, err := d.st.DB().ExecContext(ctx,
-		`UPDATE task_queue SET status=?, result_summary=?, finished_at=? WHERE id=?`,
-		status, summary, now(), q.QueueID); err != nil {
-		log.Printf("daemon: finish task_queue %s: %v", q.QueueID, err)
-	}
-	// Only flip the task status if it isn't waiting_children. If the agent
-	// called wait-children during the run, the task is intentionally parked.
-	res, err := d.st.DB().ExecContext(ctx,
-		`UPDATE task SET status=? WHERE id=? AND status!='waiting_children'`, status, q.TaskID)
+// goalOwnsSquadStatus mirrors multica's ownsIssueStatus: a leader run may only
+// push the goal to done when the goal is assigned to THIS squad (DESIGN.zh.md
+// §5.4). A guest @mentioned squad gets the "do NOT change status" briefing.
+func (d *Daemon) goalOwnsSquadStatus(ctx context.Context, goalID, squadID string) bool {
+	var at, aid string
+	err := d.st.DB().QueryRowContext(ctx, `SELECT assignee_type, assignee_id FROM goal WHERE id=?`, goalID).Scan(&at, &aid)
 	if err != nil {
-		log.Printf("daemon: finish task %s: %v", q.TaskID, err)
-	} else if n, _ := res.RowsAffected(); n == 0 {
-		// Task is waiting_children — leave it. Report that in the event.
-		status = "waiting_children"
+		return false
 	}
-	d.bus.Publish(ctx, events.Event{Topic: "task:finished", Payload: map[string]any{
-		"task_id": q.TaskID, "status": status, "summary": summary,
-	}})
-
-	// If this was a sub-task, maybe wake its parent. Only terminal statuses
-	// (completed/failed) reach here — requeued retries don't call finishTask.
-	if status == "completed" || status == "failed" {
-		if err := d.taskSvc.WakeupParentIfReady(ctx, q.TaskID); err != nil {
-			log.Printf("daemon: wakeup check for task %s: %v", q.TaskID, err)
-		}
-	}
+	return at == "squad" && aid == squadID
 }
 
-// buildPrompt assembles the opening prompt for a task turn.
+// buildPrompt assembles the opening prompt for a run turn.
 func buildPrompt(title, desc, handoff string) string {
 	s := fmt.Sprintf("Task: %s\n\n%s", title, desc)
 	if handoff != "" {
-		// Frame the handoff note as a scoping instruction, not a comment to
-		// reply to — without this prefix agents often treat the note as
-		// conversational content and respond to it instead of executing it.
 		s += "\n\nYou were handed this task with a handoff note. Treat it as the assigner's scoping instruction for this run; follow it before doing anything broader, and do not reply to it as if it were a comment:\n\n> " + handoff + "\n"
 	}
 	return s
 }
 
 // buildTeamRoster generates a "## Team Members" section listing every other
-// agent in the system with their id, name, and description, plus the handoff
-// command usage. This is injected into the agent's AGENTS.md so it knows who
-// it can hand off to. The calling agent (selfAgentID) is excluded.
+// agent so the run's agent knows who it can hand off to.
 func (d *Daemon) buildTeamRoster(ctx context.Context, selfAgentID string) string {
-	rows, err := d.st.DB().QueryContext(ctx,
-		`SELECT id, name, description FROM agent ORDER BY name`)
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name, description FROM agent ORDER BY name`)
 	if err != nil {
 		log.Printf("daemon: build team roster: %v", err)
 		return ""
 	}
 	defer rows.Close()
-
 	var b strings.Builder
 	b.WriteString("## Team Members\n\n")
 	b.WriteString("You can hand off the current task to a teammate using:\n")
-	b.WriteString("  agentwork-cli task handoff <agent-id> [--note \"...\"]\n\n")
-	b.WriteString("Collaboration rule: if the task does not fall within your role/responsibilities, ")
-	b.WriteString("hand it off to the teammate whose role best matches the task instead of doing it yourself. ")
-	b.WriteString("When you hand off, include a --note explaining what the task needs.\n\n")
-
+	b.WriteString("  agentwork-cli goal assign <to-agent-id> [--note \"...\"]\n\n")
+	b.WriteString("Collaboration rule: if the task falls outside your role, hand it off to the teammate whose role best matches it instead of doing it yourself.\n\n")
 	var n int
 	for rows.Next() {
 		var id, name, desc string
@@ -787,95 +604,26 @@ func (d *Daemon) buildTeamRoster(ctx context.Context, selfAgentID string) string
 	return b.String()
 }
 
-// injectAgentProfile writes the agent's system prompt and team roster into
-// {workdir}/AGENTS.md so the agent subprocess discovers its identity and
-// teammates via its native config file. openagent-cli reads AGENTS.md from
-// the working directory at startup.
-func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster string) error {
+// injectAgentProfile writes the agent's system prompt, team roster, and (for
+// leader runs) squad briefing into {workdir}/AGENTS.md so the subprocess
+// discovers its identity via its native config file.
+func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster, briefing string) error {
 	var b strings.Builder
 	if systemPrompt != "" {
 		b.WriteString(systemPrompt)
+		b.WriteString("\n\n")
+	}
+	if briefing != "" {
+		b.WriteString(briefing)
 		b.WriteString("\n\n")
 	}
 	b.WriteString(roster)
 	return os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(b.String()), 0o644)
 }
 
-// runHandler implements acp.EventHandler for one task run, streaming events
-// into chat_message and the WS bus. It also tracks lastActivityAt so the
-// idle watchdog can detect a hung agent (no events for > idleWindow).
-type runHandler struct {
-	daemon        *Daemon
-	taskID        string
-	bus           *events.Bus
-	ctx           context.Context // runTask's ctx, so events stop when the task/daemon stops
-	lastActivityAt *atomic.Int64  // unix nanos of last event; updated by every callback
-}
-
-func (h *runHandler) touch() {
-	if h.lastActivityAt != nil {
-		h.lastActivityAt.Store(time.Now().UnixNano())
-	}
-}
-
-func (h *runHandler) OnAgentMessage(text string) {
-	h.touch()
-	h.persist("assistant", text)
-	h.bus.Publish(h.ctx, events.Event{Topic: "task:message", Payload: map[string]any{
-		"task_id": h.taskID, "role": "assistant", "text": text,
-	}})
-}
-func (h *runHandler) OnAgentThought(text string) {
-	h.touch()
-	h.persist("thought", text)
-	h.bus.Publish(h.ctx, events.Event{Topic: "task:thought", Payload: map[string]any{
-		"task_id": h.taskID, "text": text,
-	}})
-}
-func (h *runHandler) OnUserMessage(text string) { h.touch() }
-func (h *runHandler) OnToolCall(tc acp.ToolCallUpdate) {
-	h.touch()
-	b, _ := json.Marshal(tc)
-	// Persist tool calls so the task detail view can reconstruct the full
-	// history after a refresh, not just the live WS stream. role="tool",
-	// content is the serialized ToolCallUpdate.
-	h.persistTool(string(b))
-	h.bus.Publish(h.ctx, events.Event{Topic: "task:tool", Payload: map[string]any{
-		"task_id": h.taskID, "tool": string(b),
-	}})
-}
-func (h *runHandler) OnPlan(acp.Plan)                                 { h.touch() }
-func (h *runHandler) OnAvailableCommandsUpdate([]acp.AvailableCommand) { h.touch() }
-func (h *runHandler) OnModeUpdate(acp.SessionModeId)                   { h.touch() }
-func (h *runHandler) OnConfigOptionUpdate([]acp.SessionConfigOption)   { h.touch() }
-func (h *runHandler) OnUsageUpdate(int, int, *acp.Cost)                { h.touch() }
-func (h *runHandler) OnSessionInfo(string, map[string]any)             { h.touch() }
-
-func (h *runHandler) persist(role, content string) {
-	if _, err := h.daemon.st.DB().ExecContext(h.ctx,
-		`INSERT INTO chat_message (id, task_id, role, content, tool_calls, created_at) VALUES (?,?,?,?,'[]',?)`,
-		uuid.NewString(), h.taskID, role, content, now()); err != nil {
-		log.Printf("daemon: persist message for task %s: %v", h.taskID, err)
-	}
-}
-
-// persistTool stores a tool call update with role="tool" and the serialized
-// update in the tool_calls column (content is empty — the tool_calls JSON
-// carries everything).
-func (h *runHandler) persistTool(toolCallsJSON string) {
-	if _, err := h.daemon.st.DB().ExecContext(h.ctx,
-		`INSERT INTO chat_message (id, task_id, role, content, tool_calls, created_at) VALUES (?,?,'tool','',?,?)`,
-		uuid.NewString(), h.taskID, toolCallsJSON, now()); err != nil {
-		log.Printf("daemon: persist tool call for task %s: %v", h.taskID, err)
-	}
-}
-
-// runIdleWatchdog cancels a Prompt if the agent emits no events for idleWindow.
-// It ticks at idleWindow/2 and checks lastActivityAt; if the silence exceeds
-// the budget, it calls cancel to unblock sess.Prompt. The parent ctx is
-// separate from the Prompt's ctx so cancelling the Prompt does not cancel the
-// daemon. Exits when parent ctx is cancelled (task finished or daemon stopping).
-func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.Int64, cancel context.CancelFunc, taskID string) {
+// runIdleWatchdog cancels a Prompt if the agent emits nothing for idleWindow
+// (or idleToolWindow while a tool is in flight). It ticks at window/2.
+func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.Int64, inFlightTools *atomic.Int32, cancel context.CancelFunc, runID string) {
 	interval := idleWindow / 2
 	if interval <= 0 {
 		interval = idleWindow
@@ -887,18 +635,112 @@ func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.In
 		case <-parent.Done():
 			return
 		case <-ticker.C:
+			threshold := idleWindow
+			if inFlightTools.Load() > 0 {
+				threshold = idleToolWindow
+			}
 			last := time.Unix(0, lastActivity.Load())
-			idleFor := time.Since(last)
-			if idleFor < idleWindow {
+			if time.Since(last) < threshold {
 				continue
 			}
-			log.Printf("daemon: idle watchdog firing for task %s (silent for %s), force-stopping", taskID, idleFor.Round(time.Second))
+			log.Printf("daemon: idle watchdog firing for run %s (silent %s), force-stopping", runID, time.Since(last).Round(time.Second))
 			cancel()
 			return
 		}
 	}
 }
 
-// ── helpers ──
+// ── schedule dispatch ──
 
-func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+// dispatchSchedules fires every enabled schedule whose next_run_at is due,
+// cloning a fresh goal + run. Idempotent via uq_schedule_run_planned.
+func (d *Daemon) dispatchSchedules(ctx context.Context) {
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT id, title_template, description, assignee_type, assignee_id, cron_expression, timezone, next_run_at
+		 FROM schedule WHERE enabled=1 AND next_run_at != '' AND next_run_at <= ?`, nowStr)
+	if err != nil {
+		log.Printf("daemon: schedule query: %v", err)
+		return
+	}
+	var due []scheduleDueRow
+	for rows.Next() {
+		var r scheduleDueRow
+		if err := rows.Scan(&r.ScheduleID, &r.TitleTemplate, &r.Description, &r.AssigneeType, &r.AssigneeID, &r.CronExpression, &r.Timezone, &r.NextRunAt); err != nil {
+			rows.Close()
+			log.Printf("daemon: schedule scan: %v", err)
+			return
+		}
+		due = append(due, r)
+	}
+	rows.Close()
+	for _, r := range due {
+		d.fireSchedule(ctx, r)
+	}
+}
+
+type scheduleDueRow struct {
+	ScheduleID, TitleTemplate, Description, AssigneeType, AssigneeID, CronExpression, Timezone, NextRunAt string
+}
+
+func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
+	plannedAt := r.NextRunAt
+	goalID := uuid.NewString()
+	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := d.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("daemon: schedule %s begin tx: %v", r.ScheduleID, err)
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO goal (id,title,description,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
+		 VALUES (?,?,?,'active',?,'','','system',?,?)`,
+		goalID, r.TitleTemplate, r.Description, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
+		log.Printf("daemon: schedule %s insert goal: %v", r.ScheduleID, err)
+		return
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO schedule_run (id,schedule_id,goal_id,planned_at,status,created_at) VALUES (?,?,?,?,'dispatched',?)`,
+		uuid.NewString(), r.ScheduleID, goalID, plannedAt, ts); err != nil {
+		// Unique index violation → a concurrent tick already fired this
+		// planned_at. Roll back the goal insert and just advance next_run_at.
+		log.Printf("daemon: schedule %s already fired at %s, skipping", r.ScheduleID, plannedAt)
+		d.advanceScheduleNextRun(ctx, r, plannedAt)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("daemon: schedule %s commit: %v", r.ScheduleID, err)
+		return
+	}
+	// Enqueue the first run for the new goal via the services (coalesce + leader
+	// routing for squad assignees).
+	g, err := d.goalSvc.Get(ctx, goalID)
+	if err != nil {
+		log.Printf("daemon: schedule %s load goal: %v", r.ScheduleID, err)
+	} else if _, err := d.runSvc.EnqueueForGoal(ctx, *g); err != nil {
+		log.Printf("daemon: schedule %s enqueue run: %v", r.ScheduleID, err)
+	}
+	d.advanceScheduleNextRun(ctx, r, plannedAt)
+	d.bus.Publish(ctx, events.Event{Topic: "schedule:fired", Payload: map[string]any{
+		"schedule_id": r.ScheduleID, "goal_id": goalID, "planned_at": plannedAt,
+	}})
+	log.Printf("daemon: schedule %s fired, created goal %s", r.ScheduleID, goalID)
+}
+
+func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, plannedAt string) {
+	anchor, err := time.Parse(time.RFC3339Nano, plannedAt)
+	if err != nil {
+		anchor = time.Now().UTC()
+	}
+	next, err := service.ComputeNextRun(r.CronExpression, r.Timezone, anchor)
+	if err != nil {
+		log.Printf("daemon: schedule %s advance cron: %v", r.ScheduleID, err)
+		return
+	}
+	if _, err := d.st.DB().ExecContext(ctx,
+		`UPDATE schedule SET next_run_at=?, last_run_at=? WHERE id=?`,
+		next.Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), r.ScheduleID); err != nil {
+		log.Printf("daemon: schedule %s advance next_run_at: %v", r.ScheduleID, err)
+	}
+}

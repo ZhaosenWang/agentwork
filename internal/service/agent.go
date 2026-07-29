@@ -11,8 +11,10 @@ import (
 	"github.com/eushing/agentwork/internal/store"
 )
 
-// Agent is a runtime + a persona. Creating one launches a long-lived ACP
-// server (handled by the daemon via the agent:created event).
+// Agent is a runtime + a persona. Under the per-task connection model, creating
+// an agent does NOT launch a process: a fresh connection is opened per run.
+// status/pid columns are deliberately gone — they belong to the future
+// long-lived-session model and would be dead columns today.
 type Agent struct {
 	ID            string            `json:"id"`
 	Name          string            `json:"name"`
@@ -23,8 +25,6 @@ type Agent struct {
 	WorkdirBase   string            `json:"workdir_base"`
 	Env           map[string]string `json:"env"`
 	MaxConcurrent int               `json:"max_concurrent"`
-	Status        string            `json:"status"`
-	PID           int               `json:"pid"`
 	CreatedAt     string            `json:"created_at"`
 }
 
@@ -57,24 +57,25 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 		a.MaxConcurrent = 1
 	}
 	a.ID = newID()
-	a.Status = "offline" // daemon will flip to online once the server is up
 	a.CreatedAt = now()
 	envJSON, _ := json.Marshal(a.Env)
 	_, err = s.st.DB().ExecContext(ctx,
-		`INSERT INTO agent (id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,status,pid,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, a.WorkdirBase, string(envJSON), a.MaxConcurrent, a.Status, 0, a.CreatedAt)
+		`INSERT INTO agent (id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, a.WorkdirBase, string(envJSON), a.MaxConcurrent, a.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert agent: %w", err)
 	}
-	// Tell the daemon to launch the ACP server for this agent.
+	// Notify the daemon that an agent exists (it rebuilds per-agent workers on
+	// startup; this is the live-create path). Under the per-task model no
+	// process is launched here.
 	s.bus.Publish(ctx, events.Event{Topic: "agent:created", Payload: a})
 	return &a, nil
 }
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,status,pid,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,created_at
 		 FROM agent ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -84,7 +85,7 @@ func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	for rows.Next() {
 		var a Agent
 		var envJSON string
-		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &a.WorkdirBase, &envJSON, &a.MaxConcurrent, &a.Status, &a.PID, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &a.WorkdirBase, &envJSON, &a.MaxConcurrent, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(envJSON), &a.Env)
@@ -97,9 +98,9 @@ func (s *AgentService) Get(ctx context.Context, id string) (*Agent, error) {
 	var a Agent
 	var envJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,status,pid,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,created_at
 		 FROM agent WHERE id=?`, id).
-		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &a.WorkdirBase, &envJSON, &a.MaxConcurrent, &a.Status, &a.PID, &a.CreatedAt)
+		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &a.WorkdirBase, &envJSON, &a.MaxConcurrent, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -116,18 +117,25 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	// Clean dependents in FK order. task_queue/session/schedule reference
-	// agent; task.assignee_id is NOT FK-constrained so we null it out to
-	// avoid orphan pointers. Schedules pointing at this agent are dropped
-	// (a schedule without its agent is meaningless); their run history goes
-	// too. task_queue rows for this agent are dropped (they were dispatch
-	// slots, not durable state — the task itself survives in backlog).
+	// Refuse if this agent leads a squad — forcing the caller to fix the squad
+	// first is safer than silently orphaning it (squad.leader_id is RESTRICT).
+	var squadCount int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM squad WHERE leader_id=?`, id).Scan(&squadCount); err != nil {
+		return fmt.Errorf("check leader role: %w", err)
+	}
+	if squadCount > 0 {
+		return NewValidationError(fmt.Sprintf("agent %s leads %d squad(s); delete or reassign them first", id, squadCount))
+	}
+	// chat_message references run; run references agent + goal. Schedules and
+	// goals reference agent by id (no FK) — null those assignee pointers so
+	// the goals survive as human-assigned rather than dangling.
 	for _, stmt := range []string{
-		`DELETE FROM task_queue WHERE agent_id=?`,
-		`DELETE FROM session WHERE agent_id=?`,
-		`DELETE FROM schedule_run WHERE schedule_id IN (SELECT id FROM schedule WHERE assignee_id=?)`,
-		`DELETE FROM schedule WHERE assignee_id=?`,
-		`UPDATE task SET assignee_type='human', assignee_id='' WHERE assignee_type='agent' AND assignee_id=?`,
+		`DELETE FROM chat_message WHERE run_id IN (SELECT id FROM run WHERE agent_id=?)`,
+		`DELETE FROM run WHERE agent_id=?`,
+		`DELETE FROM squad_member WHERE member_type='agent' AND member_id=?`,
+		`DELETE FROM schedule_run WHERE schedule_id IN (SELECT id FROM schedule WHERE assignee_type='agent' AND assignee_id=?)`,
+		`DELETE FROM schedule WHERE assignee_type='agent' AND assignee_id=?`,
+		`UPDATE goal SET assignee_type='human', assignee_id='' WHERE assignee_type='agent' AND assignee_id=?`,
 		`DELETE FROM agent WHERE id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
@@ -137,7 +145,7 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// Tell the daemon to stop the subprocess.
+	// Tell the daemon to drop this agent's worker.
 	s.bus.Publish(ctx, events.Event{Topic: "agent:deleted", Payload: map[string]string{"id": id}})
 	return nil
 }

@@ -11,20 +11,22 @@ import (
 	"github.com/eushing/agentwork/internal/store"
 )
 
-// Schedule is a cron-triggered task template. Each firing clones a fresh task
-// from TitleTemplate/Description and assigns it to AssigneeID.
+// Schedule is a cron-triggered goal template. Each firing clones a fresh goal
+// from TitleTemplate/Description, assigns it to AssigneeID, and enqueues a
+// run. assignee may be an agent or a squad.
 type Schedule struct {
-	ID            string `json:"id"`
-	Name          string `json:"name"`
-	TitleTemplate string `json:"title_template"`
-	Description   string `json:"description"`
-	AssigneeID    string `json:"assignee_id"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	TitleTemplate  string `json:"title_template"`
+	Description    string `json:"description"`
+	AssigneeType   string `json:"assignee_type"` // agent | squad
+	AssigneeID     string `json:"assignee_id"`
 	CronExpression string `json:"cron_expression"`
-	Timezone      string `json:"timezone"`
-	Enabled       bool   `json:"enabled"`
-	NextRunAt     string `json:"next_run_at"`
-	LastRunAt     string `json:"last_run_at"`
-	CreatedAt     string `json:"created_at"`
+	Timezone       string `json:"timezone"`
+	Enabled        bool   `json:"enabled"`
+	NextRunAt      string `json:"next_run_at"`
+	LastRunAt      string `json:"last_run_at"`
+	CreatedAt      string `json:"created_at"`
 }
 
 type ScheduleService struct {
@@ -47,6 +49,21 @@ func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, 
 	}
 	if sch.AssigneeID == "" {
 		return nil, NewValidationError("assignee_id is required")
+	}
+	if sch.AssigneeType == "" {
+		sch.AssigneeType = "agent"
+	}
+	switch sch.AssigneeType {
+	case "agent":
+		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, sch.AssigneeID, "assignee agent"); err != nil {
+			return nil, err
+		}
+	case "squad":
+		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, sch.AssigneeID, "assignee squad"); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, NewValidationError("assignee_type must be agent or squad")
 	}
 	if sch.CronExpression == "" {
 		return nil, NewValidationError("cron_expression is required")
@@ -72,9 +89,9 @@ func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, 
 		enabled = 1
 	}
 	if _, err := s.st.DB().ExecContext(ctx,
-		`INSERT INTO schedule (id,name,title_template,description,assignee_id,cron_expression,timezone,enabled,next_run_at,last_run_at,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,'')`,
-		sch.ID, sch.Name, sch.TitleTemplate, sch.Description, sch.AssigneeID, sch.CronExpression, sch.Timezone, enabled, sch.NextRunAt, sch.CreatedAt); err != nil {
+		`INSERT INTO schedule (id,name,title_template,description,assignee_type,assignee_id,cron_expression,timezone,enabled,next_run_at,last_run_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,'')`,
+		sch.ID, sch.Name, sch.TitleTemplate, sch.Description, sch.AssigneeType, sch.AssigneeID, sch.CronExpression, sch.Timezone, enabled, sch.NextRunAt, sch.CreatedAt); err != nil {
 		return nil, fmt.Errorf("insert schedule: %w", err)
 	}
 
@@ -84,7 +101,7 @@ func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, 
 
 func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,title_template,description,assignee_id,cron_expression,timezone,enabled,next_run_at,last_run_at,created_at
+		`SELECT id,name,title_template,description,assignee_type,assignee_id,cron_expression,timezone,enabled,next_run_at,last_run_at,created_at
 		 FROM schedule ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -94,7 +111,7 @@ func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
 	for rows.Next() {
 		var sch Schedule
 		var enabled int
-		if err := rows.Scan(&sch.ID, &sch.Name, &sch.TitleTemplate, &sch.Description, &sch.AssigneeID, &sch.CronExpression, &sch.Timezone, &enabled, &sch.NextRunAt, &sch.LastRunAt, &sch.CreatedAt); err != nil {
+		if err := rows.Scan(&sch.ID, &sch.Name, &sch.TitleTemplate, &sch.Description, &sch.AssigneeType, &sch.AssigneeID, &sch.CronExpression, &sch.Timezone, &enabled, &sch.NextRunAt, &sch.LastRunAt, &sch.CreatedAt); err != nil {
 			return nil, err
 		}
 		sch.Enabled = enabled != 0
@@ -107,9 +124,9 @@ func (s *ScheduleService) Get(ctx context.Context, id string) (*Schedule, error)
 	var sch Schedule
 	var enabled int
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,title_template,description,assignee_id,cron_expression,timezone,enabled,next_run_at,last_run_at,created_at
+		`SELECT id,name,title_template,description,assignee_type,assignee_id,cron_expression,timezone,enabled,next_run_at,last_run_at,created_at
 		 FROM schedule WHERE id=?`, id).
-		Scan(&sch.ID, &sch.Name, &sch.TitleTemplate, &sch.Description, &sch.AssigneeID, &sch.CronExpression, &sch.Timezone, &enabled, &sch.NextRunAt, &sch.LastRunAt, &sch.CreatedAt)
+		Scan(&sch.ID, &sch.Name, &sch.TitleTemplate, &sch.Description, &sch.AssigneeType, &sch.AssigneeID, &sch.CronExpression, &sch.Timezone, &enabled, &sch.NextRunAt, &sch.LastRunAt, &sch.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

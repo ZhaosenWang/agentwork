@@ -10,18 +10,24 @@ import (
 	"github.com/eushing/agentwork/internal/store"
 )
 
-// Runtime is a launch spec for an ACP-speaking agent. transport selects how
-// the daemon connects: stdio spawns executable+args; ws/tcp dials endpoint.
+// Runtime is a launch spec for a protocol-speaking agent. transport selects
+// how the daemon connects (stdio spawns executable+args; ws/tcp dials
+// endpoint). provider selects which backend speaks the wire protocol
+// (acp|jsonl|jsonrpc). See DESIGN.zh.md §6.
 type Runtime struct {
 	ID         string            `json:"id"`
 	Name       string            `json:"name"`
-	Transport  string            `json:"transport"` // stdio|ws|tcp
+	Transport  string            `json:"transport"`  // stdio|ws|tcp
+	Provider   string            `json:"provider"`   // acp|jsonl|jsonrpc → which backend
 	Executable string            `json:"executable"`
 	Args       []string          `json:"args"`
 	Endpoint   string            `json:"endpoint"`
 	Env        map[string]string `json:"env"`
-	Protocol   string            `json:"protocol"`
 	CreatedAt  string            `json:"created_at"`
+}
+
+func validProvider(p string) bool {
+	return p == "acp" || p == "jsonl" || p == "jsonrpc"
 }
 
 type RuntimeService struct{ st *store.Store }
@@ -53,16 +59,19 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 	if r.Env == nil {
 		r.Env = map[string]string{}
 	}
-	if r.Protocol == "" {
-		r.Protocol = "acp"
+	if r.Provider == "" {
+		r.Provider = "acp"
+	}
+	if !validProvider(r.Provider) {
+		return nil, NewValidationError("provider must be acp, jsonl, or jsonrpc")
 	}
 	r.ID = newID()
 	r.CreatedAt = now()
 	argsJSON, _ := json.Marshal(r.Args)
 	envJSON, _ := json.Marshal(r.Env)
 	_, err := s.st.DB().ExecContext(ctx,
-		`INSERT INTO runtime (id,name,transport,executable,args,endpoint,env,protocol,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Name, r.Transport, r.Executable, string(argsJSON), r.Endpoint, string(envJSON), r.Protocol, r.CreatedAt)
+		`INSERT INTO runtime (id,name,transport,provider,executable,args,endpoint,env,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Name, r.Transport, r.Provider, r.Executable, string(argsJSON), r.Endpoint, string(envJSON), r.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert runtime: %w", err)
 	}
@@ -71,7 +80,7 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 
 func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,transport,executable,args,endpoint,env,protocol,created_at FROM runtime ORDER BY created_at`)
+		`SELECT id,name,transport,provider,executable,args,endpoint,env,created_at FROM runtime ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +89,7 @@ func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	for rows.Next() {
 		var r Runtime
 		var argsJSON, envJSON string
-		if err := rows.Scan(&r.ID, &r.Name, &r.Transport, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.Protocol, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(argsJSON), &r.Args)
@@ -94,8 +103,8 @@ func (s *RuntimeService) Get(ctx context.Context, id string) (*Runtime, error) {
 	var r Runtime
 	var argsJSON, envJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,transport,executable,args,endpoint,env,protocol,created_at FROM runtime WHERE id=?`, id).
-		Scan(&r.ID, &r.Name, &r.Transport, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.Protocol, &r.CreatedAt)
+		`SELECT id,name,transport,provider,executable,args,endpoint,env,created_at FROM runtime WHERE id=?`, id).
+		Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

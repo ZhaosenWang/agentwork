@@ -18,10 +18,12 @@ import (
 // topics added to the system must be listed here or they won't reach the
 // frontend.
 var topics = []string{
-	"task:created", "task:assigned", "task:finished", "task:retrying", "task:deleted",
-	"task:message", "task:thought", "task:tool",
-	"task:waiting", "task:wakeup",
+	"goal:created", "goal:assigned", "goal:finished", "goal:retrying", "goal:retry_failed",
+	"goal:waiting", "goal:deleted",
+	"run:enqueued", "run:coalesced", "run:discarded", "run:event",
+	"comment:created",
 	"agent:created", "agent:deleted",
+	"squad:created", "squad:deleted", "squad:member_added",
 	"schedule:created", "schedule:fired",
 }
 

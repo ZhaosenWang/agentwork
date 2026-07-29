@@ -638,15 +638,22 @@ func (s *Session) handleCancelRequestNotif(params json.RawMessage) {
 	if json.Unmarshal(params, &notif) != nil {
 		return
 	}
+	// Close the pending call AND remove it from the map under the same lock.
+	// Without the delete, a subsequent transport-EOF failPending would find the
+	// same entry and close(call.done) a second time → panic (close of closed
+	// channel), crashing the reader goroutine (no recover).
 	s.mu.Lock()
-	call := s.pending[notif.RequestID]
-	s.mu.Unlock()
-	if call != nil {
-		// Deliver a synthetic cancellation error so the blocked caller
-		// returns promptly.
-		call.resp.Error = &Error{Code: ErrorCodeRequestCancelled, Message: "request cancelled by agent"}
-		close(call.done)
+	call, ok := s.pending[notif.RequestID]
+	if ok {
+		delete(s.pending, notif.RequestID)
+		if call != nil {
+			// Deliver a synthetic cancellation error so the blocked caller
+			// returns promptly.
+			call.resp.Error = &Error{Code: ErrorCodeRequestCancelled, Message: "request cancelled by agent"}
+			close(call.done)
+		}
 	}
+	s.mu.Unlock()
 }
 
 func (s *Session) dispatchSessionUpdate(params json.RawMessage) {
