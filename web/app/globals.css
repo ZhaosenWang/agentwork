@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f7f7f8;
+  --foreground: #18181b;
+  --border: #e4e4e7;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+/* Light, consistent UI — no auto dark-mode flip. */
+html {
+  color-scheme: light;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Restore Tailwind v3 default border color so bare `border` = zinc-200,
+   not currentColor (v4 breaking change). */
+@layer base {
+  *,
+  ::after,
+  ::before {
+    border-color: var(--border);
+  }
+
+  /* Form controls: always dark text on white, visible border, focus ring. */
+  input,
+  textarea,
+  select {
+    background-color: #fff;
+    color: #18181b;
+    border-color: #d4d4d8;
+  }
+  input:focus,
+  textarea:focus,
+  select:focus {
+    outline: none;
+    border-color: #3f3f46;
+    box-shadow: 0 0 0 3px rgba(63, 63, 70, 0.08);
+  }
+  input::placeholder,
+  textarea::placeholder {
+    color: #a1a1aa;
+  }
+}

@@ -43,6 +43,8 @@ func main() {
 	switch os.Args[1] {
 	case "task":
 		taskCmd(serverURL, taskID, agentID, os.Args[2:])
+	case "agent":
+		agentCmd(serverURL, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -63,6 +65,7 @@ Subcommands:
   task message [--role R] --text T        append a chat_message to the current task
   task wait                               mark the current task as waiting for its sub-tasks;
                                           the daemon re-runs it once all children finish
+  agent list                              list all agents (JSON)
 
 Environment (injected by daemon):
   AGENTWORK_SERVER_URL   server base URL (default http://127.0.0.1:7373)
@@ -90,6 +93,22 @@ func taskCmd(serverURL, taskID, agentID string, args []string) {
 		taskWait(serverURL, taskID, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown task subcommand %q\n", args[0])
+		os.Exit(2)
+	}
+}
+
+// ── agent subcommand ──
+
+func agentCmd(serverURL string, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli agent <list>")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "list":
+		get(serverURL + "/agents")
+	default:
+		fmt.Fprintf(os.Stderr, "unknown agent subcommand %q\n", args[0])
 		os.Exit(2)
 	}
 }

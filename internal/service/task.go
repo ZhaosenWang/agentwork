@@ -246,6 +246,36 @@ func (s *TaskService) AddMessage(ctx context.Context, taskID, role, text string)
 	return nil
 }
 
+// ChatMessage is one row in the chat_message cache. The frontend reads this
+// for task history; the agent runtime remains the source of truth.
+type ChatMessage struct {
+	ID        string `json:"id"`
+	TaskID    string `json:"task_id"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	ToolCalls string `json:"tool_calls"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ListMessages returns the chat_message history for a task, oldest first.
+func (s *TaskService) ListMessages(ctx context.Context, taskID string) ([]ChatMessage, error) {
+	rows, err := s.st.DB().QueryContext(ctx,
+		`SELECT id,task_id,role,content,tool_calls,created_at FROM chat_message WHERE task_id=? ORDER BY created_at`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChatMessage
+	for rows.Next() {
+		var m ChatMessage
+		if err := rows.Scan(&m.ID, &m.TaskID, &m.Role, &m.Content, &m.ToolCalls, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // Cancel marks a non-terminal task as cancelled. Running tasks are not killed
 // here — the daemon notices the status change and lets the current turn finish
 // naturally; a future long-lived-session model could interrupt it. Queued

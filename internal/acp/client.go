@@ -510,6 +510,25 @@ func (s *Session) startReader() {
 			}
 		}
 	}
+
+	// The transport closed (EOF or read error). Fail any in-flight calls so
+	// blocked Initialize/Prompt/… callers return immediately instead of
+	// hanging forever. Without this, a subprocess that exits before replying
+	// (e.g. bad args) leaves the task stuck in "running" until the idle
+	// watchdog fires minutes later.
+	s.failPending(fmt.Errorf("acp: transport closed (agent exited without responding)"))
+}
+
+// failPending delivers a terminal error to all in-flight RPC calls. Called
+// once by startReader when the read side closes.
+func (s *Session) failPending(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, call := range s.pending {
+		call.resp.Error = &Error{Code: ErrorCodeInternal, Message: err.Error()}
+		close(call.done)
+		delete(s.pending, id)
+	}
 }
 
 // handleAgentRequest dispatches an incoming Agent→Client RPC request

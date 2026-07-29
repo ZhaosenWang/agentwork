@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,6 +100,7 @@ func New(st *store.Store, bus *events.Bus, addr string, taskSvc *service.TaskSer
 // Run starts the dispatch loop. Blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.ctx = ctx
+	d.recoverWorkers(ctx)
 	d.recoverStuckRunning(ctx)
 	dispatchTick := time.NewTicker(dispatchTickInterval)
 	scheduleTick := time.NewTicker(scheduleTickInterval)
@@ -115,6 +117,33 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-scheduleTick.C:
 			d.dispatchSchedules(ctx)
 		}
+	}
+}
+
+// recoverWorkers rebuilds per-agent workers for every agent already in the DB.
+// Without this, a daemon restart has no workers for pre-existing agents, so any
+// queued task assigned to them loops on "agent not registered" forever. Workers
+// are normally created reactively by the agent:created event, but that only
+// fires for agents created during this process's lifetime.
+func (d *Daemon) recoverWorkers(ctx context.Context) {
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, max_concurrent FROM agent`)
+	if err != nil {
+		log.Printf("daemon: recover workers: %v", err)
+		return
+	}
+	defer rows.Close()
+	var n int
+	for rows.Next() {
+		var id string
+		var maxConcurrent int
+		if err := rows.Scan(&id, &maxConcurrent); err != nil {
+			continue
+		}
+		d.ensureWorker(id, maxConcurrent)
+		n++
+	}
+	if n > 0 {
+		log.Printf("daemon: recovered %d agent worker(s)", n)
 	}
 }
 
@@ -457,16 +486,16 @@ func (d *Daemon) requeue(ctx context.Context, q *queuedRow, reason string) {
 // events, and records the outcome.
 func (d *Daemon) runTask(ctx context.Context, q *queuedRow) {
 	// Load task + agent + runtime config.
-	var title, desc, handoff, workdirBase, transport, execPath, argsJSON, endpoint, envJSON string
+	var title, desc, handoff, workdirBase, systemPrompt, transport, execPath, argsJSON, endpoint, envJSON string
 	var maxConcurrent int
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT t.title, t.description, t.handoff_note, a.workdir_base,
+		`SELECT t.title, t.description, t.handoff_note, a.workdir_base, a.system_prompt,
 		        r.transport, r.executable, r.args, r.endpoint, r.env, a.max_concurrent
 		 FROM task t
 		 JOIN agent a ON a.id = t.assignee_id
 		 JOIN runtime r ON r.id = a.runtime_id
 		 WHERE t.id = ?`, q.TaskID).
-		Scan(&title, &desc, &handoff, &workdirBase, &transport, &execPath, &argsJSON, &endpoint, &envJSON, &maxConcurrent)
+		Scan(&title, &desc, &handoff, &workdirBase, &systemPrompt, &transport, &execPath, &argsJSON, &endpoint, &envJSON, &maxConcurrent)
 	if err != nil {
 		d.failOrRequeue(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -484,6 +513,15 @@ func (d *Daemon) runTask(ctx context.Context, q *queuedRow) {
 	if err := os.MkdirAll(workdir, 0o755); err != nil {
 		d.failOrRequeue(ctx, q, fmt.Sprintf("mkdir workdir: %v", err))
 		return
+	}
+
+	// Inject the agent's system prompt + team roster into the workdir so the
+	// agent subprocess discovers its identity and teammates via its native
+	// config file (AGENTS.md for openagent-cli). Without this the agent has
+	// no idea who it is or who it can hand off to.
+	roster := d.buildTeamRoster(ctx, q.AgentID)
+	if err := d.injectAgentProfile(workdir, systemPrompt, roster); err != nil {
+		log.Printf("daemon: inject agent profile for task %s: %v", q.TaskID, err)
 	}
 
 	// Parse runtime args + env.
@@ -548,14 +586,24 @@ func (d *Daemon) runTask(ctx context.Context, q *queuedRow) {
 	}
 	defer sess.Close()
 
+	// withStderr appends the agent's captured stderr to a failure summary,
+	// so a subprocess that exits with a usage error (bad args, missing
+	// config, …) surfaces its message instead of a generic "transport closed".
+	withStderr := func(summary string) string {
+		if e := sess.Stderr(); e != "" {
+			return summary + "\nstderr: " + e
+		}
+		return summary
+	}
+
 	if _, err := sess.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
-		d.failOrRequeue(ctx, q, fmt.Sprintf("initialize: %v", err))
+		d.failOrRequeue(ctx, q, withStderr(fmt.Sprintf("initialize: %v", err)))
 		return
 	}
 
 	newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{Cwd: workdir})
 	if err != nil {
-		d.failOrRequeue(ctx, q, fmt.Sprintf("new session: %v", err))
+		d.failOrRequeue(ctx, q, withStderr(fmt.Sprintf("new session: %v", err)))
 		return
 	}
 
@@ -588,9 +636,9 @@ func (d *Daemon) runTask(ctx context.Context, q *queuedRow) {
 		// Mark this session closed (run ended, unsuccessfully).
 		d.closeSession(ctx, string(newResp.SessionID), q.AgentID)
 		if promptCtx.Err() != nil && ctx.Err() == nil {
-			d.failOrRequeue(ctx, q, "idle watchdog: agent stopped emitting events")
+			d.failOrRequeue(ctx, q, withStderr("idle watchdog: agent stopped emitting events"))
 		} else {
-			d.failOrRequeue(ctx, q, fmt.Sprintf("prompt: %v", err))
+			d.failOrRequeue(ctx, q, withStderr(fmt.Sprintf("prompt: %v", err)))
 		}
 		return
 	}
@@ -693,6 +741,64 @@ func buildPrompt(title, desc, handoff string) string {
 		s += "\n\nYou were handed this task with a handoff note. Treat it as the assigner's scoping instruction for this run; follow it before doing anything broader, and do not reply to it as if it were a comment:\n\n> " + handoff + "\n"
 	}
 	return s
+}
+
+// buildTeamRoster generates a "## Team Members" section listing every other
+// agent in the system with their id, name, and description, plus the handoff
+// command usage. This is injected into the agent's AGENTS.md so it knows who
+// it can hand off to. The calling agent (selfAgentID) is excluded.
+func (d *Daemon) buildTeamRoster(ctx context.Context, selfAgentID string) string {
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT id, name, description FROM agent ORDER BY name`)
+	if err != nil {
+		log.Printf("daemon: build team roster: %v", err)
+		return ""
+	}
+	defer rows.Close()
+
+	var b strings.Builder
+	b.WriteString("## Team Members\n\n")
+	b.WriteString("You can hand off the current task to a teammate using:\n")
+	b.WriteString("  agentwork-cli task handoff <agent-id> [--note \"...\"]\n\n")
+	b.WriteString("Collaboration rule: if the task does not fall within your role/responsibilities, ")
+	b.WriteString("hand it off to the teammate whose role best matches the task instead of doing it yourself. ")
+	b.WriteString("When you hand off, include a --note explaining what the task needs.\n\n")
+
+	var n int
+	for rows.Next() {
+		var id, name, desc string
+		if err := rows.Scan(&id, &name, &desc); err != nil {
+			continue
+		}
+		if id == selfAgentID {
+			continue
+		}
+		fmt.Fprintf(&b, "- %s (id: %s)", name, id)
+		if desc != "" {
+			b.WriteString(" — ")
+			b.WriteString(desc)
+		}
+		b.WriteByte('\n')
+		n++
+	}
+	if n == 0 {
+		b.WriteString("(you are the only agent — no teammates to hand off to)\n")
+	}
+	return b.String()
+}
+
+// injectAgentProfile writes the agent's system prompt and team roster into
+// {workdir}/AGENTS.md so the agent subprocess discovers its identity and
+// teammates via its native config file. openagent-cli reads AGENTS.md from
+// the working directory at startup.
+func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster string) error {
+	var b strings.Builder
+	if systemPrompt != "" {
+		b.WriteString(systemPrompt)
+		b.WriteString("\n\n")
+	}
+	b.WriteString(roster)
+	return os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(b.String()), 0o644)
 }
 
 // runHandler implements acp.EventHandler for one task run, streaming events

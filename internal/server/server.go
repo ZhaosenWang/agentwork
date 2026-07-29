@@ -48,7 +48,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 
 	go s.hub.Run(ctx)
 
-	srv := &http.Server{Addr: addr, Handler: mux}
+	srv := &http.Server{Addr: addr, Handler: corsMiddleware(mux)}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Shutdown(context.Background())
@@ -59,4 +59,20 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		return err
 	}
 	return nil
+}
+
+// corsMiddleware allows the Next.js dev server (localhost:3000) to call the
+// API and WS endpoint cross-origin. Single-user local use; no credentialed
+// requests, no origin allow-list beyond the dev port.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "http://localhost:3000")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

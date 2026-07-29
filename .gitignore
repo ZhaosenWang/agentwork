@@ -30,11 +30,24 @@ go.work.sum
 # Build output (local binaries, not committed)
 build/
 
+# Guard against binaries built into the repo root (e.g. `go build -o ./agentwork`).
+# `build/` covers the normal case; these catch stray top-level binaries.
+/agentwork
+/agentwork-cli
+/agentwork-daemon
+
 # Local runtime data (SQLite db, workdirs)
 *.db
 *.db-*
 .agentwork/
 
+# Node / frontend (root-level backstop; web/ has its own .gitignore too)
+node_modules/
+
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# OS noise
+.DS_Store
+Thumbs.db

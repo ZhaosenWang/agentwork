@@ -19,6 +19,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -76,6 +77,8 @@ func launchStdio(ctx context.Context, spec Spec, taskEnv []string) (*acp.Session
 	if err != nil {
 		return nil, fmt.Errorf("runtime stdio: stdout pipe: %w", err)
 	}
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("runtime stdio: start %q: %w", spec.Executable, err)
 	}
@@ -89,7 +92,7 @@ func launchStdio(ctx context.Context, spec Spec, taskEnv []string) (*acp.Session
 		}
 		return nil
 	}
-	return acp.NewSession(stdout, stdin, closeFn), nil
+	return acp.NewSession(stdout, stdin, closeFn, acp.WithStderr(&stderrBuf)), nil
 }
 
 // wsRW adapts a gorilla/websocket.Conn to an io.Reader/io.Writer pair for

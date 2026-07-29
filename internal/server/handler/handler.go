@@ -34,6 +34,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /tasks/{id}/assign", h.assignTask)
 	mux.HandleFunc("POST /tasks/{id}/cancel", h.cancelTask)
 	mux.HandleFunc("POST /tasks/{id}/messages", h.postTaskMessage)
+	mux.HandleFunc("GET /tasks/{id}/messages", h.getTaskMessages)
 	mux.HandleFunc("POST /tasks/{id}/wait", h.waitTask)
 
 	mux.HandleFunc("GET /schedules", h.listSchedules)
@@ -152,6 +153,11 @@ func (h *Handlers) postTaskMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) getTaskMessages(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Task.ListMessages(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
 }
 
 func (h *Handlers) waitTask(w http.ResponseWriter, r *http.Request) {
