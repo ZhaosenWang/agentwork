@@ -349,7 +349,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// Inject the agent's identity + team roster / squad briefing into the
 	// workdir so the agent subprocess discovers who it is and who it can hand
 	// off to (AGENTS.md).
-	roster := d.buildTeamRoster(ctx, q.AgentID)
+	roster := d.buildAgentGuide(ctx, q.AgentID)
 	briefing := ""
 	if isLeaderRun && squadID != "" {
 		owns := d.goalOwnsSquadStatus(ctx, q.GoalID, squadID)
@@ -560,16 +560,36 @@ func (d *Daemon) goalOwnsSquadStatus(ctx context.Context, goalID, squadID string
 
 // buildPrompt assembles the opening prompt for a run turn.
 func buildPrompt(title, desc, handoff string) string {
-	s := fmt.Sprintf("Task: %s\n\n%s", title, desc)
-	if handoff != "" {
-		s += "\n\nYou were handed this task with a handoff note. Treat it as the assigner's scoping instruction for this run; follow it before doing anything broader, and do not reply to it as if it were a comment:\n\n> " + handoff + "\n"
+	body := desc
+	if strings.TrimSpace(body) == "" {
+		// A sub-goal created via `goal create` may carry only a title. Without a
+		// body the agent gets an empty task and may not terminate; give it an
+		// explicit, completable instruction so the run reaches a terminal state.
+		body = "Complete this sub-task. Do the work it implies, then finish your turn."
 	}
-	return s
+	if handoff != "" {
+		// A handoff/wakeup note scopes THIS turn. It is placed AHEAD of the
+		// original description, which is now *context* (not a fresh to-do
+		// list). This prevents the sub-goal loop: a woken parent that sees the
+		// child-summary note must NOT blindly re-execute the original
+		// description's "create a sub-task" steps. If the note reports the work
+		// already complete, the agent ends its turn rather than fanning out
+		// again.
+		return "Task: " + title + "\n\n" +
+			"Context (what this goal is about; do NOT blindly redo these steps):\n" + body + "\n\n" +
+			"Scope for THIS run (follow the note; do not redo steps it describes as done):\n> " + handoff + "\n\n" +
+			"If the note reports the work is already complete, do NOT start new work — end your turn immediately.\n"
+	}
+	return fmt.Sprintf("Task: %s\n\n%s", title, body)
 }
 
-// buildTeamRoster generates a "## Team Members" section listing every other
-// agent so the run's agent knows who it can hand off to.
-func (d *Daemon) buildTeamRoster(ctx context.Context, selfAgentID string) string {
+// buildAgentGuide writes the "## Team & Coordination" block that every run's
+// AGENTS.md gets: the roster of teammates plus the full agentwork-cli
+// reference the agent uses to produce structured side effects. This is the
+// agent's only source of truth for how to coordinate — without it the agent
+// doesn't know goal create/wait/comment exist, and it would never guess the
+// mention:// URI format. See DESIGN §5 (coordination primitives).
+func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string {
 	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name, description FROM agent ORDER BY name`)
 	if err != nil {
 		log.Printf("daemon: build team roster: %v", err)
@@ -577,10 +597,46 @@ func (d *Daemon) buildTeamRoster(ctx context.Context, selfAgentID string) string
 	}
 	defer rows.Close()
 	var b strings.Builder
-	b.WriteString("## Team Members\n\n")
-	b.WriteString("You can hand off the current task to a teammate using:\n")
-	b.WriteString("  agentwork-cli goal assign <to-agent-id> [--note \"...\"]\n\n")
-	b.WriteString("Collaboration rule: if the task falls outside your role, hand it off to the teammate whose role best matches it instead of doing it yourself.\n\n")
+	b.WriteString("## Team & Coordination\n\n")
+	b.WriteString("You coordinate with other agents by calling `agentwork-cli`, which is on")
+	b.WriteString(" your PATH. The server URL, goal id, run id, and your agent id are in your")
+	b.WriteString(" environment (AGENTWORK_SERVER_URL / AGENTWORK_GOAL_ID / AGENTWORK_RUN_ID")
+	b.WriteString(" / AGENTWORK_AGENT_ID). The CLI calls back over the server; do NOT edit files")
+	b.WriteString(" to communicate intent — structured side effects via the CLI are the only way.\n\n")
+	b.WriteString("This goal's id is the value of AGENTWORK_GOAL_ID.\n\n")
+
+	b.WriteString("### Sub-goals (fan out then wait)\n")
+	b.WriteString("- Create a sub-goal that another agent works on:\n")
+	b.WriteString("  agentwork-cli goal create --title \"<title>\" [--description \"<what to do>\"] --assignee <other-agent-id>\n")
+	b.WriteString("  (parent defaults to the current goal.)\n")
+	b.WriteString("- Once you have created all the sub-goals you want to fan out, wait for them:\n")
+	b.WriteString("  agentwork-cli goal wait\n")
+	b.WriteString("  Then END YOUR TURN. When every sub-goal reaches a terminal state, the system")
+	b.WriteString(" re-runs THIS goal with a wakeup note summarizing what each sub-goal produced.\n\n")
+
+	b.WriteString("### Hand off the current goal\n")
+	b.WriteString("- agentwork-cli goal assign <to-agent-id> [--note \"scoping instruction\"]\n")
+	b.WriteString("  Hands the goal's ownership to that agent. Your current run keeps running to")
+	b.WriteString(" completion, but its result no longer affects the goal — the new owner's run\n")
+	b.WriteString("  drives it forward. Include a --note that scopes the work for the new owner.\n\n")
+
+	b.WriteString("### Pull in another agent via @mention\n")
+	b.WriteString("- Post a comment on the current goal mentioning an agent to trigger a run on it:\n")
+	b.WriteString("  agentwork-cli goal comment --text \"[@Name](mention://agent/<AGENT-UUID>) <what you want>\"\n")
+	b.WriteString("- The mention MUST be a structured Markdown link with a mention:// URI; bare")
+	b.WriteString(" `@handle` prose does NOT trigger anything. Resolve the UUID first with")
+	b.WriteString(" `agentwork-cli agent list` (JSON output). mention://agent/<uuid> triggers a")
+	b.WriteString(" new run on that agent for THIS goal; mention://squad/<uuid> routes to the")
+	b.WriteString(" squad's leader. @all (mention://all/all) suppresses auto-trigger.\n\n")
+
+	b.WriteString("### Inspect\n")
+	b.WriteString("- agentwork-cli goal list      # all goals (JSON)\n")
+	b.WriteString("- agentwork-cli agent list    # all agents — use this to get the UUIDs for assign/mention\n")
+	b.WriteString("- agentwork-cli squad list    # all squads\n\n")
+
+	b.WriteString("### Team roster\n")
+	b.WriteString("If a task falls outside your role, delegate it — create a sub-goal for a")
+	b.WriteString(" teammate whose role best matches, or hand off the goal entirely.\n\n")
 	var n int
 	for rows.Next() {
 		var id, name, desc string
@@ -599,7 +655,7 @@ func (d *Daemon) buildTeamRoster(ctx context.Context, selfAgentID string) string
 		n++
 	}
 	if n == 0 {
-		b.WriteString("(you are the only agent — no teammates to hand off to)\n")
+		b.WriteString("(you are the only agent — no teammates to delegate to)\n")
 	}
 	return b.String()
 }

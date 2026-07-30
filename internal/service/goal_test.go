@@ -192,8 +192,6 @@ func TestSubGoalCoordination(t *testing.T) {
 	agentA := seedAgent(t, st, "A")
 	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
 	pr := enqueueFirst(t, rs, parent)
-
-	// Parent's first run creates two children and then waits on them.
 	c1, _ := gs.Create(ctx, Goal{Title: "child1", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
 	c2, _ := gs.Create(ctx, Goal{Title: "child2", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
 	_ = enqueueFirst(t, rs, c1)
@@ -271,6 +269,67 @@ func TestCoalescePending(t *testing.T) {
 	}
 	if pending != 1 {
 		t.Fatalf("expected exactly 1 pending run after coalesce, got %d (r1=%s)", pending, r1.Status)
+	}
+}
+
+// TestWakeRunawayGuarded: the P0-1 fix. When a parent has been woken
+// maxWakeCycles times already, another child-done does NOT wake it again —
+// instead the goal is force-failed, so a runaway re-fan-out loop is bounded
+// and surfaced rather than burning runs forever. (Guard is a state-machine
+// invariant, not prompt wording.)
+func TestWakeRunawayGuarded(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	// One child, already done (so inflight==0 → wake conditions otherwise met).
+	child, _ := gs.Create(ctx, Goal{Title: "c", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
+	cr := enqueueFirst(t, rs, child)
+	// Parent must be waiting (blocked) for a child-done to wake it.
+	if err := gs.WaitChildren(ctx, parent.ID); err != nil {
+		t.Fatalf("wait parent: %v", err)
+	}
+	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := rs.Finish(ctx, cr.ID, "completed", "ok"); err != nil {
+		t.Fatalf("finish child: %v", err)
+	}
+	// The parent was just woken once (child done). Verify it went active.
+	p, _ := gs.Get(ctx, parent.ID)
+	if p.Status != "active" || p.WakeCount != 1 {
+		t.Fatalf("expected active wake_count=1, got %s/%d", p.Status, p.WakeCount)
+	}
+	// Simulate the loop: agent waited again and we've now bumped wake_count to
+	// the limit. Force the parent back to blocked, then push wake_count to the
+	// cap, and trigger a final wake — it must fail, not wake.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='blocked', wake_count=? WHERE id=?`, maxWakeCycles, parent.ID); err != nil {
+		t.Fatalf("set blocked+maxed: %v", err)
+	}
+	runsBefore, _ := rs.List(ctx, parent.ID)
+	pendingBefore := 0
+	for _, r := range runsBefore {
+		if r.Status == "queued" || r.Status == "running" {
+			pendingBefore++
+		}
+	}
+	if err := gs.NotifyChildDone(ctx, child.ID); err != nil {
+		t.Fatalf("notify: %v", err)
+	}
+	p, _ = gs.Get(ctx, parent.ID)
+	if p.Status != "failed" {
+		t.Fatalf("runaway parent must be force-failed, got %q", p.Status)
+	}
+	// No NEW parent run was enqueued beyond what existed before the over-limit wake.
+	runsAfter, _ := rs.List(ctx, parent.ID)
+	pendingAfter := 0
+	for _, r := range runsAfter {
+		if r.Status == "queued" || r.Status == "running" {
+			pendingAfter++
+		}
+	}
+	if pendingAfter != pendingBefore {
+		t.Fatalf("runaway force-fail must enqueue no new run; before=%d after=%d", pendingBefore, pendingAfter)
 	}
 }
 

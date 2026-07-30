@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS goal (
     handoff_note    TEXT NOT NULL DEFAULT '',
     created_by_type TEXT NOT NULL DEFAULT 'human',   -- human | agent
     created_by_id   TEXT NOT NULL DEFAULT '',
-    created_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    wake_count      INTEGER NOT NULL DEFAULT 0   -- bumped each blocked→active wakeup; bounded to break runaway re-fan-out loops
 );
 
 CREATE INDEX IF NOT EXISTS idx_goal_parent ON goal(parent_id);

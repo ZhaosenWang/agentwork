@@ -28,6 +28,7 @@ type Goal struct {
 	CreatedByType string `json:"created_by_type"` // human | agent
 	CreatedByID   string `json:"created_by_id"`
 	CreatedAt     string `json:"created_at"`
+	WakeCount     int    `json:"wake_count"` // bumped each blocked→active wakeup; bounded to break runaway re-fan-out
 }
 
 // goalRunContext is what ReconcileOnRunEnd reasons about. Carried separately
@@ -44,6 +45,15 @@ type goalRunContext struct {
 }
 
 const maxAttempts = 3
+
+// maxWakeCycles bounds how many blocked→active wakeups a parent goal may take
+// before it is force-failed. This is the state-machine guard against runaway
+// re-fan-out loops: if an agent, on a wakeup turn, keeps creating sub-goals +
+// waiting again, the goal would otherwise cycle forever. The bound turns an
+// infinite loop into a bounded, surfaced failure (mirrors the maxAttempts
+// philosophy for transient run failures). Per DESIGN §9 — the loop guard is a
+// state-machine invariant, not a prompt-measured "please don't redo" hope.
+const maxWakeCycles = 3
 
 type GoalService struct {
 	st     *store.Store
@@ -140,7 +150,7 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 
 func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at
+		`SELECT id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at,wake_count
 		 FROM goal ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -150,7 +160,7 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	for rows.Next() {
 		var g Goal
 		var parentID sql.NullString
-		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &parentID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt); err != nil {
+		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &parentID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount); err != nil {
 			return nil, err
 		}
 		g.ParentID = parentID.String
@@ -163,9 +173,9 @@ func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 	var g Goal
 	var parentID sql.NullString
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at
+		`SELECT id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at,wake_count
 		 FROM goal WHERE id=?`, id).
-		Scan(&g.ID, &g.Title, &g.Description, &parentID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt)
+		Scan(&g.ID, &g.Title, &g.Description, &parentID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -494,9 +504,10 @@ func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []event
 // prevention). Per DESIGN.zh.md §5.2 (dynamic wait set).
 func (s *GoalService) wakeParentIfReadyInTx(ctx context.Context, tx *sql.Tx, parentID string) error {
 	var parentStatus, assigneeType, assigneeID string
+	var wakeCount int
 	err := tx.QueryRowContext(ctx,
-		`SELECT status, assignee_type, assignee_id FROM goal WHERE id=?`, parentID).
-		Scan(&parentStatus, &assigneeType, &assigneeID)
+		`SELECT status, assignee_type, assignee_id, wake_count FROM goal WHERE id=?`, parentID).
+		Scan(&parentStatus, &assigneeType, &assigneeID, &wakeCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -518,12 +529,30 @@ func (s *GoalService) wakeParentIfReadyInTx(ctx context.Context, tx *sql.Tx, par
 	if inflight > 0 {
 		return nil
 	}
+	// Runaway guard (P0-1): a parent would cycle forever if each woken turn
+	// created fresh sub-goals + waited again. Cap wakeups at maxWakeCycles;
+	// beyond that, refuse to wake and force the goal failed so the loop
+	// surfaces to a human instead of burning runs. (Per DESIGN §9: the loop
+	// guard is a state-machine invariant, not a prompt pleasantry.)
+	if wakeCount >= maxWakeCycles {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE goal SET status='failed' WHERE id=? AND status NOT IN ('done','failed','cancelled')`,
+			parentID); err != nil {
+			return fmt.Errorf("force-fail runaway parent: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'runaway_wake_limit','{}',?)`,
+			newID(), parentID, "system", "", now()); err != nil {
+			return fmt.Errorf("insert runaway activity: %w", err)
+		}
+		return nil
+	}
 	note, err := s.buildWakeupNoteInTx(ctx, tx, parentID)
 	if err != nil {
 		return err
 	}
 	if res, err := tx.ExecContext(ctx,
-		`UPDATE goal SET status='active', handoff_note=? WHERE id=? AND status='blocked'`,
+		`UPDATE goal SET status='active', handoff_note=?, wake_count=wake_count+1 WHERE id=? AND status='blocked'`,
 		note, parentID); err != nil {
 		return fmt.Errorf("wake parent: %w", err)
 	} else if n, _ := res.RowsAffected(); n == 0 {

@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
+	"sync"
 
 	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/proto"
@@ -54,7 +56,8 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			results <- proto.Result{Status: proto.StatusFailed, Output: withStderr("new session: " + err.Error()), Err: err}
 			return
 		}
-		sess.SetEventHandler(&eventForwarder{events: events})
+		fwd := &eventForwarder{events: events}
+		sess.SetEventHandler(fwd)
 
 		if _, err := sess.Prompt(ctx, acp.PromptRequest{
 			SessionID: newResp.SessionID,
@@ -69,14 +72,30 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			results <- proto.Result{Status: status, Output: withStderr("prompt: " + err.Error()), Err: err, SessionID: string(newResp.SessionID)}
 			return
 		}
-		results <- proto.Result{Status: proto.StatusCompleted, SessionID: string(newResp.SessionID)}
+		// Carry the assistant's text (the final answer) as Result.Output so the
+		// goal layer can fold it into a child-summary / run-detail without
+		// requiring the daemon to replay the event stream. Collected by the
+		// eventForwarder during the turn.
+		results <- proto.Result{Status: proto.StatusCompleted, Output: fwd.lastAssistantText(), SessionID: string(newResp.SessionID)}
 	}()
 
 	return &proto.Run{Events: events, Result: results}, nil
 }
 
-// eventForwarder adapts acp.EventHandler → proto.Event channel.
-type eventForwarder struct{ events chan<- proto.Event }
+// eventForwarder adapts acp.EventHandler → proto.Event channel. It also
+// accumulates the assistant's message text so the Result can carry the final
+// answer as Output (for a child-summary / run-detail) without replaying the
+// stream. Accumulation is append-only; lastAssistantText returns the full text
+// once the turn is done. Guarded because the drain reader goroutine invokes the
+// callbacks concurrently with the Execute goroutine reading the result.
+type eventForwarder struct {
+	events   chan<- proto.Event
+	mu       sync.Mutex
+	msg      strings.Builder
+	truncate int
+}
+
+const assistantOutputCap = 8 * 1024 // keep Result.Output from growing unbounded
 
 func (f *eventForwarder) push(e proto.Event) {
 	select {
@@ -85,8 +104,25 @@ func (f *eventForwarder) push(e proto.Event) {
 	}
 }
 
+func (f *eventForwarder) lastAssistantText() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.TrimSpace(f.msg.String())
+}
+
 func (f *eventForwarder) OnAgentMessage(text string) {
 	f.push(proto.Event{Type: proto.EventMessage, Text: text})
+	f.mu.Lock()
+	if f.truncate >= 0 {
+		if f.truncate+len(text) > assistantOutputCap {
+			// Cap reached: stop accumulating to bound memory.
+			f.truncate = -1
+		} else {
+			f.msg.WriteString(text)
+			f.truncate += len(text)
+		}
+	}
+	f.mu.Unlock()
 }
 func (f *eventForwarder) OnAgentThought(text string) {
 	f.push(proto.Event{Type: proto.EventThought, Text: text})

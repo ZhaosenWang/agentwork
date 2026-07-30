@@ -58,7 +58,7 @@ func usage() {
 Subcommands:
   goal list                                 list all goals (JSON)
   goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
-  goal create --title T [--assignee A] [--parent P] [--status S]
+  goal create --title T [--description D] [--assignee A] [--parent P] [--status S]
                                              create a sub-goal (parent defaults to current goal)
   goal comment --text T [--role R]           post a comment on the current goal; --text may
                                              contain a structured mention [@Name](mention://agent/<id>)
@@ -117,6 +117,7 @@ func goalAssign(serverURL, goalID string, args []string) {
 func goalCreate(serverURL, goalID, agentID string, args []string) {
 	fs := flag.NewFlagSet("goal create", flag.ExitOnError)
 	title := fs.String("title", "", "goal title (required)")
+	description := fs.String("description", "", "goal description (the work to do)")
 	assignee := fs.String("assignee", "", "assignee agent id (defaults to current agent)")
 	parent := fs.String("parent", "", "parent goal id (defaults to current goal)")
 	status := fs.String("status", "active", "goal status")
@@ -135,12 +136,13 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	}
 	body := map[string]string{
 		"title":           *title,
-		"assignee_type":   "agent",
-		"assignee_id":     *assignee,
-		"parent_id":       *parent,
-		"status":          *status,
+		"description":     *description,
+		"assignee_type":  "agent",
+		"assignee_id":    *assignee,
+		"parent_id":      *parent,
+		"status":         *status,
 		"created_by_type": "agent",
-		"created_by_id":   agentID,
+		"created_by_id":  agentID,
 	}
 	post(serverURL+"/goals", body)
 }
