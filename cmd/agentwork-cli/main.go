@@ -19,7 +19,7 @@ import (
 const (
 	// defaultServerURL matches the agentwork default listen addr.
 	defaultServerURL = "http://127.0.0.1:7373"
-	httpTimeout     = 10 * time.Second
+	httpTimeout      = 10 * time.Second
 )
 
 var httpClient = &http.Client{Timeout: httpTimeout}
@@ -56,7 +56,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `agentwork-cli — agent-side tool (called by agents during task execution)
 
 Subcommands:
-  goal list                                 list all goals (JSON)
+  goal list [--limit N]                    list goals (JSON); --limit caps to N most recent (default all)
   goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
   goal create --title T [--description D] [--assignee A] [--parent P] [--status S]
                                              create a sub-goal (parent defaults to current goal)
@@ -84,7 +84,7 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 	}
 	switch args[0] {
 	case "list":
-		get(serverURL + "/goals")
+		goalList(serverURL, args[1:])
 	case "assign":
 		goalAssign(serverURL, goalID, args[1:])
 	case "create":
@@ -97,6 +97,24 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 		fmt.Fprintf(os.Stderr, "unknown goal subcommand %q\n", args[0])
 		os.Exit(2)
 	}
+}
+
+// goalList implements `goal list [--limit N]`. --limit truncates to the N
+// most recent goals; absent (or 0) means all.
+func goalList(serverURL string, args []string) {
+	fs := flag.NewFlagSet("goal list", flag.ExitOnError)
+	limit := fs.Int("limit", 0, "max number of goals to return (0 = all)")
+	fs.Parse(args)
+	get(goalListURL(serverURL, *limit))
+}
+
+// goalListURL builds the GET /goals URL, appending ?limit=N when N > 0.
+func goalListURL(serverURL string, limit int) string {
+	url := serverURL + "/goals"
+	if limit > 0 {
+		url += fmt.Sprintf("?limit=%d", limit)
+	}
+	return url
 }
 
 func goalAssign(serverURL, goalID string, args []string) {
@@ -137,12 +155,12 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	body := map[string]string{
 		"title":           *title,
 		"description":     *description,
-		"assignee_type":  "agent",
-		"assignee_id":    *assignee,
-		"parent_id":      *parent,
-		"status":         *status,
+		"assignee_type":   "agent",
+		"assignee_id":     *assignee,
+		"parent_id":       *parent,
+		"status":          *status,
 		"created_by_type": "agent",
-		"created_by_id":  agentID,
+		"created_by_id":   agentID,
 	}
 	post(serverURL+"/goals", body)
 }

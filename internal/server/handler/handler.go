@@ -5,7 +5,9 @@ package handler
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/eushing/agentwork/internal/service"
 )
@@ -129,8 +131,19 @@ func (h *Handlers) createGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, out, nil)
 }
+// listGoals returns all goals, or the N most recent when ?limit=N is given.
+// limit must be a positive integer if present (0/absent means all).
 func (h *Handlers) listGoals(w http.ResponseWriter, r *http.Request) {
-	out, err := h.Goal.List(r.Context())
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("limit must be a positive integer, got %q", raw))
+			return
+		}
+		limit = n
+	}
+	out, err := h.Goal.List(r.Context(), limit)
 	writeJSON(w, out, err)
 }
 func (h *Handlers) getGoal(w http.ResponseWriter, r *http.Request) {

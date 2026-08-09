@@ -103,7 +103,7 @@ subprocess so agents can call back to produce structured side effects.
 
 | Command | Description |
 |---|---|
-| `goal list` | List all goals (JSON) |
+| `goal list [--limit N]` | List goals (JSON); `--limit N` caps to the N most recent (default all) |
 | `goal create --title T [--description D] [--assignee A] [--parent P] [--status S]` | Create a sub-goal |
 | `goal assign <to-agent-id> [--note N]` | Hand off the current goal to another agent |
 | `goal comment --text T [--role R]` | Post a comment; may contain `[@Name](mention://agent/<id>)` to enqueue a run on that agent |
