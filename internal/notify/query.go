@@ -59,9 +59,9 @@ type QueryStore interface {
 	// can resolve assignee/domain names to ids.
 	Agents(ctx context.Context) ([]NamedID, error)
 	Domains(ctx context.Context) ([]NamedID, error)
-	// TerminalSince lists goals whose LAST run reached a terminal status at or
-	// after since (RFC3339) — the daily digest's "yesterday" aggregation.
-	TerminalSince(ctx context.Context, since string) ([]GoalBrief, error)
+	// TerminalSince lists goals whose last run reached a terminal status in
+	// [since, until) (RFC3339) — the daily digest's "yesterday" window.
+	TerminalSince(ctx context.Context, since, until string) ([]GoalBrief, error)
 }
 
 // SQLQueryStore is the production QueryStore over SQLite. Single-user: every
@@ -148,13 +148,14 @@ func (q *SQLQueryStore) Domains(ctx context.Context) ([]NamedID, error) {
 	return out, rows.Err()
 }
 
-func (q *SQLQueryStore) TerminalSince(ctx context.Context, since string) ([]GoalBrief, error) {
+func (q *SQLQueryStore) TerminalSince(ctx context.Context, since, until string) ([]GoalBrief, error) {
 	rows, err := q.st.DB().QueryContext(ctx,
 		`SELECT g.id, g.title, g.status FROM goal g
 		 WHERE g.status IN ('done','failed')
 		   AND EXISTS (SELECT 1 FROM run r WHERE r.goal_id=g.id
-		               AND r.status IN ('completed','failed','cancelled') AND r.finished_at >= ?)`,
-		since)
+		               AND r.status IN ('completed','failed','cancelled')
+		               AND r.finished_at >= ? AND r.finished_at < ?)`,
+		since, until)
 	if err != nil {
 		return nil, err
 	}

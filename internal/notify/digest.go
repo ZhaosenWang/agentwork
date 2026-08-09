@@ -15,15 +15,16 @@ import (
 // schedule (a daily tick at the configured digest time, default 09:00) and
 // the already-sent marker; this file only builds the card.
 
-// BuildDigestCard aggregates the store into the digest card JSON. since
-// (RFC3339) is the completion window start ("yesterday"). now is the digest
-// timestamp for the card footer.
-func BuildDigestCard(ctx context.Context, qs QueryStore, since time.Time, now time.Time) (string, error) {
+// BuildDigestCard aggregates the store into the digest card JSON. The
+// completion window is [since, until) — "yesterday" — not open-ended: a
+// goal finishing this morning must not appear in the morning digest twice.
+// now is the digest timestamp for the card footer.
+func BuildDigestCard(ctx context.Context, qs QueryStore, since, until time.Time, now time.Time) (string, error) {
 	reviews, err := qs.ReviewGoals(ctx)
 	if err != nil {
 		return "", err
 	}
-	done, err := qs.TerminalSince(ctx, since.Format(time.RFC3339Nano))
+	done, err := qs.TerminalSince(ctx, since.Format(time.RFC3339Nano), until.Format(time.RFC3339Nano))
 	if err != nil {
 		return "", err
 	}

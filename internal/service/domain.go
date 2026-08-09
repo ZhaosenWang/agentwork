@@ -50,10 +50,20 @@ type Checks struct {
 	// install are; the worktree keeps its installed state across runs).
 	// Executed in order before verify; any failure = run failed (environment
 	// attribution). Empty = no preparation needed.
-	Setup  []string   `json:"setup"`
-	Verify []string   `json:"verify"` // machine verification commands (exit 0 = pass)
-	Guards []Guard    `json:"guards"` // structural constraints, checked by the daemon
-	Gates  []GateRule `json:"gates"`  // human checkpoint rules
+	Setup []string `json:"setup"`
+	// Excludes are path patterns the platform EXCLUDES when committing the
+	// agent's work (git add pathspec excludes, repo-root-relative, globs).
+	// They belong to the domain, NOT to the platform: the processor compiles
+	// them from the repo's own .gitignore / observed dependency directories,
+	// the owner confirms them on the confirmation card — the platform never
+	// hardcodes "what a repo should ignore" (a repo may intentionally track
+	// target/, and new dependency dirs would outgrow any hardcoded list).
+	// The platform's own injected AGENTWORK.md is excluded unconditionally
+	// (platform-owned namespace), everything else comes from here.
+	Excludes []string   `json:"excludes"`
+	Verify   []string   `json:"verify"` // machine verification commands (exit 0 = pass)
+	Guards   []Guard    `json:"guards"` // structural constraints, checked by the daemon
+	Gates    []GateRule `json:"gates"`  // human checkpoint rules
 }
 
 // Guard is a structural constraint — an objective, command-free check on the
@@ -132,6 +142,7 @@ func compilePrompt(d *Domain, policyText string) string {
 	b.WriteString(`checks.json 结构：
 {
   "setup": ["<验证环境准备命令，幂等，如 cd web && npm install>", ...],
+  "excludes": ["<提交时排除的路径 glob，从仓库自己的 .gitignore / 依赖目录推导，如 **/node_modules/**>", ...],
   "verify": ["<机器验证命令，exit 0 为通过，如 go test ./...>", ...],
   "guards": [{"type": "diff_contains|diff_excludes|coverage_delta", "pattern": "<glob，diff_* 必填>", "min_delta": <覆盖率百分点，仅 coverage_delta>}],
   "gates": [
@@ -142,6 +153,7 @@ func compilePrompt(d *Domain, policyText string) string {
 }`)
 	b.WriteString("\n\n另把验证强度（strong|medium|weak）写入当前工作目录的 strength.txt——判断依据：verify 命令是否真实覆盖了任务的关键风险（echo ok / true 之类是 weak）。\n\n规则：\n")
 	b.WriteString("- setup 是验证环境准备：平台在干净 worktree 上执行验证，依赖不会自己存在。识别技术栈，把需要的依赖安装写进 setup（必须幂等：npm install / pip install -r requirements.txt / go mod download 这类；已安装时秒级跳过）。go/cargo 这类自动拉依赖的可留空。\n")
+	b.WriteString("- excludes 是提交排除：平台在 run 结束后把 agent 的改动提交到 goal 分支（git add），setup 安装的依赖目录（node_modules 等）若仓库的 .gitignore 没覆盖，会被误提交进分支。读仓库的 .gitignore 和实际依赖目录，把需要排除的路径写进 excludes（glob，如 **/node_modules/**）。仓库 .gitignore 已覆盖的可省略。\n")
 	b.WriteString("- verify 里的命令必须真实存在且可执行（结合该仓库技术栈推断），且假定 setup 已执行完\n")
 	b.WriteString("- guards 表达无法用命令表达的结构化约束（禁止路径、diff 必须包含的内容、覆盖率下限）\n")
 	b.WriteString("- gates 表达“机器无法判定、必须人工决策”的要求（如“性能不能下降”）——至少包含一条 merge 卡点\n")

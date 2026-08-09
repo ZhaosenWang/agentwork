@@ -340,7 +340,8 @@ v2 新增：
 | 决策2-17 | **处理器 run 形态**：run 表加 `run_kind`（worker/processor），与 worker run 同一调度；处理器 agent 建议独立配置 |
 | 决策2-18 | **worktree 延迟分配**：第一个 run 开始前才创建，backlog 不占资源 |
 | 决策3-1 | **验证环境准备 = setup 段（属验收策略）**：M3 实战暴露"干净 worktree 无依赖（npm build 失败）"。环境准备是验收策略的一等字段（processor 编译时输出，幂等命令；确认卡可见可改；平台顺序执行 setup→verify，setup 失败=run failed 归因环境）。平台不做技术栈自动检测（违反三角分离 + heuristic 脆弱） |
-| 决策3-2 | **确认卡可编辑**：编译产物在冻结前可改（setup/verify 命令列表）——兑现 §5.3"产物可见、可改、可审" |
+| 决策3-2 | **确认卡可编辑**：编译产物在冻结前可改（setup/verify/excludes 命令列表 + 完整 JSON）——兑现 §5.3"产物可见、可改、可审" |
+| 决策3-3 | **提交排除属域（checks.excludes）**：平台提交 agent 改动时排除的路径由域声明（processor 从仓库 .gitignore/依赖目录编译 + 人确认），**平台零写死**——"仓库该忽略什么"是仓库的领地，平台硬编码 node_modules 等目录既追不上新依赖形式、又可能误排除用户故意跟踪的目录 |
 
 ---
 

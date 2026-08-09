@@ -209,9 +209,10 @@ func (d *Daemon) dispatchDigest(ctx context.Context) {
 	if now.Before(digestAt) {
 		return // not due yet today
 	}
-	// Window: yesterday 00:00 → now (the digest is a morning summary).
+	// Window: yesterday 00:00 → today 00:00 (the digest is a morning summary;
+	// a goal finishing this morning belongs to TOMORROW's digest).
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	card, err := notify.BuildDigestCard(ctx, d.qs, dayStart.Add(-24*time.Hour), now)
+	card, err := notify.BuildDigestCard(ctx, d.qs, dayStart.Add(-24*time.Hour), dayStart, now)
 	if err != nil {
 		log.Printf("daemon: digest build: %v", err)
 		return
@@ -824,8 +825,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		if domainID != "" {
 			// Make the agent's work durable on the goal branch (the agent is
 			// guided to commit; the daemon guarantees it — deliver merges the
-			// branch, and uncommitted work would deliver nothing).
-			if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID)); err != nil {
+			// branch, and uncommitted work would deliver nothing). The
+			// domain's declared excludes (checks.excludes, compiled + owner-
+			// confirmed) keep dependency dirs out of the branch.
+			checks, timeout, baseline := d.loadDomainChecks(ctx, domainID)
+			if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID), checks.Excludes); err != nil {
 				d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
 				return
 			}
@@ -833,7 +837,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// domain's verify commands run BEFORE the run is finished. A red
 			// verify ends the run failed → retry chain. The goal layer only
 			// ever sees 'completed' runs that passed.
-			checks, timeout, baseline := d.loadDomainChecks(ctx, domainID)
 			verifyReport, ok := runVerification(ctx, runRowWorkdir, checks, timeout)
 			if !ok {
 				d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)

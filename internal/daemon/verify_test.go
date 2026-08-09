@@ -42,7 +42,7 @@ func TestCommitRunChanges(t *testing.T) {
 	ctx := context.Background()
 
 	// Clean tree → no-op.
-	if err := commitRunChanges(ctx, dir, "agentwork[bot] <aw@local>"); err != nil {
+	if err := commitRunChanges(ctx, dir, "agentwork[bot] <aw@local>", nil); err != nil {
 		t.Fatalf("clean tree must be a no-op: %v", err)
 	}
 
@@ -50,7 +50,7 @@ func TestCommitRunChanges(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "new_test.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitRunChanges(ctx, dir, "agentwork[bot] <aw@local>"); err != nil {
+	if err := commitRunChanges(ctx, dir, "agentwork[bot] <aw@local>", nil); err != nil {
 		t.Fatalf("commit dirty tree: %v", err)
 	}
 	author, err := gitRun(ctx, dir, "log", "-1", "--format=%an <%ae>")
@@ -61,7 +61,7 @@ func TestCommitRunChanges(t *testing.T) {
 		t.Fatalf("commit author mismatch: %q", author)
 	}
 	// Tree is now clean again.
-	if err := commitRunChanges(ctx, dir, "x"); err != nil {
+	if err := commitRunChanges(ctx, dir, "x", nil); err != nil {
 		t.Fatalf("second commit must be a no-op: %v", err)
 	}
 }
@@ -76,7 +76,7 @@ func TestCommitRunChangesOnlyGuide(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "AGENTWORK.md"), []byte("coordination guide\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitRunChanges(ctx, dir, "x"); err != nil {
+	if err := commitRunChanges(ctx, dir, "x", nil); err != nil {
 		t.Fatalf("AGENTWORK.md-only dirty tree must be a no-op: %v", err)
 	}
 	// Still clean: nothing was committed.
@@ -186,7 +186,7 @@ func TestCheckGuardsDiffContains(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitRunChanges(ctx, dir, "agentwork[bot] <aw@local>"); err != nil {
+	if err := commitRunChanges(ctx, dir, "agentwork[bot] <aw@local>", nil); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	report, ok := checkGuards(ctx, dir, base, service.Checks{
@@ -200,7 +200,7 @@ func TestCheckGuardsDiffContains(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "main_test.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitRunChanges(ctx, dir, "x"); err != nil {
+	if err := commitRunChanges(ctx, dir, "x", nil); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	report, ok = checkGuards(ctx, dir, base, service.Checks{
@@ -220,7 +220,7 @@ func TestCheckGuardsDiffContains(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "internal", "acp", "parse_test.go"), []byte("package acp\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitRunChanges(ctx, dir, "x"); err != nil {
+	if err := commitRunChanges(ctx, dir, "x", nil); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	report, ok = checkGuards(ctx, dir, base, service.Checks{
@@ -244,7 +244,7 @@ func TestCheckGuardsDiffContains(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "config", "prod.yaml"), []byte("x: 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitRunChanges(ctx, dir, "x"); err != nil {
+	if err := commitRunChanges(ctx, dir, "x", nil); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	report, ok = checkGuards(ctx, dir, base, service.Checks{
@@ -252,6 +252,86 @@ func TestCheckGuardsDiffContains(t *testing.T) {
 	}, nil)
 	if ok {
 		t.Fatalf("expected guard failure for forbidden path, report:\n%s", report)
+	}
+}
+
+// TestGlobMatchDoublestar: "**" crosses any directory depth ("**/*_test.go"
+// matches a test file at depth 0 AND depth 2), and "**/" is optional at the
+// root. This is the semantic path.Match lacks (it treats "**" as two plain
+// '*', which never crosses '/').
+func TestGlobMatchDoublestar(t *testing.T) {
+	cases := []struct{ pattern, name string; want bool }{
+		{"**/*_test.go", "x_test.go", true},                // depth 0
+		{"**/*_test.go", "a/b/x_test.go", true},            // depth 2
+		{"**/*_test.go", "a/b/x.go", false},                // not a test
+		{"**/*_test.go", "README.md", false},               // no test anywhere
+		{"**/config/*.yaml", "config/prod.yaml", true},     // depth 0
+		{"**/config/*.yaml", "a/b/config/prod.yaml", true}, // nested
+		{"**/config/*.yaml", "config/prod.json", false},    // wrong ext
+		{"docs/**/*.md", "docs/README.md", true},
+		{"docs/**/*.md", "docs/sub/deep/README.md", true},
+		{"docs/**/*.md", "README.md", false}, // outside docs/
+	}
+	for _, tc := range cases {
+		if got := globMatch(tc.pattern, tc.name); got != tc.want {
+			t.Errorf("globMatch(%q, %q) = %v, want %v", tc.pattern, tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestCommitRunChangesExcludesDependencies: the DOMAIN-declared excludes
+// (checks.excludes — compiled by the processor from the repo's .gitignore,
+// confirmed by the owner) keep dependency directories out of the goal
+// branch even when the repo has no .gitignore of its own. The exclusion
+// knowledge belongs to the domain, never hardcoded in the platform.
+func TestCommitRunChangesExcludesDependencies(t *testing.T) {
+	dir := newTestRepo(t)
+	ctx := context.Background()
+	// node_modules tree without any .gitignore — the case the domain's
+	// excludes exist for.
+	if err := os.MkdirAll(filepath.Join(dir, "web", "node_modules", "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "web", "node_modules", "pkg", "index.js"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	excludes := []string{"**/node_modules/**"}
+	if err := commitRunChanges(ctx, dir, "agentwork[bot] <aw@local>", excludes); err != nil {
+		t.Fatalf("deps-only dirty tree must be a no-op: %v", err)
+	}
+	status, _ := gitRun(ctx, dir, "status", "--porcelain")
+	if strings.TrimSpace(status) == "" {
+		t.Fatal("node_modules must still be untracked (never committed), not cleaned")
+	}
+	// A REAL change alongside the deps is committed; the deps stay out.
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitRunChanges(ctx, dir, "agentwork[bot] <aw@local>", excludes); err != nil {
+		t.Fatalf("commit with deps present: %v", err)
+	}
+	out, _ := gitRun(ctx, dir, "ls-tree", "-r", "--name-only", "HEAD")
+	if strings.Contains(out, "node_modules") {
+		t.Fatalf("node_modules must never be committed:\n%s", out)
+	}
+	if !strings.Contains(out, "main.go") {
+		t.Fatalf("real change must be committed:\n%s", out)
+	}
+	// WITHOUT the domain's excludes, the deps WOULD be committed — the
+	// exclusion is the domain's declaration, not platform magic.
+	dir2 := newTestRepo(t)
+	if err := os.MkdirAll(filepath.Join(dir2, "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir2, "node_modules", "x.js"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitRunChanges(ctx, dir2, "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	out2, _ := gitRun(ctx, dir2, "ls-tree", "-r", "--name-only", "HEAD")
+	if !strings.Contains(out2, "node_modules/x.js") {
+		t.Fatal("without a declared exclude, the dirty dep dir IS committed — the domain decides")
 	}
 }
 
@@ -264,7 +344,7 @@ func TestBuildEvidence(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "x_test.go"), []byte("package main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitRunChanges(ctx, dir, "x"); err != nil {
+	if err := commitRunChanges(ctx, dir, "x", nil); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	ev := buildEvidence(ctx, dir, base, "agent summary", "$ go test\nok", "")

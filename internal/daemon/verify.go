@@ -19,7 +19,20 @@ import (
 // clean tree is a no-op; a dirty tree is committed deterministically (git add
 // -A) with the domain's git identity. Deliver merges the branch, so uncommitted
 // work would deliver nothing.
-func commitRunChanges(ctx context.Context, workdir, identity string) error {
+//
+// What is EXCLUDED from the commit:
+//   - AGENTWORK.md unconditionally — the daemon-injected coordination guide
+//     (per-run content) is a platform-owned namespace and must never enter
+//     the goal's commits (the agentwork namespace never touches the user's
+//     own AGENTS.md).
+//   - checks.Excludes — the DOMAIN's declared exclusion patterns (glob),
+//     compiled by the processor from the repo's own .gitignore / dependency
+//     directories and confirmed by the owner. The platform never hardcodes
+//     "what a repo should ignore"; the repo's gitignore decisions belong to
+//     the repo. (git pathspec excludes are repo-root-relative — no
+//     .gitignore-style directory recursion — so patterns like
+//     **/node_modules/** are needed for any-depth dirs.)
+func commitRunChanges(ctx context.Context, workdir, identity string, excludes []string) error {
 	status, err := gitRun(ctx, workdir, "status", "--porcelain")
 	if err != nil {
 		return fmt.Errorf("git status: %w", err)
@@ -27,11 +40,11 @@ func commitRunChanges(ctx context.Context, workdir, identity string) error {
 	if strings.TrimSpace(status) == "" {
 		return nil // clean — nothing to commit
 	}
-	// AGENTWORK.md is the daemon-injected coordination guide (per-run content);
-	// it must never enter the goal's commits. The pathspec exclude keeps it
-	// out of git add -A without touching the repo's .gitignore (the agentwork namespace
-	// never touches the user's own AGENTS.md).
-	if _, err := gitRun(ctx, workdir, "add", "-A", "--", ".", ":(exclude)AGENTWORK.md"); err != nil {
+	args := []string{"add", "-A", "--", ".", ":(exclude)AGENTWORK.md"}
+	for _, e := range excludes {
+		args = append(args, ":(exclude)"+e)
+	}
+	if _, err := gitRun(ctx, workdir, args...); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}
 	// If the only dirty path was AGENTWORK.md (a run that produced no file
@@ -205,9 +218,20 @@ func checkGuards(ctx context.Context, dir, baseSHA string, checks service.Checks
 // intuitive glob semantics humans mean: "*_test.go" matches a test file at
 // ANY depth (path.Match's '*' does not cross '/', so "internal/acp/
 // parse_test.go" would never match — the guard failed every real run until
-// this was fixed). A pattern containing '/' is matched against the full
-// path; a bare pattern is matched against the basename and each path segment.
+// this was fixed). A bare pattern matches the basename and each path segment;
+// a pattern containing '/' matches the full path; "**" crosses any depth
+// (doublestar — path.Match treats it as two plain '*', which is wrong for
+// the "**/*_test.go" patterns processor agents produce).
 func globMatch(pattern, name string) bool {
+	if strings.Contains(pattern, "**") {
+		// "**" crosses directories; "**/" is optional at depth zero
+		// ("**/*_test.go" matches "x_test.go" and "a/b/x_test.go").
+		re, err := regexp.Compile(globToRegex(pattern))
+		if err != nil {
+			return false
+		}
+		return re.MatchString(name)
+	}
 	if strings.Contains(pattern, "/") {
 		ok, _ := path.Match(pattern, name)
 		return ok
@@ -218,6 +242,35 @@ func globMatch(pattern, name string) bool {
 		}
 	}
 	return false
+}
+
+// globToRegex translates a glob pattern into an anchored regex with doublestar
+// semantics: '*' matches within a segment, '**' crosses segments, '**/' is
+// optional (zero or more directories).
+func globToRegex(p string) string {
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(p); i++ {
+		switch p[i] {
+		case '*':
+			if i+1 < len(p) && p[i+1] == '*' {
+				b.WriteString(".*")
+				i++
+				if i+1 < len(p) && p[i+1] == '/' {
+					b.WriteString("/?")
+					i++
+				}
+			} else {
+				b.WriteString("[^/]*")
+			}
+		case '?':
+			b.WriteString("[^/]")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(p[i])))
+		}
+	}
+	b.WriteString("$")
+	return b.String()
 }
 
 // changedPaths returns the paths this run changed: baseSHA..HEAD. The run's

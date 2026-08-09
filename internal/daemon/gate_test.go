@@ -25,7 +25,7 @@ func TestEvalGates(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "config", "prod.yaml"), []byte("x: 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitRunChanges(ctx, dir, "x"); err != nil {
+	if err := commitRunChanges(ctx, dir, "x", nil); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 

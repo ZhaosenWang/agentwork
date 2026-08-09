@@ -608,9 +608,18 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		return nil, NewValidationError("goal is not in review")
 	}
 	ts := now()
+	// gate_rule is WHICH rule actually parked the goal — resolved from the
+	// evidence run's gates_hit (the daemon records the fired gate names
+	// there), NOT hardcoded: the health-learning aggregation (GateStats)
+	// groups by rule, and a diff_contains decision recorded as "merge" would
+	// corrupt the learning data.
+	rule, err := s.resolveGateRule(ctx, goalID, runID, g.ReviewRequest)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := s.st.DB().ExecContext(ctx,
 		`INSERT INTO gate_decision (id,goal_id,run_id,gate_rule,decision,reason,decided_by,decided_at,review_duration) VALUES (?,?,?,?,?,?,?,?,?)`,
-		newID(), goalID, runID, "merge", decision, reason, "human", ts, 0); err != nil {
+		newID(), goalID, runID, rule, decision, reason, "human", ts, 0); err != nil {
 		return nil, fmt.Errorf("insert gate_decision: %w", err)
 	}
 
@@ -687,6 +696,43 @@ func (s *GoalService) RequestApproval(ctx context.Context, goalID, reason string
 		"goal_id": goalID, "reason": "agent 请求审批: " + reason,
 	}})
 	return s.Get(ctx, goalID)
+}
+
+// resolveGateRule names the rule that actually parked the goal in review:
+//   - the named run's gates_hit[0] (the IM card carries the evidence run),
+//   - else the goal's latest completed run's gates_hit[0] (the Web panel),
+//   - else the review_request source (a behavior-gate request is "request"),
+//   - else "merge" (the strength-linkage default gate fires with empty
+//     gates_hit).
+func (s *GoalService) resolveGateRule(ctx context.Context, goalID, runID, reviewRequest string) (string, error) {
+	if runID == "" {
+		// The Web panel resolves without naming a run — use the latest
+		// completed run, whose gates_hit the daemon recorded.
+		err := s.st.DB().QueryRowContext(ctx,
+			`SELECT id FROM run WHERE goal_id=? AND status='completed'
+			 ORDER BY finished_at DESC LIMIT 1`, goalID).Scan(&runID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("find evidence run: %w", err)
+		}
+	}
+	if runID != "" {
+		var hitJSON string
+		err := s.st.DB().QueryRowContext(ctx,
+			`SELECT gates_hit FROM run WHERE id=?`, runID).Scan(&hitJSON)
+		if err == nil && hitJSON != "" && hitJSON != "[]" {
+			var hit []string
+			if json.Unmarshal([]byte(hitJSON), &hit) == nil && len(hit) > 0 {
+				if name, _, ok := strings.Cut(hit[0], ":"); ok && strings.TrimSpace(name) != "" {
+					return strings.TrimSpace(name), nil
+				}
+				return hit[0], nil
+			}
+		}
+	}
+	if strings.HasPrefix(reviewRequest, "agent 请求审批") {
+		return "request", nil
+	}
+	return "merge", nil
 }
 
 // GateStat is one gate rule's decision history — the health-learning data

@@ -63,6 +63,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   // the human's last word: 产物可见、可改、可审 — DESIGN.v2.md §5.3).
   // jsonDraft overrides everything when edited (guards/gates included).
   const [editSetup, setEditSetup] = useState<string | null>(null);
+  const [editExcludes, setEditExcludes] = useState<string | null>(null);
   const [editVerify, setEditVerify] = useState<string | null>(null);
   const [jsonDraft, setJsonDraft] = useState<string | null>(null);
   const [jsonError, setJsonError] = useState<string | null>(null);
@@ -84,9 +85,10 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
     return {
       ...d.checks,
       setup: splitLines(editSetup ?? (d.checks.setup ?? []).join("\n")),
+      excludes: splitLines(editExcludes ?? (d.checks.excludes ?? []).join("\n")),
       verify: splitLines(editVerify ?? (d.checks.verify ?? []).join("\n")),
     };
-  }, [jsonDraft, editSetup, editVerify, d.checks]);
+  }, [jsonDraft, editSetup, editExcludes, editVerify, d.checks]);
 
   const startCompile = () => {
     if (!policyText.trim() || !processorAgent) return;
@@ -135,6 +137,15 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                     className={inputCls}
                     rows={4}
                     placeholder={"cd web && npm install"}
+                  />
+                </Field>
+                <Field label="excludes（提交时排除的路径，每行一条）" hint="依赖目录，如 **/node_modules/**">
+                  <textarea
+                    value={editExcludes ?? (d.checks.excludes ?? []).join("\n")}
+                    onChange={(e) => setEditExcludes(e.target.value)}
+                    className={inputCls}
+                    rows={4}
+                    placeholder={"**/node_modules/**"}
                   />
                 </Field>
                 <Field label="verify（机器验证命令，每行一条）" hint="exit 0 = 通过">

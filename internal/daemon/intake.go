@@ -29,7 +29,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 	// writes its result file here.
 	workdir := filepath.Join(workspaceRoot(), "proc", q.RunID)
 	if err := os.MkdirAll(workdir, 0o755); err != nil {
-		d.failProcessorRun(ctx, q, "mkdir workdir: "+err.Error())
+		d.failIntakeRun(ctx, q, "mkdir workdir: "+err.Error())
 		return
 	}
 	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
@@ -39,7 +39,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`, agentID).
 		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent)
 	if err != nil {
-		d.failProcessorRun(ctx, q, "load agent runtime: "+err.Error())
+		d.failIntakeRun(ctx, q, "load agent runtime: "+err.Error())
 		return
 	}
 	d.ensureWorker(agentID, maxConcurrent)
@@ -58,19 +58,19 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		Transport: transport, Executable: execPath, Args: args, Endpoint: endpoint, Env: rtEnv,
 	}, taskEnv)
 	if err != nil {
-		d.failProcessorRun(ctx, q, "open transport: "+err.Error())
+		d.failIntakeRun(ctx, q, "open transport: "+err.Error())
 		return
 	}
 	defer conn.Close()
 
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {
-		d.failProcessorRun(ctx, q, "provider "+provider+": "+err.Error())
+		d.failIntakeRun(ctx, q, "provider "+provider+": "+err.Error())
 		return
 	}
 	run, err := backend.Execute(ctx, proto.ExecuteSpec{Conn: conn, Cwd: workdir, Prompt: prompt})
 	if err != nil {
-		d.failProcessorRun(ctx, q, "execute: "+err.Error())
+		d.failIntakeRun(ctx, q, "execute: "+err.Error())
 		return
 	}
 	for ev := range run.Events {
@@ -85,22 +85,34 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 	}
 	d.flushRunMessages(ctx, q.RunID)
 	if result.Status != proto.StatusCompleted {
-		d.failProcessorRun(ctx, q, result.Output)
+		d.failIntakeRun(ctx, q, result.Output)
 		return
 	}
 
 	// Read the parsed action (file = structured side effect).
 	raw, err := os.ReadFile(filepath.Join(workdir, "intake.json"))
 	if err != nil {
-		d.failProcessorRun(ctx, q, "read intake.json: "+err.Error())
+		d.failIntakeRun(ctx, q, "read intake.json: "+err.Error())
 		return
 	}
 	var parsed intakeAction
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		d.failProcessorRun(ctx, q, "parse intake.json: "+err.Error())
+		d.failIntakeRun(ctx, q, "parse intake.json: "+err.Error())
 		return
 	}
 	d.replyIntake(ctx, q, parsed)
+}
+
+// failIntakeRun marks the parse run failed AND tells the owner — the inbound
+// flow already acknowledged the message ("⏳ 收到"), so a silent failure
+// would leave the user waiting for a result that never comes.
+func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summary string) {
+	if n := d.imNotifier(); n != nil {
+		if err := n.Send("⚠️ 消息解析失败：" + truncateIn(summary, 200)); err != nil {
+			log.Printf("daemon: intake failure reply: %v", err)
+		}
+	}
+	d.failProcessorRun(ctx, q, summary)
 }
 
 // intakeAction is the parser's output contract (see notify/intake.go's

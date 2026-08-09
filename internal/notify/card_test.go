@@ -142,14 +142,16 @@ func TestBuildDigestCard(t *testing.T) {
 	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='done' WHERE id=?`, done.ID); err != nil {
 		t.Fatal(err)
 	}
+	now := time.Now()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	if _, err := st.DB().ExecContext(ctx,
 		`INSERT INTO run (id,goal_id,agent_id,status,finished_at,queued_at,created_at) VALUES (?,?,?,?,?,?,?)`,
-		"r1", done.ID, "a1", "completed", time.Now().Add(-2*time.Hour).Format(time.RFC3339Nano), time.Now().Format(time.RFC3339Nano), time.Now().Format(time.RFC3339Nano)); err != nil {
+		"r1", done.ID, "a1", "completed", dayStart.Add(-2*time.Hour).Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 
 	qs := NewSQLQueryStore(st)
-	raw, err := BuildDigestCard(ctx, qs, time.Now().Add(-24*time.Hour), time.Now())
+	raw, err := BuildDigestCard(ctx, qs, dayStart.Add(-24*time.Hour), dayStart, now)
 	if err != nil {
 		t.Fatal(err)
 	}

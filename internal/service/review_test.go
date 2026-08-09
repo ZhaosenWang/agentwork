@@ -217,6 +217,42 @@ func TestReviewRecordsRunID(t *testing.T) {
 	}
 }
 
+// TestReviewRecordsActualGateRule: gate_decision.gate_rule records WHICH
+// rule parked the goal (from the evidence run's gates_hit), not a hardcoded
+// "merge" — the health-learning aggregation groups by rule, so a
+// diff_contains decision must be recorded as such (regression: every decision
+// landed as "merge" and corrupted GateStats).
+func TestReviewRecordsActualGateRule(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	run := enqueueFirst(t, rs, g)
+	// The daemon records the fired gate on the run row; the goal layer reads
+	// it (the daemon computes, the goal layer judges).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET gates_hit=? WHERE id=?`,
+		`["diff_contains: 改动含 Go 代码时人工判定测试对应性", "merge: 每次完成需人工审批"]`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Finish(ctx, run.ID, "completed", "ok"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if _, err := gs.ResolveReview(ctx, g.ID, run.ID, "approve", ""); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	var rule string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT gate_rule FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, g.ID).Scan(&rule); err != nil {
+		t.Fatalf("read gate_decision: %v", err)
+	}
+	if rule != "diff_contains" {
+		t.Fatalf("gate_rule must name the fired rule, got %q", rule)
+	}
+}
+
 // TestMarkDeliveredFailureStaysInReview: a failed deliver (merge conflict /
 // post-merge verification red) annotates review_request and leaves the goal
 // parked — the human can retry deliver or reject the change back.

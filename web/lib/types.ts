@@ -71,6 +71,7 @@ export interface Guard {
 
 export interface Checks {
   setup: string[]; // environment preparation (dependency installs) before verify
+  excludes: string[]; // commit-time exclusion globs (domain-declared, from the repo's .gitignore)
   verify: string[];
   guards: Guard[];
   gates: GateRule[];
