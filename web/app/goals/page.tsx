@@ -4,6 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import { useGoals, useAgents, useSquads, useCreateGoal, useGoalEvents } from "@/lib/queries";
 import { Badge, Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
+import { GoalStats } from "@/components/goal-stats";
 import type { Goal, GoalStatus } from "@/lib/types";
 
 const STATUS_TABS: { label: string; value: GoalStatus | "all" }[] = [
@@ -38,6 +39,9 @@ export default function GoalsPage() {
           <Button onClick={() => setShowForm(true)}>+ 新建</Button>
         }
       />
+
+      {/* Stats cards */}
+      <GoalStats goals={goals} loading={isLoading} />
 
       {/* Status filter tabs */}
       <div className="flex gap-1 mb-4 flex-wrap">
