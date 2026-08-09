@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS run (
     agent_id           TEXT NOT NULL REFERENCES agent(id),
     run_kind           TEXT NOT NULL DEFAULT 'worker', -- worker|processor
     domain_id          TEXT NOT NULL DEFAULT '',  -- processor runs: the domain being processed (compile target)
+    gates_hit          TEXT NOT NULL DEFAULT '[]',-- M2: JSON []string — gate rules this run's outcome triggered
     prompt             TEXT NOT NULL DEFAULT '',  -- platform-internal runs only (processor): the compile/processing instruction
     session_id         TEXT NOT NULL DEFAULT '',  -- protocol-returned; for history/future resume
     workdir            TEXT NOT NULL DEFAULT '',

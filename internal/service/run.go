@@ -366,7 +366,7 @@ func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Run
+	out := []Run{}
 	for rows.Next() {
 		var r Run
 		var leaderFlag int

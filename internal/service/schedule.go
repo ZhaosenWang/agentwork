@@ -118,7 +118,7 @@ func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Schedule
+	out := []Schedule{}
 	for rows.Next() {
 		var sch Schedule
 		var enabled int

@@ -174,7 +174,7 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Goal
+	out := []Goal{}
 	for rows.Next() {
 		var g Goal
 		var parentID, domainID sql.NullString
@@ -452,7 +452,7 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 		// Note: machine verification failures never reach here — the daemon
 		// runs verify before finishing the run and a red verify ends the run
 		// failed, flowing through the retry branch below.
-		hit, reason, err := s.gatesForGoal(ctx, tx, rc.GoalID)
+		hit, reason, err := s.gatesForGoal(ctx, tx, rc)
 		if err != nil {
 			return fmt.Errorf("check gates: %w", err)
 		}
@@ -491,7 +491,7 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 		// DESIGN: the daemon no longer clears handoff_note itself; only the
 		// goal layer, after confirming the run owns the goal, does.)
 		if res, err := tx.ExecContext(ctx,
-			`UPDATE goal SET status='done', handoff_note='' WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked')`,
+			`UPDATE goal SET status='done', handoff_note='' WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked','review')`,
 			rc.GoalID); err != nil {
 			return fmt.Errorf("promote goal done: %w", err)
 		} else if n, _ := res.RowsAffected(); n == 0 {
@@ -522,7 +522,7 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 			})
 		} else {
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE goal SET status='failed' WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked')`,
+				`UPDATE goal SET status='failed' WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked','review')`,
 				rc.GoalID); err != nil {
 				return fmt.Errorf("fail goal: %w", err)
 			}
@@ -535,14 +535,33 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 	return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit)
 }
 
-// gatesForGoal reads the goal's domain gates (DESIGN.v2.md §5). M0 ships a
-// single gate ("merge"): any domain with gates parks completed goals in
-// review until the human decides. Goals without a domain have no gates.
-func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, goalID string) (bool, string, error) {
-	var domainID, checksJSON string
-	err := tx.QueryRowContext(ctx,
-		`SELECT d.id, d.checks FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
-		Scan(&domainID, &checksJSON)
+// gatesForGoal decides whether a completed run parks the goal in review
+// (DESIGN.v2.md §5, M2 rule engine):
+//
+//  1. The daemon evaluated the gate rules against the run's diff and
+//     recorded the fired gates on the run row (run.gates_hit) — merge always
+//     fires, diff_* fire on pattern match. The goal layer reads that result:
+//     the daemon computes, the goal layer judges.
+//  2. Strength linkage (§5.4): a weak-verification domain with no configured
+//     gates still gets a default merge gate — weak verification must not run
+//     unattended.
+//
+// request gates are set directly by RequestApproval, not via this path.
+func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunContext) (bool, string, error) {
+	var gatesHitJSON string
+	err := tx.QueryRowContext(ctx, `SELECT gates_hit FROM run WHERE id=?`, rc.RunID).Scan(&gatesHitJSON)
+	if err == nil && gatesHitJSON != "" && gatesHitJSON != "[]" {
+		var hit []string
+		if json.Unmarshal([]byte(gatesHitJSON), &hit) == nil && len(hit) > 0 {
+			return true, strings.Join(hit, "; "), nil
+		}
+	}
+	// No gate fired for this run. Strength linkage: weak verification with no
+	// gates at all still demands a human checkpoint.
+	var checksJSON, strength string
+	err = tx.QueryRowContext(ctx,
+		`SELECT d.checks, d.verification_strength FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, rc.GoalID).
+		Scan(&checksJSON, &strength)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, "", nil // no domain → no gates
 	}
@@ -553,14 +572,13 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, goalID strin
 	if err := json.Unmarshal([]byte(checksJSON), &checks); err != nil {
 		return false, "", fmt.Errorf("parse domain checks: %w", err)
 	}
-	if len(checks.Gates) == 0 {
-		return false, "", nil
+	if len(checks.Gates) > 0 {
+		return false, "", nil // gates configured but none fired for this run
 	}
-	var parts []string
-	for _, g := range checks.Gates {
-		parts = append(parts, g.Name+": "+g.When)
+	if strength == "weak" {
+		return true, "merge (default): 弱验证域强制人工审批", nil
 	}
-	return true, strings.Join(parts, "; "), nil
+	return false, "", nil
 }
 
 // ResolveReview handles a human checkpoint decision (DESIGN.v2.md §4/§5):
@@ -631,6 +649,74 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, decision, reaso
 		"goal_id": goalID, "decision": decision,
 	}})
 	return s.Get(ctx, goalID)
+}
+
+// RequestApproval is the behavior gate (DESIGN.v2.md §5, M2): an agent that
+// hits a decision point it must not make alone parks the goal in review and
+// asks the human — via `agentwork-cli goal request-approval --reason "..."`.
+// The in-flight run keeps running; when it reports in, the reconcile sees
+// goal.status=review and does NOT advance it (review is exclusive — both the
+// done and failed promotions exclude it). The human's approve/reject then
+// resolves the goal like any other checkpoint.
+func (s *GoalService) RequestApproval(ctx context.Context, goalID, reason string) (*Goal, error) {
+	if reason == "" {
+		return nil, NewValidationError("reason is required")
+	}
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='review', review_request=? WHERE id=? AND status='active'`,
+		"agent 请求审批: "+reason, goalID)
+	if err != nil {
+		return nil, fmt.Errorf("request approval: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, NewValidationError("goal is not active — cannot request approval")
+	}
+	detail, _ := json.Marshal(map[string]string{"reason": reason})
+	if _, err := s.st.DB().ExecContext(ctx,
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'requested_review',?,?)`,
+		newID(), goalID, "agent", "", string(detail), now()); err != nil {
+		return nil, fmt.Errorf("insert activity: %w", err)
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
+		"goal_id": goalID, "reason": "agent 请求审批: " + reason,
+	}})
+	return s.Get(ctx, goalID)
+}
+
+// GateStat is one gate rule's decision history — the health-learning data
+// source (DESIGN.v2.md §13): a gate approved every time is a candidate for
+// removal; one rejected repeatedly is a candidate for tightening.
+type GateStat struct {
+	Rule     string `json:"rule"`     // gate_rule as recorded (merge, diff_contains, ...)
+	Total    int    `json:"total"`
+	Approved int    `json:"approved"`
+	Rejected int    `json:"rejected"`
+}
+
+// GateStats aggregates gate_decision by rule. Sorted by total descending so
+// the busiest gates surface first.
+func (s *GoalService) GateStats(ctx context.Context) ([]GateStat, error) {
+	rows, err := s.st.DB().QueryContext(ctx,
+		`SELECT gate_rule,
+		        COUNT(*) AS total,
+		        SUM(CASE WHEN decision='approve' THEN 1 ELSE 0 END) AS approved,
+		        SUM(CASE WHEN decision IN ('reject','redirect') THEN 1 ELSE 0 END) AS rejected
+		 FROM gate_decision
+		 GROUP BY gate_rule
+		 ORDER BY total DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []GateStat{}
+	for rows.Next() {
+		var g GateStat
+		if err := rows.Scan(&g.Rule, &g.Total, &g.Approved, &g.Rejected); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }
 
 // MarkDelivered closes the deliver step (DESIGN.v2.md §7), called by the

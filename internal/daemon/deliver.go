@@ -75,7 +75,13 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		return
 	}
 	if strings.TrimSpace(branchHead) == strings.TrimSpace(base) {
-		d.finishDeliver(ctx, goalID, false, "deliver: goal branch "+branchName+" has no commits ahead of "+defaultBranch+" — nothing to deliver (agent produced no work, or a shared-repo wipe orphaned the branch)")
+		// No commits on the branch: nothing to merge or push. For a
+		// zero-change run (behavior gate approved, a consult) the human's
+		// approval IS the outcome — closing done is correct, not a failure.
+		// (A real task that produced nothing surfaces through verification
+		// and the human's own review of the evidence before approving.)
+		log.Printf("daemon: deliver %s: branch has no commits — approving as-is", goalID)
+		d.finishDeliver(ctx, goalID, true, "no changes to deliver — approved as-is")
 		return
 	}
 

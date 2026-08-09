@@ -28,6 +28,22 @@ func seedDomainWithGates(t *testing.T, st *store.Store) string {
 	return d.ID
 }
 
+// finishWithMergeGate injects the daemon-side gate evaluation result (the
+// unit tests don't run the daemon, which computes gates_hit from the diff)
+// and finishes the run completed — the goal layer then parks in review.
+func finishWithMergeGate(t *testing.T, st *store.Store, rs *RunService, run *Run, summary string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET gates_hit=? WHERE id=?`,
+		`["merge: 合并到主分支前必须人工审批"]`, run.ID); err != nil {
+		t.Fatalf("set gates_hit: %v", err)
+	}
+	if err := rs.Finish(ctx, run.ID, "completed", summary); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+}
+
 // TestReconcileParksInReviewWithGates: a completed run in a gated domain parks
 // the goal in review (NOT done) — the checkpoint fires before any promotion.
 // Without gates the same run would promote to done.
@@ -42,9 +58,7 @@ func TestReconcileParksInReviewWithGates(t *testing.T) {
 		t.Fatalf("create goal: %v", err)
 	}
 	r := enqueueFirst(t, rs, g)
-	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
-		t.Fatalf("finish: %v", err)
-	}
+	finishWithMergeGate(t, st, rs, r, "done")
 	after, _ := gs.Get(ctx, g.ID)
 	if after.Status != "review" {
 		t.Fatalf("gated completion must park in review, got %q", after.Status)
@@ -70,9 +84,7 @@ func TestReviewApproveKeepsGoalParkedUntilDeliver(t *testing.T) {
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	r := enqueueFirst(t, rs, g)
 	_ = r
-	if err := rs.Finish(ctx, enqueueFirst(t, rs, g).ID, "completed", "ok"); err != nil {
-		t.Fatalf("finish: %v", err)
-	}
+	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
 
 	got, err := gs.ResolveReview(ctx, g.ID, "approve", "")
 	if err != nil {
@@ -115,9 +127,7 @@ func TestReviewRejectSendsBackWithReason(t *testing.T) {
 	domID := seedDomainWithGates(t, st)
 
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
-	if err := rs.Finish(ctx, enqueueFirst(t, rs, g).ID, "completed", "ok"); err != nil {
-		t.Fatalf("finish: %v", err)
-	}
+	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
 
 	got, err := gs.ResolveReview(ctx, g.ID, "reject", "方向不对，把 X 改成 Y 再看")
 	if err != nil {
@@ -154,18 +164,14 @@ func TestReviewRejectThenApproveRoundTrip(t *testing.T) {
 	domID := seedDomainWithGates(t, st)
 
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
-	if err := rs.Finish(ctx, enqueueFirst(t, rs, g).ID, "completed", "ok"); err != nil {
-		t.Fatalf("finish 1: %v", err)
-	}
+	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
 	if _, err := gs.ResolveReview(ctx, g.ID, "reject", "改一下"); err != nil {
 		t.Fatalf("reject: %v", err)
 	}
 	// Agent fixes; the new run completes → review again.
 	runs, _ := rs.List(ctx, g.ID)
 	last := runs[len(runs)-1]
-	if err := rs.Finish(ctx, last.ID, "completed", "fixed"); err != nil {
-		t.Fatalf("finish 2: %v", err)
-	}
+	finishWithMergeGate(t, st, rs, &last, "fixed")
 	g2, _ := gs.Get(ctx, g.ID)
 	if g2.Status != "review" {
 		t.Fatalf("expected review again, got %q", g2.Status)
@@ -195,9 +201,7 @@ func TestMarkDeliveredFailureStaysInReview(t *testing.T) {
 	domID := seedDomainWithGates(t, st)
 
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
-	if err := rs.Finish(ctx, enqueueFirst(t, rs, g).ID, "completed", "ok"); err != nil {
-		t.Fatalf("finish: %v", err)
-	}
+	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
 	if _, err := gs.ResolveReview(ctx, g.ID, "approve", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -223,9 +227,7 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 	domID := seedDomainWithGates(t, st)
 
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
-	if err := rs.Finish(ctx, enqueueFirst(t, rs, g).ID, "completed", "ok"); err != nil {
-		t.Fatalf("finish: %v", err)
-	}
+	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
 	if got, _ := gs.Get(ctx, g.ID); got.Status != "review" {
 		t.Fatalf("setup: expected review, got %q", got.Status)
 	}

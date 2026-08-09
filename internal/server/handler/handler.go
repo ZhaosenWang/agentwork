@@ -43,6 +43,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/cancel", h.cancelGoal)
 	mux.HandleFunc("POST /goals/{id}/wait", h.waitGoal)
 	mux.HandleFunc("POST /goals/{id}/review", h.resolveGoalReview)
+	mux.HandleFunc("POST /goals/{id}/request-approval", h.requestGoalApproval)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
@@ -65,6 +66,8 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /domains/{id}", h.deleteDomain)
 	mux.HandleFunc("POST /domains/{id}/checks", h.freezeDomainChecks)
 	mux.HandleFunc("POST /domains/{id}/compile", h.compileDomainPolicy)
+
+	mux.HandleFunc("GET /gate-decisions/stats", h.gateStats)
 
 	mux.HandleFunc("GET /im/feishu/status", h.imStatus)
 	mux.HandleFunc("POST /im/feishu/connect", h.imConnect)
@@ -193,6 +196,20 @@ func (h *Handlers) waitGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+// requestGoalApproval is the behavior gate: the agent parks its own goal in
+// review and asks the human (agentwork-cli goal request-approval).
+func (h *Handlers) requestGoalApproval(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Goal.RequestApproval(r.Context(), r.PathValue("id"), body.Reason)
+	writeJSON(w, out, err)
+}
+
 func (h *Handlers) resolveGoalReview(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Decision string `json:"decision"`
@@ -350,6 +367,13 @@ func (h *Handlers) freezeDomainChecks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := h.Domain.FreezeChecks(r.Context(), r.PathValue("id"), body.Checks, body.VerificationStrength)
+	writeJSON(w, out, err)
+}
+
+// ── gate health (M2) ──
+
+func (h *Handlers) gateStats(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Goal.GateStats(r.Context())
 	writeJSON(w, out, err)
 }
 

@@ -114,6 +114,9 @@ export const freezeDomainChecks = (
   body: { checks: Checks; verification_strength: string }
 ) => api<Domain>(`/domains/${id}/checks`, { method: "POST", body: JSON.stringify(body) });
 
+// ── Gate health (M2) ──
+export const getGateStats = () => api<import("./types").GateStat[]>("/gate-decisions/stats");
+
 // ── IM (Feishu connect) ──
 export interface ImStatus {
   status: string; // idle | waiting_qr | waiting_message | connected | failed

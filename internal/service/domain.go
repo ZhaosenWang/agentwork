@@ -55,12 +55,21 @@ type Guard struct {
 	MinDelta float64 `json:"min_delta"` // required coverage percentage-point delta
 }
 
-// GateRule names a human checkpoint. M0 ships a single rule ("merge"): a
-// completed run parks the goal in review until the human decides. Rule
-// expressions (guards/when clauses) arrive in M2.
+// GateRule names a human checkpoint (DESIGN.v2.md §5). Rule kinds (M2):
+//
+//	merge          — every completed run parks the goal in review (M0 default)
+//	diff_contains  — the run's diff must contain a path matching Pattern
+//	diff_excludes  — the run's diff must not contain a path matching Pattern
+//	request        — the agent requests approval mid-run (agentwork-cli
+//	                 goal request-approval); no condition to evaluate
+//
+// diff_* conditions are evaluated by the daemon (it owns the git diff) and
+// recorded on the run row (run.gates_hit); the goal layer only reads the
+// result — the daemon computes, the goal layer judges.
 type GateRule struct {
-	Name string `json:"name"` // merge | guard:<...> | request (M2)
-	When string `json:"when"` // human-readable condition description
+	Name    string `json:"name"`    // merge | diff_contains | diff_excludes | request
+	When    string `json:"when"`    // human-readable condition description
+	Pattern string `json:"pattern"` // diff_* gates: glob over changed paths
 }
 
 type DomainService struct {
@@ -115,7 +124,11 @@ func compilePrompt(d *Domain, policyText string) string {
 {
   "verify": ["<机器验证命令，exit 0 为通过，如 go test ./...>", ...],
   "guards": [{"type": "diff_contains|diff_excludes|coverage_delta", "pattern": "<glob，diff_* 必填>", "min_delta": <覆盖率百分点，仅 coverage_delta>}],
-  "gates": [{"name": "merge", "when": "<该卡点触发条件的人话描述>"}]
+  "gates": [
+    {"name": "merge", "when": "<该卡点触发条件的人话描述>"},
+    {"name": "diff_contains", "when": "<人话描述>", "pattern": "<glob，如 config/*>"},
+    {"name": "diff_excludes", "when": "<人话描述>", "pattern": "<glob，如 *.secret>"}
+  ]
 }`)
 	b.WriteString("\n\n另把验证强度（strong|medium|weak）写入当前工作目录的 strength.txt——判断依据：verify 命令是否真实覆盖了任务的关键风险（echo ok / true 之类是 weak）。\n\n规则：\n")
 	b.WriteString("- verify 里的命令必须真实存在且可执行（结合该仓库技术栈推断）\n")
@@ -183,7 +196,7 @@ func (s *DomainService) List(ctx context.Context) ([]Domain, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Domain
+	out := []Domain{}
 	for rows.Next() {
 		var d Domain
 		var checksJSON string

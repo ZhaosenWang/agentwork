@@ -26,11 +26,18 @@ func commitRunChanges(ctx context.Context, workdir, identity string) error {
 	if strings.TrimSpace(status) == "" {
 		return nil // clean — nothing to commit
 	}
-	// AGENTS.md is the daemon-injected coordination guide (per-run content);
+	// AGENTWORK.md is the daemon-injected coordination guide (per-run content);
 	// it must never enter the goal's commits. The pathspec exclude keeps it
-	// out of git add -A without touching the repo's .gitignore.
-	if _, err := gitRun(ctx, workdir, "add", "-A", "--", ".", ":(exclude)AGENTS.md"); err != nil {
+	// out of git add -A without touching the repo's .gitignore (the agentwork namespace
+	// never touches the user's own AGENTS.md).
+	if _, err := gitRun(ctx, workdir, "add", "-A", "--", ".", ":(exclude)AGENTWORK.md"); err != nil {
 		return fmt.Errorf("git add: %w", err)
+	}
+	// If the only dirty path was AGENTWORK.md (a run that produced no file
+	// changes — e.g. a behavior-gate run that just requested approval),
+	// nothing is staged and committing would fail with "nothing to commit".
+	if _, err := gitRun(ctx, workdir, "diff", "--cached", "--quiet"); err == nil {
+		return nil // nothing staged → no-op
 	}
 	name, email := "agentwork[bot]", "agentwork@local"
 	if l, r, ok := strings.Cut(identity, "<"); ok && strings.Contains(r, ">") {
@@ -112,6 +119,13 @@ func checkGuards(ctx context.Context, dir, baseSHA string, checks service.Checks
 	for _, g := range checks.Guards {
 		switch g.Type {
 		case "diff_contains", "diff_excludes":
+			// An EMPTY diff passes both guards: a run that changed nothing
+			// (a behavior-gate run that just requested approval, a consult)
+			// has nothing for "all changes must carry a test" to constrain —
+			// the claim holds vacuously. Only a diff that EXISTS is judged.
+			if len(names) == 0 {
+				continue
+			}
 			matched := false
 			for _, name := range names {
 				if globMatch(g.Pattern, name) {

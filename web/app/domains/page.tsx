@@ -3,7 +3,7 @@
 import { useState } from "react";
 import {
   useDomains, useDomain, useAgents, useCreateDomain, useCompileDomainPolicy,
-  useFreezeDomainChecks, useGoalEvents,
+  useFreezeDomainChecks, useGoalEvents, useGateStats,
 } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, PageHeader, Empty, Badge } from "@/components/ui";
 import type { Domain, Checks } from "@/lib/types";
@@ -34,6 +34,8 @@ export default function DomainsPage() {
           ))}
         </div>
       )}
+
+      <GateHealthTable />
 
       {showCreate && <CreateDomainDialog onClose={() => setShowCreate(false)} />}
     </div>
@@ -152,6 +154,52 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
           <Button variant="outline" onClick={() => startCompile()}>重新编译</Button>
         </div>
       )}
+    </div>
+  );
+}
+
+// GateHealthTable shows each gate rule's decision history (M2 health data,
+// DESIGN.v2.md §13): a gate approved every time is a candidate for removal;
+// one rejected repeatedly for tightening.
+function GateHealthTable() {
+  const { data: stats } = useGateStats();
+  if (!stats?.length) return null;
+  return (
+    <div className="mt-8">
+      <h3 className="text-sm font-medium mb-2">卡点健康度</h3>
+      <div className="rounded-lg border border-gray-200 overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-left text-xs text-gray-500">
+            <tr>
+              <th className="px-3 py-2">卡点规则</th>
+              <th className="px-3 py-2">决策总数</th>
+              <th className="px-3 py-2">批准</th>
+              <th className="px-3 py-2">驳回</th>
+              <th className="px-3 py-2">建议</th>
+            </tr>
+          </thead>
+          <tbody>
+            {stats.map((s) => {
+              const rate = s.total > 0 ? s.approved / s.total : 0;
+              const advice =
+                s.total >= 5 && rate >= 0.95
+                  ? "连批率高——建议放宽或移除"
+                  : s.total >= 3 && s.rejected >= 3
+                    ? "频繁驳回——建议收紧规则或改自动"
+                    : "—";
+              return (
+                <tr key={s.rule} className="border-t border-gray-100">
+                  <td className="px-3 py-2 font-mono text-xs">{s.rule}</td>
+                  <td className="px-3 py-2">{s.total}</td>
+                  <td className="px-3 py-2 text-emerald-700">{s.approved}</td>
+                  <td className="px-3 py-2 text-red-700">{s.rejected}</td>
+                  <td className="px-3 py-2 text-xs text-gray-600">{advice}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

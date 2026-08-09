@@ -80,7 +80,7 @@ func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Agent
+	out := []Agent{}
 	for rows.Next() {
 		var a Agent
 		var envJSON string

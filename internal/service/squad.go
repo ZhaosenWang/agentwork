@@ -72,7 +72,7 @@ func (s *SquadService) List(ctx context.Context) ([]Squad, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Squad
+	out := []Squad{}
 	for rows.Next() {
 		var sq Squad
 		if err := rows.Scan(&sq.ID, &sq.Name, &sq.Description, &sq.LeaderID, &sq.Instructions, &sq.CreatedAt); err != nil {
@@ -134,7 +134,7 @@ func (s *SquadService) ListMembers(ctx context.Context, squadID string) ([]Squad
 		return nil, err
 	}
 	defer rows.Close()
-	var out []SquadMember
+	out := []SquadMember{}
 	for rows.Next() {
 		var m SquadMember
 		if err := rows.Scan(&m.ID, &m.SquadID, &m.MemberType, &m.MemberID, &m.Role, &m.CreatedAt); err != nil {

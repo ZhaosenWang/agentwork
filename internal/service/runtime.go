@@ -85,7 +85,7 @@ func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Runtime
+	out := []Runtime{}
 	for rows.Next() {
 		var r Runtime
 		var argsJSON, envJSON string

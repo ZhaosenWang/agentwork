@@ -601,7 +601,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 
 	// Inject the agent's identity + team roster / squad briefing into the
 	// workdir so the agent subprocess discovers who it is and who it can hand
-	// off to (AGENTS.md).
+	// off to (AGENTWORK.md).
 	roster := d.buildAgentGuide(ctx, q.AgentID)
 	briefing := ""
 	if isLeaderRun && squadID != "" {
@@ -756,6 +756,17 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			if !ok {
 				d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
 				return
+			}
+			// Gate evaluation (M2 rule engine): merge always fires; diff_*
+			// fire on the run's changed paths. The fired gates are recorded on
+			// the run row — the goal layer reads them in the reconcile
+			// transaction (the daemon computes, the goal layer judges).
+			gatesHit := evalGates(ctx, runRowWorkdir, baseSHA, checks)
+			if len(gatesHit) > 0 {
+				gatesJSON, _ := json.Marshal(gatesHit)
+				if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET gates_hit=? WHERE id=?`, string(gatesJSON), q.RunID); err != nil {
+					log.Printf("daemon: record gates_hit for run %s: %v", q.RunID, err)
+				}
 			}
 			// Evidence bundle for the approval card (decision 2-3).
 			ev := buildEvidence(ctx, runRowWorkdir, baseSHA, result.Output, verifyReport, guardReport)
@@ -1089,6 +1100,7 @@ func buildPrompt(title, desc, handoff string) string {
 		// explicit, completable instruction so the run reaches a terminal state.
 		body = "Complete this sub-task. Do the work it implies, then finish your turn."
 	}
+	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, agentwork-cli reference, how to hand off / fan out / request approval)."
 	if handoff != "" {
 		// A handoff/wakeup note scopes THIS turn. It is placed AHEAD of the
 		// original description, which is now *context* (not a fresh to-do
@@ -1097,16 +1109,17 @@ func buildPrompt(title, desc, handoff string) string {
 		// description's "create a sub-task" steps. If the note reports the work
 		// already complete, the agent ends its turn rather than fanning out
 		// again.
-		return "Task: " + title + "\n\n" +
+		return guide + "\n\n" +
+			"Task: " + title + "\n\n" +
 			"Context (what this goal is about; do NOT blindly redo these steps):\n" + body + "\n\n" +
 			"Scope for THIS run (follow the note; do not redo steps it describes as done):\n> " + handoff + "\n\n" +
 			"If the note reports the work is already complete, do NOT start new work — end your turn immediately.\n"
 	}
-	return fmt.Sprintf("Task: %s\n\n%s", title, body)
+	return guide + "\n\n" + fmt.Sprintf("Task: %s\n\n%s", title, body)
 }
 
 // buildAgentGuide writes the "## Team & Coordination" block that every run's
-// AGENTS.md gets: the roster of teammates plus the full agentwork-cli
+// AGENTWORK.md gets: the roster of teammates plus the full agentwork-cli
 // reference the agent uses to produce structured side effects. This is the
 // agent's only source of truth for how to coordinate — without it the agent
 // doesn't know goal create/wait/comment exist, and it would never guess the
@@ -1183,7 +1196,7 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 }
 
 // injectAgentProfile writes the agent's system prompt, team roster, and (for
-// leader runs) squad briefing into {workdir}/AGENTS.md so the subprocess
+// leader runs) squad briefing into {workdir}/AGENTWORK.md so the subprocess
 // discovers its identity via its native config file.
 func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster, briefing string) error {
 	var b strings.Builder
@@ -1196,7 +1209,7 @@ func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster, briefing stri
 		b.WriteString("\n\n")
 	}
 	b.WriteString(roster)
-	return os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(b.String()), 0o644)
+	return os.WriteFile(filepath.Join(workdir, "AGENTWORK.md"), []byte(b.String()), 0o644)
 }
 
 // runIdleWatchdog cancels a Prompt if the agent emits nothing for idleWindow

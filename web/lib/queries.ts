@@ -36,6 +36,7 @@ import {
   getImStatus,
   connectFeishu,
   disconnectFeishu,
+  getGateStats,
 } from "./api";
 import { useWSEvent } from "./ws";
 
@@ -54,6 +55,7 @@ export const qk = {
   domains: ["domains"] as const,
   domain: (id: string) => ["domains", id] as const,
   im: ["im"] as const,
+  gateStats: ["gate-stats"] as const,
 };
 
 // ── Runtime hooks ──
@@ -253,6 +255,11 @@ export function useFreezeDomainChecks() {
       qc.invalidateQueries({ queryKey: qk.domains });
     },
   });
+}
+
+// ── Gate health hooks ──
+export function useGateStats() {
+  return useQuery({ queryKey: qk.gateStats, queryFn: getGateStats });
 }
 
 // ── IM hooks ──

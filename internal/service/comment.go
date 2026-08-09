@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -57,7 +56,7 @@ var MentionRe = regexp.MustCompile(`\[@?(.+?)\]\(mention://(agent|squad|human|al
 func ParseMentions(content string) []Mention {
 	matches := MentionRe.FindAllStringSubmatch(content, -1)
 	seen := map[string]struct{}{}
-	var out []Mention
+	out := []Mention{}
 	for _, m := range matches {
 		mention := Mention{Type: m[2], ID: m[3]}
 		key := mention.Type + ":" + mention.ID
@@ -192,7 +191,7 @@ func (s *CommentService) List(ctx context.Context, goalID string) ([]Comment, er
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Comment
+	out := []Comment{}
 	for rows.Next() {
 		var c Comment
 		var parentID sql.NullString
@@ -208,4 +207,3 @@ func (s *CommentService) List(ctx context.Context, goalID string) ([]Comment, er
 // sanity check that the agent/squad we mention exists is intentionally NOT done
 // here for agent: a stale agent UUID is dropped silently (matching multica's
 // blockTarget behavior). Squad is checked in enqueueLeaderRunForMention.
-var _ = json.Marshal

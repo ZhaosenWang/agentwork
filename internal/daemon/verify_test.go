@@ -66,6 +66,41 @@ func TestCommitRunChanges(t *testing.T) {
 	}
 }
 
+// TestCommitRunChangesOnlyGuide: a run whose only dirty path is the
+// daemon-injected AGENTWORK.md (e.g. a behavior-gate run that just requested
+// approval) must be a NO-OP — the exclude leaves nothing staged and a commit
+// would fail with "nothing to commit" (regression from the pathspec exclude).
+func TestCommitRunChangesOnlyGuide(t *testing.T) {
+	dir := newTestRepo(t)
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(dir, "AGENTWORK.md"), []byte("coordination guide\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitRunChanges(ctx, dir, "x"); err != nil {
+		t.Fatalf("AGENTWORK.md-only dirty tree must be a no-op: %v", err)
+	}
+	// Still clean: nothing was committed.
+	status, _ := gitRun(ctx, dir, "status", "--porcelain")
+	if strings.TrimSpace(status) != "?? AGENTWORK.md" {
+		t.Fatalf("expected only AGENTWORK.md untracked, got: %s", status)
+	}
+}
+
+// TestCheckGuardsEmptyDiffPasses: a run with an EMPTY diff (a behavior-gate
+// run that just requested approval) must pass diff_contains — "all changes
+// carry a test" holds vacuously when there are no changes.
+func TestCheckGuardsEmptyDiffPasses(t *testing.T) {
+	dir := newTestRepo(t)
+	ctx := context.Background()
+	base, _ := gitRun(ctx, dir, "rev-parse", "HEAD")
+	report, ok := checkGuards(ctx, dir, base, service.Checks{
+		Guards: []service.Guard{{Type: "diff_contains", Pattern: "*_test.go"}},
+	}, nil)
+	if !ok {
+		t.Fatalf("empty diff must pass diff_contains, report:\n%s", report)
+	}
+}
+
 // TestRunVerification: exit 0 passes, non-zero fails, and the report carries
 // the command output.
 func TestRunVerification(t *testing.T) {

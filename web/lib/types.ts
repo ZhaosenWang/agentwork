@@ -51,8 +51,16 @@ export interface Goal {
 }
 
 export interface GateRule {
-  name: string; // merge | guard:<...> | request (M2)
+  name: string; // merge | diff_contains | diff_excludes | request (M2)
   when: string;
+  pattern: string; // diff_* gates: glob over changed paths
+}
+
+export interface GateStat {
+  rule: string;
+  total: number;
+  approved: number;
+  rejected: number;
 }
 
 export interface Guard {

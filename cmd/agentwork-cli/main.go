@@ -65,6 +65,8 @@ Subcommands:
                                              to enqueue a run on that agent
   goal wait                                  mark the current goal as waiting for its sub-goals;
                                              the daemon re-runs it once all children finish
+  goal request-approval --reason R           park the current goal in review and ask the
+                                             human to decide (behavior gate)
   agent list                                 list all agents (JSON)
   squad list                                 list all squads (JSON)
 
@@ -93,6 +95,8 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 		goalComment(serverURL, goalID, args[1:])
 	case "wait":
 		goalWait(serverURL, goalID, args[1:])
+	case "request-approval":
+		goalRequestApproval(serverURL, goalID, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown goal subcommand %q\n", args[0])
 		os.Exit(2)
@@ -167,6 +171,26 @@ func goalWait(serverURL, goalID string, args []string) {
 		fail("AGENTWORK_GOAL_ID not set")
 	}
 	postNoBody(serverURL+"/goals/"+goalID+"/wait", nil)
+}
+
+// goalRequestApproval parks the current goal in review and asks the human
+// (behavior gate, DESIGN.v2.md §5). The agent uses this when it hits a
+// decision it must not make alone.
+func goalRequestApproval(serverURL, goalID string, args []string) {
+	if goalID == "" {
+		fail("AGENTWORK_GOAL_ID not set")
+	}
+	reason := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--reason" && i+1 < len(args) {
+			reason = args[i+1]
+			i++
+		}
+	}
+	if reason == "" {
+		fail("--reason is required")
+	}
+	post(serverURL+"/goals/"+goalID+"/request-approval", map[string]string{"reason": reason})
 }
 
 // ── agent / squad ──
