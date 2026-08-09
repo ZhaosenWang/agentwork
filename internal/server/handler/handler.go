@@ -18,6 +18,7 @@ type Handlers struct {
 	Comment  *service.CommentService
 	Squad    *service.SquadService
 	Schedule *service.ScheduleService
+	Domain   *service.DomainService
 }
 
 func (h *Handlers) Mount(mux *http.ServeMux) {
@@ -38,6 +39,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/assign", h.assignGoal)
 	mux.HandleFunc("POST /goals/{id}/cancel", h.cancelGoal)
 	mux.HandleFunc("POST /goals/{id}/wait", h.waitGoal)
+	mux.HandleFunc("POST /goals/{id}/review", h.resolveGoalReview)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
@@ -53,6 +55,13 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /schedules", h.createSchedule)
 	mux.HandleFunc("GET /schedules/{id}", h.getSchedule)
 	mux.HandleFunc("DELETE /schedules/{id}", h.deleteSchedule)
+
+	mux.HandleFunc("GET /domains", h.listDomains)
+	mux.HandleFunc("POST /domains", h.createDomain)
+	mux.HandleFunc("GET /domains/{id}", h.getDomain)
+	mux.HandleFunc("DELETE /domains/{id}", h.deleteDomain)
+	mux.HandleFunc("POST /domains/{id}/checks", h.freezeDomainChecks)
+	mux.HandleFunc("POST /domains/{id}/compile", h.compileDomainPolicy)
 }
 
 // ── runtime ──
@@ -177,6 +186,18 @@ func (h *Handlers) waitGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+func (h *Handlers) resolveGoalReview(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Goal.ResolveReview(r.Context(), r.PathValue("id"), body.Decision, body.Reason)
+	writeJSON(w, out, err)
+}
 func (h *Handlers) listRuns(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Run.List(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
@@ -264,6 +285,65 @@ func (h *Handlers) deleteSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── domain ──
+
+func (h *Handlers) createDomain(w http.ResponseWriter, r *http.Request) {
+	var d service.Domain
+	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Domain.Create(r.Context(), d)
+	writeJSON(w, out, err)
+}
+func (h *Handlers) listDomains(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Domain.List(r.Context())
+	writeJSON(w, out, err)
+}
+func (h *Handlers) getDomain(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Domain.Get(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+func (h *Handlers) deleteDomain(w http.ResponseWriter, r *http.Request) {
+	if err := h.Domain.Delete(r.Context(), r.PathValue("id")); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// compileDomainPolicy starts acceptance-policy compilation for a domain
+// (DESIGN.v2.md §5.3): the processor agent compiles the NL intent into
+// checks, which stay UNFROZEN until the owner confirms via FreezeChecks.
+func (h *Handlers) compileDomainPolicy(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PolicyText       string `json:"policy_text"`
+		ProcessorAgentID string `json:"processor_agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Domain.CompilePolicy(r.Context(), r.PathValue("id"), body.PolicyText, body.ProcessorAgentID)
+	writeJSON(w, out, err)
+}
+
+// freezeDomainChecks stores the compiled acceptance policy after the owner
+// confirms the processor agent's output (DESIGN.v2.md §5.3). The confirmation
+// card is the guard that keeps the "define" role with the human.
+func (h *Handlers) freezeDomainChecks(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Checks               service.Checks `json:"checks"`
+		VerificationStrength string         `json:"verification_strength"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Domain.FreezeChecks(r.Context(), r.PathValue("id"), body.Checks, body.VerificationStrength)
+	writeJSON(w, out, err)
 }
 
 // ── helpers ──

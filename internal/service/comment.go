@@ -94,7 +94,8 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 	if c.AuthorType == "" {
 		c.AuthorType = "human"
 	}
-	if _, err := s.goalSvc.Get(ctx, c.GoalID); err != nil {
+	g, err := s.goalSvc.Get(ctx, c.GoalID)
+	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, NewValidationError("goal does not exist")
 		}
@@ -131,8 +132,14 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 
 	// Dispatch mentions AFTER the comment is durably stored. @all suppresses
 	// auto-trigger entirely (no runs); other mentions enqueue runs.
-	if HasMentionAll(c.Content) {
+	// Checkpoint freeze (DESIGN.v2.md §4, decision 2-3): while the goal is in
+	// review, mentions only land as comments — no run is triggered, so the
+	// branch state under the human's decision is never mutated underneath the
+	// approval. The pending mention is visible in the goal timeline and can be
+	// acted on after the review resolves.
+	if HasMentionAll(c.Content) || g.Status == "review" {
 		// @all: notify humans only (TBD: no inbox in MVP) and suppress triggers.
+		// review: comment lands, triggers suppressed.
 		return &c, nil
 	}
 	for _, m := range ParseMentions(c.Content) {

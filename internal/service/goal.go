@@ -17,18 +17,21 @@ import (
 // checks whether the reporting run still belongs to the current assignee
 // before touching status. See DESIGN.zh.md §2/§7.
 type Goal struct {
-	ID            string `json:"id"`
-	Title         string `json:"title"`
-	Description   string `json:"description"`
-	ParentID      string `json:"parent_id"`
-	AssigneeType  string `json:"assignee_type"` // agent | squad | human
-	AssigneeID    string `json:"assignee_id"`
-	Status        string `json:"status"` // backlog|active|done|failed|blocked|cancelled
-	HandoffNote   string `json:"handoff_note"`
-	CreatedByType string `json:"created_by_type"` // human | agent
-	CreatedByID   string `json:"created_by_id"`
-	CreatedAt     string `json:"created_at"`
-	WakeCount     int    `json:"wake_count"` // bumped each blocked→active wakeup; bounded to break runaway re-fan-out
+	ID              string `json:"id"`
+	Title           string `json:"title"`
+	Description     string `json:"description"`
+	ParentID        string `json:"parent_id"`
+	DomainID        string `json:"domain_id"` // owning domain (required for agent/squad goals — v2)
+	AssigneeType    string `json:"assignee_type"` // agent | squad | human
+	AssigneeID      string `json:"assignee_id"`
+	Status          string `json:"status"` // backlog|active|done|failed|blocked|review|cancelled
+	HandoffNote     string `json:"handoff_note"`
+	ReviewRequest   string `json:"review_request"` // gate trigger reason / deliver-failure note
+	HumanIterations int    `json:"human_iterations"` // reject iterations (separate from run.attempt)
+	CreatedByType   string `json:"created_by_type"` // human | agent
+	CreatedByID     string `json:"created_by_id"`
+	CreatedAt       string `json:"created_at"`
+	WakeCount       int    `json:"wake_count"` // bumped each blocked→active wakeup; bounded to break runaway re-fan-out
 }
 
 // goalRunContext is what ReconcileOnRunEnd reasons about. Carried separately
@@ -85,10 +88,11 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	if g.CreatedByType == "" {
 		g.CreatedByType = "human"
 	}
-	// Note: blocked is a transitive status set only by WaitChildren; reject
-	// it at creation so callers can't plant a goal in a waiting state.
-	if g.Status == "blocked" {
-		return nil, NewValidationError("cannot create a goal in blocked status")
+	// Note: blocked/review are transitive statuses (WaitChildren / the
+	// checkpoint gate); reject them at creation so callers can't plant a goal
+	// in a waiting state.
+	if g.Status == "blocked" || g.Status == "review" {
+		return nil, NewValidationError("cannot create a goal in blocked/review status")
 	}
 	switch g.AssigneeType {
 	case "agent":
@@ -110,6 +114,17 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	default:
 		return nil, NewValidationError("assignee_type must be agent, squad, or human")
 	}
+	// v2: agent/squad-executed goals must belong to a domain — the domain owns
+	// the worktree and the acceptance policy (DESIGN.v2.md §2). Human/backlog
+	// goals may be domain-less.
+	if g.AssigneeType != "human" {
+		if g.DomainID == "" {
+			return nil, NewValidationError("domain_id is required for an agent/squad goal")
+		}
+		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM domain WHERE id=?`, g.DomainID, "domain"); err != nil {
+			return nil, err
+		}
+	}
 	if g.ParentID != "" {
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM goal WHERE id=?`, g.ParentID, "parent goal"); err != nil {
 			return nil, err
@@ -125,14 +140,17 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	}
 	defer tx.Rollback()
 
-	var parentID any
+	var parentID, domainID any
 	if g.ParentID != "" {
 		parentID = g.ParentID
 	}
+	if g.DomainID != "" {
+		domainID = g.DomainID
+	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO goal (id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Title, g.Description, parentID, g.AssigneeType, g.AssigneeID, g.Status, g.HandoffNote, g.CreatedByType, g.CreatedByID, g.CreatedAt); err != nil {
+		`INSERT INTO goal (id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Title, g.Description, parentID, domainID, g.AssigneeType, g.AssigneeID, g.Status, g.HandoffNote, g.CreatedByType, g.CreatedByID, g.CreatedAt); err != nil {
 		return nil, fmt.Errorf("insert goal: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -150,7 +168,7 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 
 func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at,wake_count
+		`SELECT id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,review_request,human_iterations,created_by_type,created_by_id,created_at,wake_count
 		 FROM goal ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -159,11 +177,12 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	var out []Goal
 	for rows.Next() {
 		var g Goal
-		var parentID sql.NullString
-		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &parentID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount); err != nil {
+		var parentID, domainID sql.NullString
+		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount); err != nil {
 			return nil, err
 		}
 		g.ParentID = parentID.String
+		g.DomainID = domainID.String
 		out = append(out, g)
 	}
 	return out, rows.Err()
@@ -171,11 +190,11 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 
 func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 	var g Goal
-	var parentID sql.NullString
+	var parentID, domainID sql.NullString
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at,wake_count
+		`SELECT id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,review_request,human_iterations,created_by_type,created_by_id,created_at,wake_count
 		 FROM goal WHERE id=?`, id).
-		Scan(&g.ID, &g.Title, &g.Description, &parentID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount)
+		Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -183,6 +202,7 @@ func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 		return nil, err
 	}
 	g.ParentID = parentID.String
+	g.DomainID = domainID.String
 	return &g, nil
 }
 
@@ -418,6 +438,35 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 
 	switch rc.Status {
 	case "completed":
+		// A completed run that passed machine verification has reached the
+		// acceptance-judgment step (D2: inside this transaction). If the
+		// goal's domain has checkpoint gates, the goal parks in review and
+		// the human decides; otherwise it promotes to done as before.
+		// Note: machine verification failures never reach here — the daemon
+		// runs verify before finishing the run and a red verify ends the run
+		// failed, flowing through the retry branch below.
+		hit, reason, err := s.gatesForGoal(ctx, tx, rc.GoalID)
+		if err != nil {
+			return fmt.Errorf("check gates: %w", err)
+		}
+		if hit {
+			// Park in review. The handoff/wakeup note is NOT cleared — if the
+			// human rejects, the next run resumes from it.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE goal SET status='review', review_request=? WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked','review')`,
+				reason, rc.GoalID); err != nil {
+				return fmt.Errorf("park goal in review: %w", err)
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'entered_review',?,?)`,
+				newID(), rc.GoalID, "system", "", `{"gate":"merge"}`, now()); err != nil {
+				return fmt.Errorf("insert review activity: %w", err)
+			}
+			pendingEvents = append(pendingEvents, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
+				"goal_id": rc.GoalID, "run_id": rc.RunID, "reason": reason,
+			}})
+			break
+		}
 		// Only promote to done if no non-terminal sub-goals remain. If
 		// children are inflight, leave the goal; a child-done wake advances it.
 		var inflight int
@@ -477,6 +526,155 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 		"goal_id": rc.GoalID, "status": rc.Status, "summary": rc.Summary,
 	}})
 	return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit)
+}
+
+// gatesForGoal reads the goal's domain gates (DESIGN.v2.md §5). M0 ships a
+// single gate ("merge"): any domain with gates parks completed goals in
+// review until the human decides. Goals without a domain have no gates.
+func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, goalID string) (bool, string, error) {
+	var domainID, checksJSON string
+	err := tx.QueryRowContext(ctx,
+		`SELECT d.id, d.checks FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
+		Scan(&domainID, &checksJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, "", nil // no domain → no gates
+	}
+	if err != nil {
+		return false, "", fmt.Errorf("load domain gates: %w", err)
+	}
+	var checks Checks
+	if err := json.Unmarshal([]byte(checksJSON), &checks); err != nil {
+		return false, "", fmt.Errorf("parse domain checks: %w", err)
+	}
+	if len(checks.Gates) == 0 {
+		return false, "", nil
+	}
+	var parts []string
+	for _, g := range checks.Gates {
+		parts = append(parts, g.Name+": "+g.When)
+	}
+	return true, strings.Join(parts, "; "), nil
+}
+
+// ResolveReview handles a human checkpoint decision (DESIGN.v2.md §4/§5):
+//   approve  → record the gate_decision, keep the goal in review, publish
+//              goal:approved — the daemon runs the deliver step (merge +
+//              re-verify + push) and closes with MarkDelivered.
+//   reject/redirect → record the gate_decision, bump human_iterations (the
+//              reject counter, SEPARATE from run.attempt), move the goal back
+//              to active with the reason as handoff_note, and enqueue a new
+//              run on the current assignee — the agent continues in the same
+//              worktree, working from the decision note.
+func (s *GoalService) ResolveReview(ctx context.Context, goalID, decision, reason string) (*Goal, error) {
+	if decision != "approve" && decision != "reject" && decision != "redirect" {
+		return nil, NewValidationError("decision must be approve, reject, or redirect")
+	}
+	g, err := s.Get(ctx, goalID)
+	if err != nil {
+		return nil, err
+	}
+	if g.Status != "review" {
+		return nil, NewValidationError("goal is not in review")
+	}
+	ts := now()
+	if _, err := s.st.DB().ExecContext(ctx,
+		`INSERT INTO gate_decision (id,goal_id,run_id,gate_rule,decision,reason,decided_by,decided_at,review_duration) VALUES (?,?,?,?,?,?,?,?,?)`,
+		newID(), goalID, "", "merge", decision, reason, "human", ts, 0); err != nil {
+		return nil, fmt.Errorf("insert gate_decision: %w", err)
+	}
+
+	switch decision {
+	case "approve":
+		// Stay in review; the daemon's deliver step is the only mover from
+		// here (MarkDelivered closes it).
+		s.bus.Publish(ctx, events.Event{Topic: "goal:approved", Payload: map[string]any{
+			"goal_id": goalID, "reason": reason,
+		}})
+	case "reject", "redirect":
+		note := "Review decision: " + decision
+		if reason != "" {
+			note += "\n" + reason
+		}
+		res, err := s.st.DB().ExecContext(ctx,
+			`UPDATE goal SET status='active', handoff_note=?, human_iterations=human_iterations+1, review_request='' WHERE id=? AND status='review'`,
+			note, goalID)
+		if err != nil {
+			return nil, fmt.Errorf("reject review: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil, NewValidationError("goal is no longer in review")
+		}
+		if s.runSvc == nil {
+			return nil, errors.New("goalSvc.runSvc not wired")
+		}
+		// Continue on the current assignee. attempt resets to 1: a reject
+		// iteration is a fresh human-directed cycle, not a machine retry —
+		// the reject count lives in goal.human_iterations (DESIGN.v2.md §4).
+		agentID, isLeader, squadID, err := s.runSvc.resolveLeader(ctx, g.AssigneeType, g.AssigneeID)
+		if err != nil {
+			return nil, err
+		}
+		if agentID != "" {
+			if err := s.runSvc.EnqueueExisting(ctx, goalID, agentID, 1, isLeader, squadID); err != nil {
+				return nil, fmt.Errorf("enqueue after reject: %w", err)
+			}
+		}
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "goal:review_resolved", Payload: map[string]any{
+		"goal_id": goalID, "decision": decision,
+	}})
+	return s.Get(ctx, goalID)
+}
+
+// MarkDelivered closes the deliver step (DESIGN.v2.md §7), called by the
+// daemon after its deterministic merge + re-verify + push:
+//   success → review → done (handoff_note cleared, parent woken)
+//   failure → stays in review with the reason annotated (review_request),
+//             so the human can retry deliver or reject the change back.
+func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success bool, note string) (*Goal, error) {
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var parentID sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT parent_id FROM goal WHERE id=?`, goalID).Scan(&parentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load goal: %w", err)
+	}
+
+	event := "goal:deliver_failed"
+	if success {
+		// M0 simplification: a delivered goal is done regardless of children
+		// (the deliver already merged this goal's branch). Parent coordination
+		// semantics are refined in M1/M2.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE goal SET status='done', handoff_note='' WHERE id=? AND status='review'`, goalID); err != nil {
+			return nil, fmt.Errorf("mark delivered: %w", err)
+		}
+		event = "goal:delivered"
+		if parentID.Valid && parentID.String != "" {
+			if err := s.wakeParentIfReadyInTx(ctx, tx, parentID.String); err != nil {
+				return nil, fmt.Errorf("wake parent: %w", err)
+			}
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE goal SET review_request=? WHERE id=? AND status='review'`, note, goalID); err != nil {
+			return nil, fmt.Errorf("annotate deliver failure: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.bus.Publish(ctx, events.Event{Topic: event, Payload: map[string]any{
+		"goal_id": goalID, "note": note,
+	}})
+	return s.Get(ctx, goalID)
 }
 
 // commitAndEmit commits the transaction and, only on success, publishes the

@@ -37,6 +37,20 @@ func newTestCluster(t *testing.T) (*GoalService, *RunService, *CommentService, *
 	return gs, rs, cs, st
 }
 
+// seedDomain inserts a domain (NO gates — completed runs promote to done, so
+// the pre-v2 test semantics hold) and returns its id. v2: agent-executed
+// goals require a domain (DESIGN.v2.md §2). Review-path tests freeze gates
+// separately.
+func seedDomain(t *testing.T, st *store.Store) string {
+	t.Helper()
+	ctx := context.Background()
+	d, err := NewDomainService(st, events.NewBus()).Create(ctx, Domain{Name: "test-domain", GitURL: "https://example.com/test.git"})
+	if err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+	return d.ID
+}
+
 // seedAgent inserts a runtime + agent and returns the agent id.
 func seedAgent(t *testing.T, st *store.Store, name string) string {
 	t.Helper()
@@ -70,7 +84,8 @@ func TestReconcileNormalCompletion(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	g, err := gs.Create(ctx, Goal{Title: "do thing", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "do thing", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
 	}
@@ -95,7 +110,8 @@ func TestHandoffDoesNotClobber(t *testing.T) {
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
 	agentB := seedAgent(t, st, "B")
-	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	rA := enqueueFirst(t, rs, g)
 	// Claim A's run so it's "running" (an in-flight run).
 	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
@@ -136,8 +152,9 @@ func TestHandoffNoteClearedOnOwnerDone(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
+	domID := seedDomain(t, st)
 	// Pre-seed a handoff note directly (Assign takes one, or a child wake sets it).
-	g, err := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", HandoffNote: "scope note"})
+	g, err := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", HandoffNote: "scope note", DomainID: domID})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
 	}
@@ -165,7 +182,8 @@ func TestCancelNotClobbered(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	r := enqueueFirst(t, rs, g)
 	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
 		t.Fatalf("claim: %v", err)
@@ -190,10 +208,11 @@ func TestSubGoalCoordination(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	pr := enqueueFirst(t, rs, parent)
-	c1, _ := gs.Create(ctx, Goal{Title: "child1", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
-	c2, _ := gs.Create(ctx, Goal{Title: "child2", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
+	c1, _ := gs.Create(ctx, Goal{Title: "child1", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
+	c2, _ := gs.Create(ctx, Goal{Title: "child2", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
 	_ = enqueueFirst(t, rs, c1)
 	_ = enqueueFirst(t, rs, c2)
 	if err := gs.WaitChildren(ctx, parent.ID); err != nil {
@@ -251,7 +270,8 @@ func TestCoalescePending(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	r1 := enqueueFirst(t, rs, g)
 	// Hand off to A again (re-enqueue) while r1 is still queued.
 	if _, err := gs.Assign(ctx, g.ID, "agent", agentA, "again"); err != nil {
@@ -281,9 +301,10 @@ func TestWakeRunawayGuarded(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	// One child, already done (so inflight==0 → wake conditions otherwise met).
-	child, _ := gs.Create(ctx, Goal{Title: "c", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
+	child, _ := gs.Create(ctx, Goal{Title: "c", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
 	cr := enqueueFirst(t, rs, child)
 	// Parent must be waiting (blocked) for a child-done to wake it.
 	if err := gs.WaitChildren(ctx, parent.ID); err != nil {

@@ -3,18 +3,49 @@
 -- foreign_keys + journal_mode are set per-connection via the DSN in store.go
 -- (they are per-connection pragmas, so setting them here only affects the one
 -- connection that runs this file). Kept here for visibility/documentation.
+--
+-- v2 (DESIGN.v2.md): adds the domain layer (asset/evolution domain owning
+-- acceptance policy + gates) and the review checkpoint state. M0 has no
+-- migration tooling: the DB may be wiped and rebuilt (data is disposable).
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- Two-layer coordination model (see DESIGN.zh.md §4):
---   goal  = a work item (product plane). The SOLE holder of state authority.
---   run   = one execution of a goal by one agent (execution plane). No
---           authority — on terminal status it reports up to the goal layer
---           via GoalService.reconcileOnRunEnd, which is the only place that
---           changes goal.status.
+-- Two-layer coordination model (see DESIGN.zh.md §4 / DESIGN.v2.md §2):
+--   domain = an asset/evolution domain (shared repo + acceptance policy).
+--   goal   = a work item (product plane). The SOLE holder of state authority.
+--   run    = one execution of a goal by one agent (execution plane). No
+--            authority — on terminal status it reports up to the goal layer
+--            via GoalService.reconcileOnRunEnd, which is the only place that
+--            changes goal.status.
 -- A goal can be executed many times / by many agents in succession; full
 -- history is retained across runs.
+
+-- domain: an asset/evolution domain. Owns the shared repo, the acceptance
+-- policy (NL intent + compiled checks), and default gates. M0 implements
+-- type=repo only; other asset types (docs/infra-config/knowledge/backlog)
+-- are deferred (DESIGN.v2.md §13). The acceptance policy is defined by the
+-- domain owner in natural language (policy_text), compiled by the processor
+-- agent into executable checks (checks), and frozen after user confirmation
+-- (checks_compiled_at). See DESIGN.v2.md §5 (triangle separation).
+CREATE TABLE IF NOT EXISTS domain (
+    id                     TEXT PRIMARY KEY,
+    type                   TEXT NOT NULL DEFAULT 'repo', -- repo (M0); others deferred
+    name                   TEXT NOT NULL UNIQUE,
+    git_url                TEXT NOT NULL DEFAULT '',     -- shared repo source
+    default_branch         TEXT NOT NULL DEFAULT 'main',
+    git_identity           TEXT NOT NULL DEFAULT '',     -- "name <email>" for commits
+    git_credentials        TEXT NOT NULL DEFAULT '',     -- token/ssh ref; M0 single-user shared
+    policy_text            TEXT NOT NULL DEFAULT '',     -- NL intent (source of truth)
+    checks                 TEXT NOT NULL DEFAULT '[]',   -- compiled: verify cmds + guards + gates (JSON)
+    verification_strength  TEXT NOT NULL DEFAULT 'medium', -- strong|medium|weak (processor-inferred, user-confirmed)
+    max_run_duration       INTEGER NOT NULL DEFAULT 7200,  -- seconds per run; 0 = unlimited
+    verify_timeout         INTEGER NOT NULL DEFAULT 600,   -- seconds per verify command
+    processor_agent_id     TEXT NOT NULL DEFAULT '',       -- per-domain override of the global processor agent
+    checks_compiled_at     TEXT NOT NULL DEFAULT '',       -- '' = not compiled yet
+    metrics_baseline       TEXT NOT NULL DEFAULT '{}',     -- JSON: test count / coverage at creation
+    created_at             TEXT NOT NULL
+);
 
 -- A runtime is a launch spec: how to connect to a protocol-speaking agent.
 -- Pure configuration; no capabilities of its own.
@@ -40,6 +71,8 @@ CREATE TABLE IF NOT EXISTS runtime (
 -- process under the per-task model: a fresh connection is opened per run.
 -- agent.status/pid columns are deliberately absent here — they belong to the
 -- future long-lived-session model and would be dead columns today.
+-- workdir_base was removed in v2: where a run works is decided by the goal's
+-- domain (worktree), never by the agent (DESIGN.v2.md §6).
 CREATE TABLE IF NOT EXISTS agent (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
@@ -47,7 +80,6 @@ CREATE TABLE IF NOT EXISTS agent (
     runtime_id      TEXT NOT NULL REFERENCES runtime(id),
     system_prompt   TEXT NOT NULL DEFAULT '',
     model           TEXT NOT NULL DEFAULT '',  -- optional override
-    workdir_base    TEXT NOT NULL DEFAULT '',  -- per-agent base; runs use workdir_base/<run_id>
     env             TEXT NOT NULL DEFAULT '{}', -- agent-level env, layered over runtime env
     max_concurrent  INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL
@@ -82,19 +114,26 @@ CREATE TABLE IF NOT EXISTS squad_member (
 -- goal: a work item (product plane). The sole holder of state authority.
 -- assignee is polymorphic (agent | squad | human).
 -- parent_id makes a goal a sub-goal (coordination unit), not a sub-run.
+-- domain_id: agent-executed goals must belong to a domain — the domain owns
+-- the worktree and the acceptance policy (DESIGN.v2.md §2/§5).
+-- status 'review' (v2): the goal is parked waiting for a human checkpoint
+-- decision (the symmetric partner of 'blocked' = waiting on sub-goals).
 CREATE TABLE IF NOT EXISTS goal (
-    id              TEXT PRIMARY KEY,
-    title           TEXT NOT NULL,
-    description     TEXT NOT NULL DEFAULT '',
-    parent_id       TEXT REFERENCES goal(id),        -- sub-goal
-    assignee_type   TEXT NOT NULL DEFAULT 'agent',   -- agent | squad | human
-    assignee_id     TEXT NOT NULL DEFAULT '',
-    status          TEXT NOT NULL DEFAULT 'backlog', -- backlog|active|done|failed|blocked|cancelled
-    handoff_note    TEXT NOT NULL DEFAULT '',
-    created_by_type TEXT NOT NULL DEFAULT 'human',   -- human | agent
-    created_by_id   TEXT NOT NULL DEFAULT '',
-    created_at      TEXT NOT NULL,
-    wake_count      INTEGER NOT NULL DEFAULT 0   -- bumped each blocked→active wakeup; bounded to break runaway re-fan-out loops
+    id               TEXT PRIMARY KEY,
+    title            TEXT NOT NULL,
+    description      TEXT NOT NULL DEFAULT '',
+    parent_id        TEXT REFERENCES goal(id),        -- sub-goal
+    domain_id        TEXT REFERENCES domain(id),      -- owning domain (required for agent goals)
+    assignee_type    TEXT NOT NULL DEFAULT 'agent',   -- agent | squad | human
+    assignee_id      TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'backlog', -- backlog|active|done|failed|blocked|review|cancelled
+    handoff_note     TEXT NOT NULL DEFAULT '',
+    review_request   TEXT NOT NULL DEFAULT '',        -- gate trigger reason / evidence pointer
+    human_iterations INTEGER NOT NULL DEFAULT 0,      -- human reject iterations (separate from run.attempt)
+    created_by_type  TEXT NOT NULL DEFAULT 'human',   -- human | agent
+    created_by_id    TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    wake_count       INTEGER NOT NULL DEFAULT 0   -- bumped each blocked→active wakeup; bounded to break runaway re-fan-out loops
 );
 
 CREATE INDEX IF NOT EXISTS idx_goal_parent ON goal(parent_id);
@@ -105,15 +144,22 @@ CREATE INDEX IF NOT EXISTS idx_goal_status ON goal(status);
 -- on terminal status the daemon calls GoalService.reconcileOnRunEnd(run),
 -- which checks whether this run still belongs to the current assignee before
 -- touching goal.status. status here is the execution-plane state machine.
+-- run_kind 'processor' marks platform-internal runs (e.g. the NL→checks
+-- compiler run) — same scheduling mechanism, no goal (DESIGN.v2.md §8).
+-- evidence: the gate evidence bundle (diff stats + verify output + summary).
 CREATE TABLE IF NOT EXISTS run (
     id                 TEXT PRIMARY KEY,
-    goal_id            TEXT NOT NULL REFERENCES goal(id),
+    goal_id            TEXT NOT NULL DEFAULT '',     -- '' for processor runs (no goal)
     agent_id           TEXT NOT NULL REFERENCES agent(id),
+    run_kind           TEXT NOT NULL DEFAULT 'worker', -- worker|processor
+    domain_id          TEXT NOT NULL DEFAULT '',  -- processor runs: the domain being processed (compile target)
+    prompt             TEXT NOT NULL DEFAULT '',  -- platform-internal runs only (processor): the compile/processing instruction
     session_id         TEXT NOT NULL DEFAULT '',  -- protocol-returned; for history/future resume
     workdir            TEXT NOT NULL DEFAULT '',
     status             TEXT NOT NULL DEFAULT 'queued', -- queued|running|completed|failed|cancelled
     attempt            INTEGER NOT NULL DEFAULT 1,
     result_summary     TEXT NOT NULL DEFAULT '',
+    evidence           TEXT NOT NULL DEFAULT '',   -- JSON: diff stats + verify output + agent summary
     trigger_comment_id TEXT NOT NULL DEFAULT '',  -- which comment caused this run (mention/child-done)
     is_leader_run      INTEGER NOT NULL DEFAULT 0,-- 1 if a squad leader run
     squad_id           TEXT NOT NULL DEFAULT '',  -- the squad a leader run belongs to
@@ -126,6 +172,23 @@ CREATE TABLE IF NOT EXISTS run (
 CREATE INDEX IF NOT EXISTS idx_run_goal ON run(goal_id);
 CREATE INDEX IF NOT EXISTS idx_run_agent ON run(agent_id);
 CREATE INDEX IF NOT EXISTS idx_run_status ON run(status);
+
+-- gate_decision: checkpoint decision audit + the health-learning data source
+-- (per-gate approve/reject ratios feed the "suggest dropping/ tightening a
+-- gate" loop, DESIGN.v2.md §13). Append-only.
+CREATE TABLE IF NOT EXISTS gate_decision (
+    id              TEXT PRIMARY KEY,
+    goal_id         TEXT NOT NULL REFERENCES goal(id),
+    run_id          TEXT NOT NULL DEFAULT '',   -- the run whose evidence the decision refers to
+    gate_rule       TEXT NOT NULL,              -- which gate rule fired ("merge", "guard:config", ...)
+    decision        TEXT NOT NULL,              -- approve|reject|redirect
+    reason          TEXT NOT NULL DEFAULT '',
+    decided_by      TEXT NOT NULL DEFAULT 'human',
+    decided_at      TEXT NOT NULL,
+    review_duration INTEGER NOT NULL DEFAULT 0  -- seconds spent in review before the decision
+);
+
+CREATE INDEX IF NOT EXISTS idx_gate_decision_goal ON gate_decision(goal_id, decided_at);
 
 -- comment: a message under a goal. Authors are polymorphic (human | agent |
 -- system). content is Markdown and may carry structured mention URIs:

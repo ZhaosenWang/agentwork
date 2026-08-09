@@ -16,21 +16,25 @@ import (
 // GoalService.ReconcileOnRunEnd, which is the sole path that advances a goal.
 // See DESIGN.zh.md §2/§7.
 type Run struct {
-	ID              string `json:"id"`
-	GoalID          string `json:"goal_id"`
-	AgentID         string `json:"agent_id"`
-	SessionID       string `json:"session_id"`
-	Workdir         string `json:"workdir"`
-	Status          string `json:"status"`
-	Attempt         int    `json:"attempt"`
-	ResultSummary   string `json:"result_summary"`
+	ID               string `json:"id"`
+	GoalID           string `json:"goal_id"`
+	AgentID          string `json:"agent_id"`
+	RunKind          string `json:"run_kind"` // worker|processor (platform-internal)
+	DomainID         string `json:"domain_id"`
+	Prompt           string `json:"prompt"` // processor runs only
+	SessionID        string `json:"session_id"`
+	Workdir          string `json:"workdir"`
+	Status           string `json:"status"`
+	Attempt          int    `json:"attempt"`
+	ResultSummary    string `json:"result_summary"`
+	Evidence         string `json:"evidence"` // JSON: diff stats + verify output + summary
 	TriggerCommentID string `json:"trigger_comment_id"`
-	IsLeaderRun     bool   `json:"is_leader_run"`
-	SquadID         string `json:"squad_id"`
-	QueuedAt        string `json:"queued_at"`
-	StartedAt       string `json:"started_at"`
-	FinishedAt      string `json:"finished_at"`
-	CreatedAt       string `json:"created_at"`
+	IsLeaderRun      bool   `json:"is_leader_run"`
+	SquadID          string `json:"squad_id"`
+	QueuedAt         string `json:"queued_at"`
+	StartedAt        string `json:"started_at"`
+	FinishedAt       string `json:"finished_at"`
+	CreatedAt        string `json:"created_at"`
 }
 
 type RunService struct {
@@ -157,6 +161,52 @@ func (s *RunService) EnqueueExisting(ctx context.Context, goalID, agentID string
 // current assignee) and does NOT cancel any in-flight run.
 func (s *RunService) EnqueueForMention(ctx context.Context, goalID, agentID, triggerCommentID string) (*Run, error) {
 	return s.enqueue(ctx, goalID, agentID, 1, false, "", triggerCommentID)
+}
+
+// EnqueueProcessorRun creates a platform-internal processor run (DESIGN.v2.md
+// §8): no goal, a fixed prompt, associated with a domain being processed.
+// Coalesces: if the same (domain, agent) already has a queued/running
+// processor run, it is returned instead of duplicating (a second compile of
+// the same domain would race the first).
+func (s *RunService) EnqueueProcessorRun(ctx context.Context, domainID, agentID, prompt string) (*Run, error) {
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var existing string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM run WHERE run_kind='processor' AND domain_id=? AND agent_id=? AND status IN ('queued','running') LIMIT 1`,
+		domainID, agentID).Scan(&existing)
+	if err == nil {
+		return &Run{ID: existing, DomainID: domainID, AgentID: agentID, Status: "queued"}, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("check pending processor run: %w", err)
+	}
+
+	ts := now()
+	r := Run{
+		ID:       newID(),
+		DomainID: domainID,
+		AgentID:  agentID,
+		RunKind:  "processor",
+		Prompt:   prompt,
+		Status:   "queued",
+		QueuedAt: ts,
+		CreatedAt: ts,
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,domain_id,prompt,session_id,workdir,status,attempt,result_summary,evidence,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, "", r.AgentID, r.RunKind, r.DomainID, r.Prompt, "", "", r.Status, 1, "", "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
+		return nil, fmt.Errorf("insert processor run: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &r, nil
 }
 
 func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, error) {

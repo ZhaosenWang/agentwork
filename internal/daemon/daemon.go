@@ -20,6 +20,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -72,10 +73,11 @@ type Daemon struct {
 	squadSvc  *service.SquadService
 	schedSvc  *service.ScheduleService
 
-	mu      sync.Mutex
-	workers map[string]*agentWorker // agentID → per-agent scheduler
-	stopped bool
-	ctx     context.Context
+	mu          sync.Mutex
+	workers     map[string]*agentWorker // agentID → per-agent scheduler
+	domainLocks map[string]*domainLock  // per-domain git lock (fetch + deliver)
+	stopped     bool
+	ctx         context.Context
 }
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.
@@ -99,6 +101,7 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
+	bus.Subscribe("goal:approved", d.onGoalApproved)
 	return d
 }
 
@@ -309,26 +312,165 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 	}
 }
 
+// ── worktree model (DESIGN.v2.md §6) ──
+//
+// Layout:
+//
+//	{workspaceRoot}/domains/{domainID}/repo/     shared repo (cloned once)
+//	{workspaceRoot}/domains/{domainID}/wt-{goalID}/  per-goal worktree
+//
+// The domain owns the shared repo; each goal gets its own worktree + branch,
+// so multiple goals develop the same repo in parallel without interference.
+// Worktrees are allocated lazily (decision 2-18): the first run of a goal
+// creates it; later runs of the same goal reuse it — which is what makes
+// checkpoint resume (A5) work: the file-state is physically still there.
+// git operations on the shared repo (fetch, and every deliver) are
+// serialized per domain (decision 2-10): concurrent fetches would collide on
+// index.lock.
+
+// workspaceRoot is where domain repos and goal worktrees live.
+func workspaceRoot() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "agentwork-workspaces")
+	}
+	return filepath.Join(home, ".agentwork", "workspaces")
+}
+
+func domainRepoPath(domainID string) string {
+	return filepath.Join(workspaceRoot(), "domains", domainID, "repo")
+}
+
+func goalWorktreePath(domainID, goalID string) string {
+	return filepath.Join(workspaceRoot(), "domains", domainID, "wt-"+goalID)
+}
+
+// goalBranchName is the branch a goal's worktree works on.
+func goalBranchName(goalID string) string {
+	if len(goalID) > 8 {
+		goalID = goalID[:8]
+	}
+	return "feat-" + goalID
+}
+
+// domainLocks serializes git write operations per domain (fetch + deliver —
+// decision 2-10). fetch and deliver on different domains run concurrently.
+type domainLock struct {
+	mu  sync.Mutex
+	ref int
+}
+
+func (d *Daemon) lockDomain(domainID string) func() {
+	d.mu.Lock()
+	if d.domainLocks == nil {
+		d.domainLocks = make(map[string]*domainLock)
+	}
+	l := d.domainLocks[domainID]
+	if l == nil {
+		l = &domainLock{}
+		d.domainLocks[domainID] = l
+	}
+	l.ref++
+	d.mu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		d.mu.Lock()
+		l.ref--
+		if l.ref == 0 {
+			delete(d.domainLocks, domainID)
+		}
+		d.mu.Unlock()
+	}
+}
+
+// ensureSharedRepo clones the domain repo once. Credentials: git_credentials
+// is not yet wired into the clone (M0 single-user; the caller's global git
+// config / URL-embedded credentials apply).
+func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL string) error {
+	repo := domainRepoPath(domainID)
+	if _, err := os.Stat(filepath.Join(repo, ".git")); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "git", "clone", gitURL, repo)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git clone %s: %w: %s", gitURL, err, string(out))
+	}
+	return nil
+}
+
+// ensureGoalWorktree lazily allocates (decision 2-18) and syncs the goal's
+// worktree: fetches the shared repo (under the domain lock) and, if the
+// worktree does not exist yet, creates it on a fresh branch from the domain's
+// default branch. Returns the worktree path.
+func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitURL, defaultBranch string) (string, error) {
+	wt := goalWorktreePath(domainID, goalID)
+	if _, err := os.Stat(filepath.Join(wt, ".git")); err == nil {
+		return wt, nil
+	}
+	unlock := d.lockDomain(domainID)
+	defer unlock()
+
+	if err := d.ensureSharedRepo(ctx, domainID, gitURL); err != nil {
+		return "", err
+	}
+	repo := domainRepoPath(domainID)
+	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git fetch: %w: %s", err, string(out))
+	}
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	// Create the branch from origin/{defaultBranch}; if a previous run of this
+	// goal left a branch (e.g. after a checkpoint reject the branch still
+	// exists), check it out instead of failing on -b.
+	cmd := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "-b", goalBranchName(goalID), wt, "origin/"+defaultBranch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// The branch may already exist from an earlier run (resume path).
+		if exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", wt, goalBranchName(goalID)).Run() != nil {
+			return "", fmt.Errorf("git worktree add: %w: %s", err, string(out))
+		}
+	}
+	return wt, nil
+}
+
+// gitRun runs a git command in dir and returns its combined output.
+func gitRun(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 // ── run execution ──
 
 // runTask opens a transport, hands it to the protocol backend for one Prompt,
 // drains events into chat_message + WS, and finishes the run (which triggers
-// goal-layer reconciliation).
+// goal-layer reconciliation). Processor runs (no goal — run_kind=processor,
+// e.g. the acceptance-policy compiler) take the runProcessorTask path.
 func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
-	var title, desc, handoff, workdirBase, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
+	if q.GoalID == "" {
+		d.runProcessorTask(ctx, q)
+		return
+	}
+	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
 	var maxConcurrent int
 	var isLeaderRun bool
 	var squadID string
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT g.title, g.description, g.handoff_note, a.workdir_base, a.system_prompt,
+		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
 		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent,
 		        r2.is_leader_run, r2.squad_id
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
+		 LEFT JOIN domain d ON d.id = g.domain_id
 		 JOIN agent a ON a.id = r2.agent_id
 		 JOIN runtime r ON r.id = a.runtime_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &workdirBase, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &isLeaderRun, &squadID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &isLeaderRun, &squadID)
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -336,13 +478,20 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 
 	d.ensureWorker(q.AgentID, maxConcurrent)
 
-	// Per-run working directory.
-	runRowWorkdir := filepath.Join(workdirBase, q.RunID)
-	if workdirBase == "" {
-		runRowWorkdir = filepath.Join(os.TempDir(), "agentwork", q.RunID)
+	// Working directory (DESIGN.v2.md §6): with a domain the run works in the
+	// goal's worktree — lazily allocated on first run, reused on later runs of
+	// the same goal (this is what makes checkpoint resume work: the file state
+	// is physically still there). Without a domain (human/backlog goals) the
+	// run gets a scratch dir.
+	var runRowWorkdir string
+	if domainID != "" {
+		runRowWorkdir, err = d.ensureGoalWorktree(ctx, domainID, q.GoalID, gitURL, defaultBranch)
+	} else {
+		runRowWorkdir = filepath.Join(workspaceRoot(), "scratch", q.RunID)
+		err = os.MkdirAll(runRowWorkdir, 0o755)
 	}
-	if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
-		d.failRun(ctx, q, fmt.Sprintf("mkdir workdir: %v", err))
+	if err != nil {
+		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
 		return
 	}
 
@@ -466,6 +615,37 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// run no longer owns the goal, and clearing would wipe the new owner's
 		// note (see P2 in the bug review).
 		_ = d.runSvc.MarkSession(ctx, q.RunID, result.SessionID, runRowWorkdir)
+
+		if domainID != "" {
+			// Make the agent's work durable on the goal branch (the agent is
+			// guided to commit; the daemon guarantees it — deliver merges the
+			// branch, and uncommitted work would deliver nothing).
+			if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID)); err != nil {
+				d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
+				return
+			}
+			// Machine verification (DESIGN.v2.md §4/§5, invariant 14): the
+			// domain's verify commands run BEFORE the run is finished. A red
+			// verify ends the run failed → retry chain. The goal layer only
+			// ever sees 'completed' runs that passed.
+			checks, timeout, baseline := d.loadDomainChecks(ctx, domainID)
+			verifyReport, ok := runVerification(ctx, runRowWorkdir, checks, timeout)
+			if !ok {
+				d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)
+				return
+			}
+			// Structural guards on the diff (DESIGN.v2.md §5.1).
+			guardReport, ok := checkGuards(ctx, runRowWorkdir, checks, baseline)
+			if !ok {
+				d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
+				return
+			}
+			// Evidence bundle for the approval card (decision 2-3).
+			ev := buildEvidence(ctx, runRowWorkdir, result.Output, verifyReport, guardReport)
+			if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET evidence=? WHERE id=?`, ev, q.RunID); err != nil {
+				log.Printf("daemon: store evidence for run %s: %v", q.RunID, err)
+			}
+		}
 		d.finishRunOK(ctx, q, result.Output)
 	case proto.StatusCancelled:
 		d.finishRun(ctx, q, "cancelled", "idle watchdog: "+result.Output)
@@ -473,6 +653,165 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.finishRun(ctx, q, "failed", result.Output)
 	}
 }
+
+// runProcessorTask executes a platform-internal processor run: opens the
+// agent's transport, sends the run's fixed prompt, drains events, and then
+// collects the FILE-based result — the compiled checks.json + strength.txt —
+// from the run workdir and stores it on the associated domain in an UNFROZEN
+// state (checks_compiled_at stays ''), publishing domain:compiled so the
+// frontend can show the owner confirmation card. Structured output is read
+// from files, never parsed from agent stdout (DESIGN.v2.md §5.3, §9.3).
+func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
+	var prompt, domainID, agentID string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT r2.prompt, r2.domain_id, r2.agent_id FROM run r2 WHERE r2.id=?`, q.RunID).
+		Scan(&prompt, &domainID, &agentID)
+	if err != nil {
+		log.Printf("daemon: processor run %s: load config: %v", q.RunID, err)
+		d.failProcessorRun(ctx, q, "load config: "+err.Error())
+		return
+	}
+	if prompt == "" || domainID == "" {
+		d.failProcessorRun(ctx, q, "processor run missing prompt or domain_id")
+		return
+	}
+
+	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
+	var maxConcurrent int
+	err = d.st.DB().QueryRowContext(ctx,
+		`SELECT a.system_prompt, r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent
+		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`, agentID).
+		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent)
+	if err != nil {
+		d.failProcessorRun(ctx, q, "load agent runtime: "+err.Error())
+		return
+	}
+	d.ensureWorker(agentID, maxConcurrent)
+
+	// Scratch workdir for the compile run (no repo — the processor works from
+	// the prompt alone and writes its result files here).
+	runRowWorkdir := filepath.Join(workspaceRoot(), "proc", q.RunID)
+	if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
+		d.failProcessorRun(ctx, q, "mkdir workdir: "+err.Error())
+		return
+	}
+
+	var args []string
+	_ = json.Unmarshal([]byte(argsJSON), &args)
+	var rtEnv map[string]string
+	_ = json.Unmarshal([]byte(rtEnvJSON), &rtEnv)
+	agentEnv, _ := d.loadAgentEnv(ctx, agentID)
+	taskEnv := os.Environ()
+	for k, v := range agentEnv {
+		taskEnv = append(taskEnv, k+"="+v)
+	}
+	// The processor agent is not a goal worker: no AGENTWORK_GOAL_ID/RUN_ID
+	// injection (it should not call back into the platform), just the server
+	// URL and its own identity for orientation.
+	addr := d.addr
+	if addr == "" {
+		addr = defaultListenAddr
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		d.failProcessorRun(ctx, q, "parse listen addr: "+err.Error())
+		return
+	}
+	taskEnv = append(taskEnv, "AGENTWORK_SERVER_URL=http://"+net.JoinHostPort("127.0.0.1", port))
+
+	conn, err := runtime.Open(ctx, runtime.Spec{
+		Transport: transport, Executable: execPath, Args: args, Endpoint: endpoint, Env: rtEnv,
+	}, taskEnv)
+	if err != nil {
+		d.failProcessorRun(ctx, q, "open transport: "+err.Error())
+		return
+	}
+	defer conn.Close()
+
+	backend, err := d.protoReg.Get(provider)
+	if err != nil {
+		d.failProcessorRun(ctx, q, "provider "+provider+": "+err.Error())
+		return
+	}
+	run, err := backend.Execute(ctx, proto.ExecuteSpec{Conn: conn, Cwd: runRowWorkdir, Prompt: prompt})
+	if err != nil {
+		d.failProcessorRun(ctx, q, "execute: "+err.Error())
+		return
+	}
+	for ev := range run.Events {
+		d.persistEvent(ctx, q.RunID, ev)
+		d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
+			"run_id": q.RunID, "event": ev,
+		}})
+	}
+	result, ok := <-run.Result
+	if !ok {
+		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
+	}
+	switch result.Status {
+	case proto.StatusCompleted:
+		// Read the compiled policy from the run workdir (file = structured
+		// side effect), validate, and store on the domain unfrozen.
+		checksPath := filepath.Join(runRowWorkdir, "checks.json")
+		raw, err := os.ReadFile(checksPath)
+		if err != nil {
+			d.failProcessorRun(ctx, q, "read checks.json: "+err.Error())
+			return
+		}
+		var checks service.Checks
+		if err := json.Unmarshal(raw, &checks); err != nil {
+			d.failProcessorRun(ctx, q, "parse checks.json: "+err.Error())
+			return
+		}
+		if len(checks.Verify) == 0 && len(checks.Guards) == 0 {
+			d.failProcessorRun(ctx, q, "checks.json: no verify or guards produced")
+			return
+		}
+		strength := "medium"
+		if sraw, err := os.ReadFile(filepath.Join(runRowWorkdir, "strength.txt")); err == nil {
+			if v := strings.TrimSpace(string(sraw)); v == "strong" || v == "medium" || v == "weak" {
+				strength = v
+			}
+		}
+		checksJSON, _ := json.Marshal(checks)
+		if _, err := d.st.DB().ExecContext(ctx,
+			`UPDATE domain SET checks=?, verification_strength=? WHERE id=? AND checks_compiled_at=''`,
+			string(checksJSON), strength, domainID); err != nil {
+			d.failProcessorRun(ctx, q, "store compiled checks: "+err.Error())
+			return
+		}
+		if _, err := d.st.DB().ExecContext(ctx,
+			`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
+			result.Output, nowStr(), q.RunID); err != nil {
+			log.Printf("daemon: finish processor run %s: %v", q.RunID, err)
+		}
+		d.bus.Publish(ctx, events.Event{Topic: "domain:compiled", Payload: map[string]any{
+			"domain_id": domainID, "run_id": q.RunID,
+		}})
+		log.Printf("daemon: domain %s acceptance policy compiled (strength=%s)", domainID, strength)
+	case proto.StatusCancelled:
+		d.failProcessorRun(ctx, q, "idle watchdog: "+result.Output)
+	case proto.StatusFailed, proto.StatusAborted:
+		d.failProcessorRun(ctx, q, result.Output)
+	}
+}
+
+// failProcessorRun marks a processor run failed and notifies the frontend that
+// compilation did not complete (manual checks input remains the fallback).
+func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, summary string) {
+	log.Printf("daemon: processor run %s failed: %s", q.RunID, summary)
+	if _, err := d.st.DB().ExecContext(ctx,
+		`UPDATE run SET status='failed', result_summary=?, finished_at=? WHERE id=?`,
+		summary, nowStr(), q.RunID); err != nil {
+		log.Printf("daemon: mark processor run %s failed: %v", q.RunID, err)
+	}
+	d.bus.Publish(ctx, events.Event{Topic: "domain:compile_failed", Payload: map[string]any{
+		"run_id": q.RunID, "error": summary,
+	}})
+}
+
+// nowStr is the daemon-side UTC timestamp helper (service.now is private).
+func nowStr() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 // trackToolInflight maintains the in-flight-tool counter the idle watchdog
 // reads to decide whether to use idleWindow or the larger idleToolWindow.

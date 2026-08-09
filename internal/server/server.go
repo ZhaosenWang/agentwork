@@ -26,10 +26,11 @@ type Server struct {
 	commentSvc *service.CommentService
 	squadSvc   *service.SquadService
 	schedSvc   *service.ScheduleService
+	domainSvc  *service.DomainService
 }
 
-func New(st *store.Store, bus *events.Bus, d *daemon.Daemon, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService) *Server {
-	return &Server{st: st, bus: bus, d: d, hub: ws.NewHub(bus), goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, squadSvc: squadSvc, schedSvc: schedSvc}
+func New(st *store.Store, bus *events.Bus, d *daemon.Daemon, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, domainSvc *service.DomainService) *Server {
+	return &Server{st: st, bus: bus, d: d, hub: ws.NewHub(bus), goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, squadSvc: squadSvc, schedSvc: schedSvc, domainSvc: domainSvc}
 }
 
 // ListenAndServe mounts routes and serves until ctx is cancelled.
@@ -42,6 +43,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		Comment:  s.commentSvc,
 		Squad:    s.squadSvc,
 		Schedule: s.schedSvc,
+		Domain:   s.domainSvc,
 	}
 
 	mux := http.NewServeMux()

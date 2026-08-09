@@ -54,6 +54,8 @@ func main() {
 
 	squadSvc := service.NewSquadService(st, bus)
 	schedSvc := service.NewScheduleService(st, bus)
+	domainSvc := service.NewDomainService(st, bus)
+	domainSvc.SetRunService(runSvc)
 
 	// Protocol backends registered by provider name (runtime.provider selects).
 	protoReg := proto.NewRegistry()
@@ -68,7 +70,7 @@ func main() {
 		}
 	}()
 
-	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc)
+	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc, domainSvc)
 	if err := srv.ListenAndServe(ctx, *addr); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("server: %v", err)
 	}
