@@ -1,12 +1,21 @@
 "use client";
 
-import { useImStatus, useConnectFeishu, useDisconnectFeishu } from "@/lib/queries";
+import { useState } from "react";
+import {
+  useImStatus,
+  useConnectFeishu,
+  useDisconnectFeishu,
+  useAgents,
+  usePlatformSettings,
+  useSavePlatformSettings,
+} from "@/lib/queries";
 import { Button, PageHeader } from "@/components/ui";
 
-// Settings: the IM connect module. The owner connects Feishu by scanning a
-// QR code (SDK one-click app registration), then sends the bot one message —
-// the receive target is captured and milestone notifications flow from then
-// on (DESIGN.v2.md decision 2-14).
+// Settings: the IM connect module + platform-wide M3 settings (the global
+// inbound parser agent, the daily digest time). The owner connects Feishu by
+// scanning a QR code (SDK one-click app registration) — after that, tasks
+// can be created from Feishu itself (M3: 入站), and approvals answered from
+// the notification cards (DESIGN.v2.md decision 2-14 / §11 M3).
 export default function SettingsPage() {
   const { data: im, isLoading } = useImStatus();
   const connect = useConnectFeishu();
@@ -79,6 +88,73 @@ export default function SettingsPage() {
           </div>
         )}
       </div>
+
+      <PlatformSettingsSection />
+    </div>
+  );
+}
+
+// PlatformSettingsSection configures the M3 IM settings: which agent parses
+// the owner's inbound messages (platform.intake_agent) and when the daily
+// digest arrives (platform.m3 digest_time).
+function PlatformSettingsSection() {
+  const { data: agents } = useAgents();
+  const { data: settings, isLoading } = usePlatformSettings();
+  const save = useSavePlatformSettings();
+  const [intakeAgent, setIntakeAgent] = useState<string | null>(null);
+  const [digestTime, setDigestTime] = useState<string | null>(null);
+
+  const current = (k: string, fallback: string) =>
+    k === "intake_agent" ? (intakeAgent ?? settings?.intake_agent ?? "") : (digestTime ?? settings?.digest_time ?? "");
+
+  return (
+    <div className="max-w-xl mt-10">
+      <h2 className="text-lg font-medium mb-1">平台设置（M3）</h2>
+      <p className="text-sm text-gray-500 mb-4">
+        在飞书里给机器人发消息即可创建任务——机器人用这里配置的解析 Agent 理解你的话。
+      </p>
+
+      {isLoading ? (
+        <p className="text-gray-500">加载中…</p>
+      ) : (
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm text-gray-700 mb-1">任务解析 Agent（IM 入站）</label>
+            <select
+              className="w-full rounded border border-gray-300 px-2 py-1.5 text-sm"
+              value={current("intake_agent", "")}
+              onChange={(e) => setIntakeAgent(e.target.value)}
+            >
+              <option value="">未配置（收到消息会提示）</option>
+              {(agents ?? []).map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm text-gray-700 mb-1">每日摘要时间（HH:MM，本地）</label>
+            <input
+              type="text"
+              className="w-full rounded border border-gray-300 px-2 py-1.5 text-sm"
+              placeholder="09:00"
+              value={current("digest_time", "")}
+              onChange={(e) => setDigestTime(e.target.value)}
+            />
+          </div>
+          <Button
+            onClick={() =>
+              save.mutate({ intake_agent: current("intake_agent", ""), digest_time: current("digest_time", "") })
+            }
+            disabled={save.isPending || (!intakeAgent && !digestTime)}
+          >
+            {save.isPending ? "保存中…" : "保存"}
+          </Button>
+          {save.isError && <p className="text-sm text-red-500">{String(save.error)}</p>}
+          {save.isSuccess && <p className="text-sm text-emerald-600">已保存</p>}
+        </div>
+      )}
     </div>
   );
 }

@@ -47,7 +47,9 @@ func main() {
 	// bot message captures the receive target. Credentials persist to SQLite;
 	// the daemon auto-reconnects on startup. No environment configuration.
 	settingsSvc := service.NewSettingsService(st)
+	qs := notify.NewSQLQueryStore(st) // M3: card evidence / digest / intake queries
 	imConn := notify.NewConnector(settingsSvc, bus)
+	imConn.SetQueryStore(qs)
 	go func() {
 		if err := imConn.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("notify: feishu connector ended: %v", err)
@@ -70,13 +72,19 @@ func main() {
 	domainSvc := service.NewDomainService(st, bus)
 	domainSvc.SetRunService(runSvc)
 
+	// M3 IM: the approval-card callbacks resolve through the goal layer; the
+	// owner's inbound messages become intake parse runs on the configured
+	// global parser agent (app_settings platform.intake_agent).
+	imConn.SetGoalService(goalSvc)
+	imConn.SetIntakeService(notify.NewIntakeService(qs, settingsSvc, runSvc))
+
 	// Protocol backends registered by provider name (runtime.provider selects).
 	protoReg := proto.NewRegistry()
 	protoReg.Register("acp", acpbackend.New())
 	protoReg.Register("jsonl", jsonlbackend.New())
 	protoReg.Register("jsonrpc", jsonrpcbackend.New())
 
-	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, squadSvc, schedSvc)
+	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, squadSvc, schedSvc, imConn, qs)
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("daemon: %v", err)

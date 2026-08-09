@@ -36,6 +36,8 @@ import {
   getImStatus,
   connectFeishu,
   disconnectFeishu,
+  getPlatformSettings,
+  savePlatformSettings,
   getGateStats,
 } from "./api";
 import { useWSEvent } from "./ws";
@@ -55,8 +57,21 @@ export const qk = {
   domains: ["domains"] as const,
   domain: (id: string) => ["domains", id] as const,
   im: ["im"] as const,
+  platformSettings: ["platform-settings"] as const,
   gateStats: ["gate-stats"] as const,
 };
+
+// ── Platform settings (M3) ──
+export function usePlatformSettings() {
+  return useQuery({ queryKey: qk.platformSettings, queryFn: getPlatformSettings });
+}
+export function useSavePlatformSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: savePlatformSettings,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.platformSettings }),
+  });
+}
 
 // ── Runtime hooks ──
 export function useRuntimes() {

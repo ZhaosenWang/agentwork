@@ -86,7 +86,7 @@ func TestReviewApproveKeepsGoalParkedUntilDeliver(t *testing.T) {
 	_ = r
 	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
 
-	got, err := gs.ResolveReview(ctx, g.ID, "approve", "")
+	got, err := gs.ResolveReview(ctx, g.ID, "", "approve", "")
 	if err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestReviewRejectSendsBackWithReason(t *testing.T) {
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
 
-	got, err := gs.ResolveReview(ctx, g.ID, "reject", "方向不对，把 X 改成 Y 再看")
+	got, err := gs.ResolveReview(ctx, g.ID, "", "reject", "方向不对，把 X 改成 Y 再看")
 	if err != nil {
 		t.Fatalf("reject: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestReviewRejectThenApproveRoundTrip(t *testing.T) {
 
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
-	if _, err := gs.ResolveReview(ctx, g.ID, "reject", "改一下"); err != nil {
+	if _, err := gs.ResolveReview(ctx, g.ID, "", "reject", "改一下"); err != nil {
 		t.Fatalf("reject: %v", err)
 	}
 	// Agent fixes; the new run completes → review again.
@@ -176,7 +176,7 @@ func TestReviewRejectThenApproveRoundTrip(t *testing.T) {
 	if g2.Status != "review" {
 		t.Fatalf("expected review again, got %q", g2.Status)
 	}
-	if _, err := gs.ResolveReview(ctx, g.ID, "approve", ""); err != nil {
+	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	done, err := gs.MarkDelivered(ctx, g.ID, true, "merged")
@@ -191,6 +191,32 @@ func TestReviewRejectThenApproveRoundTrip(t *testing.T) {
 	}
 }
 
+// TestReviewRecordsRunID: the decision links to the evidence run the human
+// judged — the IM approval card carries run_id in its button value, and the
+// gate_decision records it (the audit chain, M3).
+func TestReviewRecordsRunID(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	run := enqueueFirst(t, rs, g)
+	finishWithMergeGate(t, st, rs, run, "ok")
+
+	if _, err := gs.ResolveReview(ctx, g.ID, run.ID, "approve", ""); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	var recorded string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT run_id FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, g.ID).Scan(&recorded); err != nil {
+		t.Fatalf("read gate_decision: %v", err)
+	}
+	if recorded != run.ID {
+		t.Fatalf("gate_decision.run_id must link the evidence run, got %q want %q", recorded, run.ID)
+	}
+}
+
 // TestMarkDeliveredFailureStaysInReview: a failed deliver (merge conflict /
 // post-merge verification red) annotates review_request and leaves the goal
 // parked — the human can retry deliver or reject the change back.
@@ -202,7 +228,7 @@ func TestMarkDeliveredFailureStaysInReview(t *testing.T) {
 
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	finishWithMergeGate(t, st, rs, enqueueFirst(t, rs, g), "ok")
-	if _, err := gs.ResolveReview(ctx, g.ID, "approve", ""); err != nil {
+	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	got, err := gs.MarkDelivered(ctx, g.ID, false, "合并冲突：internal/acp/client.go")
@@ -244,7 +270,7 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 	}
 
 	// After the review resolves (deliver), a mention triggers normally.
-	if _, err := gs.ResolveReview(ctx, g.ID, "approve", ""); err != nil {
+	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
 	if _, err := gs.MarkDelivered(ctx, g.ID, true, "merged"); err != nil {

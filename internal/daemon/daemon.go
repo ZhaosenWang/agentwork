@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/runtime"
 	"github.com/eushing/agentwork/internal/service"
@@ -47,6 +48,14 @@ const scheduleTickInterval = 5 * time.Second
 // worktreeCleanupInterval is how often the daemon sweeps expired goal
 // worktrees (M1: every 6h).
 const worktreeCleanupInterval = 6 * time.Hour
+
+// digestTickInterval is how often the daemon checks whether the daily digest
+// is due (M3: once a minute; the digest fires at most once per day).
+const digestTickInterval = time.Minute
+
+// digestDefaultTime is the daily digest time (HH:MM, local) when the owner
+// has not configured notify.digest_time (DESIGN.v2.md §11 M3).
+const digestDefaultTime = "09:00"
 
 // worktreeRetentionDays is how long a terminal goal's worktree is kept after
 // its last run (DESIGN.v2.md §13 — M1 value: 7 days; kept for review/debug).
@@ -81,6 +90,9 @@ type Daemon struct {
 	runSvc    *service.RunService
 	squadSvc  *service.SquadService
 	schedSvc  *service.ScheduleService
+	im        *notify.Connector // M3: daily digest + intake replies (the notifier
+	// is born when the long connection connects; fetch it live)
+	qs        notify.QueryStore // M3: digest aggregation (may be nil)
 
 	mu          sync.Mutex
 	workers     map[string]*agentWorker // agentID → per-agent scheduler
@@ -102,11 +114,16 @@ type agentWorker struct {
 	maxConc    int
 }
 
-func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, squadSvc *service.SquadService, schedSvc *service.ScheduleService) *Daemon {
+// New wires the daemon. im + qs are the M3 IM surfaces: the connector is the
+// owner of the notifier (born when the long connection connects), qs feeds
+// the daily digest and intake queries. Both may be nil (notify not wired).
+func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, im *notify.Connector, qs notify.QueryStore) *Daemon {
 	d := &Daemon{
 		st: st, bus: bus, addr: addr,
 		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
+		im:         im,
+		qs:         qs,
 		workers:    make(map[string]*agentWorker),
 		msgBuffers: make(map[string]*msgBuffer),
 	}
@@ -128,9 +145,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	dispatchTick := time.NewTicker(dispatchTickInterval)
 	scheduleTick := time.NewTicker(scheduleTickInterval)
 	cleanupTick := time.NewTicker(worktreeCleanupInterval)
+	digestTick := time.NewTicker(digestTickInterval)
 	defer dispatchTick.Stop()
 	defer scheduleTick.Stop()
 	defer cleanupTick.Stop()
+	defer digestTick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -143,8 +162,80 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.dispatchSchedules(ctx)
 		case <-cleanupTick.C:
 			d.cleanupWorktrees(ctx)
+		case <-digestTick.C:
+			d.dispatchDigest(ctx)
 		}
 	}
+}
+
+// ── daily digest (M3-3) ──
+
+// dispatchDigest fires the daily summary card once per day, at the
+// configured digest time (app_settings notify.digest_time, default 09:00).
+// The already-sent marker (notify.digest_last_sent, date) makes the fire
+// idempotent across daemon restarts.
+func (d *Daemon) dispatchDigest(ctx context.Context) {
+	notifier := d.imNotifier()
+	if notifier == nil || d.qs == nil {
+		return
+	}
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	var last string
+	_ = d.st.DB().QueryRowContext(ctx,
+		`SELECT value FROM app_settings WHERE key='notify.digest_last_sent'`).Scan(&last)
+	if last == today {
+		return
+	}
+	hhmm := digestDefaultTime
+	// The digest time lives in the platform.m3 settings blob (M3 settings
+	// page: 设置 → 平台设置).
+	var blob string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT value FROM app_settings WHERE key='platform.m3'`).Scan(&blob); err == nil && blob != "" {
+		var st struct {
+			DigestTime string `json:"digest_time"`
+		}
+		if json.Unmarshal([]byte(blob), &st) == nil && st.DigestTime != "" {
+			hhmm = st.DigestTime
+		}
+	}
+	t, err := time.Parse("15:04", hhmm)
+	if err != nil {
+		log.Printf("daemon: digest time %q: %v", hhmm, err)
+		return
+	}
+	digestAt := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
+	if now.Before(digestAt) {
+		return // not due yet today
+	}
+	// Window: yesterday 00:00 → now (the digest is a morning summary).
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	card, err := notify.BuildDigestCard(ctx, d.qs, dayStart.Add(-24*time.Hour), now)
+	if err != nil {
+		log.Printf("daemon: digest build: %v", err)
+		return
+	}
+	if err := notifier.SendCard(card); err != nil {
+		log.Printf("daemon: digest send: %v", err)
+		return
+	}
+	if _, err := d.st.DB().ExecContext(ctx,
+		`INSERT INTO app_settings (key,value,updated_at) VALUES ('notify.digest_last_sent',?,?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		today, nowStr()); err != nil {
+		log.Printf("daemon: digest marker: %v", err)
+	}
+	log.Printf("daemon: daily digest sent (%s)", today)
+}
+
+// imNotifier returns the live milestone pusher (nil before the long
+// connection is up — digest and intake replies then no-op).
+func (d *Daemon) imNotifier() *notify.Notifier {
+	if d.im == nil {
+		return nil
+	}
+	return d.im.Notifier()
 }
 
 // recoverWorkers rebuilds per-agent workers for every agent in the DB —
@@ -809,13 +900,19 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 // frontend can show the owner confirmation card. Structured output is read
 // from files, never parsed from agent stdout (DESIGN.v2.md §5.3, §9.3).
 func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
-	var prompt, domainID, agentID string
+	var prompt, runType, domainID, agentID string
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT r2.prompt, r2.domain_id, r2.agent_id FROM run r2 WHERE r2.id=?`, q.RunID).
-		Scan(&prompt, &domainID, &agentID)
+		`SELECT r2.prompt, r2.run_type, r2.domain_id, r2.agent_id FROM run r2 WHERE r2.id=?`, q.RunID).
+		Scan(&prompt, &runType, &domainID, &agentID)
 	if err != nil {
 		log.Printf("daemon: processor run %s: load config: %v", q.RunID, err)
 		d.failProcessorRun(ctx, q, "load config: "+err.Error())
+		return
+	}
+	// The intake pipeline (M3-4) has no domain — its coalesce key is the
+	// inbound message id (see IntakeService.Enqueue).
+	if runType == "intake" {
+		d.runIntakeTask(ctx, q, prompt, agentID)
 		return
 	}
 	if prompt == "" || domainID == "" {
@@ -922,8 +1019,15 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 			}
 		}
 		checksJSON, _ := json.Marshal(checks)
+		// The compiled policy ALWAYS lands (a fresh compile cycle replaces
+		// the previous one wholesale — DESIGN.v2.md §5.3), and resets the
+		// freeze stamp: the domain returns to the pending-confirmation state
+		// so the owner's confirmation card reappears with the NEW product.
+		// (Regression: the old UPDATE was gated on checks_compiled_at='',
+		// which made a recompile AFTER freezing a silent no-op — the new
+		// product was discarded and runs kept verifying with the old policy.)
 		if _, err := d.st.DB().ExecContext(ctx,
-			`UPDATE domain SET checks=?, verification_strength=? WHERE id=? AND checks_compiled_at=''`,
+			`UPDATE domain SET checks=?, verification_strength=?, checks_compiled_at='' WHERE id=?`,
 			string(checksJSON), strength, domainID); err != nil {
 			d.failProcessorRun(ctx, q, "store compiled checks: "+err.Error())
 			return

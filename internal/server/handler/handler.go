@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/service"
@@ -21,6 +22,7 @@ type Handlers struct {
 	Squad    *service.SquadService
 	Schedule *service.ScheduleService
 	Domain   *service.DomainService
+	Settings *service.SettingsService
 	IM       *notify.Connector
 }
 
@@ -69,6 +71,8 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /gate-decisions/stats", h.gateStats)
 
+	mux.HandleFunc("GET /settings/platform", h.getPlatformSettings)
+	mux.HandleFunc("PUT /settings/platform", h.putPlatformSettings)
 	mux.HandleFunc("GET /im/feishu/status", h.imStatus)
 	mux.HandleFunc("POST /im/feishu/connect", h.imConnect)
 	mux.HandleFunc("DELETE /im/feishu/connect", h.imDisconnect)
@@ -219,7 +223,7 @@ func (h *Handlers) resolveGoalReview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	out, err := h.Goal.ResolveReview(r.Context(), r.PathValue("id"), body.Decision, body.Reason)
+	out, err := h.Goal.ResolveReview(r.Context(), r.PathValue("id"), "", body.Decision, body.Reason)
 	writeJSON(w, out, err)
 }
 func (h *Handlers) listRuns(w http.ResponseWriter, r *http.Request) {
@@ -378,6 +382,51 @@ func (h *Handlers) gateStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── IM (Feishu connect flow — the Web-driven QR connect) ──
+
+// ── platform settings (M3: intake agent + digest time) ──
+
+// platformSettingsKey is the JSON blob under which the platform-wide M3
+// settings live (the global inbound parser agent, the daily digest time).
+const platformSettingsKey = "platform.m3"
+
+type platformSettings struct {
+	IntakeAgent string `json:"intake_agent"` // agent id: IM inbound parser ('' = unset)
+	DigestTime  string `json:"digest_time"`  // HH:MM local, '' = default 09:00
+}
+
+func (h *Handlers) getPlatformSettings(w http.ResponseWriter, r *http.Request) {
+	var out platformSettings
+	if raw, err := h.Settings.Get(r.Context(), platformSettingsKey); err == nil && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &out)
+	}
+	writeJSON(w, out, nil)
+}
+
+func (h *Handlers) putPlatformSettings(w http.ResponseWriter, r *http.Request) {
+	var body platformSettings
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, nil, service.NewValidationError("invalid body: "+err.Error()))
+		return
+	}
+	if body.IntakeAgent != "" {
+		if _, err := h.Agent.Get(r.Context(), body.IntakeAgent); err != nil {
+			writeJSON(w, nil, service.NewValidationError("intake agent does not exist"))
+			return
+		}
+	}
+	if body.DigestTime != "" {
+		if _, err := time.Parse("15:04", body.DigestTime); err != nil {
+			writeJSON(w, nil, service.NewValidationError("digest_time must be HH:MM"))
+			return
+		}
+	}
+	raw, _ := json.Marshal(body)
+	if err := h.Settings.Set(r.Context(), platformSettingsKey, string(raw)); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, body, nil)
+}
 
 func (h *Handlers) imStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, h.IM.Status(), nil)

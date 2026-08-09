@@ -20,6 +20,7 @@ type Run struct {
 	GoalID           string `json:"goal_id"`
 	AgentID          string `json:"agent_id"`
 	RunKind          string `json:"run_kind"` // worker|processor (platform-internal)
+	RunType          string `json:"run_type"` // processor tasks: compile|intake (M3)
 	DomainID         string `json:"domain_id"`
 	Prompt           string `json:"prompt"` // processor runs only
 	SessionID        string `json:"session_id"`
@@ -130,9 +131,9 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		CreatedAt:       ts,
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO run (id,goal_id,agent_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.GoalID, r.AgentID, "", "", r.Status, r.Attempt, r.ResultSummary, r.TriggerCommentID, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Attempt, r.ResultSummary, r.TriggerCommentID, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
 		return nil, nil, fmt.Errorf("insert run: %w", err)
 	}
 	ev := &events.Event{Topic: "run:enqueued", Payload: r}
@@ -171,11 +172,17 @@ func (s *RunService) EnqueueForMention(ctx context.Context, goalID, agentID, tri
 }
 
 // EnqueueProcessorRun creates a platform-internal processor run (DESIGN.v2.md
-// §8): no goal, a fixed prompt, associated with a domain being processed.
-// Coalesces: if the same (domain, agent) already has a queued/running
-// processor run, it is returned instead of duplicating (a second compile of
-// the same domain would race the first).
-func (s *RunService) EnqueueProcessorRun(ctx context.Context, domainID, agentID, prompt string) (*Run, error) {
+// §8): no goal, a fixed prompt, associated with a domain being processed
+// (compile) or carrying the platform context for the task (intake, M3).
+// runType discriminates the processor task (compile|intake); the daemon's
+// runProcessorTask dispatches on it. Coalesces: if the same (run_type,
+// domain/agent) already has a queued/running processor run, it is returned
+// instead of duplicating (a second compile of the same domain would race the
+// first; a backlog of intake runs on the same agent would duplicate work).
+func (s *RunService) EnqueueProcessorRun(ctx context.Context, runType, domainID, agentID, prompt string) (*Run, error) {
+	if runType == "" {
+		runType = "compile" // default: the original processor task
+	}
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -184,8 +191,8 @@ func (s *RunService) EnqueueProcessorRun(ctx context.Context, domainID, agentID,
 
 	var existing string
 	err = tx.QueryRowContext(ctx,
-		`SELECT id FROM run WHERE run_kind='processor' AND domain_id=? AND agent_id=? AND status IN ('queued','running') LIMIT 1`,
-		domainID, agentID).Scan(&existing)
+		`SELECT id FROM run WHERE run_kind='processor' AND run_type=? AND domain_id=? AND agent_id=? AND status IN ('queued','running') LIMIT 1`,
+		runType, domainID, agentID).Scan(&existing)
 	if err == nil {
 		return &Run{ID: existing, DomainID: domainID, AgentID: agentID, Status: "queued"}, nil
 	}
@@ -199,15 +206,16 @@ func (s *RunService) EnqueueProcessorRun(ctx context.Context, domainID, agentID,
 		DomainID: domainID,
 		AgentID:  agentID,
 		RunKind:  "processor",
+		RunType:  runType,
 		Prompt:   prompt,
 		Status:   "queued",
 		QueuedAt: ts,
 		CreatedAt: ts,
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO run (id,goal_id,agent_id,run_kind,domain_id,prompt,session_id,workdir,status,attempt,result_summary,evidence,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, "", r.AgentID, r.RunKind, r.DomainID, r.Prompt, "", "", r.Status, 1, "", "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,prompt,session_id,workdir,status,attempt,result_summary,evidence,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, "", r.AgentID, r.RunKind, r.RunType, r.DomainID, r.Prompt, "", "", r.Status, 1, "", "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
 		return nil, fmt.Errorf("insert processor run: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -360,7 +368,7 @@ func (s *RunService) NotifyChildDone(ctx context.Context, childGoalID string) {
 
 func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,goal_id,agent_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
+		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
 		 FROM run WHERE goal_id=? ORDER BY queued_at`, goalID)
 	if err != nil {
 		return nil, err
@@ -370,7 +378,7 @@ func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	for rows.Next() {
 		var r Run
 		var leaderFlag int
-		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.SessionID, &r.Workdir, &r.Status, &r.Attempt, &r.ResultSummary, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.SessionID, &r.Workdir, &r.Status, &r.Attempt, &r.ResultSummary, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		r.IsLeaderRun = leaderFlag != 0

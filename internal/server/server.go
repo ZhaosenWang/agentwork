@@ -46,6 +46,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		Squad:    s.squadSvc,
 		Schedule: s.schedSvc,
 		Domain:   s.domainSvc,
+		Settings: service.NewSettingsService(s.st),
 		IM:       s.imConn,
 	}
 

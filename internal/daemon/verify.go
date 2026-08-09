@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"path"
@@ -77,23 +78,31 @@ func (d *Daemon) loadDomainChecks(ctx context.Context, domainID string) (service
 	return checks, timeout, baseline
 }
 
-// runVerification executes the domain's verify commands in dir. Each command
-// runs under verify_timeout (a hung verify must not keep a run 'running'
-// forever — DESIGN.v2.md §4); any non-zero exit fails verification, and a
-// failed verification ends the run failed (invariant 14: the goal layer only
-// sees 'completed' runs that passed machine verification).
+// runVerification executes the domain's verification in dir: the setup
+// commands (environment preparation — dependency installs, part of the
+// acceptance policy) first, then the verify commands. Each command runs under
+// verify_timeout (a hung command must not keep a run 'running' forever —
+// DESIGN.v2.md §4); any non-zero exit fails verification, and a failed
+// verification ends the run failed (invariant 14: the goal layer only sees
+// 'completed' runs that passed machine verification). A setup failure is
+// attributed as environment preparation, separate from the judgment.
 func runVerification(ctx context.Context, dir string, checks service.Checks, timeout int) (string, bool) {
 	var report strings.Builder
-	for _, cmd := range checks.Verify {
-		cctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
-		c := exec.CommandContext(cctx, "sh", "-c", cmd)
-		c.Dir = dir
-		out, err := c.CombinedOutput()
-		cancel()
+	for _, cmd := range checks.Setup {
 		report.WriteString("$ " + cmd + "\n")
-		report.Write(out)
+		out, err := runVerifiedCmd(ctx, dir, cmd, timeout)
+		report.WriteString(out)
 		if err != nil {
-			if cctx.Err() == context.DeadlineExceeded {
+			report.WriteString("\n[setup failed: " + err.Error() + "]\n")
+			return report.String(), false
+		}
+	}
+	for _, cmd := range checks.Verify {
+		report.WriteString("$ " + cmd + "\n")
+		out, err := runVerifiedCmd(ctx, dir, cmd, timeout)
+		report.WriteString(out)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
 				report.WriteString(fmt.Sprintf("\n[verify timed out after %ds]\n", timeout))
 			} else {
 				report.WriteString("\n[verify failed: " + err.Error() + "]\n")
@@ -102,6 +111,17 @@ func runVerification(ctx context.Context, dir string, checks service.Checks, tim
 		}
 	}
 	return report.String(), true
+}
+
+// runVerifiedCmd runs one command under verify_timeout and returns its
+// combined output + error.
+func runVerifiedCmd(ctx context.Context, dir, cmd string, timeout int) (string, error) {
+	cctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
+	c := exec.CommandContext(cctx, "sh", "-c", cmd)
+	c.Dir = dir
+	out, err := c.CombinedOutput()
+	return string(out), err
 }
 
 var coverRe = regexp.MustCompile(`coverage: ([0-9.]+)% of statements`)

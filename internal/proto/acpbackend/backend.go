@@ -214,5 +214,3 @@ func (f *eventForwarder) OnModeUpdate(acp.SessionModeId)                   {}
 func (f *eventForwarder) OnConfigOptionUpdate([]acp.SessionConfigOption)    {}
 func (f *eventForwarder) OnUsageUpdate(int, int, *acp.Cost)                 {}
 func (f *eventForwarder) OnSessionInfo(string, map[string]any)              {}
-
-var _ = json.Marshal

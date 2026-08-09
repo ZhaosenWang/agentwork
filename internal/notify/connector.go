@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	"github.com/larksuite/oapi-sdk-go/v3/scene/registration"
 	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
@@ -19,6 +21,7 @@ import (
 	"github.com/skip2/go-qrcode"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/service"
 )
 
 // Connector is the IM connection manager: the Web-driven Feishu connect
@@ -53,6 +56,14 @@ type FeishuConfig struct {
 	AppSecret    string `json:"app_secret"`
 	ReceiveID    string `json:"receive_id"`
 	ReceiveType  string `json:"receive_type"` // chat_id | open_id
+	// OwnerOpenID is the scanned app's owner (the person who authorized the
+	// registration QR) — the platform's single user. It is the authority for
+	// M3 inbound commands and approval-card callbacks. ReceiveID is the PUSH
+	// target (often a chat_id of the p2p/group conversation the owner uses
+	// with the bot) and must NOT be conflated with the owner: a p2p chat has
+	// a chat_id too, so sender(open_id) == ReceiveID never holds once the
+	// capture stored the chat.
+	OwnerOpenID string `json:"owner_open_id"`
 }
 
 // SettingsStore abstracts the persistence (the daemon wires the SQLite
@@ -73,10 +84,13 @@ type Connector struct {
 	connectID string
 	config   FeishuConfig
 
-	store   SettingsStore
-	bus     *events.Bus
-	notify  *Notifier         // milestone pusher, armed once connected
-	stop    context.CancelFunc
+	store     SettingsStore
+	bus       *events.Bus
+	qs        QueryStore         // M3: card evidence + digest queries (may be nil)
+	goalSvc   *service.GoalService // M3: approval-card callbacks resolve here
+	intakeSvc *IntakeService       // M3: inbound message pipeline (may be nil)
+	notify    *Notifier            // milestone pusher, armed once connected
+	stop      context.CancelFunc
 }
 
 // NewConnector creates the connection manager. store persists the Feishu
@@ -84,6 +98,19 @@ type Connector struct {
 func NewConnector(store SettingsStore, bus *events.Bus) *Connector {
 	return &Connector{store: store, bus: bus, status: StatusIdle}
 }
+
+// SetQueryStore wires the read-only store (M3) so the notifier built on
+// connect can carry card evidence and digest data.
+func (c *Connector) SetQueryStore(qs QueryStore) { c.qs = qs }
+
+// SetGoalService wires the approval-callback resolver (M3). The card buttons
+// call back over the long connection; the decisions go through the goal
+// layer's ResolveReview — the same arbitration as the Web approval panel.
+func (c *Connector) SetGoalService(gs *service.GoalService) { c.goalSvc = gs }
+
+// SetIntakeService wires the inbound pipeline (M3). The owner's messages
+// become parse runs on the configured global parser agent.
+func (c *Connector) SetIntakeService(s *IntakeService) { c.intakeSvc = s }
 
 // ── State ──
 
@@ -135,7 +162,12 @@ func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, erro
 				},
 				Events: registration.AppAddonsEvents{
 					Items: registration.AppAddonsEventItems{
-						Tenant: []string{"im.message.receive_v1"},
+						// im.message.receive_v1: inbound messages (M1 receive
+						// target capture; M3 inbound task creation).
+						// card.action.trigger: approval-card button callbacks
+						// (M3) — the long connection is the event channel, no
+						// public callback URL.
+						Tenant: []string{"im.message.receive_v1", "card.action.trigger"},
 					},
 				},
 			},
@@ -164,6 +196,10 @@ func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, erro
 		ownerOpenID, ownerErr := resolveOwnerOpenID(result.ClientID, result.ClientSecret)
 		c.mu.Lock()
 		if ownerErr == nil {
+			// The owner is the platform's single user (M3 authority). The
+			// receive target can still be re-captured as a chat by the first
+			// inbound message — the owner identity is kept separate.
+			c.config.OwnerOpenID = ownerOpenID
 			c.config.ReceiveID = ownerOpenID
 			c.config.ReceiveType = "open_id"
 			c.status = StatusConnected
@@ -244,6 +280,9 @@ func (c *Connector) connectWithCurrent(ctx context.Context) error {
 		OnP2MessageReceiveV1(func(_ context.Context, event *larkim.P2MessageReceiveV1) error {
 			c.captureReceive(event)
 			return nil
+		}).
+		OnP2CardActionTrigger(func(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+			return c.onCardAction(ctx, event)
 		})
 	ws := larkws.NewClient(appID, appSecret, larkws.WithEventHandler(dh))
 
@@ -256,9 +295,11 @@ func (c *Connector) connectWithCurrent(ctx context.Context) error {
 	c.mu.Unlock()
 
 	// The notifier shares the same credentials for outbound pushes and
-	// subscribes the milestone events once armed.
+	// subscribes the milestone events once armed. Its QueryStore (card
+	// evidence / digest data) comes from the connector's wiring.
 	n := New(appID, appSecret, c.receiveTypeLocked(), receive)
 	n.client = larkClientFor(appID, appSecret)
+	n.qs = c.qs
 	if c.bus != nil {
 		n.Subscribe(c.bus)
 	}
@@ -275,8 +316,121 @@ func (c *Connector) connectWithCurrent(ctx context.Context) error {
 	return ws.Start(wsCtx)
 }
 
+// ownerOpenID resolves the platform's single user: the app owner recorded at
+// registration, falling back to the open_id receive target (configs created
+// before OwnerOpenID existed). An empty result means "no owner known yet"
+// (pre-scan or a chat-only capture) — inbound commands then no-op.
+func (c *Connector) ownerOpenID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.config.OwnerOpenID != "" {
+		return c.config.OwnerOpenID
+	}
+	if c.config.ReceiveType == "open_id" {
+		return c.config.ReceiveID
+	}
+	return ""
+}
+
+// ── Approval-card callbacks (M3-1) ──
+
+// onCardAction resolves an approval-card button decision (card.action.trigger
+// over the long connection). The buttons carry {action, goal_id, run_id} in
+// the value; the optional reject-reason input arrives in form_value. The
+// decision goes through the goal layer's ResolveReview — the same
+// arbitration as the Web panel — so the IM path cannot bypass the state
+// machine. The original card is then updated to its processed state and the
+// button clicker gets a toast.
+func (c *Connector) onCardAction(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
+	if event == nil || event.Event == nil || event.Event.Action == nil || event.Event.Action.Value == nil {
+		return nil, nil
+	}
+	act := event.Event.Action
+	goalID, _ := act.Value["goal_id"].(string)
+	runID, _ := act.Value["run_id"].(string)
+	decision, _ := act.Value["action"].(string)
+	if goalID == "" || (decision != "approve" && decision != "reject") {
+		return nil, nil
+	}
+	// Single-user guard: only the owner (the scanned app's owner) may
+	// decide. The card is delivered to the owner only, so this is a cheap
+	// defense-in-depth, not the authorization model.
+	op := ""
+	if event.Event.Operator != nil {
+		op = event.Event.Operator.OpenID
+	}
+	owner := c.ownerOpenID()
+	if owner != "" && op != "" && op != owner {
+		return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+			Type: "warning", Content: "无权操作",
+		}}, nil
+	}
+	if c.goalSvc == nil {
+		return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+			Type: "error", Content: "平台未就绪（goalSvc 未接线）",
+		}}, nil
+	}
+	// The reject-reason input's value arrives in form_value (the input's name
+	// is reject_reason, set in buildReviewCard).
+	reason := ""
+	if r, ok := act.FormValue["reject_reason"]; ok {
+		if s, ok := r.(string); ok {
+			reason = s
+		}
+	}
+	if _, err := c.goalSvc.ResolveReview(ctx, goalID, runID, decision, reason); err != nil {
+		return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+			Type: "error", Content: "操作失败：" + truncate(err.Error(), 50),
+		}}, nil
+	}
+	// Stamp the original card as processed (best-effort; the decision is
+	// already recorded).
+	if event.Event.Context != nil && event.Event.Context.OpenMessageID != "" {
+		go c.updateCardProcessed(event.Event.Context.OpenMessageID, goalID, decision)
+	}
+	toast := "已批准，平台开始合入"
+	if decision == "reject" {
+		toast = "已驳回，goal 将带决策意见重跑"
+	}
+	return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+		Type: "success", Content: toast,
+	}}, nil
+}
+
+// updateCardProcessed replaces the approval card with its processed state via
+// the IM message update API (PATCH /im/v1/messages/:message_id).
+func (c *Connector) updateCardProcessed(messageID, goalID, decision string) {
+	c.mu.Lock()
+	n := c.notify
+	c.mu.Unlock()
+	if n == nil || n.client == nil {
+		return
+	}
+	content, err := buildProcessedCard(goalID, decision)
+	if err != nil {
+		return
+	}
+	resp, err := n.client.Im.Message.Update(context.Background(),
+		larkim.NewUpdateMessageReqBuilder().
+			MessageId(messageID).
+			Body(larkim.NewUpdateMessageReqBodyBuilder().
+				MsgType("interactive").
+				Content(content).
+				Build()).
+			Build())
+	if err != nil {
+		log.Printf("notify: update approval card %s: %v", messageID, err)
+		return
+	}
+	if !resp.Success() {
+		log.Printf("notify: update approval card %s failed: code=%d msg=%s", messageID, resp.Code, resp.Msg)
+	}
+}
+
 // captureReceive records the first inbound user message's target as the
-// push destination and persists it.
+// push destination and persists it. From M3 it also dispatches the owner's
+// inbound messages to the intake pipeline (natural-language task creation
+// via a processor run).
 func (c *Connector) captureReceive(event *larkim.P2MessageReceiveV1) {
 	if event == nil || event.Event == nil || event.Event.Message == nil {
 		return
@@ -314,13 +468,102 @@ func (c *Connector) captureReceive(event *larkim.P2MessageReceiveV1) {
 	}
 	c.mu.Unlock()
 
-	if !already && receiveID != "" {
+	// Persist whenever a target is captured/re-captured: the scan flow may
+	// already have set ReceiveID (the owner's open_id) — the chat target the
+	// user actually messages from must survive a daemon restart.
+	if receiveID != "" {
 		raw, _ := json.Marshal(cfg)
 		if err := c.store.Set(context.Background(), settingsKey, string(raw)); err != nil {
 			log.Printf("notify: persist feishu config: %v", err)
 		}
-		log.Printf("notify: receive target captured (%s %s) — connected", receiveType, receiveID)
+		if !already {
+			log.Printf("notify: receive target captured (%s %s) — connected", receiveType, receiveID)
+		}
 	}
+
+	c.dispatchInbound(event, sender)
+}
+
+// ── Inbound messages (M3-4) ──
+
+// dispatchInbound feeds the owner's messages to the intake pipeline: an
+// immediate "received" acknowledgement, then a processor run that parses the
+// natural-language request into an action (intake.json, file-as-side-effect)
+// which the daemon executes and replies to. Only the owner (the receive
+// target — whoever scanned the registration QR) may command; group messages
+// must @ the bot, p2p chat needs no mention.
+func (c *Connector) dispatchInbound(event *larkim.P2MessageReceiveV1, sender string) {
+	if event == nil || event.Event == nil || event.Event.Message == nil {
+		return
+	}
+	msg := event.Event.Message
+	if msg.MessageType == nil || *msg.MessageType != "text" {
+		return
+	}
+	// The message text lives in a JSON content envelope {"text":"..."}.
+	var env struct{ Text string `json:"text"` }
+	if msg.Content == nil || json.Unmarshal([]byte(*msg.Content), &env) != nil || strings.TrimSpace(env.Text) == "" {
+		return
+	}
+	// The owner is the scanned app's owner (open_id), NOT the push target:
+	// ReceiveID is often a chat_id (p2p chats have chat ids too), so comparing
+	// the sender's open_id to it would never match.
+	owner := c.ownerOpenID()
+	if owner == "" || sender == "" || sender != owner {
+		return
+	}
+	// Group chat: require the bot mention. p2p: the owner's message IS the
+	// command channel (no mention exists in p2p with a bot).
+	isP2P := msg.ChatType != nil && *msg.ChatType == "p2p"
+	if !isP2P && !containsMention(msg) {
+		return
+	}
+	// Immediate acknowledgement — the parse run may queue behind a busy
+	// worker agent.
+	if n := c.notifier(); n != nil {
+		n.asyncSend("⏳ 收到，正在解析你的消息…")
+	}
+	if c.intakeSvc == nil {
+		if n := c.notifier(); n != nil {
+			n.asyncSend("⚠️ 平台未就绪（intake 未接线），请稍后再试")
+		}
+		return
+	}
+	prompt, err := c.intakeSvc.BuildPrompt(context.Background(), env.Text)
+	if err != nil {
+		if n := c.notifier(); n != nil {
+			n.asyncSend("⚠️ " + err.Error())
+		}
+		return
+	}
+	msgID := ""
+	if msg.MessageId != nil {
+		msgID = *msg.MessageId
+	}
+	if _, err := c.intakeSvc.Enqueue(context.Background(), msgID, prompt); err != nil {
+		if n := c.notifier(); n != nil {
+			n.asyncSend("⚠️ 解析任务创建失败：" + err.Error())
+		}
+	}
+}
+
+// containsMention reports whether the message @s our bot (mentioned_type=bot).
+func containsMention(msg *larkim.EventMessage) bool {
+	if msg.Mentions == nil {
+		return false
+	}
+	for _, m := range msg.Mentions {
+		if m != nil && m.MentionedType != nil && *m.MentionedType == "bot" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Connector) notifier() *Notifier {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.notify
 }
 
 func (c *Connector) receiveTypeLocked() string {

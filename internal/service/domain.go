@@ -42,6 +42,15 @@ type Domain struct {
 // processor agent, frozen by the owner's confirmation — never mutated in
 // place after that.
 type Checks struct {
+	// Setup is the verification environment preparation (M3): dependency
+	// installs and other prerequisites that must run BEFORE verify can judge.
+	// The verification environment is part of the acceptance policy — a
+	// clean worktree has no node_modules, so "npm run build" cannot run until
+	// "npm install" did. Commands must be idempotent (npm install / pip
+	// install are; the worktree keeps its installed state across runs).
+	// Executed in order before verify; any failure = run failed (environment
+	// attribution). Empty = no preparation needed.
+	Setup  []string   `json:"setup"`
 	Verify []string   `json:"verify"` // machine verification commands (exit 0 = pass)
 	Guards []Guard    `json:"guards"` // structural constraints, checked by the daemon
 	Gates  []GateRule `json:"gates"`  // human checkpoint rules
@@ -109,7 +118,7 @@ func (s *DomainService) CompilePolicy(ctx context.Context, domainID, policyText,
 	if _, err := s.st.DB().ExecContext(ctx, `UPDATE domain SET policy_text=? WHERE id=?`, policyText, domainID); err != nil {
 		return nil, fmt.Errorf("update policy_text: %w", err)
 	}
-	return s.runSvc.EnqueueProcessorRun(ctx, domainID, processorAgentID, compilePrompt(d, policyText))
+	return s.runSvc.EnqueueProcessorRun(ctx, "compile", domainID, processorAgentID, compilePrompt(d, policyText))
 }
 
 // compilePrompt builds the instruction for the processor agent. The compiled
@@ -122,6 +131,7 @@ func compilePrompt(d *Domain, policyText string) string {
 	b.WriteString("\n\n请把它编译成结构化验收策略 JSON，写入当前工作目录的 checks.json 文件（不要输出到 stdout——文件即结果）。\n\n")
 	b.WriteString(`checks.json 结构：
 {
+  "setup": ["<验证环境准备命令，幂等，如 cd web && npm install>", ...],
   "verify": ["<机器验证命令，exit 0 为通过，如 go test ./...>", ...],
   "guards": [{"type": "diff_contains|diff_excludes|coverage_delta", "pattern": "<glob，diff_* 必填>", "min_delta": <覆盖率百分点，仅 coverage_delta>}],
   "gates": [
@@ -131,7 +141,8 @@ func compilePrompt(d *Domain, policyText string) string {
   ]
 }`)
 	b.WriteString("\n\n另把验证强度（strong|medium|weak）写入当前工作目录的 strength.txt——判断依据：verify 命令是否真实覆盖了任务的关键风险（echo ok / true 之类是 weak）。\n\n规则：\n")
-	b.WriteString("- verify 里的命令必须真实存在且可执行（结合该仓库技术栈推断）\n")
+	b.WriteString("- setup 是验证环境准备：平台在干净 worktree 上执行验证，依赖不会自己存在。识别技术栈，把需要的依赖安装写进 setup（必须幂等：npm install / pip install -r requirements.txt / go mod download 这类；已安装时秒级跳过）。go/cargo 这类自动拉依赖的可留空。\n")
+	b.WriteString("- verify 里的命令必须真实存在且可执行（结合该仓库技术栈推断），且假定 setup 已执行完\n")
 	b.WriteString("- guards 表达无法用命令表达的结构化约束（禁止路径、diff 必须包含的内容、覆盖率下限）\n")
 	b.WriteString("- gates 表达“机器无法判定、必须人工决策”的要求（如“性能不能下降”）——至少包含一条 merge 卡点\n")
 	fmt.Fprintf(&b, "- 域类型：%s；仓库名：%s\n\n", d.Type, d.Name)

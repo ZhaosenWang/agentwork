@@ -34,6 +34,7 @@ type Notifier struct {
 	client           *lark.Client
 	receiveIDType    string // chat_id | open_id
 	receiveID        string // the owner's chat / open id
+	qs               QueryStore // M3: read-only store for card evidence/digest; may be nil
 	// send overrides the SDK delivery path (tests inject a mock; nil = the
 	// lark client path). Kept unexported on purpose.
 	send func(text string) error
@@ -49,6 +50,11 @@ func New(appID, appSecret, receiveIDType, receiveID string) *Notifier {
 	return &Notifier{appID: appID, appSecret: appSecret, receiveIDType: receiveIDType, receiveID: receiveID}
 }
 
+// SetQueryStore wires the read-only store (M3): approval cards need the run
+// evidence, milestone cards the goal title. Safe to leave nil — the notifier
+// falls back to the event payload text.
+func (n *Notifier) SetQueryStore(qs QueryStore) { n.qs = qs }
+
 // Subscribe wires the milestone topics. Handlers run in the bus's own
 // goroutines (fire-and-forget with panic recovery); each send runs in its
 // own goroutine so a slow Feishu API call never blocks the bus.
@@ -60,45 +66,102 @@ func (n *Notifier) Subscribe(bus *events.Bus) {
 	bus.Subscribe("run:cancelled", n.onRunCancelled)
 }
 
-func (n *Notifier) onGoalReviewing(_ context.Context, e events.Event) {
+func (n *Notifier) onGoalReviewing(ctx context.Context, e events.Event) {
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	reason, _ := m["reason"].(string)
+	// M3 approval card: the evidence comes from the store (the event only
+	// carries the reason). Match the goal's ReviewGoal to carry its run_id —
+	// the button callback lands the gate_decision on that exact run.
+	if n.qs != nil {
+		if goals, err := n.qs.ReviewGoals(ctx); err == nil {
+			for _, g := range goals {
+				if g.GoalID == goalID {
+					if g.Title == "" {
+						g.Title = short(goalID)
+					}
+					if card, err := buildReviewCard(g); err == nil {
+						n.asyncSendCard(card)
+						return
+					}
+				}
+			}
+		}
+	}
 	n.asyncSend(fmt.Sprintf("🔔 待审批：goal %s 等你决定\n%s\n（批准后平台自动合入）", short(goalID), reason))
 }
 
-func (n *Notifier) onGoalDelivered(_ context.Context, e events.Event) {
+func (n *Notifier) onGoalDelivered(ctx context.Context, e events.Event) {
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
-	n.asyncSend(fmt.Sprintf("✅ 已自动合入：goal %s", short(goalID)))
+	title := n.goalTitle(ctx, goalID)
+	if title == "" {
+		title = short(goalID)
+	}
+	n.sendMilestoneCard("✅", "blue", "已自动合入", fmt.Sprintf("**%s**  \n`goal %s`", title, short(goalID)))
 }
 
-func (n *Notifier) onGoalDeliverFailed(_ context.Context, e events.Event) {
+func (n *Notifier) onGoalDeliverFailed(ctx context.Context, e events.Event) {
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	note, _ := m["note"].(string)
-	n.asyncSend(fmt.Sprintf("⚠️ 合入失败：goal %s\n%s", short(goalID), truncate(note, 300)))
+	title := n.goalTitle(ctx, goalID)
+	if title == "" {
+		title = short(goalID)
+	}
+	n.sendMilestoneCard("⚠️", "red", "合入失败", fmt.Sprintf("**%s**  \n`goal %s`  \n%s", title, short(goalID), truncate(note, 300)))
 }
 
-func (n *Notifier) onGoalFinished(_ context.Context, e events.Event) {
+func (n *Notifier) onGoalFinished(ctx context.Context, e events.Event) {
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	status, _ := m["status"].(string)
 	summary, _ := m["summary"].(string)
+	title := n.goalTitle(ctx, goalID)
+	if title == "" {
+		title = short(goalID)
+	}
 	switch status {
 	case "completed", "done":
-		n.asyncSend(fmt.Sprintf("🏁 goal %s 完成", short(goalID)))
+		n.sendMilestoneCard("🏁", "green", "完成", fmt.Sprintf("**%s**  \n`goal %s`", title, short(goalID)))
 	case "failed":
-		n.asyncSend(fmt.Sprintf("❌ goal %s 失败：%s", short(goalID), truncate(summary, 200)))
+		n.sendMilestoneCard("❌", "red", "失败", fmt.Sprintf("**%s**  \n`goal %s`  \n%s", title, short(goalID), truncate(summary, 200)))
 	}
 }
 
-func (n *Notifier) onRunCancelled(_ context.Context, e events.Event) {
+func (n *Notifier) onRunCancelled(ctx context.Context, e events.Event) {
 	m, _ := e.Payload.(map[string]any)
-	runID, _ := m["run_id"].(string)
 	goalID, _ := m["goal_id"].(string)
 	reason, _ := m["reason"].(string)
-	n.asyncSend(fmt.Sprintf("⏱ 任务中断：run %s（goal %s）\n%s\ngoal 保持 active，需人工处理", short(runID), short(goalID), truncate(reason, 200)))
+	title := n.goalTitle(ctx, goalID)
+	if title == "" {
+		title = short(goalID)
+	}
+	n.sendMilestoneCard("⏱", "red", "任务中断", fmt.Sprintf("**%s**  \n`goal %s`  \n%s  \n\ngoal 保持 active，需人工处理", title, short(goalID), truncate(reason, 200)))
+}
+
+// goalTitle resolves a goal's title for milestone cards (best-effort; '' when
+// the store is missing or the goal vanished).
+func (n *Notifier) goalTitle(ctx context.Context, goalID string) string {
+	if n.qs == nil {
+		return ""
+	}
+	t, err := n.qs.GoalTitle(ctx, goalID)
+	if err != nil {
+		return ""
+	}
+	return t
+}
+
+// sendMilestoneCard builds and pushes a milestone card; falls back to the
+// text form when the card cannot be built (the text path is the baseline).
+func (n *Notifier) sendMilestoneCard(emoji, template, title, body string) {
+	card, err := buildMilestoneCard(emoji, template, title, body)
+	if err != nil {
+		n.asyncSend(fmt.Sprintf("%s %s：%s", emoji, title, truncate(body, 300)))
+		return
+	}
+	n.asyncSendCard(card)
 }
 
 // asyncSend pushes one message without blocking the bus handler.
@@ -110,24 +173,45 @@ func (n *Notifier) asyncSend(text string) {
 	}()
 }
 
+// asyncSendCard pushes one interactive card without blocking the bus handler.
+func (n *Notifier) asyncSendCard(cardJSON string) {
+	go func() {
+		if err := n.SendCard(cardJSON); err != nil {
+			log.Printf("notify: feishu send card: %v", err)
+		}
+	}()
+}
+
 // Send delivers a text message to the configured receive target via the
 // Feishu IM API (the same channel the long connection authenticates).
 func (n *Notifier) Send(text string) error {
 	if n.send != nil {
 		return n.send(text)
 	}
+	return n.createMessage("text", fmt.Sprintf(`{"text":"%s"}`, escapeJSON(text)))
+}
+
+// SendCard delivers an interactive card (JSON 2.0, M3). The card content is
+// a passthrough — msg_type=interactive with the card JSON as content.
+func (n *Notifier) SendCard(cardJSON string) error {
+	if n.send != nil {
+		return n.send(cardJSON)
+	}
+	return n.createMessage("interactive", cardJSON)
+}
+
+func (n *Notifier) createMessage(msgType, content string) error {
 	if n.client == nil {
 		return fmt.Errorf("notify: client not initialized (Start not called)")
 	}
 	if n.receiveID == "" {
 		return fmt.Errorf("notify: no receive target configured")
 	}
-	content := fmt.Sprintf(`{"text":"%s"}`, escapeJSON(text))
 	resp, err := n.client.Im.Message.Create(context.Background(),
 		larkim.NewCreateMessageReqBuilder().
 			ReceiveIdType(n.receiveIDType).
 			Body(larkim.NewCreateMessageReqBodyBuilder().
-				MsgType("text").
+				MsgType(msgType).
 				ReceiveId(n.receiveID).
 				Content(content).
 				Build()).

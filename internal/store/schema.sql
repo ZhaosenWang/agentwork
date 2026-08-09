@@ -146,12 +146,17 @@ CREATE INDEX IF NOT EXISTS idx_goal_status ON goal(status);
 -- touching goal.status. status here is the execution-plane state machine.
 -- run_kind 'processor' marks platform-internal runs (e.g. the NL→checks
 -- compiler run) — same scheduling mechanism, no goal (DESIGN.v2.md §8).
+-- run_type subdivides processor runs by task (M3): compile (NL→checks) and
+-- intake (IM natural-language command parsing). The daemon's
+-- runProcessorTask dispatches on it; more processor task types (digest
+-- generation, health analysis — DESIGN.v2.md §13) extend this enum.
 -- evidence: the gate evidence bundle (diff stats + verify output + summary).
 CREATE TABLE IF NOT EXISTS run (
     id                 TEXT PRIMARY KEY,
     goal_id            TEXT NOT NULL DEFAULT '',     -- '' for processor runs (no goal)
     agent_id           TEXT NOT NULL REFERENCES agent(id),
     run_kind           TEXT NOT NULL DEFAULT 'worker', -- worker|processor
+    run_type           TEXT NOT NULL DEFAULT '',  -- processor tasks: compile|intake (M3)
     domain_id          TEXT NOT NULL DEFAULT '',  -- processor runs: the domain being processed (compile target)
     gates_hit          TEXT NOT NULL DEFAULT '[]',-- M2: JSON []string — gate rules this run's outcome triggered
     prompt             TEXT NOT NULL DEFAULT '',  -- platform-internal runs only (processor): the compile/processing instruction

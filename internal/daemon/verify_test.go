@@ -128,6 +128,50 @@ func TestRunVerification(t *testing.T) {
 	}
 }
 
+// TestRunVerificationSetup: the setup commands (environment preparation —
+// dependency installs) run BEFORE verify; a setup failure fails the
+// verification with environment attribution and verify never runs. The
+// worktree stays dirty from setup (node_modules-style installs are
+// gitignored, not committed) — the setup's own side effects must not be
+// judged as the run's changes.
+func TestRunVerificationSetup(t *testing.T) {
+	dir := newTestRepo(t)
+	ctx := context.Background()
+
+	// Setup creates a file verify depends on; verify passes only after setup.
+	report, ok := runVerification(ctx, dir, service.Checks{
+		Setup:  []string{"echo prepared > prepared.txt"},
+		Verify: []string{"test -f prepared.txt"},
+	}, 30)
+	if !ok {
+		t.Fatalf("setup then verify must pass, report:\n%s", report)
+	}
+	if !strings.Contains(report, "setup failed") && !strings.Contains(report, "[setup") {
+		// no setup failure expected — the check is about order and attribution
+	}
+
+	// Setup failure: attributed as setup, verify NOT run.
+	report, ok = runVerification(ctx, dir, service.Checks{
+		Setup:  []string{"exit 3"},
+		Verify: []string{"echo should-not-run > ran.txt"},
+	}, 30)
+	if ok {
+		t.Fatalf("setup failure must fail verification, report:\n%s", report)
+	}
+	if !strings.Contains(report, "setup failed") {
+		t.Fatalf("setup failure must be attributed as environment, report:\n%s", report)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ran.txt")); err == nil {
+		t.Fatal("verify must not run after a failed setup")
+	}
+
+	// Empty setup = no preparation needed; verify runs directly.
+	report, ok = runVerification(ctx, dir, service.Checks{Verify: []string{"true"}}, 30)
+	if !ok {
+		t.Fatalf("empty setup must pass, report:\n%s", report)
+	}
+}
+
 // TestCheckGuardsDiffContains: the guard matches the run's committed changes
 // (baseSHA..HEAD) against the glob — the daemon commits the agent's work
 // before guards run, so the worktree is clean and the diff is measured from

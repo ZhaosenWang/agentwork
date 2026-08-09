@@ -590,7 +590,13 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 //              to active with the reason as handoff_note, and enqueue a new
 //              run on the current assignee — the agent continues in the same
 //              worktree, working from the decision note.
-func (s *GoalService) ResolveReview(ctx context.Context, goalID, decision, reason string) (*Goal, error) {
+//
+// runID links the decision to the evidence run the human judged (the audit
+// chain, gate_decision.run_id). The Web resolves the goal without naming a
+// run ('' — its review panel shows the latest completed run); the IM
+// approval card carries the run id in the button value, so the decision
+// lands on exactly the run whose evidence the card displayed.
+func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision, reason string) (*Goal, error) {
 	if decision != "approve" && decision != "reject" && decision != "redirect" {
 		return nil, NewValidationError("decision must be approve, reject, or redirect")
 	}
@@ -604,7 +610,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, decision, reaso
 	ts := now()
 	if _, err := s.st.DB().ExecContext(ctx,
 		`INSERT INTO gate_decision (id,goal_id,run_id,gate_rule,decision,reason,decided_by,decided_at,review_duration) VALUES (?,?,?,?,?,?,?,?,?)`,
-		newID(), goalID, "", "merge", decision, reason, "human", ts, 0); err != nil {
+		newID(), goalID, runID, "merge", decision, reason, "human", ts, 0); err != nil {
 		return nil, fmt.Errorf("insert gate_decision: %w", err)
 	}
 

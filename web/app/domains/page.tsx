@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   useDomains, useDomain, useAgents, useCreateDomain, useCompileDomainPolicy,
   useFreezeDomainChecks, useGoalEvents, useGateStats,
@@ -59,10 +59,34 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const [processorAgent, setProcessorAgent] = useState("");
   const [compiling, setCompiling] = useState(false);
   const [strength, setStrength] = useState(d.verification_strength);
+  // Editable copies of the compiled command lists (the confirmation card is
+  // the human's last word: 产物可见、可改、可审 — DESIGN.v2.md §5.3).
+  // jsonDraft overrides everything when edited (guards/gates included).
+  const [editSetup, setEditSetup] = useState<string | null>(null);
+  const [editVerify, setEditVerify] = useState<string | null>(null);
+  const [jsonDraft, setJsonDraft] = useState<string | null>(null);
+  const [jsonError, setJsonError] = useState<string | null>(null);
 
   const compiled = d.checks_compiled_at !== "";
   const hasChecks = (d.checks.verify?.length ?? 0) > 0 || (d.checks.guards?.length ?? 0) > 0;
   const needsConfirm = !compiled && hasChecks;
+
+  // The checks the human would freeze: the JSON draft wins when edited (it
+  // covers guards/gates too), else the field editors win, else compiled.
+  const editableChecks: Checks = useMemo(() => {
+    if (jsonDraft !== null) {
+      try {
+        return JSON.parse(jsonDraft) as Checks;
+      } catch {
+        return d.checks; // invalid draft — freeze stays on compiled
+      }
+    }
+    return {
+      ...d.checks,
+      setup: splitLines(editSetup ?? (d.checks.setup ?? []).join("\n")),
+      verify: splitLines(editVerify ?? (d.checks.verify ?? []).join("\n")),
+    };
+  }, [jsonDraft, editSetup, editVerify, d.checks]);
 
   const startCompile = () => {
     if (!policyText.trim() || !processorAgent) return;
@@ -99,10 +123,52 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
       {!compiled && (
         <div className="space-y-2 border-t border-gray-100 pt-3">
           {needsConfirm ? (
-            // Confirmation card: what the processor agent compiled, human decides.
+            // Confirmation card: what the processor agent compiled, human
+            // decides — and can edit (产物可见、可改、可审).
             <div className="rounded bg-amber-50 border border-amber-200 p-3 space-y-2">
-              <p className="text-sm font-medium text-amber-900">处理器 agent 已编译验收策略——确认后冻结？</p>
-              <pre className="text-xs bg-amber-100 p-2 rounded max-h-48 overflow-auto">{JSON.stringify(d.checks, null, 2)}</pre>
+              <p className="text-sm font-medium text-amber-900">处理器 agent 已编译验收策略——检查后可编辑，确认后冻结？</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <Field label="setup（验证前环境准备，幂等，每行一条）" hint="依赖安装，如 cd web && npm install">
+                  <textarea
+                    value={editSetup ?? (d.checks.setup ?? []).join("\n")}
+                    onChange={(e) => setEditSetup(e.target.value)}
+                    className={inputCls}
+                    rows={4}
+                    placeholder={"cd web && npm install"}
+                  />
+                </Field>
+                <Field label="verify（机器验证命令，每行一条）" hint="exit 0 = 通过">
+                  <textarea
+                    value={editVerify ?? (d.checks.verify ?? []).join("\n")}
+                    onChange={(e) => setEditVerify(e.target.value)}
+                    className={inputCls}
+                    rows={4}
+                    placeholder={"go test ./..."}
+                  />
+                </Field>
+              </div>
+              <div className="text-xs text-gray-600 space-y-0.5">
+                <p><span className="font-medium">guards：</span>{d.checks.guards?.length ? d.checks.guards.map((g) => `${g.type}(${g.pattern ?? g.min_delta})`).join(", ") : "无"}</p>
+                <p><span className="font-medium">gates：</span>{d.checks.gates?.length ? d.checks.gates.map((g) => g.name).join(", ") : "无"}</p>
+                <details className="pt-1">
+                  <summary className="cursor-pointer text-amber-800 font-medium">编辑完整 JSON（setup/verify/guards/gates）</summary>
+                  <textarea
+                    value={jsonDraft ?? JSON.stringify(d.checks, null, 2)}
+                    onChange={(e) => {
+                      setJsonDraft(e.target.value);
+                      setJsonError(null);
+                      try {
+                        JSON.parse(e.target.value);
+                      } catch {
+                        setJsonError("JSON 格式错误——冻结将使用编译产物");
+                      }
+                    }}
+                    className="mt-1 w-full rounded border border-amber-300 bg-amber-100 px-2 py-1.5 text-xs font-mono"
+                    rows={10}
+                  />
+                  {jsonError && <p className="text-xs text-red-600">{jsonError}</p>}
+                </details>
+              </div>
               <div className="flex items-center gap-3 flex-wrap">
                 <Field label="验证强度">
                   <select value={strength} onChange={(e) => setStrength(e.target.value)} className={inputCls}>
@@ -113,7 +179,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                 </Field>
                 <Button
                   disabled={freeze.isPending}
-                  onClick={() => freeze.mutate({ id: d.id, checks: d.checks, verification_strength: strength })}
+                  onClick={() => freeze.mutate({ id: d.id, checks: editableChecks, verification_strength: strength })}
                 >
                   {freeze.isPending ? "冻结中…" : "确认并冻结"}
                 </Button>
@@ -270,4 +336,13 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
       </form>
     </Dialog>
   );
+}
+
+// splitLines turns an editor textarea's content into a command list: one
+// command per line, blank lines dropped.
+function splitLines(s: string): string[] {
+  return s
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
 }

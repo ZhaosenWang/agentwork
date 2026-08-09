@@ -131,6 +131,15 @@ export const connectFeishu = () =>
 export const disconnectFeishu = () =>
   api<void>("/im/feishu/connect", { method: "DELETE" });
 
+// ── Platform settings (M3: IM inbound parser agent + digest time) ──
+export interface PlatformSettings {
+  intake_agent: string; // agent id: who parses the owner's IM messages
+  digest_time: string; // HH:MM local, '' = 09:00 default
+}
+export const getPlatformSettings = () => api<PlatformSettings>("/settings/platform");
+export const savePlatformSettings = (body: PlatformSettings) =>
+  api<PlatformSettings>("/settings/platform", { method: "PUT", body: JSON.stringify(body) });
+
 // ── Schedule ──
 export const listSchedules = () => api<Schedule[]>("/schedules");
 export const getSchedule = (id: string) => api<Schedule>(`/schedules/${id}`);

@@ -70,6 +70,7 @@ export interface Guard {
 }
 
 export interface Checks {
+  setup: string[]; // environment preparation (dependency installs) before verify
   verify: string[];
   guards: Guard[];
   gates: GateRule[];
