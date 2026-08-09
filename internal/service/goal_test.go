@@ -335,3 +335,42 @@ func TestWakeRunawayGuarded(t *testing.T) {
 
 // Ensure the test binary doesn't time out on the background bus goroutines.
 var _ = time.Second
+// TestGoalListLimit: List returns newest-first, and a positive limit truncates
+// to the N most recent goals while 0/negative means all (default behavior).
+func TestGoalListLimit(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	titles := []string{"oldest", "middle", "newest"}
+	for _, title := range titles {
+		if _, err := gs.Create(ctx, Goal{Title: title, AssigneeType: "agent", AssigneeID: agentA, Status: "active"}); err != nil {
+			t.Fatalf("create goal %q: %v", title, err)
+		}
+	}
+
+	// No limit / non-positive limit → all three, newest first.
+	for _, limit := range []int{0, -1} {
+		all, err := gs.List(ctx, limit)
+		if err != nil {
+			t.Fatalf("list limit=%d: %v", limit, err)
+		}
+		if len(all) != 3 {
+			t.Fatalf("limit=%d: expected 3 goals, got %d", limit, len(all))
+		}
+		if all[0].Title != "newest" || all[2].Title != "oldest" {
+			t.Fatalf("limit=%d: expected newest-first order, got %v", limit, []string{all[0].Title, all[1].Title, all[2].Title})
+		}
+	}
+
+	// Positive limit → exactly N most recent goals.
+	two, err := gs.List(ctx, 2)
+	if err != nil {
+		t.Fatalf("list limit=2: %v", err)
+	}
+	if len(two) != 2 {
+		t.Fatalf("limit=2: expected 2 goals, got %d", len(two))
+	}
+	if two[0].Title != "newest" || two[1].Title != "middle" {
+		t.Fatalf("limit=2: expected [newest middle], got %v", []string{two[0].Title, two[1].Title})
+	}
+}

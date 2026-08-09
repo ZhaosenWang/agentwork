@@ -148,10 +148,21 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	return &g, nil
 }
 
-func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
-	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at,wake_count
-		 FROM goal ORDER BY created_at DESC`)
+// List returns goals ordered newest-first. limit <= 0 means no limit (all
+// goals); a positive limit truncates to the N most recent.
+func (s *GoalService) List(ctx context.Context, limit int) ([]Goal, error) {
+	query := `SELECT id,title,description,parent_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at,wake_count
+		 FROM goal ORDER BY created_at DESC`
+	if limit > 0 {
+		query += ` LIMIT ?`
+	}
+	var rows *sql.Rows
+	var err error
+	if limit > 0 {
+		rows, err = s.st.DB().QueryContext(ctx, query, limit)
+	} else {
+		rows, err = s.st.DB().QueryContext(ctx, query)
+	}
 	if err != nil {
 		return nil, err
 	}
