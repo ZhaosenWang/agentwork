@@ -42,6 +42,14 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		d.finishDeliver(ctx, goalID, false, "deliver: goal has no domain: "+err.Error())
 		return
 	}
+	// Deliver INTO the domain's configured default branch (DESIGN.v2.md §7).
+	// Wrong config fails loudly with the branch name — the owner fixes the
+	// domain, no silent fallbacks.
+	repo := domainRepoPath(domainID)
+	if _, err := d.ensureGoalWorktree(ctx, domainID, goalID, gitURL, defaultBranch); err != nil {
+		d.finishDeliver(ctx, goalID, false, "deliver: prepare worktree: "+err.Error())
+		return
+	}
 	if defaultBranch == "" {
 		defaultBranch = "main"
 	}
@@ -53,13 +61,25 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	unlock := d.lockDomain(domainID)
 	defer unlock()
 
-	if _, err := d.ensureGoalWorktree(ctx, domainID, goalID, gitURL, defaultBranch); err != nil {
-		d.finishDeliver(ctx, goalID, false, "deliver: prepare worktree: "+err.Error())
+	// The goal branch must have commits AHEAD of the base — an empty branch
+	// (equal to the worktree base, e.g. after a shared-repo wipe orphaned the
+	// branch) must NOT be treated as "already merged" and delivered empty.
+	base, err := gitRun(ctx, repo, "rev-parse", "origin/"+defaultBranch)
+	if err != nil {
+		d.finishDeliver(ctx, goalID, false, "deliver: resolve base: "+err.Error())
+		return
+	}
+	branchHead, err := gitRun(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branchName)
+	if err != nil || strings.TrimSpace(branchHead) == "" {
+		d.finishDeliver(ctx, goalID, false, "deliver: goal branch "+branchName+" missing — nothing to deliver")
+		return
+	}
+	if strings.TrimSpace(branchHead) == strings.TrimSpace(base) {
+		d.finishDeliver(ctx, goalID, false, "deliver: goal branch "+branchName+" has no commits ahead of "+defaultBranch+" — nothing to deliver (agent produced no work, or a shared-repo wipe orphaned the branch)")
 		return
 	}
 
 	// Idempotency: already merged (crash between merge and push)?
-	repo := domainRepoPath(domainID)
 	if _, err := gitRunCtx(ctx, repo, "merge-base", "--is-ancestor", branchName, "origin/"+defaultBranch); err == nil {
 		// Branch already in origin/default — nothing to merge; push again is a
 		// no-op and MarkDelivered closes.
@@ -81,6 +101,9 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		d.finishDeliver(ctx, goalID, false, "deliver: pull origin/"+defaultBranch+": "+err.Error())
 		return
 	}
+	// Post-merge guards measure the merge's own diff (default-branch tip before
+	// the merge .. merge commit).
+	mergeBaseSHA := strings.TrimSpace(mustGitRun(ctx, wt, "rev-parse", "HEAD"))
 
 	// Merge the goal branch (--no-ff: a merge commit makes the delivered
 	// change an explicit, revertible unit).
@@ -106,7 +129,7 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		d.finishDeliver(ctx, goalID, false, "deliver: post-merge verification failed:\n"+verifyReport)
 		return
 	}
-	if guardReport, ok := checkGuards(ctx, wt, checks, baseline); !ok {
+	if guardReport, ok := checkGuards(ctx, wt, mergeBaseSHA, checks, baseline); !ok {
 		_, _ = gitRunCtx(ctx, wt, "reset", "--hard", "origin/"+defaultBranch)
 		_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
 		d.finishDeliver(ctx, goalID, false, "deliver: post-merge guards failed:\n"+guardReport)

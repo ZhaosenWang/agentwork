@@ -103,15 +103,15 @@ var coverRe = regexp.MustCompile(`coverage: ([0-9.]+)% of statements`)
 //	coverage_delta — coverage reported by a `-cover` verify command vs the
 //	                   domain's metrics baseline (skipped with a note when the
 //	                   policy has no coverage command or no baseline).
-func checkGuards(ctx context.Context, dir string, checks service.Checks, baseline map[string]float64) (string, bool) {
+func checkGuards(ctx context.Context, dir, baseSHA string, checks service.Checks, baseline map[string]float64) (string, bool) {
 	var report strings.Builder
-	names := changedPaths(ctx, dir)
+	names := changedPaths(ctx, dir, baseSHA)
 	for _, g := range checks.Guards {
 		switch g.Type {
 		case "diff_contains", "diff_excludes":
 			matched := false
 			for _, name := range names {
-				if ok, _ := path.Match(g.Pattern, name); ok {
+				if globMatch(g.Pattern, name) {
 					matched = true
 					break
 				}
@@ -164,23 +164,42 @@ func checkGuards(ctx context.Context, dir string, checks service.Checks, baselin
 // changedPaths returns the changed paths relative to HEAD, INCLUDING
 // untracked files (git diff alone hides untracked files — the agent's work is
 // typically uncommitted when guards run; use git status --porcelain).
-func changedPaths(ctx context.Context, dir string) []string {
-	out, err := gitRun(ctx, dir, "status", "--porcelain")
+// globMatch matches a guard pattern against a changed path with the
+// intuitive glob semantics humans mean: "*_test.go" matches a test file at
+// ANY depth (path.Match's '*' does not cross '/', so "internal/acp/
+// parse_test.go" would never match — the guard failed every real run until
+// this was fixed). A pattern containing '/' is matched against the full
+// path; a bare pattern is matched against the basename and each path segment.
+func globMatch(pattern, name string) bool {
+	if strings.Contains(pattern, "/") {
+		ok, _ := path.Match(pattern, name)
+		return ok
+	}
+	for _, seg := range strings.Split(name, "/") {
+		if ok, _ := path.Match(pattern, seg); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// changedPaths returns the paths this run changed: baseSHA..HEAD. The run's
+// work is committed by the time guards run (the agent commits itself and the
+// daemon commits leftover work), so a working-tree diff would be empty — the
+// diff is measured against the run's start commit (the run's baseline).
+func changedPaths(ctx context.Context, dir, baseSHA string) []string {
+	baseSHA = strings.TrimSpace(baseSHA)
+	if baseSHA == "" {
+		return nil
+	}
+	out, err := gitRun(ctx, dir, "diff", "--name-only", baseSHA+"..HEAD")
 	if err != nil {
 		return nil
 	}
 	var paths []string
 	for _, l := range strings.Split(out, "\n") {
-		if len(l) < 4 {
-			continue
-		}
-		// Two status chars + space + path; renames read "old -> new".
-		p := l[3:]
-		if i := strings.Index(p, " -> "); i >= 0 {
-			p = p[i+4:]
-		}
-		if p = strings.TrimSpace(p); p != "" {
-			paths = append(paths, p)
+		if l = strings.TrimSpace(l); l != "" {
+			paths = append(paths, l)
 		}
 	}
 	return paths
@@ -198,11 +217,14 @@ func runVerifyOutput(ctx context.Context, dir, cmd string, timeout int) (string,
 // buildEvidence assembles the checkpoint evidence bundle (DESIGN.v2.md §4,
 // decision 2-3): diff stats + changed paths + verify output + agent summary.
 // Stored on run.evidence and shown on the approval card.
-func buildEvidence(ctx context.Context, dir, agentSummary, verifyReport, guardReport string) string {
-	stats, _ := gitRun(ctx, dir, "diff", "--stat", "HEAD")
+func buildEvidence(ctx context.Context, dir, baseSHA, agentSummary, verifyReport, guardReport string) string {
+	stats := ""
+	if baseSHA != "" {
+		stats, _ = gitRun(ctx, dir, "diff", "--stat", baseSHA+"..HEAD")
+	}
 	ev := map[string]any{
 		"diff_stat":   strings.TrimSpace(stats),
-		"changed":     changedPaths(ctx, dir),
+		"changed":     changedPaths(ctx, dir, baseSHA),
 		"verify":      verifyReport,
 		"guards":      guardReport,
 		"agent":       agentSummary,

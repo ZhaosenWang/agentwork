@@ -385,20 +385,36 @@ func (d *Daemon) lockDomain(domainID string) func() {
 	}
 }
 
-// ensureSharedRepo clones the domain repo once. Credentials: git_credentials
-// is not yet wired into the clone (M0 single-user; the caller's global git
-// config / URL-embedded credentials apply).
+// ensureSharedRepo clones the domain repo ONCE as a BARE repository. Bare is
+// the correct shape for the worktree model: a regular clone's main worktree
+// holds one branch checked out, and git refuses to check that branch out in
+// any other worktree ("already checked out") — which breaks deliver when the
+// domain's default branch is the same one the main worktree sits on. A bare
+// repo has no main worktree, so every branch is free to be checked out in any
+// goal worktree. (git worktree add works against bare repos, git 2.5+.)
+// Credentials: git_credentials is not yet wired into the clone (M0
+// single-user; the caller's global git config / URL-embedded credentials
+// apply).
 func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL string) error {
 	repo := domainRepoPath(domainID)
-	if _, err := os.Stat(filepath.Join(repo, ".git")); err == nil {
+	if _, err := os.Stat(filepath.Join(repo, "HEAD")); err == nil {
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "git", "clone", gitURL, repo)
+	cmd := exec.CommandContext(ctx, "git", "clone", "--bare", gitURL, repo)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git clone %s: %w: %s", gitURL, err, string(out))
+		return fmt.Errorf("git clone --bare %s: %w: %s", gitURL, err, string(out))
+	}
+	// A bare clone mirrors remote branches into LOCAL refs/heads/ (its
+	// remote.origin.fetch is "+refs/heads/*:refs/heads/*") and creates NO
+	// refs/remotes/origin/* — so resolveDefaultBranch, worktree add
+	// (origin/<branch>), and deliver would all fail to find the remote's
+	// branches. Point the fetch refspec at refs/remotes/origin/* instead so
+	// the rest of the code sees the usual remote-tracking namespace.
+	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*").CombinedOutput(); err != nil {
+		return fmt.Errorf("git config remote.origin.fetch: %w: %s", err, string(out))
 	}
 	return nil
 }
@@ -422,12 +438,13 @@ func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitUR
 	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git fetch: %w: %s", err, string(out))
 	}
+	// Create the branch from the domain's configured default branch
+	// (DESIGN.v2.md §6: the domain owns default_branch). If origin/
+	// {defaultBranch} does not exist, the error names it — the domain config
+	// is wrong and the owner fixes it. No silent fallbacks.
 	if defaultBranch == "" {
 		defaultBranch = "main"
 	}
-	// Create the branch from origin/{defaultBranch}; if a previous run of this
-	// goal left a branch (e.g. after a checkpoint reject the branch still
-	// exists), check it out instead of failing on -b.
 	cmd := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "-b", goalBranchName(goalID), wt, "origin/"+defaultBranch)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		// The branch may already exist from an earlier run (resume path).
@@ -443,6 +460,14 @@ func gitRun(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
 	out, err := cmd.CombinedOutput()
 	return string(out), err
+}
+
+// mustGitRun is gitRun for callers that need the (trimmed) output and can
+// tolerate a failure returning "" (baseline lookups — an empty baseline is
+// handled by the callers).
+func mustGitRun(ctx context.Context, dir string, args ...string) string {
+	out, _ := gitRun(ctx, dir, args...)
+	return strings.TrimSpace(out)
 }
 
 // ── run execution ──
@@ -494,6 +519,10 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
 		return
 	}
+	// The run's diff baseline: guards and evidence measure this run's changes
+	// as baseSHA..HEAD (the agent may commit itself, and the daemon commits
+	// leftover work at run end — both land in HEAD).
+	baseSHA := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
 
 	// Inject the agent's identity + team roster / squad briefing into the
 	// workdir so the agent subprocess discovers who it is and who it can hand
@@ -634,14 +663,17 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)
 				return
 			}
-			// Structural guards on the diff (DESIGN.v2.md §5.1).
-			guardReport, ok := checkGuards(ctx, runRowWorkdir, checks, baseline)
+			// Structural guards on the diff (DESIGN.v2.md §5.1), measured as
+			// baseSHA..HEAD — the run's own changes. git status would be empty
+			// here: the daemon just committed the agent's work (and the agent
+			// may have committed itself), so the worktree is clean.
+			guardReport, ok := checkGuards(ctx, runRowWorkdir, baseSHA, checks, baseline)
 			if !ok {
 				d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
 				return
 			}
 			// Evidence bundle for the approval card (decision 2-3).
-			ev := buildEvidence(ctx, runRowWorkdir, result.Output, verifyReport, guardReport)
+			ev := buildEvidence(ctx, runRowWorkdir, baseSHA, result.Output, verifyReport, guardReport)
 			if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET evidence=? WHERE id=?`, ev, q.RunID); err != nil {
 				log.Printf("daemon: store evidence for run %s: %v", q.RunID, err)
 			}
