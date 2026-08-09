@@ -15,6 +15,7 @@ import {
   assignGoal,
   cancelGoal,
   waitGoalChildren,
+  resolveGoalReview,
   listGoalRuns,
   listGoalComments,
   createGoalComment,
@@ -26,6 +27,12 @@ import {
   listSchedules,
   createSchedule,
   deleteSchedule,
+  listDomains,
+  getDomain,
+  createDomain,
+  deleteDomain,
+  compileDomainPolicy,
+  freezeDomainChecks,
 } from "./api";
 import { useWSEvent } from "./ws";
 
@@ -41,6 +48,8 @@ export const qk = {
   squad: (id: string) => ["squads", id] as const,
   squadMembers: (squadId: string) => ["squads", squadId, "members"] as const,
   schedules: ["schedules"] as const,
+  domains: ["domains"] as const,
+  domain: (id: string) => ["domains", id] as const,
 };
 
 // ── Runtime hooks ──
@@ -126,6 +135,17 @@ export function useWaitGoalChildren() {
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
   });
 }
+export function useResolveGoalReview() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string; decision: "approve" | "reject" | "redirect"; reason?: string }) =>
+      resolveGoalReview(id, body),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.goals });
+      qc.invalidateQueries({ queryKey: qk.goal(vars.id) });
+    },
+  });
+}
 
 // ── Run hooks ──
 export function useGoalRuns(goalId: string) {
@@ -188,6 +208,49 @@ export function useAddSquadMember() {
   });
 }
 
+// ── Domain hooks ──
+export function useDomains() {
+  return useQuery({ queryKey: qk.domains, queryFn: listDomains });
+}
+export function useDomain(id: string) {
+  return useQuery({ queryKey: qk.domain(id), queryFn: () => getDomain(id), enabled: !!id });
+}
+export function useCreateDomain() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: createDomain,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.domains }),
+  });
+}
+export function useDeleteDomain() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: deleteDomain,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.domains }),
+  });
+}
+export function useCompileDomainPolicy() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string; policy_text: string; processor_agent_id: string }) =>
+      compileDomainPolicy(id, body),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.domain(vars.id) });
+    },
+  });
+}
+export function useFreezeDomainChecks() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string; checks: import("./types").Checks; verification_strength: string }) =>
+      freezeDomainChecks(id, body),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.domain(vars.id) });
+      qc.invalidateQueries({ queryKey: qk.domains });
+    },
+  });
+}
+
 // ── Schedule hooks ──
 export function useSchedules() {
   return useQuery({ queryKey: qk.schedules, queryFn: listSchedules });
@@ -218,6 +281,11 @@ export function useGoalEvents() {
   useWSEvent("goal:retry_failed", () => qc.invalidateQueries({ queryKey: qk.goals }));
   useWSEvent("goal:waiting", () => qc.invalidateQueries({ queryKey: qk.goals }));
   useWSEvent("goal:deleted", () => qc.invalidateQueries({ queryKey: qk.goals }));
+  useWSEvent("goal:reviewing", () => qc.invalidateQueries({ queryKey: qk.goals }));
+  useWSEvent("goal:approved", () => qc.invalidateQueries({ queryKey: qk.goals }));
+  useWSEvent("goal:review_resolved", () => qc.invalidateQueries({ queryKey: qk.goals }));
+  useWSEvent("goal:delivered", () => qc.invalidateQueries({ queryKey: qk.goals }));
+  useWSEvent("goal:deliver_failed", () => qc.invalidateQueries({ queryKey: qk.goals }));
   // Agent lifecycle events
   useWSEvent("agent:created", () => qc.invalidateQueries({ queryKey: qk.agents }));
   useWSEvent("agent:deleted", () => qc.invalidateQueries({ queryKey: qk.agents }));
@@ -226,4 +294,9 @@ export function useGoalEvents() {
   useWSEvent("squad:deleted", () => qc.invalidateQueries({ queryKey: qk.squads }));
   // Schedule events
   useWSEvent("schedule:created", () => qc.invalidateQueries({ queryKey: qk.schedules }));
+  // Domain events
+  useWSEvent("domain:created", () => qc.invalidateQueries({ queryKey: qk.domains }));
+  useWSEvent("domain:deleted", () => qc.invalidateQueries({ queryKey: qk.domains }));
+  useWSEvent("domain:compiled", () => qc.invalidateQueries({ queryKey: qk.domains }));
+  useWSEvent("domain:compile_failed", () => qc.invalidateQueries({ queryKey: qk.domains }));
 }

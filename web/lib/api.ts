@@ -1,4 +1,4 @@
-import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule } from "./types";
+import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7373";
 
@@ -38,6 +38,7 @@ export const createGoal = (body: {
   title: string;
   description?: string;
   parent_id?: string;
+  domain_id?: string;
   assignee_type?: string;
   assignee_id?: string;
   status?: string;
@@ -55,6 +56,10 @@ export const cancelGoal = (id: string) =>
   api<Goal>(`/goals/${id}/cancel`, { method: "POST" });
 export const waitGoalChildren = (id: string) =>
   api<void>(`/goals/${id}/wait`, { method: "POST" });
+export const resolveGoalReview = (
+  id: string,
+  body: { decision: "approve" | "reject" | "redirect"; reason?: string }
+) => api<Goal>(`/goals/${id}/review`, { method: "POST", body: JSON.stringify(body) });
 
 // ── Run ──
 export const listGoalRuns = (goalId: string) =>
@@ -85,6 +90,29 @@ export const addSquadMember = (
 ) => api<SquadMember>(`/squads/${squadId}/members`, { method: "POST", body: JSON.stringify(body) });
 export const listSquadMembers = (squadId: string) =>
   api<SquadMember[]>(`/squads/${squadId}/members`);
+
+// ── Domain ──
+export const listDomains = () => api<Domain[]>("/domains");
+export const getDomain = (id: string) => api<Domain>(`/domains/${id}`);
+export const createDomain = (body: {
+  name: string;
+  git_url: string;
+  type?: string;
+  default_branch?: string;
+  git_identity?: string;
+  policy_text?: string;
+  processor_agent_id?: string;
+}) => api<Domain>("/domains", { method: "POST", body: JSON.stringify(body) });
+export const deleteDomain = (id: string) =>
+  api<void>(`/domains/${id}`, { method: "DELETE" });
+export const compileDomainPolicy = (
+  id: string,
+  body: { policy_text: string; processor_agent_id: string }
+) => api<Run>(`/domains/${id}/compile`, { method: "POST", body: JSON.stringify(body) });
+export const freezeDomainChecks = (
+  id: string,
+  body: { checks: Checks; verification_strength: string }
+) => api<Domain>(`/domains/${id}/checks`, { method: "POST", body: JSON.stringify(body) });
 
 // ── Schedule ──
 export const listSchedules = () => api<Schedule[]>("/schedules");

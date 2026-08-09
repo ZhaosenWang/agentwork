@@ -2,12 +2,13 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { useGoals, useAgents, useSquads, useCreateGoal, useGoalEvents } from "@/lib/queries";
+import { useGoals, useAgents, useSquads, useDomains, useCreateGoal, useGoalEvents } from "@/lib/queries";
 import { Badge, Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
 import type { Goal, GoalStatus } from "@/lib/types";
 
 const STATUS_TABS: { label: string; value: GoalStatus | "all" }[] = [
   { label: "全部", value: "all" },
+  { label: "待审批", value: "review" },
   { label: "backlog", value: "backlog" },
   { label: "active", value: "active" },
   { label: "blocked", value: "blocked" },
@@ -21,6 +22,7 @@ export default function GoalsPage() {
   const { data: goals, isLoading } = useGoals();
   const { data: agents } = useAgents();
   const { data: squads } = useSquads();
+  const { data: domains } = useDomains();
   const createGoal = useCreateGoal();
   const [filter, setFilter] = useState<GoalStatus | "all">("all");
   const [showForm, setShowForm] = useState(false);
@@ -114,7 +116,7 @@ export default function GoalsPage() {
       )}
 
       {/* Create Goal dialog */}
-      {showForm && <NewGoalForm agents={agents} squads={squads} onClose={() => setShowForm(false)} />}
+      {showForm && <NewGoalForm agents={agents} squads={squads} domains={domains} onClose={() => setShowForm(false)} />}
 
       {createGoal.isError && (
         <p className="text-sm text-red-500 mt-2">{String(createGoal.error)}</p>
@@ -126,15 +128,19 @@ export default function GoalsPage() {
 function NewGoalForm({
   agents,
   squads,
+  domains,
   onClose,
 }: {
   agents?: { id: string; name: string }[];
   squads?: { id: string; name: string }[];
+  domains?: { id: string; name: string }[];
   onClose: () => void;
 }) {
   const createGoal = useCreateGoal();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [domainId, setDomainId] = useState("");
+  const [domainErr, setDomainErr] = useState("");
   const [assigneeType, setAssigneeType] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
 
@@ -146,6 +152,14 @@ function NewGoalForm({
       body.assignee_type = assigneeType;
       body.assignee_id = assigneeId;
       body.status = "active";
+    }
+    // v2: agent/squad-executed goals must belong to a domain (DESIGN.v2.md §2).
+    if (assigneeType === "agent" || assigneeType === "squad") {
+      if (!domainId) {
+        setDomainErr("请选择所属域——agent 执行的 Goal 必须挂在一个域上（域提供 worktree 与验收策略）");
+        return;
+      }
+      body.domain_id = domainId;
     }
     createGoal.mutate(body as Record<string, string> & { title: string }, { onSuccess: onClose });
   };
@@ -169,6 +183,14 @@ function NewGoalForm({
         </Field>
         <Field label="描述">
           <textarea value={description} onChange={(e) => setDescription(e.target.value)} className={inputCls} rows={3} placeholder="可选描述…" />
+        </Field>
+        <Field label="所属域" hint="agent/squad 执行的 Goal 必填">
+          <select value={domainId} onChange={(e) => setDomainId(e.target.value)} className={inputCls}>
+            <option value="">选择…</option>
+            {domains?.map((d) => (
+              <option key={d.id} value={d.id}>{d.name}</option>
+            ))}
+          </select>
         </Field>
         <Field label="负责人类型">
           <select value={assigneeType} onChange={(e) => { setAssigneeType(e.target.value); setAssigneeId(""); }} className={inputCls}>
@@ -197,8 +219,8 @@ function NewGoalForm({
             </select>
           </Field>
         )}
-        {createGoal.isError && (
-          <p className="text-sm text-red-500">{String(createGoal.error)}</p>
+        {(createGoal.isError || domainErr) && (
+          <p className="text-sm text-red-500">{domainErr || String(createGoal.error)}</p>
         )}
       </form>
     </Dialog>

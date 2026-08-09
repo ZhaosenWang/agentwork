@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useAgents, useSquads, useAssignGoal, useCancelGoal, useWaitGoalChildren, useDeleteGoal } from "@/lib/queries";
+import { useAgents, useSquads, useAssignGoal, useCancelGoal, useWaitGoalChildren, useDeleteGoal, useResolveGoalReview, useGoalRuns } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import type { Goal } from "@/lib/types";
 
@@ -37,6 +37,8 @@ export function GoalActions({ goal }: { goal: Goal }) {
         删除
       </Button>
 
+      {goal.status === "review" && <ReviewPanel goal={goal} />}
+
       {showAssign && <AssignDialog goal={goal} onClose={() => setShowAssign(false)} />}
       {showDelete && (
         <ConfirmDialog
@@ -53,6 +55,89 @@ export function GoalActions({ goal }: { goal: Goal }) {
           {String(assign.error ?? cancel.error ?? wait.error ?? deleteGoal.error)}
         </p>
       )}
+    </div>
+  );
+}
+
+// ReviewPanel is the human checkpoint (DESIGN.v2.md §4): the goal is parked
+// in review — the human decides approve (platform delivers: merge + re-verify
+// + push) or reject (back to the agent with the reason as the next scope).
+// The evidence bundle from the last run is shown so the decision is made on
+// facts, not trust.
+function ReviewPanel({ goal }: { goal: Goal }) {
+  const resolve = useResolveGoalReview();
+  const { data: runs } = useGoalRuns(goal.id);
+  const [reason, setReason] = useState("");
+  const [showRejectForm, setShowRejectForm] = useState(false);
+
+  // Latest run's evidence (diff stats + verify output + agent summary).
+  const lastRun = runs?.filter((r) => r.status === "completed" || r.status === "failed").at(-1);
+  let evidence: Record<string, unknown> | null = null;
+  if (lastRun?.evidence) {
+    try { evidence = JSON.parse(lastRun.evidence); } catch { /* not JSON */ }
+  }
+
+  return (
+    <div className="rounded border border-amber-300 bg-amber-50 p-4 space-y-3 w-full">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-xs font-mono bg-amber-200 px-2 py-0.5 rounded">等待审批</span>
+        {goal.review_request && <span className="text-sm text-amber-900">{goal.review_request}</span>}
+        {goal.human_iterations > 0 && (
+          <span className="text-xs text-amber-700">已驳回 {goal.human_iterations} 次</span>
+        )}
+      </div>
+
+      {evidence && (
+        <details className="text-xs">
+          <summary className="cursor-pointer text-amber-800">证据包（{lastRun?.id.slice(0, 8)}）</summary>
+          <pre className="mt-2 whitespace-pre-wrap bg-amber-100 p-2 rounded text-amber-900 max-h-64 overflow-auto">
+            {String(evidence.diff_stat ?? "")}
+            {"\n"}
+            {String(evidence.verify ?? "")}
+          </pre>
+        </details>
+      )}
+      {lastRun?.result_summary && (
+        <p className="text-xs text-amber-800">
+          <span className="font-medium">Agent 汇报：</span>
+          {lastRun.result_summary.slice(0, 400)}
+        </p>
+      )}
+
+      {!showRejectForm ? (
+        <div className="flex gap-2">
+          <Button onClick={() => resolve.mutate({ id: goal.id, decision: "approve" })} disabled={resolve.isPending}>
+            {resolve.isPending ? "处理中…" : "批准并自动合入"}
+          </Button>
+          <Button variant="outline" onClick={() => setShowRejectForm(true)}>驳回</Button>
+        </div>
+      ) : (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            resolve.mutate(
+              { id: goal.id, decision: "reject", reason },
+              { onSuccess: () => { setShowRejectForm(false); setReason(""); } }
+            );
+          }}
+          className="space-y-2"
+        >
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            className={inputCls}
+            rows={3}
+            placeholder="驳回理由——会成为 agent 下一轮的执行范围"
+          />
+          <div className="flex gap-2">
+            <Button type="submit" variant="danger" disabled={resolve.isPending || !reason.trim()}>
+              {resolve.isPending ? "退回中…" : "驳回并退回 agent"}
+            </Button>
+            <Button variant="ghost" onClick={() => setShowRejectForm(false)}>返回</Button>
+          </div>
+        </form>
+      )}
+      {resolve.isError && <p className="text-sm text-red-500">{String(resolve.error)}</p>}
     </div>
   );
 }

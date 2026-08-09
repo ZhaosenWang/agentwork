@@ -11,7 +11,6 @@ export function AgentForm({ onClose }: { onClose: () => void }) {
   const [runtimeId, setRuntimeId] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [model, setModel] = useState("");
-  const [workdirBase, setWorkdirBase] = useState("");
   const [env, setEnv] = useState("{}");
   const [maxConcurrent, setMaxConcurrent] = useState("1");
 
@@ -26,7 +25,6 @@ export function AgentForm({ onClose }: { onClose: () => void }) {
         runtime_id: runtimeId,
         system_prompt: systemPrompt,
         model,
-        workdir_base: workdirBase,
         env: parsedEnv,
         max_concurrent: parseInt(maxConcurrent) || 1,
       },
@@ -67,10 +65,6 @@ export function AgentForm({ onClose }: { onClose: () => void }) {
 
         <Field label="Model" hint="留空用 runtime 默认">
           <input value={model} onChange={(e) => setModel(e.target.value)} className={inputCls} />
-        </Field>
-
-        <Field label="Workdir Base">
-          <input value={workdirBase} onChange={(e) => setWorkdirBase(e.target.value)} className={`${inputCls} font-mono`} placeholder="/tmp/agentwork/work" />
         </Field>
 
         <Field label="Env (JSON)">

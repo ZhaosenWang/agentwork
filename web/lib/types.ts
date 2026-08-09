@@ -19,7 +19,6 @@ export interface Agent {
   runtime_id: string;
   system_prompt: string;
   model: string;
-  workdir_base: string;
   env: Record<string, string>;
   max_concurrent: number;
   created_at: string;
@@ -29,6 +28,7 @@ export type GoalStatus =
   | "backlog"
   | "active"
   | "blocked"
+  | "review"
   | "done"
   | "failed"
   | "cancelled";
@@ -38,12 +38,51 @@ export interface Goal {
   title: string;
   description: string;
   parent_id: string;
+  domain_id: string;
   assignee_type: string; // agent | squad | human
   assignee_id: string;
   status: GoalStatus;
   handoff_note: string;
+  review_request: string;
+  human_iterations: number;
   created_by_type: string;
   created_by_id: string;
+  created_at: string;
+}
+
+export interface GateRule {
+  name: string; // merge | guard:<...> | request (M2)
+  when: string;
+}
+
+export interface Guard {
+  type: string; // diff_contains | diff_excludes | coverage_delta
+  pattern: string;
+  min_delta: number;
+}
+
+export interface Checks {
+  verify: string[];
+  guards: Guard[];
+  gates: GateRule[];
+}
+
+export interface Domain {
+  id: string;
+  type: string; // repo (M0)
+  name: string;
+  git_url: string;
+  default_branch: string;
+  git_identity: string;
+  git_credentials: string;
+  policy_text: string;
+  checks: Checks;
+  verification_strength: string; // strong|medium|weak
+  max_run_duration: number;
+  verify_timeout: number;
+  processor_agent_id: string;
+  checks_compiled_at: string;
+  metrics_baseline: string;
   created_at: string;
 }
 
@@ -53,11 +92,15 @@ export interface Run {
   id: string;
   goal_id: string;
   agent_id: string;
+  run_kind: string; // worker|processor
+  domain_id: string;
+  prompt: string;
   session_id: string;
   workdir: string;
   status: RunStatus;
   attempt: number;
   result_summary: string;
+  evidence: string; // JSON: diff stats + verify output + agent summary
   trigger_comment_id: string;
   is_leader_run: boolean;
   squad_id: string;
@@ -114,11 +157,14 @@ export interface Schedule {
 export type WSTopic =
   | "goal:created" | "goal:assigned" | "goal:finished"
   | "goal:retrying" | "goal:retry_failed" | "goal:waiting" | "goal:deleted"
+  | "goal:reviewing" | "goal:approved" | "goal:review_resolved"
+  | "goal:delivered" | "goal:deliver_failed"
   | "run:enqueued" | "run:coalesced" | "run:discarded" | "run:event"
   | "comment:created"
   | "agent:created" | "agent:deleted"
   | "squad:created" | "squad:deleted" | "squad:member_added"
-  | "schedule:created" | "schedule:fired";
+  | "schedule:created" | "schedule:fired"
+  | "domain:created" | "domain:deleted" | "domain:compiled" | "domain:compile_failed";
 
 export interface WSEvent {
   topic: WSTopic;
