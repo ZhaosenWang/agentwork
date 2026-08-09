@@ -24,6 +24,7 @@ func parseNow(t *testing.T, s string) time.Time {
 // exclusive. errors.Is is identity-based, not text-based: a plain error that
 // merely shares the message must NOT match.
 func TestSentinelsDistinct(t *testing.T) {
+	t.Parallel()
 	// Cross-match both ways: the handler's if/else chain depends on
 	// ErrValidation never satisfying ErrNotFound and vice versa.
 	if errors.Is(ErrValidation, ErrNotFound) {
@@ -51,6 +52,7 @@ func TestSentinelsDistinct(t *testing.T) {
 // satisfy errors.Is(err, ErrValidation) — both directly and through the
 // %w-wrapped form cron.go uses — and never satisfy ErrNotFound.
 func TestNewValidationError(t *testing.T) {
+	t.Parallel()
 	for _, msg := range []string{
 		"name is required",
 		"assignee_type must be agent, squad, or human",
@@ -83,6 +85,7 @@ func TestNewValidationError(t *testing.T) {
 // TestNewIDFormat: ids are 32 lowercase hex chars — the primary-key format
 // every entity (agents, goals, runs, ...) relies on.
 func TestNewIDFormat(t *testing.T) {
+	t.Parallel()
 	hexRe := regexp.MustCompile(`^[0-9a-f]{32}$`)
 	for i := 0; i < 100; i++ {
 		if id := newID(); !hexRe.MatchString(id) {
@@ -94,6 +97,7 @@ func TestNewIDFormat(t *testing.T) {
 // TestNewIDUnique: fresh ids must be pairwise distinct. crypto/rand makes
 // collisions astronomically unlikely, so any collision here is a real bug.
 func TestNewIDUnique(t *testing.T) {
+	t.Parallel()
 	const n = 1000
 	seen := make(map[string]struct{}, n)
 	for i := 0; i < n; i++ {
@@ -108,6 +112,7 @@ func TestNewIDUnique(t *testing.T) {
 // TestNowFormat: now() returns a UTC RFC3339Nano timestamp that round-trips
 // through time.Parse — store columns and the API surface both depend on it.
 func TestNowFormat(t *testing.T) {
+	t.Parallel()
 	ts := now()
 	if !strings.HasSuffix(ts, "Z") {
 		t.Errorf("now() = %q, want UTC (Z suffix)", ts)
@@ -126,6 +131,7 @@ func TestNowFormat(t *testing.T) {
 // (RFC3339Nano has ns resolution, but the clock can tick between calls) — the
 // only hard requirement is that later calls never go backwards.
 func TestNowMonotonic(t *testing.T) {
+	t.Parallel()
 	a, b := now(), now()
 	ta, tb := parseNow(t, a), parseNow(t, b)
 	if tb.Before(ta) {
