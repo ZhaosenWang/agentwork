@@ -114,6 +114,20 @@ export const freezeDomainChecks = (
   body: { checks: Checks; verification_strength: string }
 ) => api<Domain>(`/domains/${id}/checks`, { method: "POST", body: JSON.stringify(body) });
 
+// ── IM (Feishu connect) ──
+export interface ImStatus {
+  status: string; // idle | waiting_qr | waiting_message | connected | failed
+  receive_id: string;
+  app_id: string;
+  error: string;
+  qr: { url: string; img_base64: string; expires_at: number };
+}
+export const getImStatus = () => api<ImStatus>("/im/feishu/status");
+export const connectFeishu = () =>
+  api<{ qr: { url: string; img_base64: string; expires_at: number }; status: string }>("/im/feishu/connect", { method: "POST" });
+export const disconnectFeishu = () =>
+  api<void>("/im/feishu/connect", { method: "DELETE" });
+
 // ── Schedule ──
 export const listSchedules = () => api<Schedule[]>("/schedules");
 export const getSchedule = (id: string) => api<Schedule>(`/schedules/${id}`);

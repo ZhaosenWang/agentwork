@@ -17,8 +17,13 @@ type Event struct {
 // Handler reacts to an event.
 type Handler func(context.Context, Event)
 
-// Bus is a synchronous in-process pub/sub. Each handler runs in its own
-// goroutine with panic recovery so one bad listener can't take down the rest.
+// Bus is an asynchronous in-process pub/sub: Publish fans each event out to
+// the topic's handlers, each running in its own goroutine with panic
+// recovery, and returns immediately. Consequences (documented, not bugs):
+// handler order across publishes is not guaranteed, and there is no
+// acknowledgement. Order-sensitive consumers must not rely on cross-event
+// ordering; state transitions themselves are serialized by the DB
+// transactions, not by the bus.
 type Bus struct {
 	mu       sync.RWMutex
 	handlers map[string][]Handler

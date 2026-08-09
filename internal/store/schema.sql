@@ -247,6 +247,7 @@ CREATE TABLE IF NOT EXISTS schedule (
     description     TEXT NOT NULL DEFAULT '',  -- cloned goal description
     assignee_type   TEXT NOT NULL DEFAULT 'agent', -- agent|squad
     assignee_id     TEXT NOT NULL,
+    domain_id       TEXT REFERENCES domain(id),-- v2 (M1): fired goals belong to this domain
     cron_expression TEXT NOT NULL,             -- 5-field standard cron
     timezone        TEXT NOT NULL DEFAULT 'UTC',
     enabled         INTEGER NOT NULL DEFAULT 1,
@@ -270,3 +271,13 @@ CREATE TABLE IF NOT EXISTS schedule_run (
 
 CREATE INDEX IF NOT EXISTS idx_schedule_run_schedule ON schedule_run(schedule_id, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_run_planned ON schedule_run(schedule_id, planned_at);
+
+-- settings: key-value daemon configuration (e.g. the Feishu connection
+-- credentials + receive target captured by the IM connect flow, M1). The
+-- IM module persists here so the daemon auto-reconnects on startup with no
+-- environment configuration.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL DEFAULT '',  -- JSON
+    updated_at TEXT NOT NULL
+);

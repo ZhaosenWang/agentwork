@@ -90,9 +90,16 @@ func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID
 // the same tx so it sees the caller's un-committed state (this is what keeps
 // a parent-wake flipping blocked→active + enqueue one atomic operation, and
 // what stops two parallel child-dones from double-enqueuing the parent).
-func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, error) {
+//
+// The run event (enqueued/coalesced) is RETURNED, not published: publishing
+// inside the tx would violate the "bus.Publish after commit" invariant (a
+// rolled-back tx must not emit). The caller publishes after its commit.
+// Note: EnqueueExistingTx (the parent-wake path inside a goal tx) does not
+// publish — the goal layer's commitAndEmit covers goal events; the run event
+// for that path is a known M2 refinement.
+func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, *events.Event, error) {
 	if pending, err := s.hasPending(ctx, tx, goalID, agentID); err != nil {
-		return nil, err
+		return nil, nil, err
 	} else if pending {
 		// Coalesce: a queued/running run for this (goal,agent) already exists
 		// (possibly just advanced to active by this same tx). Don't duplicate.
@@ -100,10 +107,10 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		_ = tx.QueryRowContext(ctx,
 			`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND status IN ('queued','running') ORDER BY queued_at LIMIT 1`,
 			goalID, agentID).Scan(&id)
-		s.bus.Publish(ctx, events.Event{Topic: "run:coalesced", Payload: map[string]any{
+		ev := &events.Event{Topic: "run:coalesced", Payload: map[string]any{
 			"goal_id": goalID, "agent_id": agentID,
-		}})
-		return &Run{ID: id, GoalID: goalID, AgentID: agentID}, nil
+		}}
+		return &Run{ID: id, GoalID: goalID, AgentID: agentID}, ev, nil
 	}
 	ts := now()
 	leaderFlag := 0
@@ -126,10 +133,10 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		`INSERT INTO run (id,goal_id,agent_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.GoalID, r.AgentID, "", "", r.Status, r.Attempt, r.ResultSummary, r.TriggerCommentID, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
-		return nil, fmt.Errorf("insert run: %w", err)
+		return nil, nil, fmt.Errorf("insert run: %w", err)
 	}
-	s.bus.Publish(ctx, events.Event{Topic: "run:enqueued", Payload: r})
-	return &r, nil
+	ev := &events.Event{Topic: "run:enqueued", Payload: r}
+	return &r, ev, nil
 }
 
 // EnqueueForGoal creates the first run for a goal based on its current
@@ -215,21 +222,29 @@ func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attemp
 		return nil, err
 	}
 	defer tx.Rollback()
-	r, err := s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, triggerCommentID)
+	r, ev, err := s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, triggerCommentID)
 	if err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	// Publish only after commit (invariant 13): a rolled-back tx emits nothing.
+	if ev != nil {
+		s.bus.Publish(ctx, *ev)
+	}
 	return r, nil
 }
 
 // EnqueueExistingTx is the same-package atomic variant for a caller that
 // already holds a transaction (e.g. the parent-wake path in GoalService, which
-// flips blocked→active and enqueues in one tx).
+// flips blocked→active and enqueues in one tx). The run event is NOT
+// published here — the caller's tx owns the publish-after-commit contract
+// (goal-layer events cover the wake; the run event for this path is a known
+// M2 refinement).
 func (s *RunService) EnqueueExistingTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID string) (*Run, error) {
-	return s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, "")
+	r, _, err := s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, "")
+	return r, err
 }
 
 // ClaimedRow is a claimed run row handed to the daemon's runTask.

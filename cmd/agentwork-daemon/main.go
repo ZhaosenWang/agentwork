@@ -16,6 +16,7 @@ import (
 
 	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/proto/acpbackend"
 	"github.com/eushing/agentwork/internal/proto/jsonlbackend"
@@ -40,6 +41,18 @@ func main() {
 	defer cancel()
 
 	bus := events.NewBus()
+
+	// IM connection (DESIGN.v2.md decision 2-14): the Web UI drives the Feishu
+	// connect flow — one-click app registration via QR scan, then the first
+	// bot message captures the receive target. Credentials persist to SQLite;
+	// the daemon auto-reconnects on startup. No environment configuration.
+	settingsSvc := service.NewSettingsService(st)
+	imConn := notify.NewConnector(settingsSvc, bus)
+	go func() {
+		if err := imConn.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("notify: feishu connector ended: %v", err)
+		}
+	}()
 
 	// Services. wired together explicitly to avoid a constructor-order cycle:
 	// GoalService <-> RunService hold cross-references (reconcile enqueues
@@ -70,7 +83,7 @@ func main() {
 		}
 	}()
 
-	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc, domainSvc)
+	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc, domainSvc, imConn)
 	if err := srv.ListenAndServe(ctx, *addr); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("server: %v", err)
 	}

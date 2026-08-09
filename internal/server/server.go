@@ -10,6 +10,7 @@ import (
 
 	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/server/handler"
 	"github.com/eushing/agentwork/internal/server/ws"
 	"github.com/eushing/agentwork/internal/service"
@@ -27,10 +28,11 @@ type Server struct {
 	squadSvc   *service.SquadService
 	schedSvc   *service.ScheduleService
 	domainSvc  *service.DomainService
+	imConn     *notify.Connector
 }
 
-func New(st *store.Store, bus *events.Bus, d *daemon.Daemon, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, domainSvc *service.DomainService) *Server {
-	return &Server{st: st, bus: bus, d: d, hub: ws.NewHub(bus), goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, squadSvc: squadSvc, schedSvc: schedSvc, domainSvc: domainSvc}
+func New(st *store.Store, bus *events.Bus, d *daemon.Daemon, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, domainSvc *service.DomainService, imConn *notify.Connector) *Server {
+	return &Server{st: st, bus: bus, d: d, hub: ws.NewHub(bus), goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, squadSvc: squadSvc, schedSvc: schedSvc, domainSvc: domainSvc, imConn: imConn}
 }
 
 // ListenAndServe mounts routes and serves until ctx is cancelled.
@@ -44,6 +46,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		Squad:    s.squadSvc,
 		Schedule: s.schedSvc,
 		Domain:   s.domainSvc,
+		IM:       s.imConn,
 	}
 
 	mux := http.NewServeMux()

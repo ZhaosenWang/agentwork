@@ -33,6 +33,9 @@ import {
   deleteDomain,
   compileDomainPolicy,
   freezeDomainChecks,
+  getImStatus,
+  connectFeishu,
+  disconnectFeishu,
 } from "./api";
 import { useWSEvent } from "./ws";
 
@@ -50,6 +53,7 @@ export const qk = {
   schedules: ["schedules"] as const,
   domains: ["domains"] as const,
   domain: (id: string) => ["domains", id] as const,
+  im: ["im"] as const,
 };
 
 // ── Runtime hooks ──
@@ -248,6 +252,29 @@ export function useFreezeDomainChecks() {
       qc.invalidateQueries({ queryKey: qk.domain(vars.id) });
       qc.invalidateQueries({ queryKey: qk.domains });
     },
+  });
+}
+
+// ── IM hooks ──
+export function useImStatus() {
+  return useQuery({
+    queryKey: qk.im,
+    queryFn: getImStatus,
+    refetchInterval: 3000, // the connect flow advances server-side (QR → connected)
+  });
+}
+export function useConnectFeishu() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: connectFeishu,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.im }),
+  });
+}
+export function useDisconnectFeishu() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: disconnectFeishu,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.im }),
   });
 }
 

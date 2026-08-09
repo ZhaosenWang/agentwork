@@ -3,10 +3,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 
+	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/service"
 )
 
@@ -19,6 +21,7 @@ type Handlers struct {
 	Squad    *service.SquadService
 	Schedule *service.ScheduleService
 	Domain   *service.DomainService
+	IM       *notify.Connector
 }
 
 func (h *Handlers) Mount(mux *http.ServeMux) {
@@ -62,6 +65,10 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /domains/{id}", h.deleteDomain)
 	mux.HandleFunc("POST /domains/{id}/checks", h.freezeDomainChecks)
 	mux.HandleFunc("POST /domains/{id}/compile", h.compileDomainPolicy)
+
+	mux.HandleFunc("GET /im/feishu/status", h.imStatus)
+	mux.HandleFunc("POST /im/feishu/connect", h.imConnect)
+	mux.HandleFunc("DELETE /im/feishu/connect", h.imDisconnect)
 }
 
 // ── runtime ──
@@ -344,6 +351,32 @@ func (h *Handlers) freezeDomainChecks(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.Domain.FreezeChecks(r.Context(), r.PathValue("id"), body.Checks, body.VerificationStrength)
 	writeJSON(w, out, err)
+}
+
+// ── IM (Feishu connect flow — the Web-driven QR connect) ──
+
+func (h *Handlers) imStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, h.IM.Status(), nil)
+}
+
+func (h *Handlers) imConnect(w http.ResponseWriter, r *http.Request) {
+	// The registration runs for up to 10 minutes — it MUST outlive this HTTP
+	// request, so it gets its own context, not r.Context() (which is cancelled
+	// when the response returns).
+	_, qr, err := h.IM.StartRegistration(context.Background())
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"qr": qr, "status": h.IM.Status()["status"]}, nil)
+}
+
+func (h *Handlers) imDisconnect(w http.ResponseWriter, r *http.Request) {
+	if err := h.IM.Disconnect(r.Context()); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── helpers ──

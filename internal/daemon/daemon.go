@@ -43,6 +43,14 @@ const dispatchTickInterval = 500 * time.Millisecond
 // scheduleTickInterval is how often the daemon scans schedule for due firings.
 const scheduleTickInterval = 5 * time.Second
 
+// worktreeCleanupInterval is how often the daemon sweeps expired goal
+// worktrees (M1: every 6h).
+const worktreeCleanupInterval = 6 * time.Hour
+
+// worktreeRetentionDays is how long a terminal goal's worktree is kept after
+// its last run (DESIGN.v2.md §13 — M1 value: 7 days; kept for review/debug).
+const worktreeRetentionDays = 7
+
 // workerQueueDepth bounds how many queued runs one agent's worker holds before
 // back-pressuring the dispatcher.
 const workerQueueDepth = 64
@@ -116,8 +124,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	dispatchTick := time.NewTicker(dispatchTickInterval)
 	scheduleTick := time.NewTicker(scheduleTickInterval)
+	cleanupTick := time.NewTicker(worktreeCleanupInterval)
 	defer dispatchTick.Stop()
 	defer scheduleTick.Stop()
+	defer cleanupTick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -128,6 +138,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.dispatchOnce(ctx)
 		case <-scheduleTick.C:
 			d.dispatchSchedules(ctx)
+		case <-cleanupTick.C:
+			d.cleanupWorktrees(ctx)
 		}
 	}
 }
@@ -470,6 +482,55 @@ func mustGitRun(ctx context.Context, dir string, args ...string) string {
 	return strings.TrimSpace(out)
 }
 
+// ── worktree lifecycle (M1) ──
+
+// cleanupWorktrees removes worktrees of goals that reached a terminal state
+// more than worktreeRetentionDays ago. The goal's branch stays in the shared
+// repo (history is preserved); only the checkout is reclaimed.
+func (d *Daemon) cleanupWorktrees(ctx context.Context) {
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT g.id, g.domain_id, MAX(r.finished_at)
+		 FROM goal g JOIN run r ON r.goal_id = g.id
+		 WHERE g.status IN ('done','failed','cancelled')
+		 GROUP BY g.id, g.domain_id`)
+	if err != nil {
+		log.Printf("daemon: cleanup worktrees: query: %v", err)
+		return
+	}
+	type row struct{ goalID, domainID, finished string }
+	var found []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.goalID, &r.domainID, &r.finished); err != nil {
+			continue
+		}
+		found = append(found, r)
+	}
+	rows.Close()
+
+	cutoff := time.Now().Add(-worktreeRetentionDays * 24 * time.Hour)
+	for _, r := range found {
+		if r.domainID == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339Nano, r.finished)
+		if err != nil || t.After(cutoff) {
+			continue
+		}
+		wt := goalWorktreePath(r.domainID, r.goalID)
+		if _, err := os.Stat(wt); err != nil {
+			continue
+		}
+		unlock := d.lockDomain(r.domainID)
+		if out, err := gitRun(ctx, domainRepoPath(r.domainID), "worktree", "remove", "--force", wt); err != nil {
+			log.Printf("daemon: cleanup worktree %s: %v %s", r.goalID, err, out)
+		} else {
+			log.Printf("daemon: removed worktree for terminal goal %s (retention expired)", r.goalID)
+		}
+		unlock()
+	}
+}
+
 // ── run execution ──
 
 // runTask opens a transport, hands it to the protocol backend for one Prompt,
@@ -482,12 +543,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
-	var maxConcurrent int
+	var maxConcurrent, maxRunDuration int
 	var isLeaderRun bool
 	var squadID string
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
-		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent,
+		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
 		        r2.is_leader_run, r2.squad_id
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
@@ -495,7 +556,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 JOIN agent a ON a.id = r2.agent_id
 		 JOIN runtime r ON r.id = a.runtime_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &isLeaderRun, &squadID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &isLeaderRun, &squadID)
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -602,12 +663,19 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, fmt.Sprintf("provider %q: %v", provider, err))
 		return
 	}
-	// The idle watchdog cancels promptCtx to interrupt a hung turn; backend
-	// Execute must run under promptCtx (not the bare ctx) so the cancel takes.
+	// maxRunDuration (DESIGN.v2.md §4, decision 2-6): the run's total time
+	// budget, independent of activity — a run stuck in a tool loop must not
+	// burn forever. The idle watchdog (silence) and this (total time) are
+	// complementary cancellers of the same promptCtx. On timeout the backend
+	// reports StatusCancelled; the run is cancelled WITHOUT consuming attempt
+	// credit, the goal stays active, and the human is notified (M1 notify).
+	if maxRunDuration <= 0 {
+		maxRunDuration = 7200 // default 2h
+	}
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
 	var inFlightTools atomic.Int32
-	promptCtx, promptCancel := context.WithCancel(ctx)
+	promptCtx, promptCancel := context.WithTimeout(ctx, time.Duration(maxRunDuration)*time.Second)
 	defer promptCancel()
 	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID)
 
@@ -681,6 +749,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.finishRunOK(ctx, q, result.Output)
 	case proto.StatusCancelled:
 		d.finishRun(ctx, q, "cancelled", "idle watchdog: "+result.Output)
+		// Cancelled runs leave the goal active with no pending run (decision
+		// 2-6: the human decides) — surface it so the notify layer can tell
+		// the owner a task stalled.
+		d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
+			"run_id": q.RunID, "goal_id": q.GoalID, "reason": "idle watchdog: " + result.Output,
+		}})
 	case proto.StatusFailed, proto.StatusAborted:
 		d.finishRun(ctx, q, "failed", result.Output)
 	}
@@ -1084,7 +1158,7 @@ func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.In
 func (d *Daemon) dispatchSchedules(ctx context.Context) {
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	rows, err := d.st.DB().QueryContext(ctx,
-		`SELECT id, title_template, description, assignee_type, assignee_id, cron_expression, timezone, next_run_at
+		`SELECT id, title_template, description, assignee_type, assignee_id, domain_id, cron_expression, timezone, next_run_at
 		 FROM schedule WHERE enabled=1 AND next_run_at != '' AND next_run_at <= ?`, nowStr)
 	if err != nil {
 		log.Printf("daemon: schedule query: %v", err)
@@ -1093,7 +1167,7 @@ func (d *Daemon) dispatchSchedules(ctx context.Context) {
 	var due []scheduleDueRow
 	for rows.Next() {
 		var r scheduleDueRow
-		if err := rows.Scan(&r.ScheduleID, &r.TitleTemplate, &r.Description, &r.AssigneeType, &r.AssigneeID, &r.CronExpression, &r.Timezone, &r.NextRunAt); err != nil {
+		if err := rows.Scan(&r.ScheduleID, &r.TitleTemplate, &r.Description, &r.AssigneeType, &r.AssigneeID, &r.DomainID, &r.CronExpression, &r.Timezone, &r.NextRunAt); err != nil {
 			rows.Close()
 			log.Printf("daemon: schedule scan: %v", err)
 			return
@@ -1107,7 +1181,7 @@ func (d *Daemon) dispatchSchedules(ctx context.Context) {
 }
 
 type scheduleDueRow struct {
-	ScheduleID, TitleTemplate, Description, AssigneeType, AssigneeID, CronExpression, Timezone, NextRunAt string
+	ScheduleID, TitleTemplate, Description, AssigneeType, AssigneeID, DomainID, CronExpression, Timezone, NextRunAt string
 }
 
 func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
@@ -1120,10 +1194,14 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 		return
 	}
 	defer tx.Rollback()
+	// 11 columns → exactly 11 values: id,title,description,domain_id,
+	// assignee_type,assignee_id as parameters; status='active',
+	// handoff_note='', created_by_type='system' literal; created_by_id=
+	// schedule id, created_at=ts as parameters.
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO goal (id,title,description,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
-		 VALUES (?,?,?,'active',?,'','','system',?,?)`,
-		goalID, r.TitleTemplate, r.Description, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
+		`INSERT INTO goal (id,title,description,domain_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
+		 VALUES (?,?,?,?,?,?,'active','','system',?,?)`,
+		goalID, r.TitleTemplate, r.Description, r.DomainID, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
 		log.Printf("daemon: schedule %s insert goal: %v", r.ScheduleID, err)
 		return
 	}

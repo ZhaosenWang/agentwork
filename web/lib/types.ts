@@ -159,7 +159,7 @@ export type WSTopic =
   | "goal:retrying" | "goal:retry_failed" | "goal:waiting" | "goal:deleted"
   | "goal:reviewing" | "goal:approved" | "goal:review_resolved"
   | "goal:delivered" | "goal:deliver_failed"
-  | "run:enqueued" | "run:coalesced" | "run:discarded" | "run:event"
+  | "run:enqueued" | "run:coalesced" | "run:discarded" | "run:event" | "run:cancelled"
   | "comment:created"
   | "agent:created" | "agent:deleted"
   | "squad:created" | "squad:deleted" | "squad:member_added"
