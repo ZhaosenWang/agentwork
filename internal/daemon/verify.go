@@ -26,7 +26,10 @@ func commitRunChanges(ctx context.Context, workdir, identity string) error {
 	if strings.TrimSpace(status) == "" {
 		return nil // clean — nothing to commit
 	}
-	if _, err := gitRun(ctx, workdir, "add", "-A"); err != nil {
+	// AGENTS.md is the daemon-injected coordination guide (per-run content);
+	// it must never enter the goal's commits. The pathspec exclude keeps it
+	// out of git add -A without touching the repo's .gitignore.
+	if _, err := gitRun(ctx, workdir, "add", "-A", "--", ".", ":(exclude)AGENTS.md"); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}
 	name, email := "agentwork[bot]", "agentwork@local"

@@ -236,6 +236,13 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 	default:
 		return nil, NewValidationError("assignee_type must be agent, squad, or human")
 	}
+	// v2: a goal handed to an agent/squad must belong to a domain — the domain
+	// owns the worktree and the acceptance policy. Assigning a domain-less
+	// goal to an agent would produce a run with no worktree, no verification,
+	// and no deliver (the scratch-dir dead path).
+	if assigneeType != "human" && g.DomainID == "" {
+		return nil, NewValidationError("cannot assign to agent/squad: the goal has no domain (attach a domain first)")
+	}
 
 	if _, err := s.st.DB().ExecContext(ctx,
 		`UPDATE goal SET assignee_type=?, assignee_id=?, handoff_note=? WHERE id=?`,
@@ -491,7 +498,7 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 			break // goal is blocked (waiting children) — leave for the wake
 		}
 		if g.ParentID != "" {
-			if err := s.wakeParentIfReadyInTx(ctx, tx, g.ParentID); err != nil {
+			if err := s.wakeParentIfReadyInTx(ctx, tx, g.ParentID, &pendingEvents); err != nil {
 				return fmt.Errorf("wake parent: %w", err)
 			}
 		}
@@ -647,6 +654,7 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 		return nil, fmt.Errorf("load goal: %w", err)
 	}
 
+	var deliverEvents []events.Event
 	event := "goal:deliver_failed"
 	if success {
 		// M0 simplification: a delivered goal is done regardless of children
@@ -658,7 +666,7 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 		}
 		event = "goal:delivered"
 		if parentID.Valid && parentID.String != "" {
-			if err := s.wakeParentIfReadyInTx(ctx, tx, parentID.String); err != nil {
+			if err := s.wakeParentIfReadyInTx(ctx, tx, parentID.String, &deliverEvents); err != nil {
 				return nil, fmt.Errorf("wake parent: %w", err)
 			}
 		}
@@ -674,6 +682,10 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 	s.bus.Publish(ctx, events.Event{Topic: event, Payload: map[string]any{
 		"goal_id": goalID, "note": note,
 	}})
+	// The wake's run events, published after commit (invariant 13).
+	for _, e := range deliverEvents {
+		s.bus.Publish(ctx, e)
+	}
 	return s.Get(ctx, goalID)
 }
 
@@ -700,7 +712,10 @@ func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []event
 // parent's current assignee with a wakeup note summarising the children.
 // Guarded by `WHERE status='blocked'` so a concurrent wake bails (double-wake
 // prevention). Per DESIGN.zh.md §5.2 (dynamic wait set).
-func (s *GoalService) wakeParentIfReadyInTx(ctx context.Context, tx *sql.Tx, parentID string) error {
+// wakeParentIfReadyInTx wakes a blocked parent once all its children are
+// terminal. evs collects the run events produced by the wake's enqueue —
+// the caller publishes them after its own commit (invariant 13).
+func (s *GoalService) wakeParentIfReadyInTx(ctx context.Context, tx *sql.Tx, parentID string, evs *[]events.Event) error {
 	var parentStatus, assigneeType, assigneeID string
 	var wakeCount int
 	err := tx.QueryRowContext(ctx,
@@ -759,18 +774,27 @@ func (s *GoalService) wakeParentIfReadyInTx(ctx context.Context, tx *sql.Tx, par
 	// Enqueue the parent's run in THIS tx (blocked→active + enqueue must be
 	// one atomic operation, or two parallel child-dones could double-enqueue
 	// the parent). The coalesce check inside EnqueueExistingTx sees this tx's
-	// un-committed state.
+	// un-committed state. The returned run event is collected for the caller
+	// to publish after its commit (invariant 13).
 	if assigneeType == "agent" {
-		if _, err := s.runSvc.EnqueueExistingTx(ctx, tx, parentID, assigneeID, 1, false, ""); err != nil {
+		_, ev, err := s.runSvc.EnqueueExistingTx(ctx, tx, parentID, assigneeID, 1, false, "")
+		if err != nil {
 			return fmt.Errorf("enqueue woke parent: %w", err)
+		}
+		if ev != nil {
+			*evs = append(*evs, *ev)
 		}
 	} else { // squad: woken run is a leader run on the squad's current leader
 		var leaderID string
 		if err := tx.QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, assigneeID).Scan(&leaderID); err != nil {
 			return fmt.Errorf("load squad leader for wake: %w", err)
 		}
-		if _, err := s.runSvc.EnqueueExistingTx(ctx, tx, parentID, leaderID, 1, true, assigneeID); err != nil {
+		_, ev, err := s.runSvc.EnqueueExistingTx(ctx, tx, parentID, leaderID, 1, true, assigneeID)
+		if err != nil {
 			return fmt.Errorf("enqueue woke leader: %w", err)
+		}
+		if ev != nil {
+			*evs = append(*evs, *ev)
 		}
 	}
 	return nil
@@ -795,15 +819,23 @@ func (s *GoalService) NotifyChildDone(ctx context.Context, childGoalID string) e
 	}
 	// The authoritative guard runs inside the transaction in
 	// wakeParentIfReadyInTx.
+	var notifyEvents []events.Event
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := s.wakeParentIfReadyInTx(ctx, tx, parentID.String); err != nil {
+	if err := s.wakeParentIfReadyInTx(ctx, tx, parentID.String, &notifyEvents); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// Publish the wake's run events only after commit (invariant 13).
+	for _, e := range notifyEvents {
+		s.bus.Publish(ctx, e)
+	}
+	return nil
 }
 
 // WakeupParentIfReady is a public alias preserved for callers that name it the

@@ -75,15 +75,8 @@ type Connector struct {
 
 	store   SettingsStore
 	bus     *events.Bus
-	client  *larkClientHolder // the live SDK client + ws (built on connect)
 	notify  *Notifier         // milestone pusher, armed once connected
 	stop    context.CancelFunc
-}
-
-// larkClientHolder keeps the long-connection resources for the current
-// config (rebuilt on reconnect).
-type larkClientHolder struct {
-	ws *larkws.Client
 }
 
 // NewConnector creates the connection manager. store persists the Feishu

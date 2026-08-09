@@ -15,6 +15,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -84,6 +85,7 @@ type Daemon struct {
 	mu          sync.Mutex
 	workers     map[string]*agentWorker // agentID → per-agent scheduler
 	domainLocks map[string]*domainLock  // per-domain git lock (fetch + deliver)
+	msgBuffers  map[string]*msgBuffer   // runID → aggregated text row (persistEvent)
 	stopped     bool
 	ctx         context.Context
 }
@@ -105,7 +107,8 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		st: st, bus: bus, addr: addr,
 		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
-		workers: make(map[string]*agentWorker),
+		workers:    make(map[string]*agentWorker),
+		msgBuffers: make(map[string]*msgBuffer),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
@@ -482,6 +485,19 @@ func mustGitRun(ctx context.Context, dir string, args ...string) string {
 	return strings.TrimSpace(out)
 }
 
+// insertFiredGoal inserts the schedule-fired goal row inside the caller's
+// transaction. Extracted as its own function because its column/value
+// mapping regressed twice (excess VALUES were silently accepted and wrote
+// 'active' into assignee_id with status left empty) — the regression test
+// calls THIS, not a copy.
+func insertFiredGoal(ctx context.Context, tx *sql.Tx, goalID, title, desc, domainID, assigneeType, assigneeID, scheduleID, ts string) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO goal (id,title,description,domain_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
+		 VALUES (?,?,?,?,?,?,'active','','system',?,?)`,
+		goalID, title, desc, domainID, assigneeType, assigneeID, scheduleID, ts)
+	return err
+}
+
 // ── worktree lifecycle (M1) ──
 
 // cleanupWorktrees removes worktrees of goals that reached a terminal state
@@ -564,18 +580,16 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 
 	d.ensureWorker(q.AgentID, maxConcurrent)
 
-	// Working directory (DESIGN.v2.md §6): with a domain the run works in the
-	// goal's worktree — lazily allocated on first run, reused on later runs of
-	// the same goal (this is what makes checkpoint resume work: the file state
-	// is physically still there). Without a domain (human/backlog goals) the
-	// run gets a scratch dir.
-	var runRowWorkdir string
-	if domainID != "" {
-		runRowWorkdir, err = d.ensureGoalWorktree(ctx, domainID, q.GoalID, gitURL, defaultBranch)
-	} else {
-		runRowWorkdir = filepath.Join(workspaceRoot(), "scratch", q.RunID)
-		err = os.MkdirAll(runRowWorkdir, 0o755)
+	// Working directory (DESIGN.v2.md §6): the run works in the goal's
+	// worktree — lazily allocated on first run, reused on later runs of the
+	// same goal (this is what makes checkpoint resume work: the file state is
+	// physically still there). Every agent-executed run belongs to a domain
+	// (Create and Assign enforce it), so there is no scratch fallback.
+	if domainID == "" {
+		d.failRun(ctx, q, "run's goal has no domain — cannot allocate a worktree")
+		return
 	}
+	runRowWorkdir, err := d.ensureGoalWorktree(ctx, domainID, q.GoalID, gitURL, defaultBranch)
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
 		return
@@ -704,6 +718,9 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	if !ok {
 		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
 	}
+	// The event stream is done — flush the aggregated text buffer so the last
+	// message of the turn is persisted (persistEvent aggregates per-role).
+	d.flushRunMessages(ctx, q.RunID)
 	switch result.Status {
 	case proto.StatusCompleted:
 		// The handoff/wakeup note is consumed by the goal layer (ReconcileOnRunEnd
@@ -748,10 +765,23 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		}
 		d.finishRunOK(ctx, q, result.Output)
 	case proto.StatusCancelled:
+		// decision 2-6 + the "stuck active with no run" hole: a cancelled run
+		// does NOT fail the goal, but it also must not silently leave the goal
+		// orphaned — retry once (attempt-bounded, so repeated stalls surface
+		// instead of looping). If retries are exhausted, the goal stays active
+		// and the notification below tells the owner to take over.
+		if q.Attempt < maxAttempts {
+			var isLeader int
+			var squadID string
+			_ = d.st.DB().QueryRowContext(ctx, `SELECT is_leader_run, squad_id FROM run WHERE id=?`, q.RunID).Scan(&isLeader, &squadID)
+			if err := d.runSvc.EnqueueExisting(ctx, q.GoalID, q.AgentID, q.Attempt+1, isLeader != 0, squadID); err != nil {
+				log.Printf("daemon: requeue cancelled run %s: %v", q.RunID, err)
+			}
+		}
 		d.finishRun(ctx, q, "cancelled", "idle watchdog: "+result.Output)
-		// Cancelled runs leave the goal active with no pending run (decision
-		// 2-6: the human decides) — surface it so the notify layer can tell
-		// the owner a task stalled.
+		// Surface the stall so the notify layer can tell the owner a task
+		// stalled (cancelled runs leave the goal active with no pending run —
+		// the human decides, per decision 2-6).
 		d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
 			"run_id": q.RunID, "goal_id": q.GoalID, "reason": "idle watchdog: " + result.Output,
 		}})
@@ -854,6 +884,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	if !ok {
 		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
 	}
+	d.flushRunMessages(ctx, q.RunID)
 	switch result.Status {
 	case proto.StatusCompleted:
 		// Read the compiled policy from the run workdir (file = structured
@@ -933,18 +964,64 @@ func (d *Daemon) trackToolInflight(n *atomic.Int32, ev proto.Event) {
 	}
 }
 
+// persistEvent stores one protocol event into chat_message (the run detail
+// view's data source). Consecutive text/thought chunks from the same role
+// are AGGREGATED into one row (an ACP stream emits per-token chunks — a raw
+// per-chunk insert produced 20k+ rows per run and destroyed transcript
+// replay quality); tool events flush the pending buffer first.
 func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event) {
-	role := "assistant"
-	content := ev.Text
-	toolCalls := "[]"
-	if ev.Type == proto.EventThought {
-		role = "thought"
-	} else if ev.Type == proto.EventToolUse || ev.Type == proto.EventToolResult {
-		role = "tool"
-		content = ""
+	switch ev.Type {
+	case proto.EventMessage, proto.EventThought:
+		role := "assistant"
+		if ev.Type == proto.EventThought {
+			role = "thought"
+		}
+		d.mu.Lock()
+		b := d.msgBuffers[runID]
+		if b == nil || b.role != role {
+			d.flushMsgBuffer(ctx, runID)
+			b = &msgBuffer{role: role}
+			d.msgBuffers[runID] = b
+		}
+		b.content += ev.Text
+		d.mu.Unlock()
+	case proto.EventToolUse, proto.EventToolResult:
+		d.mu.Lock()
+		d.flushMsgBuffer(ctx, runID)
+		d.mu.Unlock()
 		tc, _ := json.Marshal(ev)
-		toolCalls = string(tc)
+		d.insertChatMessage(ctx, runID, "tool", "", string(tc))
+	default:
+		d.insertChatMessage(ctx, runID, "assistant", ev.Text, "[]")
 	}
+}
+
+// msgBuffer is the pending aggregated text row for a run (see persistEvent).
+type msgBuffer struct {
+	role    string
+	content string
+}
+
+// flushMsgBuffer writes the pending aggregated text row (if any) for a run.
+// Caller holds d.mu.
+func (d *Daemon) flushMsgBuffer(ctx context.Context, runID string) {
+	b := d.msgBuffers[runID]
+	if b == nil || b.content == "" {
+		return
+	}
+	d.insertChatMessage(ctx, runID, b.role, b.content, "[]")
+	delete(d.msgBuffers, runID)
+}
+
+// flushRunMessages flushes and forgets a run's pending buffer (run end).
+func (d *Daemon) flushRunMessages(ctx context.Context, runID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.flushMsgBuffer(ctx, runID)
+	delete(d.msgBuffers, runID)
+}
+
+func (d *Daemon) insertChatMessage(ctx context.Context, runID, role, content, toolCalls string) {
 	if _, err := d.st.DB().ExecContext(ctx,
 		`INSERT INTO chat_message (id, run_id, role, content, tool_calls, created_at) VALUES (?,?,?,?,?,?)`,
 		uuid.NewString(), runID, role, content, toolCalls, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
@@ -1198,10 +1275,7 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 	// assignee_type,assignee_id as parameters; status='active',
 	// handoff_note='', created_by_type='system' literal; created_by_id=
 	// schedule id, created_at=ts as parameters.
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO goal (id,title,description,domain_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
-		 VALUES (?,?,?,?,?,?,'active','','system',?,?)`,
-		goalID, r.TitleTemplate, r.Description, r.DomainID, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
+	if err := insertFiredGoal(ctx, tx, goalID, r.TitleTemplate, r.Description, r.DomainID, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
 		log.Printf("daemon: schedule %s insert goal: %v", r.ScheduleID, err)
 		return
 	}

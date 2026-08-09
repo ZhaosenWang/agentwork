@@ -38,15 +38,20 @@ func TestFireScheduleGoalInsert(t *testing.T) {
 		t.Fatalf("domain: %v", err)
 	}
 
-	// The exact INSERT fireSchedule runs, with its exact parameters.
+	// fireSchedule's own goal-insert function (regression: the column/value
+	// mapping was copied into tests before and drifted twice).
 	goalID := "test-goal-id"
 	ts := "2026-08-09T00:00:00Z"
 	scheduleID := "test-schedule-id"
-	if _, err := st.DB().ExecContext(ctx,
-		`INSERT INTO goal (id,title,description,domain_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
-		 VALUES (?,?,?,?,?,?,'active','','system',?,?)`,
-		goalID, "t", "d", domain.ID, "agent", agent.ID, scheduleID, ts); err != nil {
-		t.Fatalf("fireSchedule insert: %v", err)
+	tx, err := st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := insertFiredGoal(ctx, tx, goalID, "t", "d", domain.ID, "agent", agent.ID, scheduleID, ts); err != nil {
+		t.Fatalf("insertFiredGoal: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
 	}
 
 	// The fired goal must be dispatchable: correct assignee + active status.

@@ -238,13 +238,11 @@ func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attemp
 
 // EnqueueExistingTx is the same-package atomic variant for a caller that
 // already holds a transaction (e.g. the parent-wake path in GoalService, which
-// flips blocked→active and enqueues in one tx). The run event is NOT
-// published here — the caller's tx owns the publish-after-commit contract
-// (goal-layer events cover the wake; the run event for this path is a known
-// M2 refinement).
-func (s *RunService) EnqueueExistingTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID string) (*Run, error) {
-	r, _, err := s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, "")
-	return r, err
+// flips blocked→active and enqueues in one tx). The run event is RETURNED —
+// the caller's tx owns the publish-after-commit contract and publishes after
+// its commit (invariant 13).
+func (s *RunService) EnqueueExistingTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID string) (*Run, *events.Event, error) {
+	return s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, "")
 }
 
 // ClaimedRow is a claimed run row handed to the daemon's runTask.
