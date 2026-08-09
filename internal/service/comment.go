@@ -80,13 +80,16 @@ func HasMentionAll(content string) bool {
 	return false
 }
 
-// Create persists a comment and dispatches any agent/squad mentions it carries.
-// Per DESIGN.zh.md §5.3:
-//   - @all → suppress auto-trigger (no run enqueued); humans notified later.
-//   - mention://agent/<id> → enqueue a new run on that agent (same goal,
-//     different agent), does NOT cancel the current assignee's in-flight run.
-//   - mention://squad/<id> → route to the squad's leader (leader run).
-//   - mention://human/<id> → just renders a link.
+// Create persists a comment and dispatches agent/squad mentions.
+//
+// Mention dispatch matrix (agent vs human author):
+//
+//	Agent @mentions another agent → HANDOFF (reassign goal + system comment + run)
+//	Agent @mentions self           → guest run only (coalesce)
+//	Human @mentions an agent       → guest run only (ask a question, keep owner)
+//	Agent/Human @mentions squad    → leader run (handoff if agent-initiated)
+//	Human mentions                 → render link only
+//	@all                           → suppress all triggers
 func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error) {
 	if c.GoalID == "" {
 		return nil, NewValidationError("goal_id is required")
@@ -129,27 +132,43 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 
 	s.bus.Publish(ctx, events.Event{Topic: "comment:created", Payload: c})
 
-	// Dispatch mentions AFTER the comment is durably stored. @all suppresses
-	// auto-trigger entirely (no runs); other mentions enqueue runs.
 	if HasMentionAll(c.Content) {
-		// @all: notify humans only (TBD: no inbox in MVP) and suppress triggers.
 		return &c, nil
 	}
-	for _, m := range ParseMentions(c.Content) {
+
+	mentions := ParseMentions(c.Content)
+	handoffDone := false
+	currentGoal, _ := s.goalSvc.Get(ctx, c.GoalID) // best-effort; nil means no handoff possible
+
+	for _, m := range mentions {
 		switch m.Type {
 		case "agent":
 			if s.runSvc == nil {
 				continue
 			}
+			// Agent-initiated mention to a DIFFERENT agent → handoff
+			if c.AuthorType == "agent" && !handoffDone && currentGoal != nil &&
+				(currentGoal.AssigneeType != "agent" || currentGoal.AssigneeID != m.ID) {
+				if err := s.performHandoff(ctx, c, currentGoal, "agent", m.ID); err == nil {
+					handoffDone = true
+				}
+				continue
+			}
+			// Human-initiated mention, self-mention, or subsequent mention → guest run
 			if _, e := s.runSvc.EnqueueForMention(ctx, c.GoalID, m.ID, c.ID); e != nil {
-				// A bad/unknown agent UUID → drop, don't fail the whole comment.
 				continue
 			}
 		case "squad":
 			if s.runSvc == nil {
 				continue
 			}
-			// Route to the squad's leader as a leader run.
+			if c.AuthorType == "agent" && !handoffDone && currentGoal != nil &&
+				(currentGoal.AssigneeType != "squad" || currentGoal.AssigneeID != m.ID) {
+				if err := s.performSquadHandoff(ctx, c, currentGoal, m.ID); err == nil {
+					handoffDone = true
+				}
+				continue
+			}
 			if e := s.enqueueLeaderRunForMention(ctx, m.ID, c.GoalID, c.ID); e != nil {
 				continue
 			}
@@ -158,6 +177,70 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 		}
 	}
 	return &c, nil
+}
+
+// performHandoff reassigns the goal + posts a system comment + enqueues a run.
+func (s *CommentService) performHandoff(ctx context.Context, c Comment, current *Goal, newType, newID string) error {
+	// 1. Change the goal's assignee
+	if _, err := s.goalSvc.Assign(ctx, c.GoalID, newType, newID, ""); err != nil {
+		return err
+	}
+	// 2. Post a system comment recording the handoff
+	content := fmt.Sprintf("Handoff: %s/%s → %s/%s (via @mention by %s/%s)",
+		current.AssigneeType, current.AssigneeID, newType, newID,
+		c.AuthorType, c.AuthorID)
+	if err := s.insertSystemComment(ctx, c.GoalID, content); err != nil {
+		return err
+	}
+	// 3. Enqueue a run for the new assignee
+	if newType == "agent" {
+		_, err := s.runSvc.EnqueueForMention(ctx, c.GoalID, newID, c.ID)
+		return err
+	}
+	return s.enqueueLeaderRunForMention(ctx, c.GoalID, newID, c.ID)
+}
+
+// performSquadHandoff is the squad variant of performHandoff.
+func (s *CommentService) performSquadHandoff(ctx context.Context, c Comment, current *Goal, squadID string) error {
+	if _, err := s.goalSvc.Assign(ctx, c.GoalID, "squad", squadID, ""); err != nil {
+		return err
+	}
+	content := fmt.Sprintf("Handoff: %s/%s → squad/%s (via @mention by %s/%s)",
+		current.AssigneeType, current.AssigneeID, squadID,
+		c.AuthorType, c.AuthorID)
+	if err := s.insertSystemComment(ctx, c.GoalID, content); err != nil {
+		return err
+	}
+	return s.enqueueLeaderRunForMention(ctx, c.GoalID, squadID, c.ID)
+}
+
+// insertSystemComment directly inserts a system-authored comment (avoids
+// calling Create recursively).
+func (s *CommentService) insertSystemComment(ctx context.Context, goalID, content string) error {
+	c := Comment{
+		ID: newID(), GoalID: goalID, AuthorType: "system", AuthorID: "",
+		Content: content, CreatedAt: now(),
+	}
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,?,?,?)`,
+		c.ID, c.GoalID, c.AuthorType, c.AuthorID, nil, c.Content, c.CreatedAt); err != nil {
+		return fmt.Errorf("insert system comment: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,?,?,?)`,
+		newID(), goalID, "system", "", "commented", "{}", c.CreatedAt); err != nil {
+		return fmt.Errorf("insert activity: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "comment:created", Payload: c})
+	return nil
 }
 
 // enqueueLeaderRunForMention resolves a squad's leader and enqueues a leader

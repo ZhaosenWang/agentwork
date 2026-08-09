@@ -1,8 +1,8 @@
 // agentwork-cli is the agent-side tool. daemon injects it into the agent
 // subprocess's PATH plus AGENTWORK_SERVER_URL / AGENTWORK_GOAL_ID /
 // AGENTWORK_RUN_ID / AGENTWORK_AGENT_ID env vars, so the agent can call it to
-// produce structured side effects (assign/handoff, create sub-goal, comment,
-// wait-children) against the agentwork HTTP API. CLI-as-tool, like multica §4.
+// produce structured side effects (handoff via @mention, goal done/fail,
+// comment) against the agentwork HTTP API. CLI-as-tool.
 package main
 
 import (
@@ -58,13 +58,13 @@ func usage() {
 Subcommands:
   goal list                                 list all goals (JSON)
   goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
-  goal create --title T [--description D] [--assignee A] [--parent P] [--status S]
-                                             create a sub-goal (parent defaults to current goal)
+  goal create --title T [--description D] [--assignee A] [--status S]
+                                             create a new goal
   goal comment --text T [--role R]           post a comment on the current goal; --text may
                                              contain a structured mention [@Name](mention://agent/<id>)
-                                             to enqueue a run on that agent
-  goal wait                                  mark the current goal as waiting for its sub-goals;
-                                             the daemon re-runs it once all children finish
+                                             to hand off work to that agent
+  goal done --summary S                      mark the current goal as done; posts a system comment
+  goal fail --summary S                      mark the current goal as failed; posts a system comment
   agent list                                 list all agents (JSON)
   squad list                                 list all squads (JSON)
 
@@ -79,7 +79,7 @@ Environment (injected by daemon):
 
 func goalCmd(serverURL, goalID, agentID string, args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork-cli goal <list|assign|create|comment|wait>")
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli goal <list|assign|create|comment|done|fail>")
 		os.Exit(2)
 	}
 	switch args[0] {
@@ -91,8 +91,10 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 		goalCreate(serverURL, goalID, agentID, args[1:])
 	case "comment":
 		goalComment(serverURL, goalID, args[1:])
-	case "wait":
-		goalWait(serverURL, goalID, args[1:])
+	case "done":
+		goalDone(serverURL, goalID, agentID, args[1:])
+	case "fail":
+		goalFail(serverURL, goalID, agentID, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown goal subcommand %q\n", args[0])
 		os.Exit(2)
@@ -119,7 +121,6 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	title := fs.String("title", "", "goal title (required)")
 	description := fs.String("description", "", "goal description (the work to do)")
 	assignee := fs.String("assignee", "", "assignee agent id (defaults to current agent)")
-	parent := fs.String("parent", "", "parent goal id (defaults to current goal)")
 	status := fs.String("status", "active", "goal status")
 	fs.Parse(args)
 	if *title == "" {
@@ -131,15 +132,11 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	if *assignee == "" {
 		fail("--assignee is required (or AGENTWORK_AGENT_ID must be set)")
 	}
-	if *parent == "" {
-		*parent = goalID
-	}
 	body := map[string]string{
 		"title":           *title,
 		"description":     *description,
 		"assignee_type":  "agent",
 		"assignee_id":    *assignee,
-		"parent_id":      *parent,
 		"status":         *status,
 		"created_by_type": "agent",
 		"created_by_id":  agentID,
@@ -162,11 +159,38 @@ func goalComment(serverURL, goalID string, args []string) {
 	post(serverURL+"/goals/"+goalID+"/comments", body)
 }
 
-func goalWait(serverURL, goalID string, args []string) {
+func goalDone(serverURL, goalID, agentID string, args []string) {
+	fs := flag.NewFlagSet("goal done", flag.ExitOnError)
+	summary := fs.String("summary", "", "summary of what was accomplished (required)")
+	fs.Parse(args)
+	if *summary == "" {
+		fail("--summary is required")
+	}
 	if goalID == "" {
 		fail("AGENTWORK_GOAL_ID not set")
 	}
-	postNoBody(serverURL+"/goals/"+goalID+"/wait", nil)
+	if agentID == "" {
+		fail("AGENTWORK_AGENT_ID not set")
+	}
+	body := map[string]string{"agent_id": agentID, "summary": *summary}
+	postNoBody(serverURL+"/goals/"+goalID+"/done", body)
+}
+
+func goalFail(serverURL, goalID, agentID string, args []string) {
+	fs := flag.NewFlagSet("goal fail", flag.ExitOnError)
+	summary := fs.String("summary", "", "reason for failure (required)")
+	fs.Parse(args)
+	if *summary == "" {
+		fail("--summary is required")
+	}
+	if goalID == "" {
+		fail("AGENTWORK_GOAL_ID not set")
+	}
+	if agentID == "" {
+		fail("AGENTWORK_AGENT_ID not set")
+	}
+	body := map[string]string{"agent_id": agentID, "summary": *summary}
+	postNoBody(serverURL+"/goals/"+goalID+"/fail", body)
 }
 
 // ── agent / squad ──

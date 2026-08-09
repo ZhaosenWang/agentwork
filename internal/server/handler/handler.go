@@ -37,7 +37,8 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /goals/{id}", h.deleteGoal)
 	mux.HandleFunc("POST /goals/{id}/assign", h.assignGoal)
 	mux.HandleFunc("POST /goals/{id}/cancel", h.cancelGoal)
-	mux.HandleFunc("POST /goals/{id}/wait", h.waitGoal)
+	mux.HandleFunc("POST /goals/{id}/done", h.doneGoal)
+	mux.HandleFunc("POST /goals/{id}/fail", h.failGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
@@ -170,8 +171,31 @@ func (h *Handlers) cancelGoal(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Goal.Cancel(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
 }
-func (h *Handlers) waitGoal(w http.ResponseWriter, r *http.Request) {
-	if err := h.Goal.WaitChildren(r.Context(), r.PathValue("id")); err != nil {
+func (h *Handlers) doneGoal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AgentID string `json:"agent_id"`
+		Summary string `json:"summary"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Goal.MarkDone(r.Context(), r.PathValue("id"), body.AgentID, body.Summary); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+func (h *Handlers) failGoal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AgentID string `json:"agent_id"`
+		Summary string `json:"summary"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Goal.MarkFailed(r.Context(), r.PathValue("id"), body.AgentID, body.Summary); err != nil {
 		writeJSON(w, nil, err)
 		return
 	}

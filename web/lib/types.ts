@@ -28,7 +28,6 @@ export interface Agent {
 export type GoalStatus =
   | "backlog"
   | "active"
-  | "blocked"
   | "done"
   | "failed"
   | "cancelled";
@@ -37,7 +36,6 @@ export interface Goal {
   id: string;
   title: string;
   description: string;
-  parent_id: string;
   assignee_type: string; // agent | squad | human
   assignee_id: string;
   status: GoalStatus;
@@ -113,7 +111,7 @@ export interface Schedule {
 // WS event shape from the hub: {"topic":"goal:created","payload":{...}}
 export type WSTopic =
   | "goal:created" | "goal:assigned" | "goal:finished"
-  | "goal:retrying" | "goal:retry_failed" | "goal:waiting" | "goal:deleted"
+  | "goal:retrying" | "goal:retry_failed" | "goal:deleted"
   | "run:enqueued" | "run:coalesced" | "run:discarded" | "run:event"
   | "comment:created"
   | "agent:created" | "agent:deleted"

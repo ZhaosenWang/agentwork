@@ -14,7 +14,7 @@ import (
 
 // Squad is a routing group: it does no work itself. Assigning a goal to a
 // squad or @mentioning a squad routes only to its leader agent, who delegates
-// by assigning sub-goals. See DESIGN.zh.md §5.4. The leader must be an agent;
+// by handing off work to members. See DESIGN.zh.md §5.4. The leader must be an agent;
 // squads cannot nest.
 type Squad struct {
 	ID           string `json:"id"`
@@ -288,17 +288,17 @@ func (s *SquadService) agentName(ctx context.Context, agentID string) string {
 // (briefing injection vs. status authority — DESIGN.zh.md §5.4 + multica
 // squad_briefing.go). Wording is plain so it's easy to tune.
 
-const squadOperatingProtocolHeader = `You are the LEADER of a squad. Work flows through you: dispatch to teammates by
-assigning sub-goals to the member whose role best matches the work, do not do
-it all yourself. Members are NOT auto-fanned-out; you delegate explicitly.
+const squadOperatingProtocolHeader = `You are the LEADER of a squad. Work flows through you: hand off work to
+teammates by @mentioning them in comments or using goal assign. Members are NOT
+auto-fanned-out; you delegate explicitly.
 `
 
-const squadParentStatusOwned = `You own this goal's status. When the overall objective is achieved, move it to
-done. Dispatching members toward sub-work is not completion — only push the
-parent to done once the whole objective is met.
+const squadParentStatusOwned = `You own this goal's status. When the overall objective is achieved, mark it
+done with: agentwork-cli goal done --summary "..." . Handing off to members
+is not completion — only push the goal to done once the whole objective is met.
 `
 
 const squadParentStatusNotOwned = `You were @mentioned to help on a goal someone else owns. Do NOT change this
-goal's status — advise or delegate by creating sub-goals, but leave status
-changes to the owner.
+goal's status — advise or help via comments, but leave status changes to the
+owner.
 `

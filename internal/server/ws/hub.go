@@ -19,7 +19,7 @@ import (
 // frontend.
 var topics = []string{
 	"goal:created", "goal:assigned", "goal:finished", "goal:retrying", "goal:retry_failed",
-	"goal:waiting", "goal:deleted",
+	"goal:deleted",
 	"run:enqueued", "run:coalesced", "run:discarded", "run:event",
 	"comment:created",
 	"agent:created", "agent:deleted",

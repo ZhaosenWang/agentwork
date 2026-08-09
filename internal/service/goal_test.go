@@ -183,153 +183,144 @@ func TestCancelNotClobbered(t *testing.T) {
 	}
 }
 
-// TestSubGoalCoordination: parent waits on children; when all children finish,
-// the parent is woken (re-queued) with a wakeup note. Proves the dynamic
-// wait-set + child→parent notification path.
-func TestSubGoalCoordination(t *testing.T) {
-	gs, rs, _, st := newTestCluster(t)
+// TestAgentMentionTriggersHandoff: Agent A @mentions Agent B in a comment →
+// goal assignee changes to B, a system comment is posted, and a run is enqueued for B.
+func TestAgentMentionTriggersHandoff(t *testing.T) {
+	_, _, cs, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
-	pr := enqueueFirst(t, rs, parent)
-	c1, _ := gs.Create(ctx, Goal{Title: "child1", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
-	c2, _ := gs.Create(ctx, Goal{Title: "child2", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
-	_ = enqueueFirst(t, rs, c1)
-	_ = enqueueFirst(t, rs, c2)
-	if err := gs.WaitChildren(ctx, parent.ID); err != nil {
-		t.Fatalf("wait: %v", err)
+	agentB := seedAgent(t, st, "B")
+	gs := &GoalService{st: st, bus: events.NewBus()}
+	rs := &RunService{st: st, bus: events.NewBus()}
+	gs.SetRunService(rs)
+	rs.SetGoalService(gs)
+	cs.SetRunService(rs)
+	cs.SetGoalService(gs)
+
+	// Agent A owns the active goal
+	g, err := gs.Create(ctx, Goal{Title: "handoff-test", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
 	}
-	// The parent's first run ends (it called wait). It should NOT advance the
-	// goal — the goal is blocked.
-	if err := rs.Finish(ctx, pr.ID, "completed", "parent spawned children"); err != nil {
-		t.Fatalf("finish parent run1: %v", err)
-	}
-	pAfter, _ := gs.Get(ctx, parent.ID)
-	if pAfter.Status != "blocked" {
-		t.Fatalf("parent should be blocked, got %q", pAfter.Status)
+	_ = enqueueFirst(t, rs, g)
+
+	// Agent A posts a comment @mentioning Agent B
+	_, err = cs.Create(ctx, Comment{
+		GoalID: g.ID, AuthorType: "agent", AuthorID: agentA,
+		Content: "[@B](mention://agent/" + agentB + ") please take over",
+	})
+	if err != nil {
+		t.Fatalf("create comment: %v", err)
 	}
 
-	// Children complete. The LAST child's completion should wake the parent.
-	rc1 := enqueueFirst(t, rs, c1)
-	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-	if err := rs.Finish(ctx, rc1.ID, "completed", "c1 done"); err != nil {
-		t.Fatalf("finish c1: %v", err)
-	}
-	// c2 still inflight → parent should NOT wake yet.
-	pAfter, _ = gs.Get(ctx, parent.ID)
-	if pAfter.Status != "blocked" {
-		t.Fatalf("parent should still be blocked (c2 inflight), got %q", pAfter.Status)
+	// Verify goal was reassigned to B
+	after, _ := gs.Get(ctx, g.ID)
+	if after.AssigneeID != agentB {
+		t.Fatalf("goal should be reassigned to B, got %q", after.AssigneeID)
 	}
 
-	rc2 := enqueueFirst(t, rs, c2)
-	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
-		t.Fatalf("claim c2: %v", err)
+	// Verify a system comment was posted
+	comments, _ := cs.List(ctx, g.ID)
+	found := false
+	for _, c := range comments {
+		if c.AuthorType == "system" && len(c.Content) > 0 {
+			found = true
+			break
+		}
 	}
-	if err := rs.Finish(ctx, rc2.ID, "completed", "c2 done"); err != nil {
-		t.Fatalf("finish c2: %v", err)
-	}
-
-	// Now all children terminal → parent woken: status active + a new run queued.
-	pAfter, _ = gs.Get(ctx, parent.ID)
-	if pAfter.Status != "active" {
-		t.Fatalf("parent should be woken to active, got %q", pAfter.Status)
-	}
-	runs, _ := rs.List(ctx, parent.ID)
-	if len(runs) < 2 {
-		t.Fatalf("parent should have a second (wakeup) run; got %d runs", len(runs))
-	}
-	if pAfter.HandoffNote == "" {
-		t.Fatalf("parent should carry a wakeup note")
+	if !found {
+		t.Fatal("expected a system comment recording the handoff")
 	}
 }
 
-// TestCoalescePending: enqueuing a second run for the same (goal,agent) while
-// one is pending coalesces — exactly one queued/running run per pair.
-func TestCoalescePending(t *testing.T) {
+// TestHumanMentionDoesNotHandoff: Human @mentions an agent → assignee unchanged, guest run only.
+func TestHumanMentionDoesNotHandoff(t *testing.T) {
+	_, _, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	agentB := seedAgent(t, st, "B")
+	gs := &GoalService{st: st, bus: events.NewBus()}
+	rs := &RunService{st: st, bus: events.NewBus()}
+	gs.SetRunService(rs)
+	rs.SetGoalService(gs)
+	cs.SetRunService(rs)
+	cs.SetGoalService(gs)
+
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	_ = enqueueFirst(t, rs, g)
+
+	// Human posts a comment @mentioning Agent B
+	_, err := cs.Create(ctx, Comment{
+		GoalID: g.ID, AuthorType: "human", AuthorID: "",
+		Content: "[@B](mention://agent/" + agentB + ") what does this return?",
+	})
+	if err != nil {
+		t.Fatalf("create comment: %v", err)
+	}
+
+	after, _ := gs.Get(ctx, g.ID)
+	if after.AssigneeID != agentA {
+		t.Fatalf("human mention must not change assignee; expected A, got %q", after.AssigneeID)
+	}
+}
+
+// TestSelfMentionDoesNotHandoff: Agent A @mentions A → no reassign, just coalesce.
+func TestSelfMentionDoesNotHandoff(t *testing.T) {
+	_, _, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	gs := &GoalService{st: st, bus: events.NewBus()}
+	rs := &RunService{st: st, bus: events.NewBus()}
+	gs.SetRunService(rs)
+	rs.SetGoalService(gs)
+	cs.SetRunService(rs)
+	cs.SetGoalService(gs)
+
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	_ = enqueueFirst(t, rs, g)
+
+	_, err := cs.Create(ctx, Comment{
+		GoalID: g.ID, AuthorType: "agent", AuthorID: agentA,
+		Content: "[@me](mention://agent/" + agentA + ") note to self",
+	})
+	if err != nil {
+		t.Fatalf("create comment: %v", err)
+	}
+
+	after, _ := gs.Get(ctx, g.ID)
+	if after.AssigneeID != agentA {
+		t.Fatalf("self-mention must not change assignee; expected A, got %q", after.AssigneeID)
+	}
+}
+
+// TestMarkDoneByAssignee: Current assignee marks goal done → status=done + system comment.
+func TestMarkDoneByAssignee(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
 	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
-	r1 := enqueueFirst(t, rs, g)
-	// Hand off to A again (re-enqueue) while r1 is still queued.
-	if _, err := gs.Assign(ctx, g.ID, "agent", agentA, "again"); err != nil {
-		t.Fatalf("assign: %v", err)
+	_ = enqueueFirst(t, rs, g)
+
+	if err := gs.MarkDone(ctx, g.ID, agentA, "all done"); err != nil {
+		t.Fatalf("mark done: %v", err)
 	}
-	if _, err := rs.EnqueueForGoal(ctx, Goal{ID: g.ID, AssigneeType: "agent", AssigneeID: agentA}); err != nil {
-		t.Fatalf("re-enqueue: %v", err)
-	}
-	runs, _ := rs.List(ctx, g.ID)
-	pending := 0
-	for _, r := range runs {
-		if r.Status == "queued" || r.Status == "running" {
-			pending++
-		}
-	}
-	if pending != 1 {
-		t.Fatalf("expected exactly 1 pending run after coalesce, got %d (r1=%s)", pending, r1.Status)
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "done" {
+		t.Fatalf("expected done, got %q", after.Status)
 	}
 }
 
-// TestWakeRunawayGuarded: the P0-1 fix. When a parent has been woken
-// maxWakeCycles times already, another child-done does NOT wake it again —
-// instead the goal is force-failed, so a runaway re-fan-out loop is bounded
-// and surfaced rather than burning runs forever. (Guard is a state-machine
-// invariant, not prompt wording.)
-func TestWakeRunawayGuarded(t *testing.T) {
+// TestMarkDoneByNonAssignee: Non-assignee tries → error.
+func TestMarkDoneByNonAssignee(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
-	// One child, already done (so inflight==0 → wake conditions otherwise met).
-	child, _ := gs.Create(ctx, Goal{Title: "c", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
-	cr := enqueueFirst(t, rs, child)
-	// Parent must be waiting (blocked) for a child-done to wake it.
-	if err := gs.WaitChildren(ctx, parent.ID); err != nil {
-		t.Fatalf("wait parent: %v", err)
-	}
-	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-	if err := rs.Finish(ctx, cr.ID, "completed", "ok"); err != nil {
-		t.Fatalf("finish child: %v", err)
-	}
-	// The parent was just woken once (child done). Verify it went active.
-	p, _ := gs.Get(ctx, parent.ID)
-	if p.Status != "active" || p.WakeCount != 1 {
-		t.Fatalf("expected active wake_count=1, got %s/%d", p.Status, p.WakeCount)
-	}
-	// Simulate the loop: agent waited again and we've now bumped wake_count to
-	// the limit. Force the parent back to blocked, then push wake_count to the
-	// cap, and trigger a final wake — it must fail, not wake.
-	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='blocked', wake_count=? WHERE id=?`, maxWakeCycles, parent.ID); err != nil {
-		t.Fatalf("set blocked+maxed: %v", err)
-	}
-	runsBefore, _ := rs.List(ctx, parent.ID)
-	pendingBefore := 0
-	for _, r := range runsBefore {
-		if r.Status == "queued" || r.Status == "running" {
-			pendingBefore++
-		}
-	}
-	if err := gs.NotifyChildDone(ctx, child.ID); err != nil {
-		t.Fatalf("notify: %v", err)
-	}
-	p, _ = gs.Get(ctx, parent.ID)
-	if p.Status != "failed" {
-		t.Fatalf("runaway parent must be force-failed, got %q", p.Status)
-	}
-	// No NEW parent run was enqueued beyond what existed before the over-limit wake.
-	runsAfter, _ := rs.List(ctx, parent.ID)
-	pendingAfter := 0
-	for _, r := range runsAfter {
-		if r.Status == "queued" || r.Status == "running" {
-			pendingAfter++
-		}
-	}
-	if pendingAfter != pendingBefore {
-		t.Fatalf("runaway force-fail must enqueue no new run; before=%d after=%d", pendingBefore, pendingAfter)
+	agentB := seedAgent(t, st, "B")
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	_ = enqueueFirst(t, rs, g)
+
+	if err := gs.MarkDone(ctx, g.ID, agentB, "not mine"); err == nil {
+		t.Fatal("expected error when non-assignee marks done")
 	}
 }
 

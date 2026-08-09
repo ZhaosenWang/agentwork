@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
@@ -83,9 +82,8 @@ func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID
 
 // enqueueTx is the atomic enqueue core: inserts a run row under the caller's
 // transaction. It performs the per-(goal,agent) pending coalesce check INSIDE
-// the same tx so it sees the caller's un-committed state (this is what keeps
-// a parent-wake flipping blocked→active + enqueue one atomic operation, and
-// what stops two parallel child-dones from double-enqueuing the parent).
+// the same tx so it sees the caller's un-committed state (this keeps
+// assign + enqueue as one atomic operation).
 func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, error) {
 	if pending, err := s.hasPending(ctx, tx, goalID, agentID); err != nil {
 		return nil, err
@@ -176,8 +174,7 @@ func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attemp
 }
 
 // EnqueueExistingTx is the same-package atomic variant for a caller that
-// already holds a transaction (e.g. the parent-wake path in GoalService, which
-// flips blocked→active and enqueues in one tx).
+// already holds a transaction.
 func (s *RunService) EnqueueExistingTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID string) (*Run, error) {
 	return s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, "")
 }
@@ -280,19 +277,6 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 		return errors.New("runSvc.goalSvc not wired")
 	}
 	return s.goalSvc.ReconcileOnRunEnd(ctx, rc)
-}
-
-// NotifyChildDone is called after a sub-goal reaches a terminal status. It
-// delegates to the goal layer's parent-wake logic (which checks the parent is
-// blocked and all sub-goals terminal, then re-queues the parent's assignee).
-// Kept on RunService for convenience; the real guard is in GoalService.
-func (s *RunService) NotifyChildDone(ctx context.Context, childGoalID string) {
-	if s.goalSvc == nil {
-		return
-	}
-	if err := s.goalSvc.NotifyChildDone(ctx, childGoalID); err != nil {
-		log.Printf("run: notify child-done for goal %s: %v", childGoalID, err)
-	}
 }
 
 func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {

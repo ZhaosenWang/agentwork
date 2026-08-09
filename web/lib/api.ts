@@ -37,7 +37,6 @@ export const getGoal = (id: string) => api<Goal>(`/goals/${id}`);
 export const createGoal = (body: {
   title: string;
   description?: string;
-  parent_id?: string;
   assignee_type?: string;
   assignee_id?: string;
   status?: string;
@@ -53,8 +52,10 @@ export const assignGoal = (
 ) => api<Goal>(`/goals/${id}/assign`, { method: "POST", body: JSON.stringify(body) });
 export const cancelGoal = (id: string) =>
   api<Goal>(`/goals/${id}/cancel`, { method: "POST" });
-export const waitGoalChildren = (id: string) =>
-  api<void>(`/goals/${id}/wait`, { method: "POST" });
+export const doneGoal = (id: string, body: { agent_id: string; summary: string }) =>
+  api<void>(`/goals/${id}/done`, { method: "POST", body: JSON.stringify(body) });
+export const failGoal = (id: string, body: { agent_id: string; summary: string }) =>
+  api<void>(`/goals/${id}/fail`, { method: "POST", body: JSON.stringify(body) });
 
 // ── Run ──
 export const listGoalRuns = (goalId: string) =>

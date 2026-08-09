@@ -14,7 +14,6 @@ import {
   deleteGoal,
   assignGoal,
   cancelGoal,
-  waitGoalChildren,
   listGoalRuns,
   listGoalComments,
   createGoalComment,
@@ -119,14 +118,6 @@ export function useCancelGoal() {
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
   });
 }
-export function useWaitGoalChildren() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: waitGoalChildren,
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
-  });
-}
-
 // ── Run hooks ──
 export function useGoalRuns(goalId: string) {
   return useQuery({
@@ -216,7 +207,6 @@ export function useGoalEvents() {
   useWSEvent("goal:finished", () => qc.invalidateQueries({ queryKey: qk.goals }));
   useWSEvent("goal:retrying", () => qc.invalidateQueries({ queryKey: qk.goals }));
   useWSEvent("goal:retry_failed", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:waiting", () => qc.invalidateQueries({ queryKey: qk.goals }));
   useWSEvent("goal:deleted", () => qc.invalidateQueries({ queryKey: qk.goals }));
   // Agent lifecycle events
   useWSEvent("agent:created", () => qc.invalidateQueries({ queryKey: qk.agents }));

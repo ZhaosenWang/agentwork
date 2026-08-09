@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS agent (
 
 -- A squad is a routing group. It does no work itself: assigning a goal to a
 -- squad or @mentioning a squad routes only to its leader agent, who then
--- delegates by assigning sub-goals. Designed per multica §7 (no member
+-- delegates by handing off work to members. Designed per multica §7 (no member
 -- fan-out). The leader must be an agent; squads cannot nest.
 CREATE TABLE IF NOT EXISTS squad (
     id           TEXT PRIMARY KEY,
@@ -81,23 +81,21 @@ CREATE TABLE IF NOT EXISTS squad_member (
 
 -- goal: a work item (product plane). The sole holder of state authority.
 -- assignee is polymorphic (agent | squad | human).
--- parent_id makes a goal a sub-goal (coordination unit), not a sub-run.
+-- Coordination is via @mention in comments (the comment thread is the workflow
+-- record); there is no sub-goal hierarchy. See DESIGN.zh.md §5.
 CREATE TABLE IF NOT EXISTS goal (
     id              TEXT PRIMARY KEY,
     title           TEXT NOT NULL,
     description     TEXT NOT NULL DEFAULT '',
-    parent_id       TEXT REFERENCES goal(id),        -- sub-goal
     assignee_type   TEXT NOT NULL DEFAULT 'agent',   -- agent | squad | human
     assignee_id     TEXT NOT NULL DEFAULT '',
-    status          TEXT NOT NULL DEFAULT 'backlog', -- backlog|active|done|failed|blocked|cancelled
+    status          TEXT NOT NULL DEFAULT 'backlog', -- backlog|active|done|failed|cancelled
     handoff_note    TEXT NOT NULL DEFAULT '',
     created_by_type TEXT NOT NULL DEFAULT 'human',   -- human | agent
     created_by_id   TEXT NOT NULL DEFAULT '',
-    created_at      TEXT NOT NULL,
-    wake_count      INTEGER NOT NULL DEFAULT 0   -- bumped each blocked→active wakeup; bounded to break runaway re-fan-out loops
+    created_at      TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_goal_parent ON goal(parent_id);
 CREATE INDEX IF NOT EXISTS idx_goal_assignee ON goal(assignee_type, assignee_id);
 CREATE INDEX IF NOT EXISTS idx_goal_status ON goal(status);
 

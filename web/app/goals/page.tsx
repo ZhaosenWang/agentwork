@@ -10,7 +10,6 @@ const STATUS_TABS: { label: string; value: GoalStatus | "all" }[] = [
   { label: "全部", value: "all" },
   { label: "backlog", value: "backlog" },
   { label: "active", value: "active" },
-  { label: "blocked", value: "blocked" },
   { label: "done", value: "done" },
   { label: "failed", value: "failed" },
   { label: "cancelled", value: "cancelled" },
