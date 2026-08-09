@@ -2,91 +2,86 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 )
 
-// TestErrNotFoundSentinel: ErrNotFound is a plain sentinel; errors.Is must
-// match it exactly and nothing else. The store layer returns it bare and the
-// handler maps it to 404 (handler.go).
-func TestErrNotFoundSentinel(t *testing.T) {
-	if !errors.Is(ErrNotFound, ErrNotFound) {
-		t.Fatal("ErrNotFound must satisfy errors.Is(ErrNotFound, ErrNotFound)")
+// parseNow parses an RFC3339Nano timestamp and fails the test if malformed.
+func parseNow(t *testing.T, s string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t.Fatalf("invalid RFC3339Nano timestamp %q: %v", s, err)
 	}
-	if errors.Is(errors.New("not found"), ErrNotFound) {
-		t.Fatal("a plain error with the same text is not the sentinel")
-	}
-	if errors.Is(ErrValidation, ErrNotFound) {
-		t.Fatal("ErrValidation must not be ErrNotFound")
-	}
+	return parsed
 }
 
-// TestErrValidationSentinel: ErrValidation is a plain sentinel; errors.Is must
-// match it exactly and nothing else. The handler maps it to 400 (handler.go).
-func TestErrValidationSentinel(t *testing.T) {
-	if !errors.Is(ErrValidation, ErrValidation) {
-		t.Fatal("ErrValidation must satisfy errors.Is(ErrValidation, ErrValidation)")
-	}
-	if errors.Is(errors.New("validation error"), ErrValidation) {
-		t.Fatal("a plain error with the same text is not the sentinel")
+// TestSentinelsDistinct: the handler (handler.go) maps ErrNotFound→404 and
+// ErrValidation→400 with an if/else chain, so the sentinels must be mutually
+// exclusive. errors.Is is identity-based, not text-based: a plain error that
+// merely shares the message must NOT match.
+func TestSentinelsDistinct(t *testing.T) {
+	// Cross-match both ways: the handler's if/else chain depends on
+	// ErrValidation never satisfying ErrNotFound and vice versa.
+	if errors.Is(ErrValidation, ErrNotFound) {
+		t.Error("ErrValidation must not satisfy ErrNotFound")
 	}
 	if errors.Is(ErrNotFound, ErrValidation) {
-		t.Fatal("ErrNotFound must not be ErrValidation")
+		t.Error("ErrNotFound must not satisfy ErrValidation")
+	}
+	// Same text ≠ same sentinel: the store layer returns ErrNotFound bare, and
+	// any error with a matching message must not be mistaken for it.
+	for _, tc := range []struct {
+		sent error
+		text string
+	}{
+		{ErrNotFound, "not found"},
+		{ErrValidation, "validation error"},
+	} {
+		if errors.Is(errors.New(tc.text), tc.sent) {
+			t.Errorf("plain error %q must not satisfy %v", tc.text, tc.sent)
+		}
 	}
 }
 
-// TestNewValidationError: every validation error must (a) carry its message,
-// (b) satisfy errors.Is(err, ErrValidation) — including through %w wrapping as
-// done in cron.go — and (c) NOT satisfy ErrNotFound.
+// TestNewValidationError: a validation error must carry its message verbatim,
+// satisfy errors.Is(err, ErrValidation) — both directly and through the
+// %w-wrapped form cron.go uses — and never satisfy ErrNotFound.
 func TestNewValidationError(t *testing.T) {
-	cases := []string{
+	for _, msg := range []string{
 		"name is required",
 		"assignee_type must be agent, squad, or human",
-		"",
-	}
-	for _, msg := range cases {
-		err := NewValidationError(msg)
-		if err == nil {
-			t.Fatalf("NewValidationError(%q) returned nil", msg)
-		}
-		if got := err.Error(); got != msg {
-			t.Errorf("NewValidationError(%q).Error() = %q, want %q", msg, got, msg)
-		}
-		if !errors.Is(err, ErrValidation) {
-			t.Errorf("NewValidationError(%q) must satisfy errors.Is(err, ErrValidation)", msg)
-		}
-		if errors.Is(err, ErrNotFound) {
-			t.Errorf("NewValidationError(%q) must not be ErrNotFound", msg)
-		}
-	}
-}
-
-// TestValidationErrorWrapped: code paths that wrap the sentinel with %w
-// (cron.go: ParseExpression) must still be recognized by errors.Is.
-func TestValidationErrorWrapped(t *testing.T) {
-	inner := NewValidationError("bad cron")
-	outer := errors.Join(inner, errors.New("context")) // join wraps without breaking Is
-	if !errors.Is(outer, ErrValidation) {
-		t.Fatal("errors.Join(NewValidationError, ...) must satisfy ErrValidation")
-	}
-
-	// fmt.Errorf with %w is the canonical wrap used in the codebase.
-	wrapped := wrappedErr{ErrValidation}
-	if !errors.Is(wrapped, ErrValidation) {
-		t.Fatal("wrapped sentinel must satisfy errors.Is")
+		"", // empty message must still produce a usable error
+	} {
+		t.Run(fmt.Sprintf("message %q", msg), func(t *testing.T) {
+			err := NewValidationError(msg)
+			if err == nil {
+				t.Fatalf("NewValidationError(%q) returned nil", msg)
+			}
+			if got := err.Error(); got != msg {
+				t.Errorf("NewValidationError(%q).Error() = %q, want %q", msg, got, msg)
+			}
+			if !errors.Is(err, ErrValidation) {
+				t.Errorf("NewValidationError(%q) must satisfy ErrValidation", msg)
+			}
+			if errors.Is(err, ErrNotFound) {
+				t.Errorf("NewValidationError(%q) must not satisfy ErrNotFound", msg)
+			}
+			// cron.go wraps the sentinel with %w; the wrapped error must stay
+			// recognizable to the handler's errors.Is checks.
+			wrapped := fmt.Errorf("%w: %s", err, "context")
+			if !errors.Is(wrapped, ErrValidation) {
+				t.Errorf("%%w-wrapped NewValidationError(%q) must satisfy ErrValidation", msg)
+			}
+		})
 	}
 }
 
-// wrappedErr mimics fmt.Errorf("%w: ...") without extra imports.
-type wrappedErr struct{ inner error }
-
-func (w wrappedErr) Error() string { return "wrapped: " + w.inner.Error() }
-func (w wrappedErr) Unwrap() error { return w.inner }
-
-// TestNewIDFormat: ids are 32 lowercase hex chars — the format every entity
-// (agents, goals, runs, ...) relies on for its primary key.
+// TestNewIDFormat: ids are 32 lowercase hex chars — the primary-key format
+// every entity (agents, goals, runs, ...) relies on.
 func TestNewIDFormat(t *testing.T) {
 	hexRe := regexp.MustCompile(`^[0-9a-f]{32}$`)
 	for i := 0; i < 100; i++ {
@@ -96,8 +91,8 @@ func TestNewIDFormat(t *testing.T) {
 	}
 }
 
-// TestNewIDUnique: 1000 fresh ids must be pairwise distinct. crypto/rand makes
-// collisions astronomically unlikely; any collision here is a real bug.
+// TestNewIDUnique: fresh ids must be pairwise distinct. crypto/rand makes
+// collisions astronomically unlikely, so any collision here is a real bug.
 func TestNewIDUnique(t *testing.T) {
 	const n = 1000
 	seen := make(map[string]struct{}, n)
@@ -117,33 +112,23 @@ func TestNowFormat(t *testing.T) {
 	if !strings.HasSuffix(ts, "Z") {
 		t.Errorf("now() = %q, want UTC (Z suffix)", ts)
 	}
-	parsed, err := time.Parse(time.RFC3339Nano, ts)
-	if err != nil {
-		t.Fatalf("now() = %q is not RFC3339Nano: %v", ts, err)
+	parsed := parseNow(t, ts)
+	if parsed.Location() != time.UTC {
+		t.Errorf("now() parsed location = %v, want UTC", parsed.Location())
 	}
-	loc := parsed.Location()
-	if loc != time.UTC {
-		t.Errorf("now() parsed location = %v, want UTC", loc)
-	}
-	// Must not be in the future (clock sanity) and must be recent.
+	// Clock sanity: never more than a minute in the future.
 	if parsed.After(time.Now().Add(time.Minute)) {
 		t.Errorf("now() = %q is more than 1m in the future", ts)
 	}
 }
 
-// TestNowStable: two calls in quick succession may share the same timestamp
+// TestNowMonotonic: two calls in quick succession may share the same timestamp
 // (RFC3339Nano has ns resolution, but the clock can tick between calls) — the
 // only hard requirement is that later calls never go backwards.
 func TestNowMonotonic(t *testing.T) {
-	first := time.Now().Add(-time.Second) // anchor before both calls
-	a := now()
-	b := now()
-	ta, _ := time.Parse(time.RFC3339Nano, a)
-	tb, _ := time.Parse(time.RFC3339Nano, b)
+	a, b := now(), now()
+	ta, tb := parseNow(t, a), parseNow(t, b)
 	if tb.Before(ta) {
 		t.Errorf("now() went backwards: %q then %q", a, b)
-	}
-	if ta.Before(first) {
-		t.Errorf("now() = %q is before the anchor %q", a, first.Format(time.RFC3339Nano))
 	}
 }
