@@ -154,3 +154,5 @@ export const createSchedule = (body: {
 }) => api<Schedule>("/schedules", { method: "POST", body: JSON.stringify(body) });
 export const deleteSchedule = (id: string) =>
   api<void>(`/schedules/${id}`, { method: "DELETE" });
+export const setScheduleEnabled = (id: string, enabled: boolean) =>
+  api<Schedule>(`/schedules/${id}/enabled`, { method: "PUT", body: JSON.stringify({ enabled }) });

@@ -40,7 +40,8 @@ func newIntakeDaemon(t *testing.T) (*Daemon, *store.Store) {
 	if _, err := ds.Create(ctx, service.Domain{Name: "d1", GitURL: "https://e.com/d1.git"}); err != nil {
 		t.Fatal(err)
 	}
-	d := &Daemon{st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc, qs: notify.NewSQLQueryStore(st)}
+	schedSvc := service.NewScheduleService(st, bus)
+	d := &Daemon{st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc, schedSvc: schedSvc, qs: notify.NewSQLQueryStore(st)}
 	return d, st
 }
 
@@ -115,6 +116,69 @@ func TestIntakeReviewListAndStatus(t *testing.T) {
 	}
 	if r := d.intakeGoalStatus(ctx, "zzzzzzzz"); !strings.Contains(r, "查询失败") {
 		t.Fatalf("unknown id must fail cleanly: %q", r)
+	}
+}
+
+// TestIntakeCreateSchedule: the platform executes the parsed schedule
+// action through the service layer (cron validated, next_run computed);
+// schedule_list and schedule_stop round-trip.
+func TestIntakeCreateSchedule(t *testing.T) {
+	d, _ := newIntakeDaemon(t)
+	ctx := context.Background()
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+
+	reply := d.intakeCreateSchedule(ctx, intakeAction{Intent: "create_schedule", Schedule: struct {
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Cron        string `json:"cron"`
+		AssigneeID  string `json:"assignee_id"`
+		DomainID    string `json:"domain_id"`
+	}{Name: "每小时巡检", Title: "定时巡检", Cron: "0 * * * *", AssigneeID: "a1", DomainID: domID}})
+	if !strings.Contains(reply, "已创建定时任务") {
+		t.Fatalf("expected creation reply, got %q", reply)
+	}
+	// Bad cron → the validator's message, not a crash.
+	if r := d.intakeCreateSchedule(ctx, intakeAction{Intent: "create_schedule", Schedule: struct {
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Cron        string `json:"cron"`
+		AssigneeID  string `json:"assignee_id"`
+		DomainID    string `json:"domain_id"`
+	}{Name: "坏cron", Title: "x", Cron: "not-a-cron", AssigneeID: "a1", DomainID: domID}}); !strings.Contains(r, "创建定时任务失败") {
+		t.Fatalf("bad cron must surface the validator message, got %q", r)
+	}
+
+	list := d.intakeScheduleList(ctx)
+	if !strings.Contains(list, "每小时巡检") || !strings.Contains(list, "0 * * * *") {
+		t.Fatalf("schedule list must carry the created schedule: %q", list)
+	}
+
+	stop := d.intakeScheduleStop(ctx, intakeAction{Intent: "schedule_stop", Schedule: struct {
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Cron        string `json:"cron"`
+		AssigneeID  string `json:"assignee_id"`
+		DomainID    string `json:"domain_id"`
+	}{Name: "每小时巡检"}})
+	if !strings.Contains(stop, "已停用") {
+		t.Fatalf("expected stop reply, got %q", stop)
+	}
+	if r := d.intakeScheduleStop(ctx, intakeAction{Intent: "schedule_stop", Schedule: struct {
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Cron        string `json:"cron"`
+		AssigneeID  string `json:"assignee_id"`
+		DomainID    string `json:"domain_id"`
+	}{Name: "不存在"}}); !strings.Contains(r, "没找到") {
+		t.Fatalf("stopping an unknown schedule must say so, got %q", r)
+	}
+	// Disabled schedules drop out of the list.
+	if r := d.intakeScheduleList(ctx); strings.Contains(r, "每小时巡检") {
+		t.Fatalf("disabled schedule must leave the list: %q", r)
 	}
 }
 

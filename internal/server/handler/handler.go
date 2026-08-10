@@ -61,6 +61,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /schedules", h.createSchedule)
 	mux.HandleFunc("GET /schedules/{id}", h.getSchedule)
 	mux.HandleFunc("DELETE /schedules/{id}", h.deleteSchedule)
+	mux.HandleFunc("PUT /schedules/{id}/enabled", h.setScheduleEnabled)
 
 	mux.HandleFunc("GET /domains", h.listDomains)
 	mux.HandleFunc("POST /domains", h.createDomain)
@@ -313,6 +314,24 @@ func (h *Handlers) deleteSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// setScheduleEnabled toggles a schedule without deleting it (the IM intake
+// "停掉定时任务" flow and the Web toggle share this).
+func (h *Handlers) setScheduleEnabled(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, nil, service.NewValidationError("invalid body: "+err.Error()))
+		return
+	}
+	out, err := h.Schedule.SetEnabled(r.Context(), r.PathValue("id"), body.Enabled)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, out, nil)
 }
 
 // ── domain ──

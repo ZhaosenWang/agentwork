@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/proto"
@@ -126,6 +127,15 @@ type intakeAction struct {
 		DomainID    string `json:"domain_id"`
 	} `json:"goal"`
 	GoalID string `json:"goal_id"`
+	// Schedule carries the parsed定时任务 fields (create_schedule / schedule_stop).
+	Schedule struct {
+		Name        string `json:"name"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		Cron        string `json:"cron"`
+		AssigneeID  string `json:"assignee_id"`
+		DomainID    string `json:"domain_id"`
+	} `json:"schedule"`
 }
 
 // replyIntake executes the parsed action and replies over IM. The run row is
@@ -139,8 +149,14 @@ func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed 
 		reply = d.intakeReviewList(ctx)
 	case "goal_status":
 		reply = d.intakeGoalStatus(ctx, parsed.GoalID)
+	case "create_schedule":
+		reply = d.intakeCreateSchedule(ctx, parsed)
+	case "schedule_list":
+		reply = d.intakeScheduleList(ctx)
+	case "schedule_stop":
+		reply = d.intakeScheduleStop(ctx, parsed)
 	default:
-		reply = "没听懂这条指令 😅 你可以这样问我：\n- “创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>”\n- “查看待审批”\n- “查询任务状态 <id>”"
+		reply = "没听懂这条指令 😅 你可以这样问我：\n- “创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>”\n- “查看待审批”\n- “查询任务状态 <id>”\n- “每 1 个小时做 <任务>”\n- “查看定时任务”\n- “停掉定时任务 <名字>”"
 	}
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
@@ -231,6 +247,103 @@ func (d *Daemon) intakeGoalStatus(ctx context.Context, id string) string {
 		b.WriteString("\n最近结果：" + truncateIn(v.Summary, 200))
 	}
 	return b.String()
+}
+
+// intakeCreateSchedule creates a cron schedule through the service layer —
+// the parser converts natural-language frequency to cron, the platform
+// validates (cron syntax, assignee/domain existence) and computes the first
+// next_run_at.
+func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) string {
+	sch := parsed.Schedule
+	if strings.TrimSpace(sch.Name) == "" || strings.TrimSpace(sch.Title) == "" {
+		return "创建定时任务失败：缺少任务名或任务标题"
+	}
+	if strings.TrimSpace(sch.Cron) == "" {
+		return "创建定时任务失败：缺少 cron 表达式（没听懂频率？）"
+	}
+	if strings.TrimSpace(sch.DomainID) == "" {
+		return "创建定时任务失败：没有可用的 domain（先在 Web 建域并配置验收策略）"
+	}
+	if strings.TrimSpace(sch.AssigneeID) == "" {
+		return "创建定时任务失败：没有可用的 agent（先在 Web 配置 agent）"
+	}
+	// The schedule runs on the daemon machine's OWN local time — the owner
+	// speaks in their local hours ("每天 9 点"), and on a single-user machine
+	// that IS the daemon's zone. Hardcoding a zone (e.g. Asia/Shanghai)
+	// silently mis-times every schedule on a machine in another zone.
+	timezone := time.Local.String()
+	if timezone == "" {
+		timezone = "UTC"
+	}
+	s, err := d.schedSvc.Create(ctx, service.Schedule{
+		Name:          sch.Name,
+		TitleTemplate: sch.Title,
+		Description:   sch.Description,
+		AssigneeType:  "agent",
+		AssigneeID:    sch.AssigneeID,
+		DomainID:      sch.DomainID,
+		CronExpression: sch.Cron,
+		Timezone:      timezone,
+		Enabled:       true,
+	})
+	if err != nil {
+		return "创建定时任务失败：" + err.Error()
+	}
+	return fmt.Sprintf("✅ 已创建定时任务：**%s**（`%s`，%s），下次执行 %s", s.Name, s.CronExpression, s.Timezone, shortID(s.ID))
+}
+
+// intakeScheduleList answers "查看定时任务" with the enabled schedules.
+func (d *Daemon) intakeScheduleList(ctx context.Context) string {
+	all, err := d.schedSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+	enabled := []service.Schedule{}
+	for _, s := range all {
+		if s.Enabled {
+			enabled = append(enabled, s)
+		}
+	}
+	if len(enabled) == 0 {
+		return "📭 当前没有启用的定时任务"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "📅 启用的定时任务（%d 个）：\n", len(enabled))
+	for _, s := range enabled {
+		fmt.Fprintf(&b, "- **%s**（`%s`）\n", s.Name, s.CronExpression)
+		if s.Description != "" {
+			b.WriteString("  " + firstLineIn(s.Description) + "\n")
+		}
+	}
+	b.WriteString("\n停掉某个：发送“停掉定时任务 <名字>”")
+	return b.String()
+}
+
+// intakeScheduleStop disables a schedule by name (the row and firing history
+// stay; dispatchSchedules only fires enabled rows).
+func (d *Daemon) intakeScheduleStop(ctx context.Context, parsed intakeAction) string {
+	name := strings.TrimSpace(parsed.Schedule.Name)
+	if name == "" {
+		return "停掉定时任务需要名字（如：停掉定时任务 每小时巡检）"
+	}
+	all, err := d.schedSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+	var target *service.Schedule
+	for i := range all {
+		if all[i].Enabled && all[i].Name == name {
+			target = &all[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Sprintf("没找到启用的定时任务 %q——先“查看定时任务”确认名字", name)
+	}
+	if _, err := d.schedSvc.SetEnabled(ctx, target.ID, false); err != nil {
+		return "停用失败：" + err.Error()
+	}
+	return fmt.Sprintf("⏹ 已停用定时任务：**%s**（%s）", target.Name, target.CronExpression)
 }
 
 func shortID(id string) string {

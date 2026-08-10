@@ -313,7 +313,15 @@ func (c *Connector) connectWithCurrent(ctx context.Context) error {
 			return c.onCardAction(ctx, event)
 		})
 
+	// A connection that drops in seconds, repeatedly, is not a network blip —
+	// it is almost always dead credentials (the app was deleted, the secret
+	// rotated). Retrying forever would hammer the Feishu API in a loop; after
+	// maxReconnectFailures the connector gives up, reports failed, and waits
+	// for the owner to reconnect (重新扫码). Each SUCCESSFUL long connection
+	// resets the counter (the loop only exits on deliberate stop).
+	const maxReconnectFailures = 3
 	backoff := 5 * time.Second
+	failures := 0
 	for {
 		ws := larkws.NewClient(appID, appSecret,
 			larkws.WithEventHandler(dh),
@@ -339,7 +347,16 @@ func (c *Connector) connectWithCurrent(ctx context.Context) error {
 		if ctx.Err() != nil || wsCtx.Err() != nil {
 			return err // deliberate stop (Disconnect / shutdown)
 		}
-		log.Printf("notify: feishu long connection dropped (%v) — reconnecting in %s", err, backoff)
+		failures++
+		if failures >= maxReconnectFailures {
+			c.mu.Lock()
+			c.lastErr = "connection keeps dropping — check the Feishu app credentials and reconnect"
+			c.status = StatusFailed
+			c.mu.Unlock()
+			log.Printf("notify: feishu connection failed %d times in a row — giving up, waiting for reconnect", failures)
+			return nil
+		}
+		log.Printf("notify: feishu long connection dropped (%v) — reconnecting in %s (%d/%d)", err, backoff, failures, maxReconnectFailures)
 		c.setStatus(StatusReconnecting)
 		select {
 		case <-time.After(backoff):

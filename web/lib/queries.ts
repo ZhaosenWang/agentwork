@@ -27,6 +27,7 @@ import {
   listSchedules,
   createSchedule,
   deleteSchedule,
+  setScheduleEnabled,
   listDomains,
   getDomain,
   createDomain,
@@ -315,6 +316,13 @@ export function useDeleteSchedule() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: deleteSchedule,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.schedules }),
+  });
+}
+export function useSetScheduleEnabled() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => setScheduleEnabled(id, enabled),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.schedules }),
   });
 }

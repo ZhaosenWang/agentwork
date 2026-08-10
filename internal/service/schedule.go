@@ -148,6 +148,24 @@ func (s *ScheduleService) Get(ctx context.Context, id string) (*Schedule, error)
 	return &sch, nil
 }
 
+// SetEnabled toggles a schedule without deleting it (the IM intake
+// "停掉定时任务" flow — the schedule row and its firing history stay, the
+// daemon's dispatchSchedules only fires enabled=1 rows).
+func (s *ScheduleService) SetEnabled(ctx context.Context, id string, enabled bool) (*Schedule, error) {
+	v := 0
+	if enabled {
+		v = 1
+	}
+	res, err := s.st.DB().ExecContext(ctx, `UPDATE schedule SET enabled=? WHERE id=?`, v, id)
+	if err != nil {
+		return nil, fmt.Errorf("set schedule enabled: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, ErrNotFound
+	}
+	return s.Get(ctx, id)
+}
+
 func (s *ScheduleService) Delete(ctx context.Context, id string) error {
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
