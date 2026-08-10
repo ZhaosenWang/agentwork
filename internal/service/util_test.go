@@ -1,3 +1,7 @@
+// Tests for the shared helpers in util.go: the two error sentinels
+// (ErrNotFound, ErrValidation), NewValidationError, newID, and now().
+// Every other test in this package exercises these helpers indirectly,
+// so this file pins down their contracts in isolation.
 package service
 
 import (
@@ -58,6 +62,7 @@ func TestNewValidationError(t *testing.T) {
 		"assignee_type must be agent, squad, or human",
 		"", // empty message must still produce a usable error
 	} {
+		// One subtest per message so a failure pinpoints the exact case.
 		t.Run(fmt.Sprintf("message %q", msg), func(t *testing.T) {
 			err := NewValidationError(msg)
 			if err == nil {
@@ -87,6 +92,9 @@ func TestNewValidationError(t *testing.T) {
 func TestNewIDFormat(t *testing.T) {
 	t.Parallel()
 	hexRe := regexp.MustCompile(`^[0-9a-f]{32}$`)
+	// 100 draws: a structural bug (wrong length, bad alphabet, uppercase)
+	// would fail on the very first draw, so the loop guards against a skewed
+	// or occasionally-broken source rather than a broken format.
 	for i := 0; i < 100; i++ {
 		if id := newID(); !hexRe.MatchString(id) {
 			t.Fatalf("newID() = %q, want 32 lowercase hex chars", id)
@@ -98,6 +106,8 @@ func TestNewIDFormat(t *testing.T) {
 // collisions astronomically unlikely, so any collision here is a real bug.
 func TestNewIDUnique(t *testing.T) {
 	t.Parallel()
+	// 1000 draws into a map: a duplicate means the entropy source stopped
+	// being random (e.g. a reused/static reader), not bad luck.
 	const n = 1000
 	seen := make(map[string]struct{}, n)
 	for i := 0; i < n; i++ {
@@ -117,6 +127,8 @@ func TestNowFormat(t *testing.T) {
 	if !strings.HasSuffix(ts, "Z") {
 		t.Errorf("now() = %q, want UTC (Z suffix)", ts)
 	}
+	// parseNow doubles as the round-trip check: it fails the test outright
+	// if the string is not exactly RFC3339Nano.
 	parsed := parseNow(t, ts)
 	if parsed.Location() != time.UTC {
 		t.Errorf("now() parsed location = %v, want UTC", parsed.Location())
@@ -134,6 +146,9 @@ func TestNowMonotonic(t *testing.T) {
 	t.Parallel()
 	a, b := now(), now()
 	ta, tb := parseNow(t, a), parseNow(t, b)
+	// A backwards clock would corrupt ordering assumptions in the store
+	// layer (runs/goals sorted by timestamp), so monotonicity is the one
+	// property that must always hold.
 	if tb.Before(ta) {
 		t.Errorf("now() went backwards: %q then %q", a, b)
 	}
