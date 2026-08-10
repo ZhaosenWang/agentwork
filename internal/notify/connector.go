@@ -39,6 +39,7 @@ const (
 	StatusWaitingQR      ConnStatus = "waiting_qr"       // QR issued, awaiting scan
 	StatusWaitingMessage ConnStatus = "waiting_message"  // app created, awaiting first message to capture the receive target
 	StatusConnected      ConnStatus = "connected"
+	StatusReconnecting   ConnStatus = "reconnecting"     // connection dropped; the reconnect loop is backing off (M4)
 	StatusFailed         ConnStatus = "failed"
 )
 
@@ -221,7 +222,13 @@ func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, erro
 		} else {
 			log.Printf("notify: feishu connected to app owner %s", ownerOpenID)
 		}
-		c.connectWithCurrent(regCtx)
+		// The long connection must NOT ride on regCtx: that context carries a
+		// 10-minute registration timeout, and a cancelled context kills the
+		// WS (and its auto-reconnect) 10 minutes after the scan — the
+		// connection silently died and the UI kept showing "connected"
+		// (regression found in M4). A background context keeps the
+		// connection alive; Disconnect stops it via c.stop.
+		c.connectWithCurrent(context.Background())
 	}()
 	return c.connectID, c.qr, nil
 }
@@ -267,14 +274,35 @@ func (c *Connector) Start(ctx context.Context) error {
 	return nil
 }
 
-// connectWithCurrent starts the long connection for the current config. The
-// first inbound user message captures the receive target (when unset) and
-// flips the status to connected.
+// connectWithCurrent runs the long connection for the current config, with a
+// reconnect loop: the SDK's own auto-reconnect covers transient drops, and
+// when ws.Start finally returns (credentials rejected, SDK gave up) this loop
+// backs off and reconnects — otherwise a drop after the SDK gave up would end
+// the goroutine and the connection would never come back (the M4 regression:
+// the UI kept showing "connected" while inbound messages silently died).
+// The notifier is created ONCE (the reconnect loop must not re-subscribe the
+// bus — every event would then be pushed N times).
 func (c *Connector) connectWithCurrent(ctx context.Context) error {
 	c.mu.Lock()
 	appID, appSecret := c.config.AppID, c.config.AppSecret
 	receive := c.config.ReceiveID
+	first := c.notify == nil
 	c.mu.Unlock()
+
+	if first {
+		// The notifier shares the same credentials for outbound pushes and
+		// subscribes the milestone events once armed. Its QueryStore (card
+		// evidence / digest data) comes from the connector's wiring.
+		n := New(appID, appSecret, c.receiveTypeLocked(), receive)
+		n.client = larkClientFor(appID, appSecret)
+		n.qs = c.qs
+		if c.bus != nil {
+			n.Subscribe(c.bus)
+		}
+		c.mu.Lock()
+		c.notify = n
+		c.mu.Unlock()
+	}
 
 	dh := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(func(_ context.Context, event *larkim.P2MessageReceiveV1) error {
@@ -284,36 +312,48 @@ func (c *Connector) connectWithCurrent(ctx context.Context) error {
 		OnP2CardActionTrigger(func(ctx context.Context, event *callback.CardActionTriggerEvent) (*callback.CardActionTriggerResponse, error) {
 			return c.onCardAction(ctx, event)
 		})
-	ws := larkws.NewClient(appID, appSecret, larkws.WithEventHandler(dh))
 
-	c.mu.Lock()
-	if c.stop != nil {
-		c.stop()
-	}
-	wsCtx, stop := context.WithCancel(ctx)
-	c.stop = stop
-	c.mu.Unlock()
-
-	// The notifier shares the same credentials for outbound pushes and
-	// subscribes the milestone events once armed. Its QueryStore (card
-	// evidence / digest data) comes from the connector's wiring.
-	n := New(appID, appSecret, c.receiveTypeLocked(), receive)
-	n.client = larkClientFor(appID, appSecret)
-	n.qs = c.qs
-	if c.bus != nil {
-		n.Subscribe(c.bus)
-	}
-	c.mu.Lock()
-	c.notify = n
-	c.mu.Unlock()
-
-	if receive != "" {
+	backoff := 5 * time.Second
+	for {
+		ws := larkws.NewClient(appID, appSecret,
+			larkws.WithEventHandler(dh),
+			larkws.WithOnReconnecting(func() { c.setStatus(StatusReconnecting) }),
+			larkws.WithOnReconnected(func() {
+				c.mu.Lock()
+				c.status = StatusConnected
+				c.mu.Unlock()
+			}),
+		)
+		wsCtx, stop := context.WithCancel(ctx)
 		c.mu.Lock()
-		c.status = StatusConnected
+		if c.stop != nil {
+			c.stop() // stop the previous loop's connection if any
+		}
+		c.stop = stop
+		if c.config.ReceiveID != "" {
+			c.status = StatusConnected
+		}
 		c.mu.Unlock()
+
+		err := ws.Start(wsCtx)
+		if ctx.Err() != nil || wsCtx.Err() != nil {
+			return err // deliberate stop (Disconnect / shutdown)
+		}
+		log.Printf("notify: feishu long connection dropped (%v) — reconnecting in %s", err, backoff)
+		c.setStatus(StatusReconnecting)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	log.Printf("notify: feishu long connection up (app %s)", appID)
-	return ws.Start(wsCtx)
+}
+
+// setStatus updates the connection state seen by the Web UI.
+func (c *Connector) setStatus(s ConnStatus) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.status = s
 }
 
 // ownerOpenID resolves the platform's single user: the app owner recorded at

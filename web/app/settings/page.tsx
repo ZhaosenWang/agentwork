@@ -47,6 +47,11 @@ export default function SettingsPage() {
               </Button>
             </div>
           </div>
+        ) : status === "reconnecting" ? (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 space-y-2">
+            <p className="text-amber-800 font-medium">🔄 连接中断，正在自动重连…</p>
+            <p className="text-xs text-amber-700">网络恢复后会自动恢复，无需操作。</p>
+          </div>
         ) : status === "waiting_qr" || status === "waiting_message" ? (
           <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 space-y-3">
             <p className="text-blue-800 font-medium">
