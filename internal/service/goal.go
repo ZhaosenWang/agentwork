@@ -334,6 +334,22 @@ func (s *GoalService) WaitChildren(ctx context.Context, goalID string) error {
 	if status != "active" && status != "queued" {
 		return ErrNotFound // terminal or invalid
 	}
+	// Wait is only meaningful with something to wait for: zero non-terminal
+	// sub-goals means nothing will ever wake this goal (the wake is driven by
+	// child-done) — a wait would deadlock it in blocked forever. Refuse
+	// loudly: the agent sees the error and ends its turn instead of parking
+	// the goal. (The dynamic wait-set covers sub-goals created BEFORE the
+	// wait; nothing can create one after — the parent is blocked and mention
+	// triggers only fire on active goals.)
+	var inflight int
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM goal WHERE parent_id=? AND status NOT IN ('done','failed','cancelled')`,
+		goalID).Scan(&inflight); err != nil {
+		return fmt.Errorf("count children: %w", err)
+	}
+	if inflight == 0 {
+		return NewValidationError("没有未完成的子任务可等待（wait 只用于等待子任务完成）")
+	}
 	if _, err := s.st.DB().ExecContext(ctx,
 		`UPDATE goal SET status='blocked' WHERE id=?`, goalID); err != nil {
 		return fmt.Errorf("wait-children: %w", err)
@@ -504,10 +520,18 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 		if hit {
 			// Park in review. The handoff/wakeup note is NOT cleared — if the
 			// human rejects, the next run resumes from it.
-			if _, err := tx.ExecContext(ctx,
+			res, err := tx.ExecContext(ctx,
 				`UPDATE goal SET status='review', review_request=? WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked','review')`,
-				reason, rc.GoalID); err != nil {
+				reason, rc.GoalID)
+			if err != nil {
 				return fmt.Errorf("park goal in review: %w", err)
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				// The goal is not parkable (blocked / already review /
+				// terminal): the gate cannot fire here. NO activity, NO
+				// reviewing event — a fake park must not mislead the review
+				// trigger into firing on a non-review goal.
+				break
 			}
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'entered_review',?,?)`,

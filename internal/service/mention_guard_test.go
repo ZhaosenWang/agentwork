@@ -184,6 +184,71 @@ func TestDoneCancelsQueuedRuns(t *testing.T) {
 	}
 }
 
+// TestWaitChildrenRefusesWithoutSubGoals: a wait with zero non-terminal
+// sub-goals would deadlock the goal forever (nothing can ever wake it) —
+// refused loudly so the agent ends its turn instead of parking.
+func TestWaitChildrenRefusesWithoutSubGoals(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "work", Description: "do it", DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	if err := gs.WaitChildren(ctx, g.ID); err == nil {
+		t.Fatal("wait without sub-goals must be refused")
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "active" {
+		t.Fatalf("goal must stay active after refused wait, got %q", after.Status)
+	}
+}
+
+// TestBlockedRunCompletionDoesNotFakeReview: a completed run on a blocked
+// goal must not leave an entered_review trace (the park UPDATE hit 0 rows) —
+// a fake park would mislead the review trigger into firing on a non-review
+// goal.
+func TestBlockedRunCompletionDoesNotFakeReview(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "gated work", Description: "do it", DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	// A sub-goal exists so the wait is legal.
+	child, err := gs.Create(ctx, Goal{Title: "child", ParentID: g.ID, DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if err := gs.WaitChildren(ctx, g.ID); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+	r := enqueueFirst(t, rs, g)
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET gates_hit=? WHERE id=?`, `["merge: 合并到主分支前必须人工审批"]`, r.ID); err != nil {
+		t.Fatalf("set gates: %v", err)
+	}
+	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "blocked" {
+		t.Fatalf("goal must stay blocked (no fake park), got %q", after.Status)
+	}
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM activity_log WHERE goal_id=? AND action='entered_review'`, g.ID).Scan(&n); err != nil {
+		t.Fatalf("count review activity: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("no entered_review trace expected on blocked goal, got %d", n)
+	}
+	_ = child
+}
+
 // TestWaitChildrenCancelsQueuedRuns: waiting on sub-goals drops queued runs —
 // a blocked goal is not working.
 func TestWaitChildrenCancelsQueuedRuns(t *testing.T) {
@@ -195,6 +260,9 @@ func TestWaitChildrenCancelsQueuedRuns(t *testing.T) {
 	g, err := gs.Create(ctx, Goal{Title: "work", Description: "do it", DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
+	}
+	if _, err := gs.Create(ctx, Goal{Title: "child", ParentID: g.ID, DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"}); err != nil {
+		t.Fatalf("create child: %v", err)
 	}
 	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "agent", AuthorID: agentA, Content: "[@B](mention://agent/" + agentB + ") 排队"}); err != nil {
 		t.Fatalf("comment: %v", err)
