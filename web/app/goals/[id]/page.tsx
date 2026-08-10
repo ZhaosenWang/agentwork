@@ -32,7 +32,7 @@ export default function GoalDetailPage() {
   const children = allGoals?.filter((t) => t.parent_id === id) ?? [];
 
   return (
-    <div className="p-8 space-y-5 max-w-4xl">
+    <div className="p-8 space-y-5 max-w-4xl page-enter">
       {/* Breadcrumb */}
       <div>
         <Link href="/goals" className="text-sm text-zinc-400 hover:text-zinc-700 hover:underline">
@@ -45,6 +45,11 @@ export default function GoalDetailPage() {
         <p className="text-sm text-zinc-500 mt-1">
           分配给：{assigneeLabel}
         </p>
+        {goal.source_ref && (
+          <p className="text-xs text-zinc-400 mt-1">
+            来源：<span className="font-mono">{goal.source_ref}</span>
+          </p>
+        )}
         {goal.description && (
           <p className="text-sm text-zinc-600 mt-3 whitespace-pre-wrap">{goal.description}</p>
         )}
@@ -65,7 +70,8 @@ export default function GoalDetailPage() {
       {/* Runs */}
       <GoalRuns goalId={id} />
 
-      {/* Sub-goals */}
+      {/* Sub-goals（机制休眠中——决策 3-6，非空才显示） */}
+      {children.length > 0 && (
       <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">
         <div className="px-4 py-2.5 border-b border-zinc-100 text-xs font-medium text-zinc-500 uppercase tracking-wide">
           子 Goal{children.length > 0 && `（${children.length}）`}
@@ -94,6 +100,7 @@ export default function GoalDetailPage() {
           )}
         </div>
       </div>
+      )}
     </div>
   );
 }

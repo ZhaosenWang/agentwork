@@ -4,6 +4,7 @@ import { useState, useMemo } from "react";
 import { useGoalRuns, useGoalRunMessages, useAgents } from "@/lib/queries";
 import { useWSEvent } from "@/lib/ws";
 import { Badge, Empty } from "@/components/ui";
+import { Markdown } from "@/components/markdown";
 import type { Run } from "@/lib/types";
 import type { ChatMessage } from "@/lib/api";
 
@@ -31,7 +32,7 @@ export function GoalRuns({ goalId }: { goalId: string }) {
   );
 
   return (
-    <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">
+    <div className="bg-white rounded-2xl border border-zinc-200/80 shadow-sm overflow-hidden">
       <div className="px-4 py-2.5 border-b border-zinc-100 text-xs font-medium text-zinc-500 uppercase tracking-wide">
         运行历史{runs && runs.length > 0 && `（${runs.length}）`}
       </div>
@@ -71,68 +72,69 @@ export function GoalRuns({ goalId }: { goalId: string }) {
 
 function RunTable({ runs, goalId, agentName }: { runs: Run[]; goalId: string; agentName: (id: string) => string }) {
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full text-xs">
-        <thead>
-          <tr className="border-b border-zinc-100">
-            <th className="text-left py-1.5 px-2 font-medium text-zinc-500">Agent</th>
-            <th className="text-left py-1.5 px-2 font-medium text-zinc-500">状态</th>
-            <th className="text-left py-1.5 px-2 font-medium text-zinc-500">尝试</th>
-            <th className="text-left py-1.5 px-2 font-medium text-zinc-500">结果</th>
-            <th className="text-left py-1.5 px-2 font-medium text-zinc-500">开始</th>
-            <th className="text-left py-1.5 px-2 font-medium text-zinc-500">结束</th>
-            <th className="text-left py-1.5 px-2 font-medium text-zinc-500"></th>
-          </tr>
-        </thead>
-        <tbody>
-          {runs.map((r) => (
-            <RunRow key={r.id} run={r} goalId={goalId} agentName={agentName} />
-          ))}
-        </tbody>
-      </table>
+    <div className="space-y-2">
+      {runs.map((r) => (
+        <RunCard key={r.id} run={r} goalId={goalId} agentName={agentName} />
+      ))}
     </div>
   );
 }
 
-// RunRow shows one run; clicking the chevron opens the LIVE interaction
+// RunCard shows one run as a card; clicking it opens the LIVE interaction
 // stream (chat_message — what the agent is doing right now), refreshed on
 // every run:event over the WS.
-function RunRow({ run, goalId, agentName }: { run: Run; goalId: string; agentName: (id: string) => string }) {
+function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentName: (id: string) => string }) {
   const [open, setOpen] = useState(false);
   const { data: messages, refetch } = useGoalRunMessages(goalId, run.id);
   useWSEvent("run:event", () => {
     if (open) refetch();
   });
 
+  const timeRange = [
+    run.started_at ? new Date(run.started_at).toLocaleString("zh-CN") : "-",
+    run.finished_at ? new Date(run.finished_at).toLocaleString("zh-CN") : null,
+  ].filter(Boolean).join(" → ");
+
   return (
-    <>
-      <tr className="border-b border-zinc-50 hover:bg-zinc-50/50">
-        <td className="py-1.5 px-2 text-zinc-700 font-medium text-xs">{run.agent_id ? agentName(run.agent_id) : "-"}</td>
-        <td className="py-1.5 px-2"><Badge status={run.status} /></td>
-        <td className="py-1.5 px-2 text-zinc-500">#{run.attempt}</td>
-        <td className="py-1.5 px-2 text-zinc-500 max-w-[200px] truncate">{run.result_summary || "-"}</td>
-        <td className="py-1.5 px-2 text-zinc-400">{run.started_at ? new Date(run.started_at).toLocaleString("zh-CN") : "-"}</td>
-        <td className="py-1.5 px-2 text-zinc-400">{run.finished_at ? new Date(run.finished_at).toLocaleString("zh-CN") : "-"}</td>
-        <td className="py-1.5 px-2">
-          <button onClick={() => setOpen(!open)} className="text-zinc-400 hover:text-zinc-600 text-xs">
-            {open ? "▾" : "▸"}
-          </button>
-        </td>
-      </tr>
-      {open && (
-        <tr>
-          <td colSpan={7} className="py-2 px-3 bg-zinc-50/60">
-            {run.status === "running" && (
-              <div className="text-[11px] text-emerald-600 mb-1.5 flex items-center gap-1">
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                运行中——实时交互流
-              </div>
-            )}
-            <RunMessages messages={messages ?? []} />
-          </td>
-        </tr>
+    <div className="bg-white rounded-2xl border border-zinc-200/80 shadow-sm overflow-hidden">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full text-left p-3.5 flex items-center gap-3 hover:bg-zinc-50/60 transition-colors"
+      >
+        <span className="h-2 w-2 rounded-full bg-indigo-400 shrink-0" />
+        <span className="font-medium text-sm text-zinc-900">{run.agent_id ? agentName(run.agent_id) : "-"}</span>
+        <Badge status={run.status} />
+        <span className="text-xs text-zinc-400 shrink-0">#{run.attempt}</span>
+        <span className="text-xs text-zinc-400 ml-auto hidden sm:block">{timeRange}</span>
+        <span className="text-zinc-400 text-xs shrink-0">{open ? "▾" : "▸"}</span>
+      </button>
+
+      {!open && run.result_summary && (
+        <div className="px-4 pb-3.5">
+          <div className="max-h-24 overflow-hidden text-xs text-zinc-500">
+            <Markdown content={run.result_summary} agentName={agentName} />
+          </div>
+        </div>
       )}
-    </>
+
+      {open && (
+        <div className="border-t border-zinc-100 bg-zinc-50/60 p-4 space-y-3">
+          {run.result_summary && (
+            <div className="text-xs text-zinc-700">
+              <div className="text-[11px] font-medium text-zinc-400 uppercase tracking-wide mb-1">结果</div>
+              <Markdown content={run.result_summary} agentName={agentName} />
+            </div>
+          )}
+          {run.status === "running" && (
+            <div className="text-[11px] text-emerald-600 flex items-center gap-1">
+              <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              运行中——实时交互流
+            </div>
+          )}
+          <RunMessages messages={messages ?? []} />
+        </div>
+      )}
+    </div>
   );
 }
 

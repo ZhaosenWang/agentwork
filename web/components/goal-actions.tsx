@@ -2,8 +2,9 @@
 
 import { useState } from "react";
 import { useAgents, useSquads, useAssignGoal, useCancelGoal,
-  useReopenGoal, useWaitGoalChildren, useDeleteGoal, useResolveGoalReview, useGoalRuns } from "@/lib/queries";
+  useReopenGoal, useWaitGoalChildren, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
+import { Markdown } from "@/components/markdown";
 import type { Goal } from "@/lib/types";
 
 export function GoalActions({ goal }: { goal: Goal }) {
@@ -75,9 +76,16 @@ export function GoalActions({ goal }: { goal: Goal }) {
 function ReviewPanel({ goal }: { goal: Goal }) {
   const resolve = useResolveGoalReview();
   const { data: runs } = useGoalRuns(goal.id);
+  const { data: comments } = useGoalComments(goal.id);
+  const { data: agents } = useAgents();
   const [reason, setReason] = useState("");
   const [showRejectForm, setShowRejectForm] = useState(false);
   const [justResolved, setJustResolved] = useState<string | null>(null);
+
+  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
+  // 审查意见 / 人的话 — 审批时直接可见，不用滚到评论区（squad 审查的
+  // 价值就在审批这一刻）。最近 4 条，倒序。
+  const recentComments = (comments ?? []).slice(-4).reverse();
 
   // The deliver step runs ASYNC after approve — the goal stays in review
   // until merge+re-verify+push finishes (or fails back). Give the human
@@ -94,7 +102,7 @@ function ReviewPanel({ goal }: { goal: Goal }) {
   }
 
   return (
-    <div className="rounded border border-amber-300 bg-amber-50 p-4 space-y-3 w-full">
+    <div className="rounded-2xl border border-amber-300/80 bg-amber-50/70 p-4 space-y-3 w-full shadow-sm shadow-amber-500/5">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-xs font-mono bg-amber-200 px-2 py-0.5 rounded">等待审批</span>
         {goal.review_request && <span className="text-sm text-amber-900">{goal.review_request}</span>}
@@ -114,10 +122,29 @@ function ReviewPanel({ goal }: { goal: Goal }) {
         </details>
       )}
       {lastRun?.result_summary && (
-        <p className="text-xs text-amber-800">
-          <span className="font-medium">Agent 汇报：</span>
-          {lastRun.result_summary.slice(0, 400)}
-        </p>
+        <div className="text-xs text-amber-800">
+          <div className="font-medium text-amber-900 mb-0.5">Agent 汇报</div>
+          <Markdown content={lastRun.result_summary.slice(0, 500)} agentName={agentName} />
+        </div>
+      )}
+
+      {/* 最新交流（审查意见 / 人的话）——审批不离上下文 */}
+      {recentComments.length > 0 && (
+        <div className="space-y-1.5 text-xs">
+          <div className="text-[11px] font-medium text-amber-700 uppercase tracking-wide">最新交流</div>
+          {recentComments.map((c) => {
+            const author =
+              c.author_type === "human" ? "你" :
+              c.author_type === "system" ? "系统" :
+              agentName(c.author_id);
+            return (
+              <div key={c.id} className="bg-amber-100/60 rounded-lg p-2">
+                <span className="font-medium text-amber-900">{author}</span>
+                <Markdown content={c.content} agentName={agentName} className="text-amber-800 mt-0.5" />
+              </div>
+            );
+          })}
+        </div>
       )}
 
       {resolveOutcome === "approved" && (

@@ -34,6 +34,9 @@ type Goal struct {
 	CreatedAt       string `json:"created_at"`
 	WakeCount       int    `json:"wake_count"` // bumped each blocked→active wakeup; bounded to break runaway re-fan-out
 	SourceRef       string `json:"source_ref"` // external source (M4-B): "github:owner/repo#123"
+	// CurrentAgentID is the agent of the goal's latest running/queued run —
+	// the list card's "who is working right now" ('' = nobody in flight).
+	CurrentAgentID string `json:"current_agent_id"`
 }
 
 // goalRunContext is what ReconcileOnRunEnd reasons about. Carried separately
@@ -192,8 +195,9 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 
 func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,review_request,human_iterations,created_by_type,created_by_id,created_at,wake_count,source_ref
-		 FROM goal ORDER BY created_at DESC`)
+		`SELECT g.id,g.title,g.description,g.parent_id,g.domain_id,g.assignee_type,g.assignee_id,g.status,g.handoff_note,g.review_request,g.human_iterations,g.created_by_type,g.created_by_id,g.created_at,g.wake_count,g.source_ref,
+		        (SELECT r.agent_id FROM run r WHERE r.goal_id = g.id AND r.status IN ('running','queued') ORDER BY r.created_at DESC LIMIT 1)
+		 FROM goal g ORDER BY g.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -201,12 +205,13 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	out := []Goal{}
 	for rows.Next() {
 		var g Goal
-		var parentID, domainID sql.NullString
-		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount, &g.SourceRef); err != nil {
+		var parentID, domainID, currentAgent sql.NullString
+		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount, &g.SourceRef, &currentAgent); err != nil {
 			return nil, err
 		}
 		g.ParentID = parentID.String
 		g.DomainID = domainID.String
+		g.CurrentAgentID = currentAgent.String
 		out = append(out, g)
 	}
 	return out, rows.Err()
@@ -214,11 +219,12 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 
 func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 	var g Goal
-	var parentID, domainID sql.NullString
+	var parentID, domainID, currentAgent sql.NullString
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,review_request,human_iterations,created_by_type,created_by_id,created_at,wake_count,source_ref
-		 FROM goal WHERE id=?`, id).
-		Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount, &g.SourceRef)
+		`SELECT g.id,g.title,g.description,g.parent_id,g.domain_id,g.assignee_type,g.assignee_id,g.status,g.handoff_note,g.review_request,g.human_iterations,g.created_by_type,g.created_by_id,g.created_at,g.wake_count,g.source_ref,
+		        (SELECT r.agent_id FROM run r WHERE r.goal_id = g.id AND r.status IN ('running','queued') ORDER BY r.created_at DESC LIMIT 1)
+		 FROM goal g WHERE g.id=?`, id).
+		Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount, &g.SourceRef, &currentAgent)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -227,6 +233,7 @@ func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 	}
 	g.ParentID = parentID.String
 	g.DomainID = domainID.String
+	g.CurrentAgentID = currentAgent.String
 	return &g, nil
 }
 

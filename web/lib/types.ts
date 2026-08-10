@@ -48,6 +48,8 @@ export interface Goal {
   created_by_type: string;
   created_by_id: string;
   created_at: string;
+  source_ref: string; // M4-B: "github:owner/repo#123" (external issue source)
+  current_agent_id: string; // latest running/queued run's agent ('' = none)
 }
 
 export interface GateRule {

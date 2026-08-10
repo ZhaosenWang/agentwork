@@ -17,6 +17,20 @@ const STATUS_TABS: { label: string; value: GoalStatus | "all" }[] = [
   { label: "cancelled", value: "cancelled" },
 ];
 
+// 卡片顶部状态色条（与 Badge 同色系，一眼可扫）
+const STATUS_BAR: Record<string, string> = {
+  backlog: "from-zinc-300 to-zinc-400",
+  active: "from-blue-500 to-indigo-500",
+  blocked: "from-amber-400 to-amber-500",
+  review: "from-purple-500 to-fuchsia-500",
+  done: "from-emerald-500 to-teal-500",
+  failed: "from-red-500 to-rose-500",
+  cancelled: "from-zinc-300 to-zinc-400",
+};
+
+// 负责人头像首字母
+const initials = (name: string) => (name ? name.slice(0, 1).toUpperCase() : "?");
+
 export default function GoalsPage() {
   useGoalEvents();
   const { data: goals, isLoading } = useGoals();
@@ -33,7 +47,7 @@ export default function GoalsPage() {
   const filtered = goals?.filter((g) => filter === "all" || g.status === filter) ?? [];
 
   return (
-    <div className="p-8">
+    <div className="p-8 page-enter">
       <PageHeader
         title="Goal"
         action={
@@ -69,7 +83,7 @@ export default function GoalsPage() {
         })}
       </div>
 
-      {/* Goals table */}
+      {/* Goals — 卡片：状态色条 + 谁在干 + 元信息（不是表格的伪卡片） */}
       {isLoading ? (
         <div className="text-sm text-zinc-400 py-16 text-center">加载中…</div>
       ) : filtered.length === 0 ? (
@@ -77,41 +91,53 @@ export default function GoalsPage() {
           {filter === "all" ? "暂无 Goal，点击「+ 新建」创建第一个。" : "没有符合条件的 Goal。"}
         </Empty>
       ) : (
-        <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-zinc-100 bg-zinc-50/50">
-                <th className="text-left px-4 py-2.5 text-xs font-medium text-zinc-500 uppercase tracking-wide">标题</th>
-                <th className="text-left px-4 py-2.5 text-xs font-medium text-zinc-500 uppercase tracking-wide">负责人</th>
-                <th className="text-left px-4 py-2.5 text-xs font-medium text-zinc-500 uppercase tracking-wide">状态</th>
-                <th className="text-left px-4 py-2.5 text-xs font-medium text-zinc-500 uppercase tracking-wide">创建时间</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map((g: Goal) => (
-                <tr key={g.id} className="border-b border-zinc-50 hover:bg-zinc-50/50 transition-colors">
-                  <td className="px-4 py-2.5">
-                    <Link href={`/goals/${g.id}`} className="font-medium text-zinc-900 hover:text-blue-600 hover:underline">
-                      {g.title}
-                    </Link>
-                  </td>
-                  <td className="px-4 py-2.5 text-zinc-500">
-                    {g.assignee_type === "squad"
-                      ? (squadName(g.assignee_id) || g.assignee_id)
-                      : g.assignee_id
-                        ? (agentName(g.assignee_id) || g.assignee_id)
-                        : "-"}
-                  </td>
-                  <td className="px-4 py-2.5">
-                    <Badge status={g.status} />
-                  </td>
-                  <td className="px-4 py-2.5 text-zinc-400 text-xs">
-                    {g.created_at ? new Date(g.created_at).toLocaleString("zh-CN") : "-"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="grid gap-3 md:grid-cols-2">
+          {filtered.map((g: Goal) => (
+            <Link
+              key={g.id}
+              href={`/goals/${g.id}`}
+              className="group relative flex bg-white rounded-2xl border border-zinc-200/80 shadow-sm overflow-hidden hover:shadow-lg hover:shadow-indigo-500/5 hover:-translate-y-0.5 hover:border-indigo-200 transition-all duration-200"
+            >
+              {/* 状态在左侧：竖向渐变条（一眼可扫） */}
+              <div className={`w-1.5 shrink-0 bg-gradient-to-b ${STATUS_BAR[g.status] ?? "from-zinc-300 to-zinc-400"}`} />
+              <div className="p-4 flex-1 min-w-0">
+                <div className="flex items-start justify-between gap-3">
+                  <h3 className="font-medium text-zinc-900 group-hover:text-indigo-700 transition-colors">
+                    {g.title}
+                  </h3>
+                  <Badge status={g.status} className="shrink-0" />
+                </div>
+                {g.status === "review" && g.review_request && (
+                  <p className="mt-1.5 text-xs text-purple-700 line-clamp-1">{g.review_request}</p>
+                )}
+                {/* 元信息：谁在干 / 负责人 · 时间 */}
+                <div className="mt-3 flex items-center gap-x-4 gap-y-1 flex-wrap text-xs text-zinc-400">
+                  {g.current_agent_id ? (
+                    <span className="flex items-center gap-1.5 font-medium text-emerald-600">
+                      <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                      {agentName(g.current_agent_id)} 正在执行
+                    </span>
+                  ) : (
+                    <span className="flex items-center gap-1.5">
+                      <span className="inline-block h-4 w-4 rounded-full bg-indigo-100 text-indigo-600 text-[10px] leading-4 text-center font-medium">
+                        {initials(g.assignee_type === "squad" ? (squadName(g.assignee_id) || "?") : (agentName(g.assignee_id) || "?"))}
+                      </span>
+                      {g.assignee_type === "squad"
+                        ? (squadName(g.assignee_id) || g.assignee_id)
+                        : g.assignee_id
+                          ? (agentName(g.assignee_id) || g.assignee_id)
+                          : "未分配"}
+                    </span>
+                  )}
+                  <span>
+                    {g.created_at ? new Date(g.created_at).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""}
+                  </span>
+                  {g.status === "done" && <span className="text-emerald-500 font-medium">✓ 已完成</span>}
+                  {g.status === "failed" && <span className="text-red-500 font-medium">✕ 失败</span>}
+                </div>
+              </div>
+            </Link>
+          ))}
         </div>
       )}
 
