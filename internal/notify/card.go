@@ -134,7 +134,9 @@ func evidenceSummary(raw string) string {
 		}
 	}
 	if a := strings.TrimSpace(ev.Agent); a != "" {
-		parts = append(parts, "agent："+truncate(a, 200))
+		// The agent's report is markdown (lark_md renders it); a longer slice
+		// keeps the approval decision on the actual work, not a teaser.
+		parts = append(parts, "agent："+truncate(a, 800))
 	}
 	return strings.Join(parts, "  \n")
 }

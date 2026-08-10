@@ -94,11 +94,26 @@ func (n *Notifier) onGoalReviewing(ctx context.Context, e events.Event) {
 func (n *Notifier) onGoalDelivered(ctx context.Context, e events.Event) {
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
+	note, _ := m["note"].(string)
+	commits, _ := m["commits"].([]string)
 	title := n.goalTitle(ctx, goalID)
 	if title == "" {
 		title = short(goalID)
 	}
-	n.sendMilestoneCard("✅", "blue", "已自动合入", fmt.Sprintf("**%s**  \n`goal %s`", title, short(goalID)))
+	body := fmt.Sprintf("**%s**  \n`goal %s`", title, short(goalID))
+	if s := strings.TrimSpace(note); s != "" {
+		body += "  \n" + s
+	}
+	if len(commits) > 0 {
+		body += "  \n\n提交："
+		for i, c := range commits {
+			if i >= 5 {
+				break
+			}
+			body += "  \n- `" + truncate(c, 90) + "`"
+		}
+	}
+	n.sendMilestoneCard("✅", "blue", "已自动合入", body)
 }
 
 func (n *Notifier) onGoalDeliverFailed(ctx context.Context, e events.Event) {
@@ -123,7 +138,14 @@ func (n *Notifier) onGoalFinished(ctx context.Context, e events.Event) {
 	}
 	switch status {
 	case "completed", "done":
-		n.sendMilestoneCard("🏁", "green", "完成", fmt.Sprintf("**%s**  \n`goal %s`", title, short(goalID)))
+		// The agent's full report (markdown) travels with the completion —
+		// the card renders it (lark_md), so Feishu shows what the web
+		// comment feed shows, not a bare title.
+		body := fmt.Sprintf("**%s**  \n`goal %s`", title, short(goalID))
+		if s := strings.TrimSpace(summary); s != "" {
+			body += "  \n\n" + truncate(s, 2000)
+		}
+		n.sendMilestoneCard("🏁", "green", "完成", body)
 	case "failed":
 		n.sendMilestoneCard("❌", "red", "失败", fmt.Sprintf("**%s**  \n`goal %s`  \n%s", title, short(goalID), truncate(summary, 200)))
 	}
