@@ -148,15 +148,22 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
 	bus.Subscribe("goal:approved", d.onGoalApproved)
 	// M4-B: a delivered issue-sourced goal closes its GitHub issue (the
-	// work is merged — the issue is done).
+	// work is merged — the issue is done). The fix commits (structured, from
+	// the deliver) travel into the close comment so the issue records WHAT
+	// was done with clickable links.
 	bus.Subscribe("goal:delivered", func(_ context.Context, e events.Event) {
 		m, ok := e.Payload.(map[string]any)
 		if !ok {
 			return
 		}
 		goalID, _ := m["goal_id"].(string)
+		note, _ := m["note"].(string)
+		var commits []string
+		if raw, ok := m["commits"].([]string); ok {
+			commits = raw
+		}
 		if goalID != "" {
-			d.issueCloser.OnDelivered(context.Background(), goalID)
+			d.issueCloser.OnDelivered(context.Background(), goalID, note, commits)
 		}
 	})
 	return d

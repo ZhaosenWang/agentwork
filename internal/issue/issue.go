@@ -125,6 +125,11 @@ func (c *Client) CloseIssue(ctx context.Context, repo string, number int) error 
 		map[string]string{"state": "closed"}, nil)
 }
 
+// CommitURL is the GitHub commit link.
+func (c *Client) CommitURL(repo, sha string) string {
+	return "https://github.com/" + repo + "/commit/" + sha
+}
+
 // ── Poller: open issues → goals ──
 
 // Poller turns a domain's open issues into goals (one goal per issue,
@@ -264,8 +269,11 @@ func NewCloser(st *store.Store) *Closer {
 	return &Closer{st: st, newProvider: NewProvider}
 }
 
-// OnDelivered is the bus handler for goal:delivered.
-func (c *Closer) OnDelivered(ctx context.Context, goalID string) {
+// OnDelivered is the bus handler for goal:delivered. commits ("<full sha>
+// <title>", structured from the deliver — never parsed from the note text)
+// become clickable fix links, the way an open-source maintainer closes an
+// issue.
+func (c *Closer) OnDelivered(ctx context.Context, goalID, note string, commits []string) {
 	var ref, token string
 	err := c.st.DB().QueryRowContext(ctx,
 		`SELECT g.source_ref, d.git_credentials FROM goal g JOIN domain d ON d.id=g.domain_id WHERE g.id=?`, goalID).
@@ -287,9 +295,27 @@ func (c *Closer) OnDelivered(ctx context.Context, goalID string) {
 		fmt.Printf("issue: close %s:%s#%d: %v\n", provider, repo, number, err)
 		return
 	}
-	// Tell the human what happened, with the commit context.
-	_ = client.CreateComment(ctx, repo, number,
-		fmt.Sprintf("✅ 已由 agentwork 修复并合入（goal %s）。", short(goalID)))
+	comment := fmt.Sprintf("✅ 已由 agentwork 修复并合入（goal %s）。", short(goalID))
+	if trimmed := strings.TrimSpace(note); trimmed != "" {
+		comment += "\n\n" + trimmed
+	}
+	for _, line := range commits {
+		if len(line) >= 40 && isHexSHA(line[:40]) {
+			sha, title := line[:40], strings.TrimSpace(line[40:])
+			comment += fmt.Sprintf("\n- [%s %s](%s)", sha[:8], title, client.CommitURL(repo, sha))
+		}
+	}
+	_ = client.CreateComment(ctx, repo, number, comment)
+}
+
+// isHexSHA reports whether s looks like a full git sha.
+func isHexSHA(s string) bool {
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func short(id string) string {

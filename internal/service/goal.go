@@ -886,7 +886,11 @@ func (s *GoalService) GateStats(ctx context.Context) ([]GateStat, error) {
 //   success → review → done (handoff_note cleared, parent woken)
 //   failure → stays in review with the reason annotated (review_request),
 //             so the human can retry deliver or reject the change back.
-func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success bool, note string) (*Goal, error) {
+//
+// fixCommits ("<full sha> <title>") is the fix evidence the daemon collected;
+// the goal layer passes it through verbatim to the delivered event — the
+// issue closer links it. The goal layer never parses it (not its domain).
+func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success bool, note string, fixCommits []string) (*Goal, error) {
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -928,7 +932,7 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 		return nil, err
 	}
 	s.bus.Publish(ctx, events.Event{Topic: event, Payload: map[string]any{
-		"goal_id": goalID, "note": note,
+		"goal_id": goalID, "note": note, "commits": fixCommits,
 	}})
 	// The wake's run events, published after commit (invariant 13).
 	for _, e := range deliverEvents {

@@ -107,7 +107,7 @@ func TestReviewApproveKeepsGoalParkedUntilDeliver(t *testing.T) {
 	}
 
 	// Only MarkDelivered closes the loop.
-	done, err := gs.MarkDelivered(ctx, g.ID, true, "merged")
+	done, err := gs.MarkDelivered(ctx, g.ID, true, "merged", nil)
 	if err != nil {
 		t.Fatalf("mark delivered: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestReviewRejectThenApproveRoundTrip(t *testing.T) {
 	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	done, err := gs.MarkDelivered(ctx, g.ID, true, "merged")
+	done, err := gs.MarkDelivered(ctx, g.ID, true, "merged", nil)
 	if err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
@@ -267,7 +267,7 @@ func TestMarkDeliveredFailureStaysInReview(t *testing.T) {
 	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	got, err := gs.MarkDelivered(ctx, g.ID, false, "合并冲突：internal/acp/client.go")
+	got, err := gs.MarkDelivered(ctx, g.ID, false, "合并冲突：internal/acp/client.go", nil)
 	if err != nil {
 		t.Fatalf("mark delivered failed: %v", err)
 	}
@@ -309,7 +309,7 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
-	if _, err := gs.MarkDelivered(ctx, g.ID, true, "merged"); err != nil {
+	if _, err := gs.MarkDelivered(ctx, g.ID, true, "merged", nil); err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
 	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 现在可以做了" }); err != nil {

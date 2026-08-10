@@ -111,6 +111,20 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// the merge .. merge commit).
 	mergeBaseSHA := strings.TrimSpace(mustGitRun(ctx, wt, "rev-parse", "HEAD"))
 
+	// The goal branch's ORIGINAL commits (base..branch) are the human-readable
+	// fix evidence — the close comment must say WHAT was done, not just that
+	// it was merged (the merge commit itself is the platform's noise). FULL
+	// hashes so the closer can build clickable commit links. Carried
+	// STRUCTURED (not parsed from the note text) — the goal layer passes them
+	// through to the delivered event verbatim.
+	fixLog, _ := gitRun(ctx, wt, "log", "--format=%H %s", base+".."+branchName)
+	var fixCommits []string
+	for _, l := range strings.Split(fixLog, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			fixCommits = append(fixCommits, l)
+		}
+	}
+
 	// Merge the goal branch (--no-ff: a merge commit makes the delivered
 	// change an explicit, revertible unit).
 	mergeOut, err := gitRunCtx(ctx, wt, "merge", "--no-ff", branchName, "-m", "Merge "+branchName+" (agentwork deliver)")
@@ -154,14 +168,21 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// the agent's state where it was.
 	_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
 
-	d.finishDeliver(ctx, goalID, true, "merged "+branchName+" → "+defaultBranch)
+	// The delivered note carries the merge info; the fix commits travel
+	// STRUCTURED to the delivered event (the close comment links them).
+	note := "merged " + branchName + " → " + defaultBranch
+	d.finishDeliver(ctx, goalID, true, note, fixCommits)
 }
 
 // finishDeliver closes the deliver step via the goal layer's MarkDelivered
 // (the goal layer is the only authority over goal.status).
-func (d *Daemon) finishDeliver(ctx context.Context, goalID string, success bool, note string) {
+func (d *Daemon) finishDeliver(ctx context.Context, goalID string, success bool, note string, commits ...[]string) {
 	log.Printf("daemon: deliver %s: %s", goalID, note)
-	if _, err := d.goalSvc.MarkDelivered(ctx, goalID, success, note); err != nil {
+	var fixCommits []string
+	if len(commits) > 0 {
+		fixCommits = commits[0]
+	}
+	if _, err := d.goalSvc.MarkDelivered(ctx, goalID, success, note, fixCommits); err != nil {
 		log.Printf("daemon: MarkDelivered %s: %v", goalID, err)
 	}
 }

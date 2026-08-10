@@ -378,8 +378,8 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
             ))}
           </select>
         </Field>
-        <Field label="平台操作 token（git_credentials）" hint="建议用 agentwork-bot 账号的 token——issue 评论/close 和 git push 都以该账号身份出现（决策 3-5）">
-          <input value={gitCredentials} onChange={(e) => setGitCredentials(e.target.value)} className={inputCls} placeholder="GitHub PAT 或 GitCode token（bot 账号）" type="password" />
+        <Field label="平台操作 token（git_credentials）" hint="bot 账号 token（决策 3-5）：issue 评论/close + git push 都以此身份出现。权限需覆盖：仓库读写（Contents）+ issues 读写。GitHub 用 fine-grained PAT 只授权本仓库；GitCode 用 token-classic">
+          <input value={gitCredentials} onChange={(e) => setGitCredentials(e.target.value)} className={inputCls} placeholder="GitHub PAT 或 GitCode token（bot 账号，需仓库+issue 读写）" type="password" />
         </Field>
         {create.isError && <p className="text-sm text-red-500">{String(create.error)}</p>}
       </form>

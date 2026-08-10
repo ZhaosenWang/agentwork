@@ -128,3 +128,8 @@ func (c *GitCodeClient) CloseIssue(ctx context.Context, repo string, number int)
 	return c.do(ctx, http.MethodPatch, "/repos/"+owner+"/issues/"+strconv.Itoa(number),
 		url.Values{"repo": {repoName}, "number": {strconv.Itoa(number)}, "state": {"close"}}, nil)
 }
+
+// CommitURL is the GitCode commit link (verified: /commit/<sha> resolves).
+func (c *GitCodeClient) CommitURL(repo, sha string) string {
+	return "https://gitcode.com/" + repo + "/commit/" + sha
+}

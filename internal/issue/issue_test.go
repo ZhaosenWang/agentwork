@@ -31,6 +31,11 @@ func mockGitHub(t *testing.T) (*httptest.Server, *[]string) {
 			json.NewEncoder(w).Encode([]map[string]any{
 				{"id": 1, "body": "注意保留旧接口兼容", "user": map[string]any{"login": "eushing"}, "created_at": time.Now()},
 			})
+		case strings.HasSuffix(r.URL.Path, "/comments") && r.Method == http.MethodPost:
+			var cm struct{ Body string `json:"body"` }
+			json.NewDecoder(r.Body).Decode(&cm)
+			calls = append(calls, "BODY: "+cm.Body)
+			w.WriteHeader(http.StatusCreated)
 		default:
 			w.WriteHeader(http.StatusNoContent)
 		}
@@ -163,8 +168,8 @@ func TestCloserClosesIssueOnDelivered(t *testing.T) {
 		cl.baseURL = srv.URL
 		return cl, nil
 	}
-	c.OnDelivered(ctx, issueGoal.ID)
-	c.OnDelivered(ctx, plainGoal.ID)
+	c.OnDelivered(ctx, issueGoal.ID, "merged feat-x → main", []string{"77cfd90b95bbe2cd8ae4393b470d679b528226b3 docs: 添加 README"})
+	c.OnDelivered(ctx, plainGoal.ID, "", nil)
 
 	joined := strings.Join(*calls, " ")
 	if !strings.Contains(joined, "PATCH /repos/x/y/issues/7") {
@@ -172,6 +177,9 @@ func TestCloserClosesIssueOnDelivered(t *testing.T) {
 	}
 	if !strings.Contains(joined, "POST /repos/x/y/issues/7/comments") {
 		t.Fatalf("issue goal must comment on close, calls: %s", joined)
+	}
+	if !strings.Contains(joined, "77cfd90b docs: 添加 README") || !strings.Contains(joined, "https://github.com/x/y/commit/77cfd90b95bbe2cd8ae4393b470d679b528226b3") {
+		t.Fatalf("close comment must carry a clickable fix commit link, calls: %s", joined)
 	}
 }
 

@@ -17,6 +17,10 @@ type Provider interface {
 	ListComments(ctx context.Context, repo string, number int) ([]Comment, error)
 	CreateComment(ctx context.Context, repo string, number int, body string) error
 	CloseIssue(ctx context.Context, repo string, number int) error
+	// CommitURL builds the human-clickable commit link — the close comment's
+	// fix evidence. The domain is the provider's own (github.com,
+	// gitcode.com, ...), never guessed by the caller.
+	CommitURL(repo, sha string) string
 }
 
 // NewProvider builds the provider named by the domain's issue_provider
