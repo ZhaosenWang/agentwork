@@ -326,3 +326,35 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 		t.Fatalf("mention after review must trigger a run on the mentioned agent")
 	}
 }
+
+// TestReviewRejectBlockedWhileDelivering: approve starts the async deliver and
+// the goal stays in review — a reject in that window must be refused (the
+// merge may already have pushed; the agent must not restart on a branch whose
+// work is already in the default branch). A FAILED deliver re-opens both
+// paths (retry deliver / reject back to fix).
+func TestReviewRejectBlockedWhileDelivering(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	run := enqueueFirst(t, rs, g)
+	finishWithMergeGate(t, st, rs, run, "ok")
+	if _, err := gs.ResolveReview(ctx, g.ID, run.ID, "approve", ""); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	// Reject while delivering → refused.
+	if _, err := gs.ResolveReview(ctx, g.ID, run.ID, "reject", "反悔了"); err == nil {
+		t.Fatal("reject during deliver must be refused")
+	}
+	// Deliver fails (conflict annotated) → reject becomes legal (the agent
+	// goes back to fix the conflict).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE goal SET review_request=? WHERE id=?`, "deliver: merge conflict in main.go", g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.ResolveReview(ctx, g.ID, run.ID, "reject", "解决冲突"); err != nil {
+		t.Fatalf("reject after deliver failure must be allowed: %v", err)
+	}
+}

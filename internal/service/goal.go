@@ -608,19 +608,30 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	if g.Status != "review" {
 		return nil, NewValidationError("goal is not in review")
 	}
-	// Duplicate-decision guard: an approve recorded for this review cycle must
-	// not be re-approved — the human clicking "批准" again (the page shows no
-	// feedback while the async deliver runs) would pile up gate_decision rows
-	// and corrupt the health data. EXCEPTION: a FAILED deliver annotates
-	// review_request ("deliver: ...") and the human must be able to retry the
-	// approval — that is the designed retry path.
-	if decision == "approve" {
-		var lastDecision, lastAt string
+	// Duplicate-decision guard: the deliver step runs ASYNC after an approve,
+	// and the goal stays in review until it finishes — a second decision in
+	// that window would race the merge. Both directions are guarded:
+	//   - re-approve: the human clicking again (the page shows no feedback
+	//     while deliver runs) would pile up gate_decision rows.
+	//   - reject after approve: the goal would go back to active + a new run
+	//     while the deliver may already have pushed — the agent would then
+	//     continue on a branch whose work is already in the default branch.
+	// EXCEPTION: a FAILED deliver annotates review_request ("deliver: ...")
+	// and BOTH decisions must be allowed — re-approve retries the deliver,
+	// reject sends the agent back to fix the conflict (the designed paths).
+	deliverFailed := strings.HasPrefix(g.ReviewRequest, "deliver:")
+	if decision == "approve" || decision == "reject" || decision == "redirect" {
+		var lastDecision string
 		err := s.st.DB().QueryRowContext(ctx,
-			`SELECT decision, decided_at FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, goalID).
-			Scan(&lastDecision, &lastAt)
-		if err == nil && lastDecision == "approve" && !strings.HasPrefix(g.ReviewRequest, "deliver:") {
-			return nil, NewValidationError("goal already approved — waiting for the deliver step (or check the deliver result)")
+			`SELECT decision FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, goalID).
+			Scan(&lastDecision)
+		if err == nil && !deliverFailed {
+			if decision == "approve" && lastDecision == "approve" {
+				return nil, NewValidationError("goal already approved — waiting for the deliver step (or check the deliver result)")
+			}
+			if (decision == "reject" || decision == "redirect") && lastDecision == "approve" {
+				return nil, NewValidationError("goal is being delivered — reject is available after the deliver finishes or fails")
+			}
 		}
 	}
 	ts := now()
