@@ -1,10 +1,11 @@
 "use client";
 
 import { useState, useMemo } from "react";
-import { useGoalRuns } from "@/lib/queries";
+import { useGoalRuns, useGoalRunMessages } from "@/lib/queries";
 import { useWSEvent } from "@/lib/ws";
 import { Badge, Empty } from "@/components/ui";
 import type { Run } from "@/lib/types";
+import type { ChatMessage } from "@/lib/api";
 
 export function GoalRuns({ goalId }: { goalId: string }) {
   const { data: runs, isLoading, refetch } = useGoalRuns(goalId);
@@ -41,7 +42,7 @@ export function GoalRuns({ goalId }: { goalId: string }) {
             {activeRuns.length > 0 && (
               <div>
                 <div className="text-xs font-medium text-zinc-500 mb-2">活跃运行</div>
-                <RunTable runs={activeRuns} />
+                <RunTable runs={activeRuns} goalId={goalId} />
               </div>
             )}
 
@@ -54,7 +55,7 @@ export function GoalRuns({ goalId }: { goalId: string }) {
                 >
                   {showPast ? "▾" : "▸"} 历史运行（{pastRuns.length}）
                 </button>
-                {showPast && <RunTable runs={pastRuns} />}
+                {showPast && <RunTable runs={pastRuns} goalId={goalId} />}
               </div>
             )}
           </div>
@@ -64,7 +65,7 @@ export function GoalRuns({ goalId }: { goalId: string }) {
   );
 }
 
-function RunTable({ runs }: { runs: Run[] }) {
+function RunTable({ runs, goalId }: { runs: Run[]; goalId: string }) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-xs">
@@ -76,21 +77,107 @@ function RunTable({ runs }: { runs: Run[] }) {
             <th className="text-left py-1.5 px-2 font-medium text-zinc-500">结果</th>
             <th className="text-left py-1.5 px-2 font-medium text-zinc-500">开始</th>
             <th className="text-left py-1.5 px-2 font-medium text-zinc-500">结束</th>
+            <th className="text-left py-1.5 px-2 font-medium text-zinc-500"></th>
           </tr>
         </thead>
         <tbody>
           {runs.map((r) => (
-            <tr key={r.id} className="border-b border-zinc-50 hover:bg-zinc-50/50">
-              <td className="py-1.5 px-2 text-zinc-700 font-mono text-xs">{r.agent_id?.slice(0, 8) ?? "-"}</td>
-              <td className="py-1.5 px-2"><Badge status={r.status} /></td>
-              <td className="py-1.5 px-2 text-zinc-500">#{r.attempt}</td>
-              <td className="py-1.5 px-2 text-zinc-500 max-w-[200px] truncate">{r.result_summary || "-"}</td>
-              <td className="py-1.5 px-2 text-zinc-400">{r.started_at ? new Date(r.started_at).toLocaleString("zh-CN") : "-"}</td>
-              <td className="py-1.5 px-2 text-zinc-400">{r.finished_at ? new Date(r.finished_at).toLocaleString("zh-CN") : "-"}</td>
-            </tr>
+            <RunRow key={r.id} run={r} goalId={goalId} />
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// RunRow shows one run; clicking the chevron opens the LIVE interaction
+// stream (chat_message — what the agent is doing right now), refreshed on
+// every run:event over the WS.
+function RunRow({ run, goalId }: { run: Run; goalId: string }) {
+  const [open, setOpen] = useState(false);
+  const { data: messages, refetch } = useGoalRunMessages(goalId, run.id);
+  useWSEvent("run:event", () => {
+    if (open) refetch();
+  });
+
+  return (
+    <>
+      <tr className="border-b border-zinc-50 hover:bg-zinc-50/50">
+        <td className="py-1.5 px-2 text-zinc-700 font-mono text-xs">{run.agent_id?.slice(0, 8) ?? "-"}</td>
+        <td className="py-1.5 px-2"><Badge status={run.status} /></td>
+        <td className="py-1.5 px-2 text-zinc-500">#{run.attempt}</td>
+        <td className="py-1.5 px-2 text-zinc-500 max-w-[200px] truncate">{run.result_summary || "-"}</td>
+        <td className="py-1.5 px-2 text-zinc-400">{run.started_at ? new Date(run.started_at).toLocaleString("zh-CN") : "-"}</td>
+        <td className="py-1.5 px-2 text-zinc-400">{run.finished_at ? new Date(run.finished_at).toLocaleString("zh-CN") : "-"}</td>
+        <td className="py-1.5 px-2">
+          <button onClick={() => setOpen(!open)} className="text-zinc-400 hover:text-zinc-600 text-xs">
+            {open ? "▾" : "▸"}
+          </button>
+        </td>
+      </tr>
+      {open && (
+        <tr>
+          <td colSpan={7} className="py-2 px-3 bg-zinc-50/60">
+            {run.status === "running" && (
+              <div className="text-[11px] text-emerald-600 mb-1.5 flex items-center gap-1">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                运行中——实时交互流
+              </div>
+            )}
+            <RunMessages messages={messages ?? []} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// RunMessages renders the interaction stream: assistant text, thoughts, and
+// tool calls (each tool use shows its name + input).
+function RunMessages({ messages }: { messages: ChatMessage[] }) {
+  if (messages.length === 0) {
+    return <div className="text-[11px] text-zinc-400 py-2">尚无交互记录…</div>;
+  }
+  return (
+    <div className="max-h-72 overflow-y-auto space-y-1.5">
+      {messages.map((m, i) => {
+        if (m.role === "tool" && m.tool_calls) {
+          try {
+            const tc = JSON.parse(m.tool_calls);
+            if (tc.type === "tool_use") {
+              const input = typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input ?? "");
+              return (
+                <div key={i} className="text-[11px]">
+                  <span className="text-purple-600 font-medium">⚙ {tc.tool}</span>
+                  <span className="text-zinc-400 ml-1 break-all">{String(input).slice(0, 160)}</span>
+                </div>
+              );
+            }
+            if (tc.type === "tool_result") {
+              const out = typeof tc.output === "string" ? tc.output : JSON.stringify(tc.output ?? "");
+              return (
+                <div key={i} className="text-[11px] pl-3 border-l-2 border-zinc-200">
+                  <span className="text-zinc-400 break-all whitespace-pre-wrap">{String(out).slice(0, 240)}</span>
+                </div>
+              );
+            }
+          } catch {
+            /* not tool JSON */
+          }
+        }
+        if (m.role === "thought") {
+          return (
+            <div key={i} className="text-[11px] text-zinc-400 italic">
+              💭 {m.content}
+            </div>
+          );
+        }
+        return (
+          <div key={i} className="text-[11px] text-zinc-700">
+            {m.content}
+          </div>
+        );
+      })}
     </div>
   );
 }

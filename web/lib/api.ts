@@ -66,6 +66,14 @@ export const resolveGoalReview = (
 // ── Run ──
 export const listGoalRuns = (goalId: string) =>
   api<Run[]>(`/goals/${goalId}/runs`);
+export interface ChatMessage {
+  role: string; // user|assistant|tool|system
+  content: string;
+  tool_calls: string; // JSON
+  created_at: string;
+}
+export const listGoalRunMessages = (goalId: string, runId: string) =>
+  api<ChatMessage[]>(`/goals/${goalId}/runs/${runId}/messages`);
 
 // ── Comment ──
 export const listGoalComments = (goalId: string) =>

@@ -387,6 +387,34 @@ func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	return out, rows.Err()
 }
 
+// RunMessage is one row of a run's interaction stream (chat_message) — the
+// Web run detail's "what is the agent doing right now" view.
+type RunMessage struct {
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	ToolCalls string `json:"tool_calls"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ListMessages returns the run's persisted interaction stream, oldest first.
+func (s *RunService) ListMessages(ctx context.Context, runID string) ([]RunMessage, error) {
+	rows, err := s.st.DB().QueryContext(ctx,
+		`SELECT role, content, tool_calls, created_at FROM chat_message WHERE run_id=? ORDER BY created_at`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RunMessage{}
+	for rows.Next() {
+		var m RunMessage
+		if err := rows.Scan(&m.Role, &m.Content, &m.ToolCalls, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // inPlaceholders builds "?,?,?" for a slice and returns the args slice.
 func inPlaceholders(ids []string) (string, []any) {
 	ph := ""

@@ -18,6 +18,7 @@ import {
   resolveGoalReview,
   reopenGoal,
   listGoalRuns,
+  listGoalRunMessages,
   listGoalComments,
   createGoalComment,
   listSquads,
@@ -184,6 +185,12 @@ export function useGoalRuns(goalId: string) {
   return useQuery({
     queryKey: qk.goalRuns(goalId),
     queryFn: () => listGoalRuns(goalId),
+  });
+}
+export function useGoalRunMessages(goalId: string, runId: string) {
+  return useQuery({
+    queryKey: ["goal-runs", runId, "messages"],
+    queryFn: () => listGoalRunMessages(goalId, runId),
   });
 }
 

@@ -43,6 +43,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"reflect"
+	"strings"
 	"fmt"
 	"io"
 	"os/exec"
@@ -205,6 +207,63 @@ func (s *Session) NewSession(ctx context.Context, req NewSessionRequest) (*NewSe
 	s.sessionID = resp.SessionID
 	s.mu.Unlock()
 	return &resp, nil
+}
+
+// normalizeNilSlices deep-converts nil slices into empty arrays before JSON
+// marshaling. ACP servers differ in strictness: openagent tolerates null
+// arrays, opencode's zod schema REJECTS them ("expected array, received
+// undefined") — the same request (e.g. session/new's mcpServers) must be
+// accepted by both. omitempty fields are still omitted when zero.
+func normalizeNilSlices(v any) any {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return v
+		}
+		rv = rv.Elem()
+	}
+	if !rv.IsValid() {
+		return v
+	}
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		if rv.Kind() == reflect.Slice && rv.IsNil() {
+			return []any{}
+		}
+		out := make([]any, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			out[i] = normalizeNilSlices(rv.Index(i).Interface())
+		}
+		return out
+	case reflect.Struct:
+		out := map[string]any{}
+		t := rv.Type()
+		for i := 0; i < rv.NumField(); i++ {
+			f := rv.Field(i)
+			if !f.CanInterface() {
+				continue
+			}
+			tag := t.Field(i).Tag.Get("json")
+			parts := strings.Split(tag, ",")
+			name := parts[0]
+			if name == "" || name == "-" {
+				continue
+			}
+			omitEmpty := false
+			for _, p := range parts[1:] {
+				if p == "omitempty" {
+					omitEmpty = true
+				}
+			}
+			if omitEmpty && f.IsZero() {
+				continue
+			}
+			out[name] = normalizeNilSlices(f.Interface())
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // SetEventHandler registers the callback that receives session/update
@@ -382,7 +441,7 @@ func (s *Session) request(ctx context.Context, method string, params any) (rpcRe
 		ID      string `json:"id"`
 		Method  string `json:"method"`
 		Params  any    `json:"params,omitempty"`
-	}{JSONRPC: "2.0", ID: id, Method: method, Params: params}
+	}{JSONRPC: "2.0", ID: id, Method: method, Params: normalizeNilSlices(params)}
 
 	reqBody, _ := json.Marshal(req)
 	call := &pendingCall{done: make(chan struct{})}

@@ -56,6 +56,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/request-approval", h.requestGoalApproval)
 	mux.HandleFunc("POST /goals/{id}/reopen", h.reopenGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
+	mux.HandleFunc("GET /goals/{id}/runs/{runId}/messages", h.listRunMessages)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
 
@@ -251,6 +252,13 @@ func (h *Handlers) reopenGoal(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) listRuns(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Run.List(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+
+// listRunMessages returns the run's live interaction stream — the Web run
+// detail's "what is the agent doing right now" view.
+func (h *Handlers) listRunMessages(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Run.ListMessages(r.Context(), r.PathValue("runId"))
 	writeJSON(w, out, err)
 }
 

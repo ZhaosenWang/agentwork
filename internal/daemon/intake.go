@@ -58,6 +58,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 
 	conn, err := runtime.Open(ctx, runtime.Spec{
 		Transport: transport, Executable: execPath, Args: args, Endpoint: endpoint, Env: rtEnv,
+		Cwd: workdir, // the parser's scratch dir — see Spec.Cwd
 	}, taskEnv)
 	if err != nil {
 		d.failIntakeRun(ctx, q, "open transport: "+err.Error())

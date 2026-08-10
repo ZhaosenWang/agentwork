@@ -925,6 +925,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		Args:       args,
 		Endpoint:   endpoint,
 		Env:        rtEnv,
+		Cwd:        runRowWorkdir, // the goal's worktree — see Spec.Cwd
 	}
 	conn, err := runtime.Open(ctx, spec, taskEnv)
 	if err != nil {
@@ -937,6 +938,31 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// human-agent dialogue channel — the agent starts with the latest
 	// conversation, nothing stored).
 	prompt := buildPrompt(title, desc, handoff)
+	// Goal comments (the human's words on this goal) are injected too —
+	// otherwise a comment is invisible to the agent until a reject carries
+	// it in the note (the regression the user hit: "添加评论没啥作用").
+	// Only human/system comments — the agent's own are already in its
+	// transcript.
+	if rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT author_type, content FROM comment WHERE goal_id=? AND author_type IN ('human','system')
+		 ORDER BY created_at DESC LIMIT 5`, q.GoalID); err == nil {
+		var comments []string
+		for rows.Next() {
+			var at, content string
+			if rows.Scan(&at, &content) == nil && strings.TrimSpace(content) != "" {
+				comments = append(comments, at+"："+content)
+			}
+		}
+		rows.Close()
+		if len(comments) > 0 {
+			var b strings.Builder
+			b.WriteString("\n\n## Goal 评论（人在这个任务上的话）\n")
+			for i := len(comments) - 1; i >= 0; i-- { // 时间正序
+				b.WriteString("- " + comments[i] + "\n")
+			}
+			prompt += b.String()
+		}
+	}
 	if len(issueComments) > 0 {
 		var b strings.Builder
 		b.WriteString("\n\n## Issue 最新交流（来自 GitHub）\n")
@@ -1150,6 +1176,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 
 	conn, err := runtime.Open(ctx, runtime.Spec{
 		Transport: transport, Executable: execPath, Args: args, Endpoint: endpoint, Env: rtEnv,
+		Cwd: runRowWorkdir, // the processor's scratch dir — see Spec.Cwd
 	}, taskEnv)
 	if err != nil {
 		d.failProcessorRun(ctx, q, "open transport: "+err.Error())
