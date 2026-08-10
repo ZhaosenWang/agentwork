@@ -149,6 +149,10 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
 	bus.Subscribe("goal:approved", d.onGoalApproved)
+	// Squad review checkpoint: a squad-owned goal parking in review triggers
+	// the squad's role=reviewer members (the squad's own rule, enforced by
+	// the platform — not by the leader's discretion).
+	bus.Subscribe("goal:reviewing", d.onGoalReviewing)
 	// M4-B: a delivered issue-sourced goal closes its GitHub issue (the
 	// work is merged — the issue is done). The fix commits (structured, from
 	// the deliver) travel into the close comment so the issue records WHAT
