@@ -58,7 +58,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `agentwork-cli — agent-side tool (called by agents during task execution)
 
 Subcommands:
-  goal list [--limit N]                    list goals (JSON); --limit caps to N most recent (default all)
+  goal list [--limit N] [--status S]       list goals (JSON); --limit caps to N most recent (default all);
+                                             --status keeps only goals whose status equals S (exact match)
   goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
   goal create --title T [--description D] [--assignee A] [--parent P] [--status S]
                                              create a sub-goal (parent defaults to current goal)
@@ -105,13 +106,50 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 	}
 }
 
-// goalList implements `goal list [--limit N]`. --limit truncates to the N
-// most recent goals; absent (or 0) means all.
+// goalList implements `goal list [--limit N] [--status S]`. --limit truncates
+// to the N most recent goals; absent (or 0) means all. --status filters to
+// goals whose status exactly matches S. The server's /goals endpoint only
+// supports ?limit, so the status filter is applied client-side, and --limit
+// then truncates the filtered list to the N most recent matches.
 func goalList(serverURL string, args []string) {
 	fs := flag.NewFlagSet("goal list", flag.ExitOnError)
 	limit := fs.Int("limit", 0, "max number of goals to return (0 = all)")
+	status := fs.String("status", "", "only list goals with this status (exact match)")
 	fs.Parse(args)
-	get(goalListURL(serverURL, *limit))
+	if *status == "" {
+		get(goalListURL(serverURL, *limit))
+		return
+	}
+	var goals []json.RawMessage
+	if err := getJSON(goalListURL(serverURL, 0), &goals); err != nil {
+		fail("%v", err)
+	}
+	out := filterGoalsByStatus(goals, *status)
+	if *limit > 0 && len(out) > *limit {
+		out = out[:*limit]
+	}
+	if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+		fail("encode: %v", err)
+	}
+}
+
+// filterGoalsByStatus returns the goals whose status equals want, preserving
+// order. The status is probed via a minimal unmarshal so each goal object
+// passes through byte-for-byte (no field loss, no key reordering).
+func filterGoalsByStatus(goals []json.RawMessage, want string) []json.RawMessage {
+	out := make([]json.RawMessage, 0, len(goals))
+	for _, g := range goals {
+		var probe struct {
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(g, &probe); err != nil {
+			continue // malformed goal object: skip
+		}
+		if probe.Status == want {
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // goalListURL builds the GET /goals URL, appending ?limit=N when N > 0.
