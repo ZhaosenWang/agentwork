@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/runtime"
 	"github.com/eushing/agentwork/internal/service"
@@ -181,7 +182,17 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 		return "创建任务失败：缺少标题"
 	}
 	if strings.TrimSpace(g.DomainID) == "" {
-		return "创建任务失败：没有可用的 domain（先在 Web 建域并配置验收策略）"
+		// Domain is a REQUIRED parameter (multi-domain): the parser was told
+		// not to guess. Save the draft and ask the owner to name the repo —
+		// the next inbound message is parsed with the draft as context, so a
+		// bare repo name completes this task.
+		if d.intakeSvc != nil {
+			_ = d.intakeSvc.SaveDraft(ctx, notify.IntakeDraft{
+				Title: g.Title, Description: g.Description, AssigneeID: g.AssigneeID,
+				CreatedAt: nowStr(),
+			})
+		}
+		return "这个任务需要在哪个仓库执行？请回复仓库名：\n" + d.intakeDomainList(ctx)
 	}
 	if strings.TrimSpace(g.AssigneeID) == "" {
 		return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
@@ -201,7 +212,34 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 	if _, err := d.runSvc.EnqueueForGoal(ctx, *goal); err != nil {
 		return "任务已创建但启动失败：" + err.Error()
 	}
+	// The pending clarification (if any) is resolved — the task exists now.
+	if d.intakeSvc != nil {
+		_ = d.intakeSvc.ClearDraft(ctx)
+	}
 	return fmt.Sprintf("✅ 已创建任务：**%s**（`goal %s`），agent 开始执行", goal.Title, shortID(goal.ID))
+}
+
+// intakeDomainList lists the available domains for the clarification ask.
+func (d *Daemon) intakeDomainList(ctx context.Context) string {
+	var b strings.Builder
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM domain ORDER BY name`)
+	if err != nil {
+		return "（当前没有可用仓库——先在 Web 建域）"
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "- %s\n", name)
+		n++
+	}
+	if n == 0 {
+		return "（当前没有可用仓库——先在 Web 建域）"
+	}
+	return b.String()
 }
 
 // intakeReviewList answers "待审批" with the current checkpoint queue.

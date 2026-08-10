@@ -107,6 +107,7 @@ type Daemon struct {
 	qs        notify.QueryStore // M3: digest aggregation (may be nil)
 	issuePoll *issue.Poller     // M4-B: open issues → goals
 	issueCloser *issue.Closer   // M4-B: delivered goal → close its issue
+	intakeSvc   *notify.IntakeService // M4-B: multi-domain clarification draft store
 	lastIssuePoll time.Time     // last poll time (the interval is configurable)
 
 	mu          sync.Mutex
@@ -132,13 +133,14 @@ type agentWorker struct {
 // New wires the daemon. im + qs are the M3 IM surfaces: the connector is the
 // owner of the notifier (born when the long connection connects), qs feeds
 // the daily digest and intake queries. Both may be nil (notify not wired).
-func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, im *notify.Connector, qs notify.QueryStore) *Daemon {
+func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, im *notify.Connector, qs notify.QueryStore, intakeSvc *notify.IntakeService) *Daemon {
 	d := &Daemon{
 		st: st, bus: bus, addr: addr,
 		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
 		im:          im,
 		qs:          qs,
+		intakeSvc:   intakeSvc,
 		issuePoll:   issue.NewPoller(st, goalSvc, runSvc),
 		issueCloser: issue.NewCloser(st),
 		workers:     make(map[string]*agentWorker),

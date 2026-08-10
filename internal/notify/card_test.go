@@ -209,3 +209,53 @@ type mapSettings struct {
 func (m *mapSettings) Get(_ context.Context, key string) (string, error) { return m.vals[key], nil }
 func (m *mapSettings) Set(_ context.Context, key, value string) error    { m.vals[key] = value; return nil }
 func (m *mapSettings) Delete(_ context.Context, key string) error        { delete(m.vals, key); return nil }
+
+// TestIntakeDraftClarification: the multi-domain clarification — a pending
+// draft surfaces in the next parser prompt (so a bare repo name completes the
+// pending task), expires after TTL, and clears.
+func TestIntakeDraftClarification(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	runSvc := service.NewRunService(st, events.NewBus())
+	seedAgentRow(t, ctx, st)
+	qs := NewSQLQueryStore(st)
+	fake := &mapSettings{vals: map[string]string{}}
+	is := NewIntakeService(qs, fake, runSvc)
+
+	// No draft → no clarification context.
+	p, err := is.BuildPrompt(ctx, "创建任务：修一下")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(p, "补全") {
+		t.Fatal("no draft must not inject clarification context")
+	}
+	// Save a draft → the next prompt carries it.
+	if err := is.SaveDraft(ctx, IntakeDraft{Title: "修一下", AssigneeID: "a1", CreatedAt: time.Now().Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	p, err = is.BuildPrompt(ctx, "test-repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(p, "补全") || !strings.Contains(p, "修一下") {
+		t.Fatalf("draft context must be injected: %s", p)
+	}
+	if err := is.ClearDraft(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Cleared → gone.
+	if _, ok := is.LoadDraft(ctx); ok {
+		t.Fatal("cleared draft must be gone")
+	}
+	// Expired draft → treated as absent.
+	if err := is.SaveDraft(ctx, IntakeDraft{Title: "旧任务", CreatedAt: time.Now().Add(-30 * time.Minute).Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := is.LoadDraft(ctx); ok {
+		t.Fatal("expired draft must be treated as absent")
+	}
+}

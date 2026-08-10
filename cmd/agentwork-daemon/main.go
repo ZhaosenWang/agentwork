@@ -76,7 +76,8 @@ func main() {
 	// owner's inbound messages become intake parse runs on the configured
 	// global parser agent (app_settings platform.intake_agent).
 	imConn.SetGoalService(goalSvc)
-	imConn.SetIntakeService(notify.NewIntakeService(qs, settingsSvc, runSvc))
+	intakeSvc := notify.NewIntakeService(qs, settingsSvc, runSvc)
+	imConn.SetIntakeService(intakeSvc)
 
 	// Protocol backends registered by provider name (runtime.provider selects).
 	protoReg := proto.NewRegistry()
@@ -84,7 +85,7 @@ func main() {
 	protoReg.Register("jsonl", jsonlbackend.New())
 	protoReg.Register("jsonrpc", jsonrpcbackend.New())
 
-	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, squadSvc, schedSvc, imConn, qs)
+	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, squadSvc, schedSvc, imConn, qs, intakeSvc)
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("daemon: %v", err)
