@@ -173,7 +173,7 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 		if err != nil {
 			return nil, fmt.Errorf("resolve assignee label: %w", err)
 		}
-		content := "[" + label + "](mention://" + g.AssigneeType + "/" + g.AssigneeID + ") " + g.Description
+		content := "[@" + label + "](mention://" + g.AssigneeType + "/" + g.AssigneeID + ") " + g.Description
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
 			newID(), g.ID, g.CreatedByType, g.CreatedByID, content, g.CreatedAt); err != nil {

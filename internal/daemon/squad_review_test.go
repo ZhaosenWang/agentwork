@@ -91,7 +91,7 @@ func TestSquadReviewTrigger(t *testing.T) {
 		Scan(&commentID, &content); err != nil {
 		t.Fatalf("system review comment: %v", err)
 	}
-	if !strings.Contains(content, "[reviewer](mention://agent/"+reviewerID+")") {
+	if !strings.Contains(content, "[@reviewer](mention://agent/"+reviewerID+")") {
 		t.Fatalf("comment should carry the mention URI, got: %q", content)
 	}
 	if !strings.Contains(content, "不要修改任何文件") {

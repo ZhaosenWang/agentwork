@@ -44,7 +44,7 @@ func TestCreateWritesAssignmentComment(t *testing.T) {
 	}
 	// The creation comment is a MENTION — same shape an agent produces:
 	// [@Name](mention://agent/<id>) + instruction. Uniform coordination.
-	if want := "[writer](mention://agent/" + agentA + ")"; !strings.Contains(c.Content, want) {
+	if want := "[@writer](mention://agent/" + agentA + ")"; !strings.Contains(c.Content, want) {
 		t.Fatalf("comment should be a structured mention %q, got: %q", want, c.Content)
 	}
 	if !strings.Contains(c.Content, "string_utils.py") {
