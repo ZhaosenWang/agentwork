@@ -38,14 +38,15 @@ type Goal struct {
 // goalRunContext is what ReconcileOnRunEnd reasons about. Carried separately
 // so the reconciliation logic is testable without a live run row.
 type goalRunContext struct {
-	RunID        string
-	GoalID       string
-	AgentID      string
-	IsLeaderRun  bool
-	SquadID      string
-	Status       string // run's terminal status: completed|failed
-	Attempt      int
-	Summary      string
+	RunID            string
+	GoalID           string
+	AgentID          string
+	IsLeaderRun      bool
+	SquadID          string
+	Status           string // run's terminal status: completed|failed
+	Attempt          int
+	Summary          string
+	TriggerCommentID string // mention/协作来源（guest run 失败留痕用）
 }
 
 const maxAttempts = 3
@@ -337,6 +338,12 @@ func (s *GoalService) WaitChildren(ctx context.Context, goalID string) error {
 		`UPDATE goal SET status='blocked' WHERE id=?`, goalID); err != nil {
 		return fmt.Errorf("wait-children: %w", err)
 	}
+	// Blocked = waiting on sub-goals, not working — a mention run that raced
+	// ahead of the wait must not be claimed onto a waiting goal.
+	if _, err := s.st.DB().ExecContext(ctx,
+		`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
+		return fmt.Errorf("cancel queued runs on wait: %w", err)
+	}
 	if _, err := s.st.DB().ExecContext(ctx,
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'waiting_children','{}',?)`,
 		newID(), goalID, "agent", "", now()); err != nil {
@@ -380,20 +387,20 @@ func (s *GoalService) Delete(ctx context.Context, goalID string) error {
 // self-consistent without an external authority (DESIGN.zh.md §7).
 //
 //	agent-assigned goal: the run's agent must equal the goal's assignee.
-//	squad-assigned goal: the run must be a leader run whose agent is that
-//	  squad's current leader. (A leader change, if ever supported, orphaning
-//	  the prior leader's in-flight run is handled here for free.)
+//	squad-assigned goal: the run's agent must be the squad's CURRENT leader
+//	  — judged dynamically at reconcile time, NOT from the run's static
+//	  is_leader_run mark (a leader mentioned by name via mention://agent is
+//	  still the owner: authority follows the assignee relationship, not how
+//	  the run was triggered). A leader change orphans the prior leader's
+//	  in-flight run for free.
 //	human-assigned goal: never has an agent-run owner — fall through to false.
 func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunContext, g Goal) (bool, error) {
 	switch g.AssigneeType {
 	case "agent":
 		return rc.AgentID == g.AssigneeID && !rc.IsLeaderRun, nil
 	case "squad":
-		if !rc.IsLeaderRun || rc.SquadID != g.AssigneeID {
-			return false, nil
-		}
 		var leaderID string
-		err := tx.QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, rc.SquadID).Scan(&leaderID)
+		err := tx.QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, g.AssigneeID).Scan(&leaderID)
 		if err != nil {
 			return false, fmt.Errorf("load squad leader: %w", err)
 		}
@@ -450,8 +457,24 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 		return err
 	}
 	if !owns {
-		// Orphaned run (handoff/reassign/leader-change). Its result has no
-		// authority over the goal. Drop it silently.
+		// Orphaned run (handoff/reassign/leader-change) or a guest run
+		// (mention-triggered collaboration). Its result has no authority over
+		// the goal. A FAILED collaboration run is not silent though — the
+		// human waiting at a checkpoint must see that the review/help run
+		// failed, not an empty request (the guest-failure path: no retry, no
+		// goal effect, but a durable trace in the feed).
+		if rc.Status == "failed" && rc.TriggerCommentID != "" {
+			summary := strings.TrimSpace(rc.Summary)
+			if len(summary) > 200 {
+				summary = summary[:200] + "…"
+			}
+			content := "协作 run 失败：" + summary
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
+				newID(), rc.GoalID, content, now()); err != nil {
+				return fmt.Errorf("insert guest-failure comment: %w", err)
+			}
+		}
 		pendingEvents = append(pendingEvents, events.Event{Topic: "run:discarded", Payload: map[string]any{
 			"run_id": rc.RunID, "goal_id": rc.GoalID, "reason": "orphaned",
 		}})
@@ -519,6 +542,12 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 		} else if n, _ := res.RowsAffected(); n == 0 {
 			break // goal is blocked (waiting children) — leave for the wake
 		}
+		// The goal reached a terminal state — queued runs (a mention that
+		// raced ahead) must not be claimed onto a finished goal.
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, rc.GoalID); err != nil {
+			return fmt.Errorf("cancel queued runs on done: %w", err)
+		}
 		if g.ParentID != "" {
 			if err := s.wakeParentIfReadyInTx(ctx, tx, g.ParentID, &pendingEvents); err != nil {
 				return fmt.Errorf("wake parent: %w", err)
@@ -547,6 +576,11 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 				`UPDATE goal SET status='failed' WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked','review')`,
 				rc.GoalID); err != nil {
 				return fmt.Errorf("fail goal: %w", err)
+			}
+			// Terminal state — drop queued runs (same rule as the done path).
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, rc.GoalID); err != nil {
+				return fmt.Errorf("cancel queued runs on fail: %w", err)
 			}
 		}
 	}
@@ -936,6 +970,11 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE goal SET status='done', handoff_note='' WHERE id=? AND status='review'`, goalID); err != nil {
 			return nil, fmt.Errorf("mark delivered: %w", err)
+		}
+		// Terminal state — drop queued runs (same rule as the reconcile paths).
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
+			return nil, fmt.Errorf("cancel queued runs on delivered: %w", err)
 		}
 		event = "goal:delivered"
 		if parentID.Valid && parentID.String != "" {

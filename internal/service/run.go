@@ -349,9 +349,9 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 	// Re-read the minimal context the goal layer needs to reconcile.
 	var rc goalRunContext
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary
+		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary, trigger_comment_id
 		 FROM run WHERE id=?`, runID).
-		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary)
+		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary, &rc.TriggerCommentID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

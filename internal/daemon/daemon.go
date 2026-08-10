@@ -764,19 +764,17 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	}
 	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
 	var maxConcurrent, maxRunDuration int
-	var isLeaderRun bool
-	var squadID string
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
 		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
-		        r2.is_leader_run, r2.squad_id, g.source_ref, d.git_credentials
+		        g.source_ref, d.git_credentials
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
 		 LEFT JOIN domain d ON d.id = g.domain_id
 		 JOIN agent a ON a.id = r2.agent_id
 		 JOIN runtime r ON r.id = a.runtime_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &isLeaderRun, &squadID, &sourceRef, &gitCredentials)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials)
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -847,8 +845,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// workdir so the agent subprocess discovers who it is and who it can hand
 	// off to (AGENTWORK.md).
 	roster := d.buildAgentGuide(ctx, q.AgentID)
+	// Squad briefing is judged DYNAMICALLY — the run's agent must be the
+	// goal's squad owner and its CURRENT leader. A leader mentioned by name
+	// (mention://agent/<leader>) gets the same operating protocol as a leader
+	// run triggered by assignment; authority and protocol stay consistent.
 	briefing := ""
-	if isLeaderRun && squadID != "" {
+	if squadID, isLeader := d.leaderSquadFor(ctx, q.GoalID, q.AgentID); isLeader && squadID != "" {
 		owns := d.goalOwnsSquadStatus(ctx, q.GoalID, squadID)
 		if b, err := d.squadSvc.BuildLeaderBriefing(ctx, squadID, owns); err == nil {
 			briefing = b
@@ -974,6 +976,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			fmt.Fprintf(&b, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
 		}
 		prompt += b.String()
+	}
+	// Mention-cycle hint (soft tier): the goal's agent-triggered churn is
+	// above the hint threshold — tell the agents to stop circular handoffs
+	// instead of perpetuating them. (The hard tier fails the goal at the
+	// trigger site.)
+	if n, err := d.agentTriggeredRunCount(ctx, q.GoalID); err == nil && n > service.MaxMentionHints {
+		prompt += fmt.Sprintf("\n\n⚠️ 协作警告：agent 之间已互相转移任务 %d 次。请不要再把任务转给其他 agent——自己完成剩余工作，或结束本轮等待人工处理。", n)
 	}
 
 	backend, err := d.protoReg.Get(provider)
@@ -1427,6 +1436,34 @@ func (d *Daemon) goalOwnsSquadStatus(ctx context.Context, goalID, squadID string
 		return false
 	}
 	return at == "squad" && aid == squadID
+}
+
+// leaderSquadFor reports the squad the goal belongs to when the given agent
+// is its CURRENT leader (dynamic — judged at run time, not from a static
+// run mark).
+func (d *Daemon) leaderSquadFor(ctx context.Context, goalID, agentID string) (string, bool) {
+	var atype, aid string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT assignee_type, assignee_id FROM goal WHERE id=?`, goalID).Scan(&atype, &aid)
+	if err != nil || atype != "squad" || aid == "" {
+		return "", false
+	}
+	var leaderID string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT leader_id FROM squad WHERE id=?`, aid).Scan(&leaderID); err != nil {
+		return "", false
+	}
+	return aid, leaderID == agentID
+}
+
+// agentTriggeredRunCount counts the goal's runs triggered by AGENT-authored
+// comments (the mention-churn signal; platform system triggers excluded).
+func (d *Daemon) agentTriggeredRunCount(ctx context.Context, goalID string) (int, error) {
+	var n int
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run r JOIN comment c ON c.id = r.trigger_comment_id
+		 WHERE r.goal_id=? AND c.author_type='agent'`, goalID).Scan(&n)
+	return n, err
 }
 
 // buildPrompt assembles the opening prompt for a run turn.

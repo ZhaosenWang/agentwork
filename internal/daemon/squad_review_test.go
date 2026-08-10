@@ -152,6 +152,105 @@ func TestSquadReviewNoReviewerMember(t *testing.T) {
 	}
 }
 
+// TestSquadReviewDedupWithExistingMention: when the agent already mentioned
+// the reviewer (a pending run exists), the platform's squad-review trigger
+// must NOT post a duplicate request — the ask is already out.
+func TestSquadReviewDedupWithExistingMention(t *testing.T) {
+	d, st, gs, runSvc, squadSvc := newSquadReviewDaemon(t)
+	ctx := context.Background()
+	goalID, reviewerID := squadWithReviewer(t, d, st, gs, squadSvc, "reviewer")
+
+	// The agent mentions the reviewer first (its own comment + run).
+	if _, err := runSvc.EnqueueForMention(ctx, goalID, reviewerID, "agent-mention-comment"); err != nil {
+		t.Fatalf("agent mention: %v", err)
+	}
+	// The platform's squad-review trigger must now be a no-op.
+	if err := d.maybeTriggerSquadReview(ctx, goalID); err != nil {
+		t.Fatalf("trigger squad review: %v", err)
+	}
+
+	var runs, sysComments int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=?`, goalID, reviewerID).Scan(&runs); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if runs != 1 {
+		t.Fatalf("expected exactly 1 review run (no duplicate), got %d", runs)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system'`, goalID).Scan(&sysComments); err != nil {
+		t.Fatalf("count system comments: %v", err)
+	}
+	if sysComments != 0 {
+		t.Fatalf("no duplicate system review comment expected, got %d", sysComments)
+	}
+}
+
+// TestSquadReviewSkipsC4Park: the worktree-dirty park is a platform problem
+// (the run never started) — there is no finished work to review, so no
+// review request may fire.
+func TestSquadReviewSkipsC4Park(t *testing.T) {
+	d, st, gs, _, squadSvc := newSquadReviewDaemon(t)
+	ctx := context.Background()
+	goalID, _ := squadWithReviewer(t, d, st, gs, squadSvc, "reviewer")
+
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE goal SET review_request=? WHERE id=?`,
+		"worktree 有未归因的改动（可能是手动编辑）：\n M secret.txt\n请检查 worktree 后批准继续或驳回。", goalID); err != nil {
+		t.Fatalf("park goal: %v", err)
+	}
+	if err := d.maybeTriggerSquadReview(ctx, goalID); err != nil {
+		t.Fatalf("trigger squad review: %v", err)
+	}
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system'`, goalID).Scan(&n); err != nil {
+		t.Fatalf("count comments: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("C4 park → no review request, got %d", n)
+	}
+}
+
+// TestSquadReviewSkipsLeaderSelfReview: a reviewer who IS the leader would
+// review its own work — the platform excludes it.
+func TestSquadReviewSkipsLeaderSelfReview(t *testing.T) {
+	d, st, gs, _, squadSvc := newSquadReviewDaemon(t)
+	ctx := context.Background()
+
+	leaderID := seedReviewAgent(t, st, "leader")
+	dom, err := service.NewDomainService(st, events.NewBus()).Create(ctx, service.Domain{Name: "self-dom", GitURL: "https://e.com/self.git"})
+	if err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+	sq, err := squadSvc.Create(ctx, service.Squad{Name: "self-team", LeaderID: leaderID})
+	if err != nil {
+		t.Fatalf("create squad: %v", err)
+	}
+	// The leader is ALSO declared the reviewer.
+	if _, err := squadSvc.AddMember(ctx, sq.ID, "agent", leaderID, "reviewer"); err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+	g, err := gs.Create(ctx, service.Goal{
+		Title: "self work", Description: "do it",
+		DomainID: dom.ID, AssigneeType: "squad", AssigneeID: sq.ID, Status: "active",
+	})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	if err := d.maybeTriggerSquadReview(ctx, g.ID); err != nil {
+		t.Fatalf("trigger squad review: %v", err)
+	}
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system'`, g.ID).Scan(&n); err != nil {
+		t.Fatalf("count comments: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("leader self-review → no request, got %d", n)
+	}
+}
+
 // TestSquadReviewNotSquadOwned: an agent-owned goal has no squad rule — no
 // review trigger even if the agent happens to be in a squad.
 func TestSquadReviewNotSquadOwned(t *testing.T) {

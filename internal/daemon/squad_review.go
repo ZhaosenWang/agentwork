@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/eushing/agentwork/internal/events"
@@ -58,10 +59,10 @@ func (d *Daemon) onGoalReviewing(ctx context.Context, e events.Event) {
 // approval's evidence). Coalescing on (goal, reviewer) keeps repeated parks
 // from stacking runs.
 func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) error {
-	var assigneeType, assigneeID string
+	var assigneeType, assigneeID, reviewRequest string
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT assignee_type, assignee_id FROM goal WHERE id=?`, goalID).
-		Scan(&assigneeType, &assigneeID)
+		`SELECT assignee_type, assignee_id, review_request FROM goal WHERE id=?`, goalID).
+		Scan(&assigneeType, &assigneeID, &reviewRequest)
 	if err == sql.ErrNoRows {
 		return nil // goal vanished
 	}
@@ -71,6 +72,20 @@ func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) err
 	if assigneeType != "squad" || assigneeID == "" {
 		return nil // not squad-owned — no squad rule applies
 	}
+	// The review-request guard: only reviews of FINISHED work trigger the
+	// squad review. The C4 worktree-dirty park is a platform problem, not
+	// finished work — the run never started, so a review run would audit a
+	// stale worktree (possibly a human's manual edits) and review nothing.
+	// (A deliver failure re-parks via goal:deliver_failed, not goal:reviewing
+	// — it never reaches here.)
+	if strings.HasPrefix(reviewRequest, "worktree") {
+		return nil
+	}
+
+	// The squad's leader (a reviewer who IS the leader would review its own
+	// work — excluded, the review must come from a different member).
+	var leaderID string
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, assigneeID).Scan(&leaderID)
 
 	// The squad's reviewers (members declared with role=reviewer). Collected
 	// BEFORE the enqueues: each enqueue writes rows, and a query cursor held
@@ -97,6 +112,22 @@ func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) err
 		return err
 	}
 	for _, r := range reviewers {
+		if r.id == leaderID {
+			continue // leader cannot review its own work
+		}
+		// The reviewer already has a pending run on this goal — the agent
+		// mentioned it itself (or a previous park did) — the request is
+		// already out; a second comment would duplicate the ask.
+		var pending int
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND status IN ('queued','running')`,
+			goalID, r.id).Scan(&pending); err != nil {
+			log.Printf("daemon: squad review pending check %s → %s: %v", goalID, r.id, err)
+			continue
+		}
+		if pending > 0 {
+			continue
+		}
 		if err := d.enqueueSquadReview(ctx, goalID, r.id, r.name); err != nil {
 			log.Printf("daemon: squad review enqueue %s → %s: %v", goalID, r.id, err)
 		}

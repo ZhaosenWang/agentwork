@@ -305,7 +305,9 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 		}
 	}
 
-	// After the review resolves (deliver), a mention triggers normally.
+	// After the review resolves and the goal is delivered (terminal), a
+	// mention lands as a comment but triggers nothing — terminal goals take
+	// no new work (the mention stays in the feed, never lost).
 	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", ""); err != nil {
 		t.Fatalf("approve: %v", err)
 	}
@@ -315,15 +317,11 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 现在可以做了" }); err != nil {
 		t.Fatalf("comment 2: %v", err)
 	}
-	found := false
 	runs, _ = rs.List(ctx, g.ID)
 	for _, r := range runs {
 		if r.AgentID == agentB && (r.Status == "queued" || r.Status == "running") {
-			found = true
+			t.Fatalf("terminal goal must not trigger mention runs, found %s", r.Status)
 		}
-	}
-	if !found {
-		t.Fatalf("mention after review must trigger a run on the mentioned agent")
 	}
 }
 

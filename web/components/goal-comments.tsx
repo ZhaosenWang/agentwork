@@ -111,9 +111,11 @@ export function GoalComments({ goalId }: { goalId: string }) {
 // markdown — the agent-to-agent handoff reads as "请 @reviewer 审查" not
 // "[@reviewer](mention://agent/1399…)".
 function renderCommentContent(content: string, agentName: (id: string) => string): React.ReactNode {
-  const parts = content.split(/(\[@[^\]]+\]\(mention:\/\/[^)]+\))/g);
+  // The @ is optional — platform-generated mentions (creation, review
+  // requests) and agent-written ones share the shape; both must render.
+  const parts = content.split(/(\[@?[^\]]+\]\(mention:\/\/[^)]+\))/g);
   return parts.map((part, i) => {
-    const m = part.match(/^\[@([^\]]+)\]\(mention:\/\/(agent|squad|human|all)\/([^)]+)\)$/);
+    const m = part.match(/^\[@?([^\]]+)\]\(mention:\/\/(agent|squad|human|all)\/([^)]+)\)$/);
     if (!m) return part;
     const name = m[1] === "all" ? "all" : m[2] === "agent" ? agentName(m[3]) : m[1];
     return (

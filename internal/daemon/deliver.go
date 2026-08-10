@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -33,6 +34,10 @@ func (d *Daemon) onGoalApproved(ctx context.Context, e events.Event) {
 	go d.deliverGoal(context.Background(), goalID)
 }
 
+// deliverWaitForRuns bounds how long deliver waits for an in-flight run
+// (the review-window squad review is the usual waiter) before giving up.
+const deliverWaitForRuns = 5 * time.Minute
+
 func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	var domainID, defaultBranch, gitURL, gitCredentials string
 	err := d.st.DB().QueryRowContext(ctx,
@@ -41,6 +46,28 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	if err != nil {
 		d.finishDeliver(ctx, goalID, false, "deliver: goal has no domain: "+err.Error())
 		return
+	}
+	// No in-flight run before the merge touches the worktree: a review-window
+	// run (the squad review checkpoint) is the usual waiter — wait for it to
+	// finish (bounded), never race it. The approve/reject guard keeps the
+	// goal in review while deliver runs, so the wait cannot be invalidated by
+	// a concurrent decision.
+	waitDeadline := time.Now().Add(deliverWaitForRuns)
+	for {
+		var running int
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='running'`, goalID).Scan(&running); err == nil && running == 0 {
+			break
+		}
+		if time.Now().After(waitDeadline) {
+			d.finishDeliver(ctx, goalID, false, "deliver: 等待运行中的 run 结束超时（5 分钟），请稍后再次批准")
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
 	}
 	// Deliver INTO the domain's configured default branch (DESIGN.v2.md §7).
 	// Wrong config fails loudly with the branch name — the owner fixes the

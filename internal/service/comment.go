@@ -44,6 +44,18 @@ type Mention struct {
 	ID   string `json:"id"`
 }
 
+// Mention-cycle guard (two thresholds): a goal whose runs are repeatedly
+// triggered by AGENT comments is likely an agent ping-pong (A mentions B,
+// B mentions A, ...). Healthy work does not churn agent-triggered runs;
+// repeated churn (including repeated human rejects) means the task itself is
+// stuck. Over maxMentionHints the next run's prompt warns the agents to stop
+// circular handoffs; over maxMentionCycle the next trigger is refused and
+// the goal fails with the cycle count as the reason.
+const (
+	MaxMentionHints  = 4
+	MaxMentionCycle  = 8
+)
+
 // MentionRe matches `[@Name](mention://(agent|squad|human|all)/(<uuid-ish>|all))`.
 // Matches multica's parser shape (server/internal/util/mention.go): only
 // structured Markdown URIs, only UUID-ish ids (or literal "all"). Bare `@handle`
@@ -131,14 +143,16 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 
 	// Dispatch mentions AFTER the comment is durably stored. @all suppresses
 	// auto-trigger entirely (no runs); other mentions enqueue runs.
-	// Checkpoint freeze (DESIGN.v2.md §4, decision 2-3): while the goal is in
-	// review, mentions only land as comments — no run is triggered, so the
-	// branch state under the human's decision is never mutated underneath the
-	// approval. The pending mention is visible in the goal timeline and can be
-	// acted on after the review resolves.
-	if HasMentionAll(c.Content) || g.Status == "review" {
+	// State freeze (DESIGN.v2.md §4, decision 2-3): mentions only trigger on
+	// an ACTIVE goal. While the goal is in review (or blocked / terminal), a
+	// mention lands as a comment — no run — so the branch state under the
+	// human's decision is never mutated underneath the approval, and a
+	// finished goal never gets new work. The comment stays in the feed (never
+	// lost); the human decides whether to act on it (approve/reject already
+	// IS that decision for the review window).
+	if HasMentionAll(c.Content) || g.Status != "active" {
 		// @all: notify humans only (TBD: no inbox in MVP) and suppress triggers.
-		// review: comment lands, triggers suppressed.
+		// non-active: comment lands, triggers suppressed.
 		return &c, nil
 	}
 	for _, m := range ParseMentions(c.Content) {
@@ -147,12 +161,22 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 			if s.runSvc == nil {
 				continue
 			}
+			// Mention-cycle guard: an agent-triggered run churn above the hard
+			// threshold fails the goal (the task is stuck in a handoff loop).
+			if exceeds, err := s.mentionCycleExceeds(ctx, c.GoalID, MaxMentionCycle); err == nil && exceeds {
+				s.forceMentionCycleFailed(ctx, c.GoalID)
+				continue
+			}
 			if _, e := s.runSvc.EnqueueForMention(ctx, c.GoalID, m.ID, c.ID); e != nil {
 				// A bad/unknown agent UUID → drop, don't fail the whole comment.
 				continue
 			}
 		case "squad":
 			if s.runSvc == nil {
+				continue
+			}
+			if exceeds, err := s.mentionCycleExceeds(ctx, c.GoalID, MaxMentionCycle); err == nil && exceeds {
+				s.forceMentionCycleFailed(ctx, c.GoalID)
 				continue
 			}
 			// Route to the squad's leader as a leader run.
@@ -164,6 +188,59 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 		}
 	}
 	return &c, nil
+}
+
+// MentionCycleCount counts a goal's agent-triggered runs (trigger_comment_id
+// pointing at an AGENT-authored comment). Platform triggers (system review
+// requests) and human triggers are not agent churn.
+func (s *CommentService) MentionCycleCount(ctx context.Context, goalID string) (int, error) {
+	var n int
+	err := s.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run r JOIN comment c ON c.id = r.trigger_comment_id
+		 WHERE r.goal_id=? AND c.author_type='agent'`, goalID).Scan(&n)
+	return n, err
+}
+
+// mentionCycleExceeds reports whether the goal's agent-triggered churn is at
+// or above the hard threshold (the NEXT trigger is the one refused).
+func (s *CommentService) mentionCycleExceeds(ctx context.Context, goalID string, limit int) (bool, error) {
+	n, err := s.MentionCycleCount(ctx, goalID)
+	if err != nil {
+		return false, err
+	}
+	return n >= limit, nil
+}
+
+// forceMentionCycleFailed fails a goal stuck in an agent handoff loop: the
+// goal goes failed (the human take-over path, Reopen), the failure reason
+// names the cycle count, queued runs are dropped, and the failure is
+// recorded in the feed.
+func (s *CommentService) forceMentionCycleFailed(ctx context.Context, goalID string) {
+	n, err := s.MentionCycleCount(ctx, goalID)
+	if err != nil {
+		n = MaxMentionCycle
+	}
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='failed' WHERE id=? AND status='active'`, goalID)
+	if err != nil {
+		return
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return // already moved (review/reject raced) — the loop is moot
+	}
+	reason := fmt.Sprintf("agent 协作循环 %d 次（超过上限 %d）", n, MaxMentionCycle)
+	ts := now()
+	_, _ = s.st.DB().ExecContext(ctx,
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,'','mention_cycle_failed',?,?)`,
+		newID(), goalID, "system", `{"reason":"`+reason+`"}`, ts)
+	_, _ = s.st.DB().ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
+		newID(), goalID, "任务失败："+reason+"。agent 反复互相转移任务，请检查后重开。", ts)
+	_, _ = s.st.DB().ExecContext(ctx,
+		`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, goalID)
+	s.bus.Publish(ctx, events.Event{Topic: "goal:finished", Payload: map[string]any{
+		"goal_id": goalID, "status": "failed", "summary": reason,
+	}})
 }
 
 // enqueueLeaderRunForMention resolves a squad's leader and enqueues a leader
