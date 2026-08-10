@@ -71,6 +71,38 @@ func TestMentionCycleFailsGoal(t *testing.T) {
 	}
 }
 
+// TestUnfrozenPolicyForcesReview: a domain whose acceptance policy was never
+// confirmed (checks_compiled_at empty) must park completed runs in review —
+// nothing ran against an unconfirmed definition, so no machine judgment
+// exists and the goal must not promote unattended (决策 2-4/2-5 confirmation
+// gate).
+func TestUnfrozenPolicyForcesReview(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	ds := NewDomainService(st, events.NewBus())
+	d, err := ds.Create(ctx, Domain{Name: "unfrozen-dom", GitURL: "https://example.com/unfrozen.git"})
+	if err != nil {
+		t.Fatalf("create domain: %v", err)
+	}
+	// No FreezeChecks — the policy stays unfrozen.
+	g, err := gs.Create(ctx, Goal{Title: "work", Description: "do it", DomainID: d.ID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	r := enqueueFirst(t, rs, g)
+	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "review" {
+		t.Fatalf("unfrozen policy must park in review, got %q", after.Status)
+	}
+	if !strings.Contains(after.ReviewRequest, "未确认") {
+		t.Fatalf("review_request should name the unfrozen policy, got: %q", after.ReviewRequest)
+	}
+}
+
 // TestGuestFailedRunLeavesTrace: a mention-triggered (guest) run that FAILS
 // leaves a system trace in the feed — the human waiting at a checkpoint sees
 // "the collaboration run failed" instead of an empty request.

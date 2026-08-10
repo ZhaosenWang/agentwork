@@ -73,22 +73,23 @@ func (d *Daemon) domainGitIdentity(ctx context.Context, domainID string) string 
 	return id
 }
 
-// loadDomainChecks loads the domain's frozen acceptance policy, the verify
-// timeout, and the metrics baseline (for coverage_delta guards).
-func (d *Daemon) loadDomainChecks(ctx context.Context, domainID string) (service.Checks, int, map[string]float64) {
-	var checks service.Checks
-	var checksJSON, baselineJSON string
-	var timeout int
+// loadDomainChecks loads the domain's acceptance policy, the verify timeout,
+// and the metrics baseline (for coverage_delta guards). frozen reports
+// whether the policy was CONFIRMED by the owner (checks_compiled_at set —
+// the "define by the human" guarantee, 决策 2-4/2-5): an unfrozen policy
+// must never drive machine verification — nothing runs against it, and the
+// goal layer forces the human checkpoint instead.
+func (d *Daemon) loadDomainChecks(ctx context.Context, domainID string) (checks service.Checks, timeout int, baseline map[string]float64, frozen bool) {
+	var checksJSON, baselineJSON, compiledAt string
 	_ = d.st.DB().QueryRowContext(ctx,
-		`SELECT checks, verify_timeout, metrics_baseline FROM domain WHERE id=?`, domainID).
-		Scan(&checksJSON, &timeout, &baselineJSON)
+		`SELECT checks, verify_timeout, metrics_baseline, checks_compiled_at FROM domain WHERE id=?`, domainID).
+		Scan(&checksJSON, &timeout, &baselineJSON, &compiledAt)
 	if timeout <= 0 {
 		timeout = 600 // DESIGN.v2.md §4: default verify_timeout 10min
 	}
 	_ = json.Unmarshal([]byte(checksJSON), &checks)
-	var baseline map[string]float64
 	_ = json.Unmarshal([]byte(baselineJSON), &baseline)
-	return checks, timeout, baseline
+	return checks, timeout, baseline, compiledAt != ""
 }
 
 // runVerification executes the domain's verification in dir: the setup

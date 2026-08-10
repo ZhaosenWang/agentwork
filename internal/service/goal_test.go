@@ -38,16 +38,22 @@ func newTestCluster(t *testing.T) (*GoalService, *RunService, *CommentService, *
 	return gs, rs, cs, st
 }
 
-// seedDomain inserts a domain (NO gates — completed runs promote to done, so
-// the pre-v2 test semantics hold) and returns its id. v2: agent-executed
-// goals require a domain (DESIGN.v2.md §2). Review-path tests freeze gates
-// separately.
+// seedDomain inserts a domain with a FROZEN empty acceptance policy (NO
+// gates — completed runs promote to done, so the pre-v2 test semantics
+// hold) and returns its id. The freeze matters: an unfrozen policy forces
+// the human checkpoint by design (决策 2-4/2-5 confirmation gate). v2:
+// agent-executed goals require a domain (DESIGN.v2.md §2). Review-path
+// tests freeze gates separately.
 func seedDomain(t *testing.T, st *store.Store) string {
 	t.Helper()
 	ctx := context.Background()
-	d, err := NewDomainService(st, events.NewBus()).Create(ctx, Domain{Name: "test-domain", GitURL: "https://example.com/test.git"})
+	ds := NewDomainService(st, events.NewBus())
+	d, err := ds.Create(ctx, Domain{Name: "test-domain", GitURL: "https://example.com/test.git"})
 	if err != nil {
 		t.Fatalf("seed domain: %v", err)
+	}
+	if _, err := ds.FreezeChecks(ctx, d.ID, Checks{}, "medium"); err != nil {
+		t.Fatalf("freeze seed domain checks: %v", err)
 	}
 	return d.ID
 }

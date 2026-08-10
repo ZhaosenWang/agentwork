@@ -38,6 +38,46 @@ func (d *Daemon) onGoalApproved(ctx context.Context, e events.Event) {
 // (the review-window squad review is the usual waiter) before giving up.
 const deliverWaitForRuns = 5 * time.Minute
 
+// recoverPendingDelivers re-runs the deliver step for goals whose approve
+// never delivered (decision 2-9, trigger side): a crash between the approve
+// and the merge/push leaves the goal in review with the latest gate_decision
+// = approve and a review_request that is NOT a deliver failure ("deliver:" —
+// that is a real failure awaiting the human's retry/reject, never replayed).
+// The replay itself is safe: deliverGoal's merge/push idempotency skips
+// already-done steps. Returns how many delivers were re-triggered.
+func (d *Daemon) recoverPendingDelivers(ctx context.Context) (int, error) {
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT g.id FROM goal g
+		 WHERE g.status='review'
+		   AND g.review_request NOT LIKE 'deliver:%'
+		   AND EXISTS (
+		     SELECT 1 FROM gate_decision d
+		     WHERE d.goal_id = g.id AND d.decision='approve'
+		       AND d.decided_at = (SELECT MAX(decided_at) FROM gate_decision WHERE goal_id = g.id)
+		   )`)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		log.Printf("daemon: replaying pending deliver for %s", id)
+		go d.deliverGoal(context.Background(), id)
+	}
+	return len(ids), nil
+}
+
 func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	var domainID, defaultBranch, gitURL, gitCredentials string
 	err := d.st.DB().QueryRowContext(ctx,
@@ -169,22 +209,27 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	}
 
 	// Re-verify the MERGED state (DESIGN.v2.md §7): what enters the default
-	// branch must be green, not just the branch in isolation.
-	checks, timeout, baseline := d.loadDomainChecks(ctx, domainID)
-	verifyReport, ok := runVerification(ctx, wt, checks, timeout)
-	if !ok {
-		// Verification red after merge: reset the default branch, hand the
-		// worktree back to the goal branch, and report.
-		_, _ = gitRunCtx(ctx, wt, "reset", "--hard", "origin/"+defaultBranch)
-		_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
-		d.finishDeliver(ctx, goalID, false, "deliver: post-merge verification failed:\n"+verifyReport)
-		return
-	}
-	if guardReport, ok := checkGuards(ctx, wt, mergeBaseSHA, checks, baseline); !ok {
-		_, _ = gitRunCtx(ctx, wt, "reset", "--hard", "origin/"+defaultBranch)
-		_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
-		d.finishDeliver(ctx, goalID, false, "deliver: post-merge guards failed:\n"+guardReport)
-		return
+	// branch must be green, not just the branch in isolation. An UNFROZEN
+	// policy runs nothing (the human checkpoint already covered it — the
+	// goal layer only approves a review; unfrozen policies force that
+	// checkpoint by design).
+	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
+	if checksFrozen {
+		verifyReport, ok := runVerification(ctx, wt, checks, timeout)
+		if !ok {
+			// Verification red after merge: reset the default branch, hand the
+			// worktree back to the goal branch, and report.
+			_, _ = gitRunCtx(ctx, wt, "reset", "--hard", "origin/"+defaultBranch)
+			_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
+			d.finishDeliver(ctx, goalID, false, "deliver: post-merge verification failed:\n"+verifyReport)
+			return
+		}
+		if guardReport, ok := checkGuards(ctx, wt, mergeBaseSHA, checks, baseline); !ok {
+			_, _ = gitRunCtx(ctx, wt, "reset", "--hard", "origin/"+defaultBranch)
+			_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
+			d.finishDeliver(ctx, goalID, false, "deliver: post-merge guards failed:\n"+guardReport)
+			return
+		}
 	}
 
 	if _, err := gitRunCtx(ctx, wt, "push", "origin", defaultBranch); err != nil {

@@ -184,6 +184,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if n > 0 {
 		log.Printf("daemon: recovered %d stuck running run(s)", n)
 	}
+	// Decision 2-9, trigger side: an approve followed by a crash leaves the
+	// goal in review with the approve recorded and no deliver — re-run the
+	// deliver (its merge/push idempotency makes the replay safe).
+	if n, err := d.recoverPendingDelivers(ctx); err != nil {
+		log.Printf("daemon: recover pending delivers: %v", err)
+	} else if n > 0 {
+		log.Printf("daemon: re-delivering %d goal(s) whose approve never delivered", n)
+	}
 	dispatchTick := time.NewTicker(dispatchTickInterval)
 	scheduleTick := time.NewTicker(scheduleTickInterval)
 	cleanupTick := time.NewTicker(worktreeCleanupInterval)
@@ -809,7 +817,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	//   - the goal was just REJECTED → the dirt is what the agent must fix
 	//     this round (the human told it to, via the review decision note) —
 	//     blocking the run would trap the goal in park→reject forever.
-	checks, timeout, baseline := d.loadDomainChecks(ctx, domainID)
+	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
 	if dirty := unattributedDirty(ctx, runRowWorkdir, checks.Excludes); dirty != "" {
 		var priorCancelled int
 		_ = d.st.DB().QueryRowContext(ctx,
@@ -1058,29 +1066,38 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// domain's verify commands run BEFORE the run is finished. A red
 			// verify ends the run failed → retry chain. The goal layer only
 			// ever sees 'completed' runs that passed.
-			verifyReport, ok := runVerification(ctx, runRowWorkdir, checks, timeout)
-			if !ok {
-				d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)
-				return
-			}
-			// Structural guards on the diff (DESIGN.v2.md §5.1), measured as
-			// baseSHA..HEAD — the run's own changes. git status would be empty
-			// here: the daemon just committed the agent's work (and the agent
-			// may have committed itself), so the worktree is clean.
-			guardReport, ok := checkGuards(ctx, runRowWorkdir, baseSHA, checks, baseline)
-			if !ok {
-				d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
-				return
-			}
-			// Gate evaluation (M2 rule engine): merge always fires; diff_*
-			// fire on the run's changed paths. The fired gates are recorded on
-			// the run row — the goal layer reads them in the reconcile
-			// transaction (the daemon computes, the goal layer judges).
-			gatesHit := evalGates(ctx, runRowWorkdir, baseSHA, checks)
-			if len(gatesHit) > 0 {
-				gatesJSON, _ := json.Marshal(gatesHit)
-				if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET gates_hit=? WHERE id=?`, string(gatesJSON), q.RunID); err != nil {
-					log.Printf("daemon: record gates_hit for run %s: %v", q.RunID, err)
+			//
+			// An UNFROZEN policy (checks_compiled_at empty — the owner never
+			// confirmed the compiled checks) runs NOTHING: no setup/verify/
+			// guards against an unconfirmed definition, and no gate evaluation
+			// (the goal layer forces the human checkpoint instead). Evidence
+			// still carries the diff + agent summary for that checkpoint.
+			verifyReport, guardReport := "", ""
+			if checksFrozen {
+				verifyReport, ok := runVerification(ctx, runRowWorkdir, checks, timeout)
+				if !ok {
+					d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)
+					return
+				}
+				// Structural guards on the diff (DESIGN.v2.md §5.1), measured as
+				// baseSHA..HEAD — the run's own changes. git status would be empty
+				// here: the daemon just committed the agent's work (and the agent
+				// may have committed itself), so the worktree is clean.
+				guardReport, ok = checkGuards(ctx, runRowWorkdir, baseSHA, checks, baseline)
+				if !ok {
+					d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
+					return
+				}
+				// Gate evaluation (M2 rule engine): merge always fires; diff_*
+				// fire on the run's changed paths. The fired gates are recorded on
+				// the run row — the goal layer reads them in the reconcile
+				// transaction (the daemon computes, the goal layer judges).
+				gatesHit := evalGates(ctx, runRowWorkdir, baseSHA, checks)
+				if len(gatesHit) > 0 {
+					gatesJSON, _ := json.Marshal(gatesHit)
+					if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET gates_hit=? WHERE id=?`, string(gatesJSON), q.RunID); err != nil {
+						log.Printf("daemon: record gates_hit for run %s: %v", q.RunID, err)
+					}
 				}
 			}
 			// Evidence bundle for the approval card (decision 2-3).

@@ -638,15 +638,24 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 	}
 	// No gate fired for this run. Strength linkage: weak verification with no
 	// gates at all still demands a human checkpoint.
-	var checksJSON, strength string
+	var checksJSON, strength, compiledAt string
 	err = tx.QueryRowContext(ctx,
-		`SELECT d.checks, d.verification_strength FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, rc.GoalID).
-		Scan(&checksJSON, &strength)
+		`SELECT d.checks, d.verification_strength, d.checks_compiled_at FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, rc.GoalID).
+		Scan(&checksJSON, &strength, &compiledAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, "", nil // no domain → no gates
 	}
 	if err != nil {
 		return false, "", fmt.Errorf("load domain gates: %w", err)
+	}
+	// The confirmation gate (决策 2-4/2-5): an UNFROZEN acceptance policy is
+	// no acceptance policy — nothing was run against it (the daemon skips
+	// verification for unfrozen domains), so no machine judgment exists and
+	// the goal must NOT promote unattended. The human checkpoint is the
+	// only safe default: "define by the human" is enforced here, not hoped
+	// for.
+	if compiledAt == "" {
+		return true, "域验收策略未确认（checks 未冻结）——强制人工审批", nil
 	}
 	var checks Checks
 	if err := json.Unmarshal([]byte(checksJSON), &checks); err != nil {
