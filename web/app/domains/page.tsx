@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import {
-  useDomains, useDomain, useAgents, useCreateDomain, useCompileDomainPolicy,
+  useDomains, useDomain, useAgents, useSquads, useCreateDomain, useUpdateDomain, useCompileDomainPolicy,
   useFreezeDomainChecks, useGoalEvents, useGateStats,
 } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, PageHeader, Empty, Badge } from "@/components/ui";
@@ -55,6 +55,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const compile = useCompileDomainPolicy();
   const freeze = useFreezeDomainChecks();
   const { data: agents } = useAgents();
+  const [showEdit, setShowEdit] = useState(false);
   const [policyText, setPolicyText] = useState(d.policy_text);
   const [processorAgent, setProcessorAgent] = useState("");
   const [compiling, setCompiling] = useState(false);
@@ -110,7 +111,15 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
           <span className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded bg-purple-50 text-purple-700 ring-1 ring-purple-200">待确认</span>
         ) : null}
         <span className="text-xs text-gray-500 ml-auto break-all">{d.git_url}</span>
+        <button
+          onClick={() => setShowEdit(true)}
+          className="text-xs text-indigo-600 hover:text-indigo-800 hover:underline shrink-0"
+        >
+          编辑
+        </button>
       </div>
+
+      {showEdit && <EditDomainDialog domain={d} onClose={() => setShowEdit(false)} />}
 
       <div className="text-xs text-gray-600 space-y-1">
         <p><span className="font-medium">验收策略（NL）：</span>{d.policy_text || "（未填写——用一句话描述这个域怎么算“干对了”）"}</p>
@@ -301,15 +310,120 @@ function strengthBadge(s: string) {
   return `${base} bg-blue-50 text-blue-700 ring-blue-200`;
 }
 
+// EditDomainDialog edits a domain's mutable configuration — the issue
+// handler can be switched (agent → squad) after creation, and the repo /
+// credentials updated. Compile artifacts stay untouched (they have their
+// own freeze/recompile flow).
+function EditDomainDialog({ domain, onClose }: { domain: Domain; onClose: () => void }) {
+  const update = useUpdateDomain();
+  const { data: agents } = useAgents();
+  const { data: squads } = useSquads();
+  const [gitUrl, setGitUrl] = useState(domain.git_url);
+  const [defaultBranch, setDefaultBranch] = useState(domain.default_branch || "main");
+  const [gitIdentity, setGitIdentity] = useState(domain.git_identity);
+  const [gitCredentials, setGitCredentials] = useState(domain.git_credentials);
+  const [issueRepo, setIssueRepo] = useState(domain.issue_repo);
+  const [issueAssigneeType, setIssueAssigneeType] = useState(domain.issue_assignee_type || "agent");
+  const [issueAssignee, setIssueAssignee] = useState(domain.issue_assignee);
+  const [issueProvider, setIssueProvider] = useState(domain.issue_provider || "github");
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    update.mutate(
+      {
+        id: domain.id,
+        body: {
+          git_url: gitUrl,
+          default_branch: defaultBranch,
+          git_identity: gitIdentity,
+          git_credentials: gitCredentials,
+          issue_repo: issueRepo,
+          issue_assignee: issueAssignee,
+          issue_assignee_type: issueAssigneeType,
+          issue_provider: issueProvider,
+        },
+      },
+      { onSuccess: onClose }
+    );
+  };
+
+  return (
+    <Dialog
+      title={`编辑域：${domain.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>取消</Button>
+          <Button type="submit" form="edit-domain-form" disabled={update.isPending || !gitUrl.trim()}>
+            {update.isPending ? "保存中…" : "保存"}
+          </Button>
+        </>
+      }
+    >
+      <form id="edit-domain-form" onSubmit={handleSubmit} className="space-y-4">
+        <Field label="Git 仓库地址">
+          <input value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} className={inputCls} required />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="默认分支">
+            <input value={defaultBranch} onChange={(e) => setDefaultBranch(e.target.value)} className={inputCls} />
+          </Field>
+          <Field label="Git 身份（commit 作者）">
+            <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
+          </Field>
+        </div>
+        <Field label="平台令牌（git_credentials，远程操作身份）">
+          <input value={gitCredentials} onChange={(e) => setGitCredentials(e.target.value)} className={inputCls} type="password" placeholder="bot 账号的 token" />
+        </Field>
+        <Field label="Issue 追踪（M4-B）" hint="open issue 自动变成任务，处理完自动 close">
+          <input value={issueRepo} onChange={(e) => setIssueRepo(e.target.value)} className={inputCls} placeholder="owner/repo" />
+          <div className="mt-2 flex gap-2 items-center">
+            <label className="text-xs text-gray-500">平台：</label>
+            <select value={issueProvider} onChange={(e) => setIssueProvider(e.target.value)} className={inputCls}>
+              <option value="github">GitHub</option>
+              <option value="gitcode">GitCode</option>
+            </select>
+          </div>
+        </Field>
+        <Field label="issue 处理方" hint="agent 或 squad——处理方随时可以换">
+          <div className="flex gap-2 items-center">
+            <select
+              value={issueAssigneeType}
+              onChange={(e) => { setIssueAssigneeType(e.target.value); setIssueAssignee(""); }}
+              className={inputCls}
+            >
+              <option value="agent">Agent</option>
+              <option value="squad">Squad</option>
+            </select>
+            <select value={issueAssignee} onChange={(e) => setIssueAssignee(e.target.value)} className={inputCls}>
+              <option value="">{issueAssigneeType === "agent" ? "选择 agent…" : "选择 squad…"}</option>
+              {issueAssigneeType === "agent"
+                ? agents?.map((a) => (
+                    <option key={a.id} value={a.id}>{a.name}</option>
+                  ))
+                : squads?.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+            </select>
+          </div>
+        </Field>
+        {update.isError && <p className="text-sm text-red-500">{String(update.error)}</p>}
+      </form>
+    </Dialog>
+  );
+}
+
 function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const create = useCreateDomain();
   const compile = useCompileDomainPolicy();
   const { data: agents } = useAgents();
+  const { data: squads } = useSquads();
   const [name, setName] = useState("");
   const [gitUrl, setGitUrl] = useState("");
   const [policyText, setPolicyText] = useState("");
   const [processorAgent, setProcessorAgent] = useState("");
   const [issueRepo, setIssueRepo] = useState("");
+  const [issueAssigneeType, setIssueAssigneeType] = useState("agent");
   const [issueAssignee, setIssueAssignee] = useState("");
   const [issueProvider, setIssueProvider] = useState("github");
   const [gitCredentials, setGitCredentials] = useState("");
@@ -317,7 +431,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     create.mutate(
-      { name, git_url: gitUrl, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: issueRepo, issue_assignee: issueAssignee, issue_provider: issueProvider, git_credentials: gitCredentials },
+      { name, git_url: gitUrl, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: issueRepo, issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: issueProvider, git_credentials: gitCredentials },
       {
         onSuccess: (d) => {
           if (policyText.trim() && processorAgent) {
@@ -370,13 +484,27 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
             </select>
           </div>
         </Field>
-        <Field label="issue 处理 agent（选填，配了 issue_repo 后生效）">
-          <select value={issueAssignee} onChange={(e) => setIssueAssignee(e.target.value)} className={inputCls}>
-            <option value="">选择…</option>
-            {agents?.map((a) => (
-              <option key={a.id} value={a.id}>{a.name}</option>
-            ))}
-          </select>
+        <Field label="issue 处理方（选填，配了 issue_repo 后生效）" hint="选 agent 由单个 agent 处理；选 squad 由小队处理（含自动审查）">
+          <div className="flex gap-2 items-center">
+            <select
+              value={issueAssigneeType}
+              onChange={(e) => { setIssueAssigneeType(e.target.value); setIssueAssignee(""); }}
+              className={inputCls}
+            >
+              <option value="agent">Agent</option>
+              <option value="squad">Squad</option>
+            </select>
+            <select value={issueAssignee} onChange={(e) => setIssueAssignee(e.target.value)} className={inputCls}>
+              <option value="">选择…</option>
+              {issueAssigneeType === "agent"
+                ? agents?.map((a) => (
+                    <option key={a.id} value={a.id}>{a.name}</option>
+                  ))
+                : squads?.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+            </select>
+          </div>
         </Field>
         <Field label="平台操作 token（git_credentials）" hint="bot 账号 token（决策 3-5）：issue 评论/close + git push 都以此身份出现。权限需覆盖：仓库读写（Contents）+ issues 读写。GitHub 用 fine-grained PAT 只授权本仓库；GitCode 用 token-classic">
           <input value={gitCredentials} onChange={(e) => setGitCredentials(e.target.value)} className={inputCls} placeholder="GitHub PAT 或 GitCode token（bot 账号，需仓库+issue 读写）" type="password" />

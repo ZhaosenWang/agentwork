@@ -76,6 +76,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /domains", h.listDomains)
 	mux.HandleFunc("POST /domains", h.createDomain)
 	mux.HandleFunc("GET /domains/{id}", h.getDomain)
+	mux.HandleFunc("PUT /domains/{id}", h.updateDomain)
 	mux.HandleFunc("DELETE /domains/{id}", h.deleteDomain)
 	mux.HandleFunc("POST /domains/{id}/checks", h.freezeDomainChecks)
 	mux.HandleFunc("POST /domains/{id}/compile", h.compileDomainPolicy)
@@ -389,6 +390,17 @@ func (h *Handlers) deleteDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// updateDomain edits a domain's mutable configuration (issue handler etc.).
+func (h *Handlers) updateDomain(w http.ResponseWriter, r *http.Request) {
+	var d service.Domain
+	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Domain.Update(r.Context(), r.PathValue("id"), d)
+	writeJSON(w, out, err)
 }
 
 // compileDomainPolicy starts acceptance-policy compilation for a domain

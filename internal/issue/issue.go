@@ -150,18 +150,21 @@ func NewPoller(st *store.Store, goalSvc *service.GoalService, runSvc *service.Ru
 // Poll scans every tracking domain once. Returns how many goals were created.
 func (p *Poller) Poll(ctx context.Context) (int, error) {
 	rows, err := p.st.DB().QueryContext(ctx,
-		`SELECT id, issue_provider, issue_repo, issue_assignee, git_credentials FROM domain
+		`SELECT id, issue_provider, issue_repo, issue_assignee, issue_assignee_type, git_credentials FROM domain
 		 WHERE issue_repo != '' AND issue_assignee != '' AND git_credentials != ''`)
 	if err != nil {
 		return 0, err
 	}
-	type dom struct{ id, provider, repo, assignee, token string }
+	type dom struct{ id, provider, repo, assignee, assigneeType, token string }
 	var doms []dom
 	for rows.Next() {
 		var d dom
-		if err := rows.Scan(&d.id, &d.provider, &d.repo, &d.assignee, &d.token); err != nil {
+		if err := rows.Scan(&d.id, &d.provider, &d.repo, &d.assignee, &d.assigneeType, &d.token); err != nil {
 			rows.Close()
 			return 0, err
+		}
+		if d.assigneeType == "" {
+			d.assigneeType = "agent"
 		}
 		doms = append(doms, d)
 	}
@@ -178,7 +181,7 @@ func (p *Poller) Poll(ctx context.Context) (int, error) {
 	return created, nil
 }
 
-func (p *Poller) pollDomain(ctx context.Context, d struct{ id, provider, repo, assignee, token string }) (int, error) {
+func (p *Poller) pollDomain(ctx context.Context, d struct{ id, provider, repo, assignee, assigneeType, token string }) (int, error) {
 	client, err := p.newProvider(d.provider, d.token)
 	if err != nil {
 		return 0, fmt.Errorf("domain %s: %w", d.id, err)
@@ -189,7 +192,7 @@ func (p *Poller) pollDomain(ctx context.Context, d struct{ id, provider, repo, a
 	}
 	created := 0
 	for _, iss := range issues {
-		ok, err := p.CreateGoalForIssue(ctx, d.id, d.assignee, d.provider, d.repo, iss)
+		ok, err := p.CreateGoalForIssue(ctx, d.id, d.assignee, d.assigneeType, d.provider, d.repo, iss)
 		if err != nil {
 			return created, err
 		}
@@ -204,7 +207,7 @@ func (p *Poller) pollDomain(ctx context.Context, d struct{ id, provider, repo, a
 // source_ref). Shared by the poller AND the webhook handler — both triggers
 // converge on the same create path, so webhook + poll racing can never
 // double-create. Returns whether a goal was created.
-func (p *Poller) CreateGoalForIssue(ctx context.Context, domainID, assigneeID, provider, repo string, iss Issue) (bool, error) {
+func (p *Poller) CreateGoalForIssue(ctx context.Context, domainID, assigneeID, assigneeType, provider, repo string, iss Issue) (bool, error) {
 	ref := SourceRef(provider, repo, iss.Number)
 	var exists int
 	if err := p.st.DB().QueryRowContext(ctx,
@@ -225,7 +228,7 @@ func (p *Poller) CreateGoalForIssue(ctx context.Context, domainID, assigneeID, p
 		Title:         title,
 		Description:   desc,
 		DomainID:      domainID,
-		AssigneeType:  "agent",
+		AssigneeType:  assigneeType, // agent | squad (domain 配置决定谁处理 issue)
 		AssigneeID:    assigneeID,
 		Status:        "active",
 		CreatedByType: "system",
@@ -396,17 +399,20 @@ func (h *WebhookHandler) Handle(ctx context.Context, body []byte, signature, tok
 	}
 	// Route to the domain tracking this repo (provider must match the
 	// endpoint — a github delivery on the gitcode endpoint is not ours).
-	var domainID, assignee string
+	var domainID, assignee, assigneeType string
 	err = h.st.DB().QueryRowContext(ctx,
-		`SELECT id, issue_assignee FROM domain WHERE issue_repo=? AND issue_provider=?`, ev.Repository.FullName, h.provider).
-		Scan(&domainID, &assignee)
+		`SELECT id, issue_assignee, issue_assignee_type FROM domain WHERE issue_repo=? AND issue_provider=?`, ev.Repository.FullName, h.provider).
+		Scan(&domainID, &assignee, &assigneeType)
 	if err != nil {
 		return nil // repo not tracked — nothing to do (not an error)
 	}
 	if assignee == "" {
 		return nil
 	}
-	_, err = h.poller.CreateGoalForIssue(ctx, domainID, assignee, h.provider, ev.Repository.FullName, ev.Issue)
+	if assigneeType == "" {
+		assigneeType = "agent"
+	}
+	_, err = h.poller.CreateGoalForIssue(ctx, domainID, assignee, assigneeType, h.provider, ev.Repository.FullName, ev.Issue)
 	return err
 }
 

@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS domain (
     checks_compiled_at     TEXT NOT NULL DEFAULT '',       -- '' = not compiled yet
     metrics_baseline       TEXT NOT NULL DEFAULT '{}',     -- JSON: test count / coverage at creation
     issue_repo             TEXT NOT NULL DEFAULT '',       -- M4-B: "owner/repo" to track issues from ('' = none)
-    issue_assignee         TEXT NOT NULL DEFAULT '',       -- M4-B: agent id that handles this repo's issues ('' = don't auto-create)
+    issue_assignee         TEXT NOT NULL DEFAULT '',       -- M4-B: agent|squad id that handles this repo's issues ('' = don't auto-create)
+    issue_assignee_type    TEXT NOT NULL DEFAULT 'agent',  -- M4-B: agent | squad (what issue_assignee points at)
     issue_provider         TEXT NOT NULL DEFAULT 'github', -- M4-B: github | gitcode (issue API + webhook signature shape)
     created_at             TEXT NOT NULL
 );

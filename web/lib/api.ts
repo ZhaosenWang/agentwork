@@ -115,8 +115,21 @@ export const createDomain = (body: {
   processor_agent_id?: string;
   issue_repo?: string;
   issue_assignee?: string;
+  issue_assignee_type?: string;
   issue_provider?: string;
 }) => api<Domain>("/domains", { method: "POST", body: JSON.stringify(body) });
+
+// updateDomain edits a domain's mutable config (issue handler etc.).
+export const updateDomain = (id: string, body: {
+  git_url?: string;
+  default_branch?: string;
+  git_identity?: string;
+  git_credentials?: string;
+  issue_repo?: string;
+  issue_assignee?: string;
+  issue_assignee_type?: string;
+  issue_provider?: string;
+}) => api<Domain>(`/domains/${id}`, { method: "PUT", body: JSON.stringify(body) });
 export const deleteDomain = (id: string) =>
   api<void>(`/domains/${id}`, { method: "DELETE" });
 export const compileDomainPolicy = (

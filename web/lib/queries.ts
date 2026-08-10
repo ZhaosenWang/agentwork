@@ -33,6 +33,7 @@ import {
   listDomains,
   getDomain,
   createDomain,
+  updateDomain,
   deleteDomain,
   compileDomainPolicy,
   freezeDomainChecks,
@@ -258,6 +259,14 @@ export function useCreateDomain() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: createDomain,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.domains }),
+  });
+}
+export function useUpdateDomain() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body: Parameters<typeof updateDomain>[1] }) =>
+      updateDomain(id, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.domains }),
   });
 }

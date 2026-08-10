@@ -96,7 +96,8 @@ export interface Domain {
   checks_compiled_at: string;
   metrics_baseline: string;
   issue_repo: string; // M4-B: "owner/repo" tracked for issues ('' = none)
-  issue_assignee: string; // M4-B: agent handling this repo's issues
+  issue_assignee: string; // M4-B: agent|squad handling this repo's issues
+  issue_assignee_type: string; // M4-B: agent | squad
   issue_provider: string; // M4-B: github | gitcode
   created_at: string;
 }
