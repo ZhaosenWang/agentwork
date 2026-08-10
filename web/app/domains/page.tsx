@@ -296,11 +296,15 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const [gitUrl, setGitUrl] = useState("");
   const [policyText, setPolicyText] = useState("");
   const [processorAgent, setProcessorAgent] = useState("");
+  const [issueRepo, setIssueRepo] = useState("");
+  const [issueAssignee, setIssueAssignee] = useState("");
+  const [issueProvider, setIssueProvider] = useState("github");
+  const [gitCredentials, setGitCredentials] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     create.mutate(
-      { name, git_url: gitUrl, policy_text: policyText, processor_agent_id: processorAgent },
+      { name, git_url: gitUrl, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: issueRepo, issue_assignee: issueAssignee, issue_provider: issueProvider, git_credentials: gitCredentials },
       {
         onSuccess: (d) => {
           if (policyText.trim() && processorAgent) {
@@ -342,6 +346,27 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
               <option key={a.id} value={a.id}>{a.name}</option>
             ))}
           </select>
+        </Field>
+        <Field label="Issue 追踪（可选，M4-B）" hint="仓库的 open issue 自动变成任务，处理完自动 close">
+          <input value={issueRepo} onChange={(e) => setIssueRepo(e.target.value)} className={inputCls} placeholder="owner/repo，如 yusheng-g/agentwork" />
+          <div className="mt-2 flex gap-2 items-center">
+            <label className="text-xs text-gray-500">平台：</label>
+            <select value={issueProvider} onChange={(e) => setIssueProvider(e.target.value)} className={inputCls}>
+              <option value="github">GitHub</option>
+              <option value="gitcode">GitCode</option>
+            </select>
+          </div>
+        </Field>
+        <Field label="issue 处理 agent（选填，配了 issue_repo 后生效）">
+          <select value={issueAssignee} onChange={(e) => setIssueAssignee(e.target.value)} className={inputCls}>
+            <option value="">选择…</option>
+            {agents?.map((a) => (
+              <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="GitHub token（git_credentials，issue 追踪用）">
+          <input value={gitCredentials} onChange={(e) => setGitCredentials(e.target.value)} className={inputCls} placeholder="ghp_… 或 fine-grained PAT" type="password" />
         </Field>
         {create.isError && <p className="text-sm text-red-500">{String(create.error)}</p>}
       </form>

@@ -32,6 +32,7 @@ type Goal struct {
 	CreatedByID     string `json:"created_by_id"`
 	CreatedAt       string `json:"created_at"`
 	WakeCount       int    `json:"wake_count"` // bumped each blocked→active wakeup; bounded to break runaway re-fan-out
+	SourceRef       string `json:"source_ref"` // external source (M4-B): "github:owner/repo#123"
 }
 
 // goalRunContext is what ReconcileOnRunEnd reasons about. Carried separately
@@ -148,9 +149,9 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 		domainID = g.DomainID
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO goal (id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		g.ID, g.Title, g.Description, parentID, domainID, g.AssigneeType, g.AssigneeID, g.Status, g.HandoffNote, g.CreatedByType, g.CreatedByID, g.CreatedAt); err != nil {
+		`INSERT INTO goal (id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at,source_ref)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		g.ID, g.Title, g.Description, parentID, domainID, g.AssigneeType, g.AssigneeID, g.Status, g.HandoffNote, g.CreatedByType, g.CreatedByID, g.CreatedAt, g.SourceRef); err != nil {
 		return nil, fmt.Errorf("insert goal: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -168,7 +169,7 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 
 func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,review_request,human_iterations,created_by_type,created_by_id,created_at,wake_count
+		`SELECT id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,review_request,human_iterations,created_by_type,created_by_id,created_at,wake_count,source_ref
 		 FROM goal ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -178,7 +179,7 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	for rows.Next() {
 		var g Goal
 		var parentID, domainID sql.NullString
-		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount); err != nil {
+		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount, &g.SourceRef); err != nil {
 			return nil, err
 		}
 		g.ParentID = parentID.String
@@ -192,9 +193,9 @@ func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 	var g Goal
 	var parentID, domainID sql.NullString
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,review_request,human_iterations,created_by_type,created_by_id,created_at,wake_count
+		`SELECT id,title,description,parent_id,domain_id,assignee_type,assignee_id,status,handoff_note,review_request,human_iterations,created_by_type,created_by_id,created_at,wake_count,source_ref
 		 FROM goal WHERE id=?`, id).
-		Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount)
+		Scan(&g.ID, &g.Title, &g.Description, &parentID, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.WakeCount, &g.SourceRef)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -711,6 +712,22 @@ func (s *GoalService) RequestApproval(ctx context.Context, goalID, reason string
 		"goal_id": goalID, "reason": "agent 请求审批: " + reason,
 	}})
 	return s.Get(ctx, goalID)
+}
+
+// IssueSource returns the goal's external source reference and the owning
+// domain's git_credentials (M4-B: the issue identity + the GitHub token the
+// platform uses to act on it). ok=false when the goal is not issue-sourced.
+func (s *GoalService) IssueSource(ctx context.Context, goalID string) (ref, token string, ok bool, err error) {
+	err = s.st.DB().QueryRowContext(ctx,
+		`SELECT g.source_ref, d.git_credentials FROM goal g JOIN domain d ON d.id=g.domain_id WHERE g.id=?`, goalID).
+		Scan(&ref, &token)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", false, nil
+		}
+		return "", "", false, err
+	}
+	return ref, token, ref != "", nil
 }
 
 // resolveGateRule names the rule that actually parked the goal in review:

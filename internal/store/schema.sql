@@ -44,6 +44,9 @@ CREATE TABLE IF NOT EXISTS domain (
     processor_agent_id     TEXT NOT NULL DEFAULT '',       -- per-domain override of the global processor agent
     checks_compiled_at     TEXT NOT NULL DEFAULT '',       -- '' = not compiled yet
     metrics_baseline       TEXT NOT NULL DEFAULT '{}',     -- JSON: test count / coverage at creation
+    issue_repo             TEXT NOT NULL DEFAULT '',       -- M4-B: "owner/repo" to track issues from ('' = none)
+    issue_assignee         TEXT NOT NULL DEFAULT '',       -- M4-B: agent id that handles this repo's issues ('' = don't auto-create)
+    issue_provider         TEXT NOT NULL DEFAULT 'github', -- M4-B: github | gitcode (issue API + webhook signature shape)
     created_at             TEXT NOT NULL
 );
 
@@ -133,12 +136,14 @@ CREATE TABLE IF NOT EXISTS goal (
     created_by_type  TEXT NOT NULL DEFAULT 'human',   -- human | agent
     created_by_id    TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL,
-    wake_count       INTEGER NOT NULL DEFAULT 0   -- bumped each blocked→active wakeup; bounded to break runaway re-fan-out loops
+    wake_count       INTEGER NOT NULL DEFAULT 0,   -- bumped each blocked→active wakeup; bounded to break runaway re-fan-out loops
+    source_ref       TEXT NOT NULL DEFAULT ''      -- external source (M4-B): "github:owner/repo#123" — one goal per issue
 );
 
 CREATE INDEX IF NOT EXISTS idx_goal_parent ON goal(parent_id);
 CREATE INDEX IF NOT EXISTS idx_goal_assignee ON goal(assignee_type, assignee_id);
 CREATE INDEX IF NOT EXISTS idx_goal_status ON goal(status);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_source_ref ON goal(source_ref) WHERE source_ref != '';
 
 -- run: one execution of a goal by one agent (execution plane). No authority:
 -- on terminal status the daemon calls GoalService.reconcileOnRunEnd(run),

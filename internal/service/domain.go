@@ -25,7 +25,7 @@ type Domain struct {
 	GitURL               string `json:"git_url"`
 	DefaultBranch        string `json:"default_branch"`
 	GitIdentity          string `json:"git_identity"`    // "name <email>" for commits
-	GitCredentials       string `json:"git_credentials"` // token/ssh ref; M0 single-user shared
+	GitCredentials       string `json:"git_credentials"` // token/ssh ref; M0 single-user shared; M4-B: the GitHub token for issue tracking
 	PolicyText           string `json:"policy_text"`     // NL intent (source of truth)
 	Checks               Checks `json:"checks"`          // compiled, frozen after confirmation
 	VerificationStrength string `json:"verification_strength"` // strong|medium|weak
@@ -34,6 +34,9 @@ type Domain struct {
 	ProcessorAgentID     string `json:"processor_agent_id"`    // per-domain override of the global processor agent
 	ChecksCompiledAt     string `json:"checks_compiled_at"`    // '' = not compiled/frozen yet
 	MetricsBaseline      string `json:"metrics_baseline"`      // JSON: test count / coverage at creation
+	IssueRepo            string `json:"issue_repo"`            // M4-B: "owner/repo" whose open issues auto-become goals ('' = none)
+	IssueAssignee        string `json:"issue_assignee"`        // M4-B: agent id handling this repo's issues ('' = don't auto-create)
+	IssueProvider        string `json:"issue_provider"`        // M4-B: github | gitcode (default github)
 	CreatedAt            string `json:"created_at"`
 }
 
@@ -197,13 +200,34 @@ func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 			return nil, err
 		}
 	}
+	// M4-B: issue tracking needs a repo AND an assignee (git_credentials is
+	// independently valid — it also serves commit identity). Reject
+	// half-configured issue tracking loudly instead of silently never
+	// polling.
+	if d.IssueRepo != "" || d.IssueAssignee != "" {
+		if d.IssueRepo == "" || d.IssueAssignee == "" {
+			return nil, NewValidationError("issue tracking needs both issue_repo and issue_assignee")
+		}
+		if d.GitCredentials == "" {
+			return nil, NewValidationError("issue tracking needs git_credentials (the platform token)")
+		}
+		if d.IssueProvider == "" {
+			d.IssueProvider = "github"
+		}
+		if d.IssueProvider != "github" && d.IssueProvider != "gitcode" {
+			return nil, NewValidationError("issue_provider must be github or gitcode")
+		}
+		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, d.IssueAssignee, "issue assignee"); err != nil {
+			return nil, err
+		}
+	}
 	d.ID = newID()
 	d.CreatedAt = now()
 	checksJSON, _ := json.Marshal(d.Checks)
 	_, err := s.st.DB().ExecContext(ctx,
-		`INSERT INTO domain (id,type,name,git_url,default_branch,git_identity,git_credentials,policy_text,checks,verification_strength,max_run_duration,verify_timeout,processor_agent_id,checks_compiled_at,metrics_baseline,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		d.ID, d.Type, d.Name, d.GitURL, d.DefaultBranch, d.GitIdentity, d.GitCredentials, d.PolicyText, string(checksJSON), d.VerificationStrength, d.MaxRunDuration, d.VerifyTimeout, d.ProcessorAgentID, d.ChecksCompiledAt, d.MetricsBaseline, d.CreatedAt)
+		`INSERT INTO domain (id,type,name,git_url,default_branch,git_identity,git_credentials,policy_text,checks,verification_strength,max_run_duration,verify_timeout,processor_agent_id,checks_compiled_at,metrics_baseline,issue_repo,issue_assignee,issue_provider,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		d.ID, d.Type, d.Name, d.GitURL, d.DefaultBranch, d.GitIdentity, d.GitCredentials, d.PolicyText, string(checksJSON), d.VerificationStrength, d.MaxRunDuration, d.VerifyTimeout, d.ProcessorAgentID, d.ChecksCompiledAt, d.MetricsBaseline, d.IssueRepo, d.IssueAssignee, d.IssueProvider, d.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert domain: %w", err)
 	}
@@ -213,7 +237,7 @@ func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 
 func (s *DomainService) List(ctx context.Context) ([]Domain, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,type,name,git_url,default_branch,git_identity,git_credentials,policy_text,checks,verification_strength,max_run_duration,verify_timeout,processor_agent_id,checks_compiled_at,metrics_baseline,created_at
+		`SELECT id,type,name,git_url,default_branch,git_identity,git_credentials,policy_text,checks,verification_strength,max_run_duration,verify_timeout,processor_agent_id,checks_compiled_at,metrics_baseline,issue_repo,issue_assignee,issue_provider,created_at
 		 FROM domain ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -223,7 +247,7 @@ func (s *DomainService) List(ctx context.Context) ([]Domain, error) {
 	for rows.Next() {
 		var d Domain
 		var checksJSON string
-		if err := rows.Scan(&d.ID, &d.Type, &d.Name, &d.GitURL, &d.DefaultBranch, &d.GitIdentity, &d.GitCredentials, &d.PolicyText, &checksJSON, &d.VerificationStrength, &d.MaxRunDuration, &d.VerifyTimeout, &d.ProcessorAgentID, &d.ChecksCompiledAt, &d.MetricsBaseline, &d.CreatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.Type, &d.Name, &d.GitURL, &d.DefaultBranch, &d.GitIdentity, &d.GitCredentials, &d.PolicyText, &checksJSON, &d.VerificationStrength, &d.MaxRunDuration, &d.VerifyTimeout, &d.ProcessorAgentID, &d.ChecksCompiledAt, &d.MetricsBaseline, &d.IssueRepo, &d.IssueAssignee, &d.IssueProvider, &d.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(checksJSON), &d.Checks)
@@ -236,9 +260,9 @@ func (s *DomainService) Get(ctx context.Context, id string) (*Domain, error) {
 	var d Domain
 	var checksJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,type,name,git_url,default_branch,git_identity,git_credentials,policy_text,checks,verification_strength,max_run_duration,verify_timeout,processor_agent_id,checks_compiled_at,metrics_baseline,created_at
+		`SELECT id,type,name,git_url,default_branch,git_identity,git_credentials,policy_text,checks,verification_strength,max_run_duration,verify_timeout,processor_agent_id,checks_compiled_at,metrics_baseline,issue_repo,issue_assignee,issue_provider,created_at
 		 FROM domain WHERE id=?`, id).
-		Scan(&d.ID, &d.Type, &d.Name, &d.GitURL, &d.DefaultBranch, &d.GitIdentity, &d.GitCredentials, &d.PolicyText, &checksJSON, &d.VerificationStrength, &d.MaxRunDuration, &d.VerifyTimeout, &d.ProcessorAgentID, &d.ChecksCompiledAt, &d.MetricsBaseline, &d.CreatedAt)
+		Scan(&d.ID, &d.Type, &d.Name, &d.GitURL, &d.DefaultBranch, &d.GitIdentity, &d.GitCredentials, &d.PolicyText, &checksJSON, &d.VerificationStrength, &d.MaxRunDuration, &d.VerifyTimeout, &d.ProcessorAgentID, &d.ChecksCompiledAt, &d.MetricsBaseline, &d.IssueRepo, &d.IssueAssignee, &d.IssueProvider, &d.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

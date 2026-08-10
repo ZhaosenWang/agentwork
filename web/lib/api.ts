@@ -100,8 +100,12 @@ export const createDomain = (body: {
   type?: string;
   default_branch?: string;
   git_identity?: string;
+  git_credentials?: string;
   policy_text?: string;
   processor_agent_id?: string;
+  issue_repo?: string;
+  issue_assignee?: string;
+  issue_provider?: string;
 }) => api<Domain>("/domains", { method: "POST", body: JSON.stringify(body) });
 export const deleteDomain = (id: string) =>
   api<void>(`/domains/${id}`, { method: "DELETE" });
@@ -135,6 +139,7 @@ export const disconnectFeishu = () =>
 export interface PlatformSettings {
   intake_agent: string; // agent id: who parses the owner's IM messages
   digest_time: string; // HH:MM local, '' = 09:00 default
+  webhook_secret: string; // platform webhook secret, shared across providers ('' = polling only)
 }
 export const getPlatformSettings = () => api<PlatformSettings>("/settings/platform");
 export const savePlatformSettings = (body: PlatformSettings) =>

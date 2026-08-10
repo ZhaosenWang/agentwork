@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -43,6 +44,8 @@ func main() {
 		agentCmd(serverURL, os.Args[2:])
 	case "squad":
 		squadCmd(serverURL, os.Args[2:])
+	case "issue":
+		issueCmd(serverURL, goalID, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -50,6 +53,39 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// issueCmd lets the agent reply to the issue behind its current goal (M4-B):
+// the platform owns the GitHub token and executes the comment — the agent
+// only produces the structured side effect.
+func issueCmd(serverURL, goalID string, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli issue comment --text \"...\"")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("issue comment", flag.ExitOnError)
+	text := fs.String("text", "", "comment body")
+	_ = fs.Parse(args)
+	if *text == "" {
+		fail("--text is required")
+	}
+	if goalID == "" {
+		fail("AGENTWORK_GOAL_ID not set — this command must run inside a goal's run")
+	}
+	body, err := json.Marshal(map[string]string{"goal_id": goalID, "text": *text})
+	if err != nil {
+		fail(err.Error())
+	}
+	resp, err := http.Post(serverURL+"/issue-comments", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		fail("issue comment: " + err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		fail(fmt.Sprintf("issue comment failed: %s: %s", resp.Status, strings.TrimSpace(string(raw))))
+	}
+	fmt.Println("issue comment posted")
 }
 
 func usage() {
@@ -69,6 +105,9 @@ Subcommands:
                                              human to decide (behavior gate)
   agent list                                 list all agents (JSON)
   squad list                                 list all squads (JSON)
+  issue comment --text T                     reply to the GitHub issue behind the current
+                                             goal (the platform owns the token; only for
+                                             issue-sourced goals, M4-B)
 
 Environment (injected by daemon):
   AGENTWORK_SERVER_URL   server base URL (default http://127.0.0.1:7373)

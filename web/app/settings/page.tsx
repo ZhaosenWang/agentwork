@@ -25,7 +25,7 @@ export default function SettingsPage() {
 
   return (
     <div className="p-8">
-      <PageHeader title="设置" />
+      <PageHeader title="Settings" />
 
       <div className="max-w-xl">
         <h2 className="text-lg font-medium mb-2">飞书通知（IM 连接）</h2>
@@ -108,9 +108,14 @@ function PlatformSettingsSection() {
   const save = useSavePlatformSettings();
   const [intakeAgent, setIntakeAgent] = useState<string | null>(null);
   const [digestTime, setDigestTime] = useState<string | null>(null);
+  const [webhookSecret, setWebhookSecret] = useState<string | null>(null);
 
   const current = (k: string, fallback: string) =>
-    k === "intake_agent" ? (intakeAgent ?? settings?.intake_agent ?? "") : (digestTime ?? settings?.digest_time ?? "");
+    k === "intake_agent"
+      ? (intakeAgent ?? settings?.intake_agent ?? "")
+      : k === "digest_time"
+        ? (digestTime ?? settings?.digest_time ?? "")
+        : (webhookSecret ?? settings?.webhook_secret ?? "");
 
   return (
     <div className="max-w-xl mt-10">
@@ -148,11 +153,25 @@ function PlatformSettingsSection() {
               onChange={(e) => setDigestTime(e.target.value)}
             />
           </div>
+          <div>
+            <label className="block text-sm text-gray-700 mb-1">平台 webhook secret（可选，M4-B，GitHub/GitCode 共用）</label>
+            <input
+              type="password"
+              className="w-full rounded border border-gray-300 px-2 py-1.5 text-sm"
+              placeholder="配了才有实时 issue 触发（不配则 5 分钟轮询兜底）"
+              value={current("webhook_secret", "")}
+              onChange={(e) => setWebhookSecret(e.target.value)}
+            />
+          </div>
           <Button
             onClick={() =>
-              save.mutate({ intake_agent: current("intake_agent", ""), digest_time: current("digest_time", "") })
+              save.mutate({
+                intake_agent: current("intake_agent", ""),
+                digest_time: current("digest_time", ""),
+                webhook_secret: current("webhook_secret", ""),
+              })
             }
-            disabled={save.isPending || (!intakeAgent && !digestTime)}
+            disabled={save.isPending || (!intakeAgent && !digestTime && !webhookSecret)}
           >
             {save.isPending ? "保存中…" : "保存"}
           </Button>

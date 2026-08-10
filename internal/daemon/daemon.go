@@ -23,12 +23,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/issue"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/runtime"
@@ -56,6 +58,11 @@ const digestTickInterval = time.Minute
 // digestDefaultTime is the daily digest time (HH:MM, local) when the owner
 // has not configured notify.digest_time (DESIGN.v2.md §11 M3).
 const digestDefaultTime = "09:00"
+
+// issuePollInterval is how often the daemon scans tracked repos for new open
+// issues (M4-B: the trigger is a poll — no public webhook on a single-user
+// machine; a new issue becomes a goal within this window).
+const issuePollInterval = 5 * time.Minute
 
 // worktreeRetentionDays is how long a terminal goal's worktree is kept after
 // its last run (DESIGN.v2.md §13 — M1 value: 7 days; kept for review/debug).
@@ -93,6 +100,8 @@ type Daemon struct {
 	im        *notify.Connector // M3: daily digest + intake replies (the notifier
 	// is born when the long connection connects; fetch it live)
 	qs        notify.QueryStore // M3: digest aggregation (may be nil)
+	issuePoll *issue.Poller     // M4-B: open issues → goals
+	issueCloser *issue.Closer   // M4-B: delivered goal → close its issue
 
 	mu          sync.Mutex
 	workers     map[string]*agentWorker // agentID → per-agent scheduler
@@ -122,14 +131,28 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		st: st, bus: bus, addr: addr,
 		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
-		im:         im,
-		qs:         qs,
-		workers:    make(map[string]*agentWorker),
-		msgBuffers: make(map[string]*msgBuffer),
+		im:          im,
+		qs:          qs,
+		issuePoll:   issue.NewPoller(st, goalSvc, runSvc),
+		issueCloser: issue.NewCloser(st),
+		workers:     make(map[string]*agentWorker),
+		msgBuffers:  make(map[string]*msgBuffer),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
 	bus.Subscribe("goal:approved", d.onGoalApproved)
+	// M4-B: a delivered issue-sourced goal closes its GitHub issue (the
+	// work is merged — the issue is done).
+	bus.Subscribe("goal:delivered", func(_ context.Context, e events.Event) {
+		m, ok := e.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		goalID, _ := m["goal_id"].(string)
+		if goalID != "" {
+			d.issueCloser.OnDelivered(context.Background(), goalID)
+		}
+	})
 	return d
 }
 
@@ -146,10 +169,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	scheduleTick := time.NewTicker(scheduleTickInterval)
 	cleanupTick := time.NewTicker(worktreeCleanupInterval)
 	digestTick := time.NewTicker(digestTickInterval)
+	issueTick := time.NewTicker(issuePollInterval)
 	defer dispatchTick.Stop()
 	defer scheduleTick.Stop()
 	defer cleanupTick.Stop()
 	defer digestTick.Stop()
+	defer issueTick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -164,7 +189,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.cleanupWorktrees(ctx)
 		case <-digestTick.C:
 			d.dispatchDigest(ctx)
+		case <-issueTick.C:
+			d.dispatchIssues(ctx)
 		}
+	}
+}
+
+// dispatchIssues polls tracked repos for new open issues and turns them into
+// goals (M4-B). The poll interval bounds how quickly a new issue reaches the
+// queue — no public webhook needed on a single-user machine.
+func (d *Daemon) dispatchIssues(ctx context.Context) {
+	n, err := d.issuePoll.Poll(ctx)
+	if err != nil {
+		log.Printf("daemon: issue poll: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("daemon: issue poll created %d goal(s)", n)
 	}
 }
 
@@ -229,6 +270,10 @@ func (d *Daemon) dispatchDigest(ctx context.Context) {
 	}
 	log.Printf("daemon: daily digest sent (%s)", today)
 }
+
+// Poller exposes the issue poller for the server's webhook wiring (M4-B:
+// both triggers share the same create-goal path).
+func (d *Daemon) Poller() *issue.Poller { return d.issuePoll }
 
 // imNotifier returns the live milestone pusher (nil before the long
 // connection is up — digest and intake replies then no-op).
@@ -650,21 +695,21 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.runProcessorTask(ctx, q)
 		return
 	}
-	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
+	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
 	var maxConcurrent, maxRunDuration int
 	var isLeaderRun bool
 	var squadID string
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
 		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
-		        r2.is_leader_run, r2.squad_id
+		        r2.is_leader_run, r2.squad_id, g.source_ref, d.git_credentials
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
 		 LEFT JOIN domain d ON d.id = g.domain_id
 		 JOIN agent a ON a.id = r2.agent_id
 		 JOIN runtime r ON r.id = a.runtime_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &isLeaderRun, &squadID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &isLeaderRun, &squadID, &sourceRef, &gitCredentials)
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -745,6 +790,30 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		"AGENTWORK_AGENT_ID="+q.AgentID,
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
+	// M4-B: issue-sourced goals carry the issue identity so the agent can
+	// reply via `agentwork-cli issue comment` (the platform owns the token);
+	// the LIVE issue comments are fetched at run start and injected into the
+	// prompt — the issue stays the source of truth, nothing is stored.
+	var issueRepo, issueNumber string
+	var issueComments []issue.Comment
+	if sourceRef != "" && gitCredentials != "" {
+		if provider, repo, num, ok := issue.ParseSourceRef(sourceRef); ok {
+			issueRepo, issueNumber = repo, strconv.Itoa(num)
+			if client, err := issue.NewProvider(provider, gitCredentials); err == nil {
+				if comments, err := client.ListComments(ctx, repo, num); err == nil {
+					issueComments = comments
+				} else if err != nil {
+					log.Printf("daemon: issue comments for %s: %v", sourceRef, err)
+				}
+			}
+		}
+	}
+	if issueRepo != "" {
+		taskEnv = append(taskEnv,
+			"AGENTWORK_ISSUE_REPO="+issueRepo,
+			"AGENTWORK_ISSUE_NUMBER="+issueNumber,
+		)
+	}
 
 	// Open the transport (stdio/ws/tcp); the backend speaks the protocol.
 	spec := runtime.Spec{
@@ -760,8 +829,19 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 
-	// Prompt the run: title + description + handoff/wakeup note.
+	// Prompt the run: title + description + handoff/wakeup note, plus the
+	// issue comments fetched at run start (M4-B: the issue is the
+	// human-agent dialogue channel — the agent starts with the latest
+	// conversation, nothing stored).
 	prompt := buildPrompt(title, desc, handoff)
+	if len(issueComments) > 0 {
+		var b strings.Builder
+		b.WriteString("\n\n## Issue 最新交流（来自 GitHub）\n")
+		for _, cm := range issueComments {
+			fmt.Fprintf(&b, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
+		}
+		prompt += b.String()
+	}
 
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {

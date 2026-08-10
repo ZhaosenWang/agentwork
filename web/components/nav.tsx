@@ -12,7 +12,7 @@ const NAV_ITEMS = [
   { href: "/squads", label: "Squad", icon: Users },
   { href: "/schedules", label: "Schedule", icon: Clock },
   { href: "/domains", label: "Domain", icon: Boxes },
-  { href: "/settings", label: "设置", icon: Settings },
+  { href: "/settings", label: "Settings", icon: Settings },
 ];
 
 export function Nav() {

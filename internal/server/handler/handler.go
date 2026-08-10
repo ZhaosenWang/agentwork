@@ -6,9 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/eushing/agentwork/internal/issue"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/service"
 )
@@ -24,6 +28,10 @@ type Handlers struct {
 	Domain   *service.DomainService
 	Settings *service.SettingsService
 	IM       *notify.Connector
+	// IssueWebhooks are the real-time issue triggers (M4-B), keyed by
+	// provider ("github" | "gitcode"); absent = that provider's webhook
+	// disabled (polling still covers intake).
+	IssueWebhooks map[string]*issue.WebhookHandler
 }
 
 func (h *Handlers) Mount(mux *http.ServeMux) {
@@ -72,6 +80,9 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /gate-decisions/stats", h.gateStats)
 
+	mux.HandleFunc("POST /issue-comments", h.createIssueComment)
+	mux.HandleFunc("POST /webhooks/github", h.githubWebhook)
+	mux.HandleFunc("POST /webhooks/gitcode", h.gitcodeWebhook)
 	mux.HandleFunc("GET /settings/platform", h.getPlatformSettings)
 	mux.HandleFunc("PUT /settings/platform", h.putPlatformSettings)
 	mux.HandleFunc("GET /im/feishu/status", h.imStatus)
@@ -402,21 +413,113 @@ func (h *Handlers) gateStats(w http.ResponseWriter, r *http.Request) {
 
 // ── IM (Feishu connect flow — the Web-driven QR connect) ──
 
+// ── issue comments (M4-B) ──
+
+// createIssueComment posts a comment on the issue behind a goal: the goal's
+// source_ref names the repo+number, the domain's git_credentials is the
+// GitHub token — the agent never touches either (the platform executes the
+// structured side effect).
+func (h *Handlers) createIssueComment(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		GoalID string `json:"goal_id"`
+		Text   string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, nil, service.NewValidationError("invalid body: "+err.Error()))
+		return
+	}
+	if body.GoalID == "" || strings.TrimSpace(body.Text) == "" {
+		writeJSON(w, nil, service.NewValidationError("goal_id and text are required"))
+		return
+	}
+	ref, token, isIssue, err := h.Goal.IssueSource(r.Context(), body.GoalID)
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	if !isIssue {
+		writeJSON(w, nil, service.NewValidationError("goal has no issue source"))
+		return
+	}
+	provider, repo, number, ok := issue.ParseSourceRef(ref)
+	if !ok {
+		writeJSON(w, nil, service.NewValidationError("goal source is not an issue ref"))
+		return
+	}
+	if token == "" {
+		writeJSON(w, nil, service.NewValidationError("domain has no git_credentials (the platform token)"))
+		return
+	}
+	client, err := issue.NewProvider(provider, token)
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	if err := client.CreateComment(r.Context(), repo, number, body.Text); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// githubWebhook / gitcodeWebhook are the real-time issue triggers (M4-B):
+// the hosting platform pushes `issues` events; the handler verifies the
+// provider-specific signature and creates the goal immediately (the poller
+// stays as the safety net). Comment events are ignored — the run-start
+// comment fetch covers the dialogue.
+func (h *Handlers) githubWebhook(w http.ResponseWriter, r *http.Request) {
+	h.handleWebhook(w, r, "github", "X-Hub-Signature-256")
+}
+
+func (h *Handlers) gitcodeWebhook(w http.ResponseWriter, r *http.Request) {
+	h.handleWebhook(w, r, "gitcode", "X-GitCode-Signature-256")
+}
+
+func (h *Handlers) handleWebhook(w http.ResponseWriter, r *http.Request, provider, sigHeader string) {
+	wh := h.IssueWebhooks[provider]
+	if wh == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("webhook %s not configured", provider))
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := wh.Handle(r.Context(), body, r.Header.Get(sigHeader), r.Header.Get("X-GitCode-Token")); err != nil {
+		writeErr(w, http.StatusUnauthorized, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // ── platform settings (M3: intake agent + digest time) ──
 
 // platformSettingsKey is the JSON blob under which the platform-wide M3
 // settings live (the global inbound parser agent, the daily digest time).
 const platformSettingsKey = "platform.m3"
 
+// webhookSecretKey is the standalone key for the platform webhook secret —
+// shared across providers (github/gitcode endpoints verify with the same
+// secret on a single-user platform). Kept apart from the m3 blob: it is a
+// credential, not a toggle.
+const webhookSecretKey = "platform.webhook_secret"
+
 type platformSettings struct {
 	IntakeAgent string `json:"intake_agent"` // agent id: IM inbound parser ('' = unset)
 	DigestTime  string `json:"digest_time"`  // HH:MM local, '' = default 09:00
+	// WebhookSecret verifies GitHub's X-Hub-Signature-256 ('' = webhook
+	// disabled; polling still covers issue intake).
+	WebhookSecret string `json:"webhook_secret"`
 }
 
 func (h *Handlers) getPlatformSettings(w http.ResponseWriter, r *http.Request) {
 	var out platformSettings
 	if raw, err := h.Settings.Get(r.Context(), platformSettingsKey); err == nil && raw != "" {
 		_ = json.Unmarshal([]byte(raw), &out)
+	}
+	if v, _ := h.Settings.Get(r.Context(), webhookSecretKey); v != "" {
+		out.WebhookSecret = v
 	}
 	writeJSON(w, out, nil)
 }
@@ -439,6 +542,13 @@ func (h *Handlers) putPlatformSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The webhook secret lives on its own key (a credential), the rest in
+	// the m3 blob.
+	if err := h.Settings.Set(r.Context(), webhookSecretKey, body.WebhookSecret); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	body.WebhookSecret = ""
 	raw, _ := json.Marshal(body)
 	if err := h.Settings.Set(r.Context(), platformSettingsKey, string(raw)); err != nil {
 		writeJSON(w, nil, err)
