@@ -270,7 +270,7 @@ func TestGitCodeClient(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/issues") && r.Method == http.MethodGet:
 			json.NewEncoder(w).Encode([]map[string]any{
-				{"number": 3, "title": "gitcode issue", "body": "b"},
+				{"number": "3", "title": "gitcode issue", "body": "b"}, // GitCode numbers are STRINGS
 			})
 		default:
 			w.WriteHeader(http.StatusNoContent)

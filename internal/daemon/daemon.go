@@ -59,10 +59,15 @@ const digestTickInterval = time.Minute
 // has not configured notify.digest_time (DESIGN.v2.md §11 M3).
 const digestDefaultTime = "09:00"
 
-// issuePollInterval is how often the daemon scans tracked repos for new open
-// issues (M4-B: the trigger is a poll — no public webhook on a single-user
-// machine; a new issue becomes a goal within this window).
-const issuePollInterval = 5 * time.Minute
+// issuePollInterval is the default issue-trigger latency (M4-B: the trigger
+// is a poll — no public webhook on a single-user machine). Default 30s so an
+// issue becomes a goal quickly; the owner can raise it via app_settings
+// (platform.issue_poll_interval, seconds) for many tracked repos + rate
+// limits. issuePollMinInterval is the tick floor (rate-limit protection).
+const (
+	issuePollInterval    = 30 * time.Second
+	issuePollMinInterval = 15 * time.Second
+)
 
 // worktreeRetentionDays is how long a terminal goal's worktree is kept after
 // its last run (DESIGN.v2.md §13 — M1 value: 7 days; kept for review/debug).
@@ -102,6 +107,7 @@ type Daemon struct {
 	qs        notify.QueryStore // M3: digest aggregation (may be nil)
 	issuePoll *issue.Poller     // M4-B: open issues → goals
 	issueCloser *issue.Closer   // M4-B: delivered goal → close its issue
+	lastIssuePoll time.Time     // last poll time (the interval is configurable)
 
 	mu          sync.Mutex
 	workers     map[string]*agentWorker // agentID → per-agent scheduler
@@ -196,9 +202,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 }
 
 // dispatchIssues polls tracked repos for new open issues and turns them into
-// goals (M4-B). The poll interval bounds how quickly a new issue reaches the
-// queue — no public webhook needed on a single-user machine.
+// goals (M4-B). The interval bounds how quickly a new issue reaches the
+// queue — no public webhook needed on a single-user machine. The ticker
+// fires at the minimum interval; the effective interval (default 30s,
+// app_settings platform.issue_poll_interval in seconds, floor 15s) gates the
+// actual poll.
 func (d *Daemon) dispatchIssues(ctx context.Context) {
+	interval := issuePollInterval
+	var raw string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT value FROM app_settings WHERE key='platform.issue_poll_interval'`).Scan(&raw); err == nil && raw != "" {
+		if sec, err := strconv.Atoi(raw); err == nil && sec >= int(issuePollMinInterval/time.Second) {
+			interval = time.Duration(sec) * time.Second
+		}
+	}
+	d.mu.Lock()
+	now := time.Now()
+	if now.Sub(d.lastIssuePoll) < interval {
+		d.mu.Unlock()
+		return
+	}
+	d.lastIssuePoll = now
+	d.mu.Unlock()
+
 	n, err := d.issuePoll.Poll(ctx)
 	if err != nil {
 		log.Printf("daemon: issue poll: %v", err)
