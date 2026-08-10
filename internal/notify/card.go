@@ -25,6 +25,14 @@ func buildReviewCard(g ReviewGoal) (string, error) {
 	if ev := evidenceSummary(g.Evidence); ev != "" {
 		b.WriteString("\n\n" + ev)
 	}
+	// The squad review opinions — the approval decision reads the review,
+	// not just the worker's claim.
+	if len(g.Comments) > 0 {
+		b.WriteString("\n\n**审查意见**")
+		for _, c := range g.Comments {
+			b.WriteString("\n> " + truncate(c, 400))
+		}
+	}
 	card := map[string]any{
 		"config": map[string]any{"wide_screen_mode": true},
 		"header": map[string]any{"template": "orange", "title": map[string]any{

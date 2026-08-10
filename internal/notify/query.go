@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"strings"
 
 	"github.com/eushing/agentwork/internal/store"
 )
@@ -21,6 +22,7 @@ type ReviewGoal struct {
 	Reason   string
 	RunID    string // the evidence run — recorded on the gate_decision (audit chain)
 	Evidence string // the run.evidence JSON bundle
+	Comments []string // latest agent-authored comments — the squad review opinions the approval card must show
 }
 
 // GoalBrief is one goal in a digest aggregation.
@@ -80,7 +82,11 @@ func (q *SQLQueryStore) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) {
 		        COALESCE((SELECT r.id FROM run r WHERE r.goal_id=g.id AND r.status='completed'
 		                  ORDER BY r.finished_at DESC LIMIT 1), ''),
 		        COALESCE((SELECT r.evidence FROM run r WHERE r.goal_id=g.id AND r.status='completed'
-		                  ORDER BY r.finished_at DESC LIMIT 1), '')
+		                  ORDER BY r.finished_at DESC LIMIT 1), ''),
+		        COALESCE((SELECT GROUP_CONCAT(content, '\n---\n') FROM (
+		            SELECT content FROM comment WHERE goal_id=g.id AND author_type='agent'
+		            ORDER BY created_at DESC LIMIT 3
+		        )), '')
 		 FROM goal g WHERE g.status='review' ORDER BY g.created_at`)
 	if err != nil {
 		return nil, err
@@ -89,8 +95,12 @@ func (q *SQLQueryStore) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) {
 	out := []ReviewGoal{}
 	for rows.Next() {
 		var r ReviewGoal
-		if err := rows.Scan(&r.GoalID, &r.Title, &r.Reason, &r.RunID, &r.Evidence); err != nil {
+		var comments string
+		if err := rows.Scan(&r.GoalID, &r.Title, &r.Reason, &r.RunID, &r.Evidence, &comments); err != nil {
 			return nil, err
+		}
+		if comments != "" {
+			r.Comments = strings.Split(comments, "\n---\n")
 		}
 		out = append(out, r)
 	}

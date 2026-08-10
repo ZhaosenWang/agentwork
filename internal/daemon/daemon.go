@@ -1059,6 +1059,19 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// note (see P2 in the bug review).
 		_ = d.runSvc.MarkSession(ctx, q.RunID, result.SessionID, runRowWorkdir)
 
+		// The run's REPORT is its last assistant message — the agent's final
+		// summary (what it did + how it verified), NOT the full transcript
+		// (which opens with the agent's thinking). The approval card, the
+		// comment feed, and the deliver note all read this; a transcript
+		// opening made Feishu's approval card show "I'm the worker agent…"
+		// instead of the work. Falls back to the backend output.
+		var report string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT content FROM chat_message WHERE run_id=? AND role='assistant' AND content != '' ORDER BY created_at DESC LIMIT 1`,
+			q.RunID).Scan(&report); err != nil || strings.TrimSpace(report) == "" {
+			report = result.Output
+		}
+
 		if domainID != "" {
 			// Make the agent's work durable on the goal branch (the agent is
 			// guided to commit; the daemon guarantees it — deliver merges the
@@ -1108,12 +1121,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				}
 			}
 			// Evidence bundle for the approval card (decision 2-3).
-			ev := buildEvidence(ctx, runRowWorkdir, baseSHA, result.Output, verifyReport, guardReport)
+			ev := buildEvidence(ctx, runRowWorkdir, baseSHA, report, verifyReport, guardReport)
 			if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET evidence=? WHERE id=?`, ev, q.RunID); err != nil {
 				log.Printf("daemon: store evidence for run %s: %v", q.RunID, err)
 			}
 		}
-		d.finishRunOK(ctx, q, result.Output)
+		d.finishRunOK(ctx, q, report)
 	case proto.StatusCancelled:
 		// decision 2-6 + the "stuck active with no run" hole: a cancelled run
 		// does NOT fail the goal, and does NOT consume attempt credit — the
