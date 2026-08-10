@@ -117,7 +117,11 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// hashes so the closer can build clickable commit links. Carried
 	// STRUCTURED (not parsed from the note text) — the goal layer passes them
 	// through to the delivered event verbatim.
-	fixLog, _ := gitRun(ctx, wt, "log", "--format=%H %s", base+".."+branchName)
+	// base came from gitRun (newline included) — it must be trimmed before
+	// it becomes a rev argument, or git fails to parse "sha\n..branch" and
+	// the fix evidence silently comes back empty (the close comment lost its
+	// links; regression found on the live GitCode issue #3).
+	fixLog, _ := gitRun(ctx, wt, "log", "--format=%H %s", strings.TrimSpace(base)+".."+branchName)
 	var fixCommits []string
 	for _, l := range strings.Split(fixLog, "\n") {
 		if l = strings.TrimSpace(l); l != "" {

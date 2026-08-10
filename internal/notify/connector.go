@@ -436,8 +436,18 @@ func (c *Connector) onCardAction(ctx context.Context, event *callback.CardAction
 		}
 	}
 	if _, err := c.goalSvc.ResolveReview(ctx, goalID, runID, decision, reason); err != nil {
+		// The validator's message is developer-oriented; the toast must be
+		// human-oriented (the most common case: a duplicate click while the
+		// async deliver runs — the card still shows buttons until the update
+		// lands, so the human clicks again).
+		msg := "操作失败，请稍后重试"
+		if strings.Contains(err.Error(), "already approved") || strings.Contains(err.Error(), "being delivered") {
+			msg = "该任务已批准，正在合入中——请稍候，无需重复操作"
+		} else if strings.Contains(err.Error(), "not in review") {
+			msg = "该任务已不在待审批状态（可能已被处理）"
+		}
 		return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
-			Type: "error", Content: "操作失败：" + truncate(err.Error(), 50),
+			Type: "error", Content: msg,
 		}}, nil
 	}
 	// Stamp the original card as processed (best-effort; the decision is
