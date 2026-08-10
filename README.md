@@ -110,6 +110,7 @@ subprocess so agents can call back to produce structured side effects.
 | `goal wait` | Mark the current goal as waiting for its sub-goals |
 | `agent list` | List all agents (JSON) |
 | `squad list` | List all squads (JSON) |
+| `stats` | Goal/run status statistics (JSON): total + per-status counts for goals (`backlog`/`active`/`blocked`/`done`/`failed`/`cancelled` from `GET /goals`) and for runs (`queued`/`running`/`completed`/`failed`/`cancelled`, aggregated across every goal's `GET /goals/{id}/runs`) |
 
 The daemon sets these environment variables for every agent subprocess:
 `AGENTWORK_SERVER_URL`, `AGENTWORK_GOAL_ID`, `AGENTWORK_RUN_ID`,
