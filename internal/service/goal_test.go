@@ -410,3 +410,59 @@ func TestParkForManualReview(t *testing.T) {
 		t.Fatalf("parked goal must be in review with the reason, got %+v", got)
 	}
 }
+
+// TestClaimPerGoalSerialization: a queued run of a goal is NOT claimed while
+// another run of the same goal is running (the worktree is exclusive); it
+// becomes claimable once the running run finishes. Processor runs (no goal)
+// are never blocked.
+func TestClaimPerGoalSerialization(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	agentB := seedAgent(t, st, "B") // reviewer — a DIFFERENT agent than the runner
+
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: seedDomainWithGates(t, st)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := enqueueFirst(t, rs, g)
+	// The writer's run is claimed (running).
+	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
+		t.Fatal(err)
+	}
+	// A mention-triggered run on ANOTHER agent (the reviewer) lands mid-run.
+	// Coalescing is per-(goal,agent), so this creates a NEW run — and it
+	// must WAIT: the goal's worktree is exclusive.
+	if _, err := rs.EnqueueForMention(ctx, g.ID, agentB, "c1"); err != nil {
+		t.Fatal(err)
+	}
+	// Running run of the same goal → the queued one must NOT be claimable.
+	c, err := rs.Claim(ctx, []string{agentB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c != nil {
+		t.Fatalf("queued run must wait while the goal's run is running, claimed %s", c.RunID)
+	}
+	// A DIFFERENT goal's run is still claimable (serialization is per-goal).
+	g2, _ := gs.Create(ctx, Goal{Title: "g2", AssigneeType: "agent", AssigneeID: agentB, Status: "active", DomainID: seedDomain(t, st)})
+	enqueueFirst(t, rs, g2)
+	c, err = rs.Claim(ctx, []string{agentB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c == nil {
+		t.Fatal("another goal's queued run must be claimable")
+	}
+	// Finish the writer's run → the reviewer's queued run becomes claimable.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE run SET status='completed', finished_at=? WHERE id=?`, now(), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	c, err = rs.Claim(ctx, []string{agentB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c == nil || c.GoalID != g.ID {
+		t.Fatalf("queued run must be claimable after the running run finishes, got %+v", c)
+	}
+}

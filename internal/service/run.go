@@ -266,6 +266,13 @@ type ClaimedRow struct {
 // Per DESIGN.zh.md §7 the claim avoids the old global head-of-line blocking by
 // letting the daemon pass the set of agents with free capacity and claiming
 // only within that set. Returns (nil, nil) when nothing is claimable.
+//
+// PER-GOAL SERIALIZATION: a goal's runs are strictly sequential — a queued
+// run is not claimed while ANOTHER run of the same goal is running (the
+// worktree is exclusive to one run at a time; a mention-triggered run
+// arriving mid-run must WAIT, not race the worktree — the C4 cleanliness
+// gate used to cancel it instead, which silently dropped the review step).
+// Processor runs (goal_id='') are unaffected.
 func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedRow, error) {
 	if len(readyAgents) == 0 {
 		return nil, nil
@@ -286,6 +293,10 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 		   SELECT r.id FROM run r
 		   JOIN agent a ON a.id = r.agent_id
 		   WHERE r.status='queued' AND r.agent_id IN (`+placeholders+`)
+		     AND NOT EXISTS (
+		       SELECT 1 FROM run r2
+		       WHERE r2.goal_id != '' AND r2.goal_id = r.goal_id AND r2.status='running'
+		     )
 		   ORDER BY r.queued_at
 		   LIMIT 1
 		 )
