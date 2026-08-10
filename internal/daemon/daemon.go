@@ -630,7 +630,7 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString(" squad's leader. @all (mention://all/all) suppresses auto-trigger.\n\n")
 
 	b.WriteString("### Inspect\n")
-	b.WriteString("- agentwork-cli goal list [--limit N]   # goals (JSON), capped to N most recent (default all)\n")
+	b.WriteString("- agentwork-cli goal list [--limit N] [--json]   # goals (JSON; --json explicit), capped to N most recent (default all)\n")
 	b.WriteString("- agentwork-cli agent list    # all agents — use this to get the UUIDs for assign/mention\n")
 	b.WriteString("- agentwork-cli squad list    # all squads\n\n")
 
