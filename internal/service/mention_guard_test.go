@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -100,6 +101,39 @@ func TestUnfrozenPolicyForcesReview(t *testing.T) {
 	}
 	if !strings.Contains(after.ReviewRequest, "未确认") {
 		t.Fatalf("review_request should name the unfrozen policy, got: %q", after.ReviewRequest)
+	}
+}
+
+// TestReviewDurationRecorded: gate_decision.review_duration measures the
+// seconds the goal spent in review before the decision (the health-learning
+// data source), not a hardcoded zero.
+func TestReviewDurationRecorded(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "gated work", Description: "do it", DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	r := enqueueFirst(t, rs, g)
+	finishWithMergeGate(t, st, rs, r, "done")
+	// Backdate the review entry so the duration is measurable.
+	tenSecAgo := time.Now().Add(-10 * time.Second).UTC().Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE activity_log SET created_at=? WHERE goal_id=? AND action='entered_review'`, tenSecAgo, g.ID); err != nil {
+		t.Fatalf("backdate review entry: %v", err)
+	}
+	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", "looks good"); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	var duration int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT review_duration FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, g.ID).Scan(&duration); err != nil {
+		t.Fatalf("load gate_decision: %v", err)
+	}
+	if duration < 9 {
+		t.Fatalf("review_duration should be ~10s, got %d", duration)
 	}
 }
 

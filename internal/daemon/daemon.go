@@ -503,9 +503,16 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 		case w.queue <- q:
 			claimed++
 		default:
-			// Worker queue full; the claim is already 'running'. Bail and let
-			// the next tick re-evaluate. (Rare; bounded by queueDepth.)
-			log.Printf("daemon: worker queue full for agent %s", q.AgentID)
+			// Worker queue full (rare — bounded by workerQueueDepth): the
+			// claim already stamped the run 'running', so bailing would leave
+			// a dead run that never reaches a worker (stuck until restart).
+			// Return it to queued — the next tick re-claims it, attempt
+			// untouched.
+			log.Printf("daemon: worker queue full for agent %s — returning run %s to queued", q.AgentID, q.RunID)
+			if _, err := d.st.DB().ExecContext(ctx,
+				`UPDATE run SET status='queued', started_at='' WHERE id=?`, q.RunID); err != nil {
+				log.Printf("daemon: requeue overflow run %s: %v", q.RunID, err)
+			}
 			return
 		}
 	}
@@ -1109,15 +1116,23 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.finishRunOK(ctx, q, result.Output)
 	case proto.StatusCancelled:
 		// decision 2-6 + the "stuck active with no run" hole: a cancelled run
-		// does NOT fail the goal, but it also must not silently leave the goal
-		// orphaned — retry once (attempt-bounded, so repeated stalls surface
-		// instead of looping). If retries are exhausted, the goal stays active
-		// and the notification below tells the owner to take over.
-		if q.Attempt < maxAttempts {
+		// does NOT fail the goal, and does NOT consume attempt credit — the
+		// requeue keeps the SAME attempt (a timeout is not a machine failure).
+		// The convergence rule is separate: only the FIRST cancellation gets an
+		// automatic retry; a second consecutive stall is systemic (the agent
+		// keeps hanging) and surfaces to the owner instead of looping.
+		// Only TIMEOUT cancellations count toward the convergence rule — the
+		// C4 worktree-dirty park and human cancels also mark runs cancelled
+		// (without the watchdog summary) and must not consume the single
+		// automatic retry.
+		var priorCancelled int
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='cancelled' AND result_summary LIKE 'idle watchdog:%'`, q.GoalID).Scan(&priorCancelled)
+		if priorCancelled == 0 {
 			var isLeader int
 			var squadID string
 			_ = d.st.DB().QueryRowContext(ctx, `SELECT is_leader_run, squad_id FROM run WHERE id=?`, q.RunID).Scan(&isLeader, &squadID)
-			if err := d.runSvc.EnqueueExisting(ctx, q.GoalID, q.AgentID, q.Attempt+1, isLeader != 0, squadID); err != nil {
+			if err := d.runSvc.EnqueueExisting(ctx, q.GoalID, q.AgentID, q.Attempt, isLeader != 0, squadID); err != nil {
 				log.Printf("daemon: requeue cancelled run %s: %v", q.RunID, err)
 			}
 		}

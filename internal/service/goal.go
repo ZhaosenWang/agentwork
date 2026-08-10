@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
@@ -732,9 +733,25 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	if err != nil {
 		return nil, err
 	}
+	// review_duration: seconds spent in review before this decision — the
+	// health-learning data source (gate_decision.review_duration). Measured
+	// from the most recent entry into review (any of the three park paths).
+	duration := 0
+	var enteredAt string
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT created_at FROM activity_log WHERE goal_id=? AND action IN ('entered_review','requested_review','parked_review') ORDER BY created_at DESC LIMIT 1`,
+		goalID).Scan(&enteredAt); err == nil && enteredAt != "" {
+		if et, err := time.Parse(time.RFC3339Nano, enteredAt); err == nil {
+			if dt, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+				if secs := int(dt.Sub(et).Seconds()); secs > 0 {
+					duration = secs
+				}
+			}
+		}
+	}
 	if _, err := s.st.DB().ExecContext(ctx,
 		`INSERT INTO gate_decision (id,goal_id,run_id,gate_rule,decision,reason,decided_by,decided_at,review_duration) VALUES (?,?,?,?,?,?,?,?,?)`,
-		newID(), goalID, runID, rule, decision, reason, "human", ts, 0); err != nil {
+		newID(), goalID, runID, rule, decision, reason, "human", ts, duration); err != nil {
 		return nil, fmt.Errorf("insert gate_decision: %w", err)
 	}
 
