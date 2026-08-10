@@ -25,7 +25,13 @@ type Domain struct {
 	GitURL               string `json:"git_url"`
 	DefaultBranch        string `json:"default_branch"`
 	GitIdentity          string `json:"git_identity"`    // "name <email>" for commits
-	GitCredentials       string `json:"git_credentials"` // token/ssh ref; M0 single-user shared; M4-B: the GitHub token for issue tracking
+	// GitCredentials is the platform's REMOTE-OPERATION identity (decision
+	// 3-5): the token used for issue comments/close AND git push — every
+	// remote action appears under this account. Configure a dedicated
+	// agentwork-bot account's token (GitHub or GitCode — both platforms
+	// render comments under the authenticating account) so the human's own
+	// identity stays clean; commits are separately authored by git_identity.
+	GitCredentials       string `json:"git_credentials"`
 	PolicyText           string `json:"policy_text"`     // NL intent (source of truth)
 	Checks               Checks `json:"checks"`          // compiled, frozen after confirmation
 	VerificationStrength string `json:"verification_strength"` // strong|medium|weak

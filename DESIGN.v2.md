@@ -343,6 +343,7 @@ v2 新增：
 | 决策3-2 | **确认卡可编辑**：编译产物在冻结前可改（setup/verify/excludes 命令列表 + 完整 JSON）——兑现 §5.3"产物可见、可改、可审" |
 | 决策3-3 | **提交排除属域（checks.excludes）**：平台提交 agent 改动时排除的路径由域声明（processor 从仓库 .gitignore/依赖目录编译 + 人确认），**平台零写死**——"仓库该忽略什么"是仓库的领地，平台硬编码 node_modules 等目录既追不上新依赖形式、又可能误排除用户故意跟踪的目录 |
 | 决策3-4 | **issue 适配器多 provider（github/gitcode）**：Git 托管平台各说各话（API 形态、webhook 签名头、close 语义不同）——`internal/issue` 定义 Provider 接口（list/comment/close），域级 `issue_provider` 选实现；source_ref 带 provider 前缀；webhook 端点按 provider 分（X-Hub-Signature-256 / X-GitCode-Signature-256 / X-GitCode-Token）；轮询兜底不依赖任何平台特性 |
+| 决策3-5 | **远程操作身份 bot 分离**：git_credentials 是平台的远程操作身份（issue 评论/close + git push 都以此账号出现——托管平台 API 硬约束：评论作者 = 认证 token 属主，无法伪装）。配置专用 agentwork-bot 账号的 token（GitHub/GitCode 一致），人的身份保持干净；commit 身份已由 git_identity 独立（"agentwork[bot]"） |
 
 ---
 

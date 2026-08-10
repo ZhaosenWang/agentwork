@@ -603,15 +603,26 @@ func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL, gitCred
 	return nil
 }
 
-// gitCloneURL injects the domain's credentials into an HTTPS clone URL: the
-// token acts as the username (machine-identity convention). A URL that
-// already carries credentials (the owner embedded them explicitly) is left
-// untouched; SSH URLs are returned as-is.
+// gitCloneURL injects the domain's credentials into an HTTPS clone URL. The
+// username convention differs PER HOST (surfaced by the first live GitCode
+// run: the agent's push with the token as username was rejected, while the
+// oauth2: prefix — the GitLab PAT format GitCode speaks — worked):
+//
+//	github.com → token as the username (machine-identity convention)
+//	gitcode.com → oauth2:TOKEN (GitLab-style PAT)
+//
+// Unknown hosts fall back to token-as-username. A URL that already carries
+// credentials (the owner embedded them explicitly) is left untouched; SSH
+// URLs are returned as-is.
 func gitCloneURL(gitURL, credentials string) string {
 	if credentials == "" || !strings.HasPrefix(gitURL, "https://") || strings.Contains(gitURL, "@") {
 		return gitURL
 	}
-	return "https://" + credentials + "@" + strings.TrimPrefix(gitURL, "https://")
+	cred := credentials
+	if strings.Contains(gitURL, "gitcode.com") {
+		cred = "oauth2:" + credentials
+	}
+	return "https://" + cred + "@" + strings.TrimPrefix(gitURL, "https://")
 }
 
 // ensureGoalWorktree lazily allocates (decision 2-18) and syncs the goal's

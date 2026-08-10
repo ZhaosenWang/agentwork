@@ -400,6 +400,8 @@ func TestGitCloneURL(t *testing.T) {
 	cases := []struct{ url, cred, want string }{
 		{"https://github.com/yusheng-g/agentwork.git", "ghp_abc123",
 			"https://ghp_abc123@github.com/yusheng-g/agentwork.git"},
+		{"https://gitcode.com/eushing/test-repo.git", "gck-abc", // GitCode → oauth2: prefix (GitLab-style PAT)
+			"https://oauth2:gck-abc@gitcode.com/eushing/test-repo.git"},
 		{"https://github.com/yusheng-g/agentwork.git", "", // no cred → unchanged
 			"https://github.com/yusheng-g/agentwork.git"},
 		{"git@github.com:yusheng-g/agentwork.git", "ghp_abc123", // SSH → keys, no injection
