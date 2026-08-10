@@ -289,7 +289,13 @@ func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) 
 	if err != nil {
 		return "创建定时任务失败：" + err.Error()
 	}
-	return fmt.Sprintf("✅ 已创建定时任务：**%s**（`%s`，%s），下次执行 %s", s.Name, s.CronExpression, s.Timezone, shortID(s.ID))
+	next := s.NextRunAt
+	if next != "" {
+		if t, err := time.Parse(time.RFC3339Nano, next); err == nil {
+			next = t.Local().Format("01-02 15:04")
+		}
+	}
+	return fmt.Sprintf("✅ 已创建定时任务：**%s**（`%s`），下次执行 %s（本地时间）", s.Name, s.CronExpression, next)
 }
 
 // intakeScheduleList answers "查看定时任务" with the enabled schedules.
