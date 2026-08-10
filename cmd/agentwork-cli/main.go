@@ -94,13 +94,11 @@ func usage() {
 Subcommands:
   goal list                                 list all goals (JSON)
   goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
-  goal create --title T [--description D] [--assignee A] [--parent P] [--status S]
-                                             create a sub-goal (parent defaults to current goal)
+  goal create --title T [--description D] [--assignee A] [--status S]
+                                             create a goal
   goal comment --text T [--role R]           post a comment on the current goal; --text may
                                              contain a structured mention [@Name](mention://agent/<id>)
                                              to enqueue a run on that agent
-  goal wait                                  mark the current goal as waiting for its sub-goals;
-                                             the daemon re-runs it once all children finish
   goal request-approval --reason R           park the current goal in review and ask the
                                              human to decide (behavior gate)
   agent list                                 list all agents (JSON)
@@ -162,7 +160,11 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	title := fs.String("title", "", "goal title (required)")
 	description := fs.String("description", "", "goal description (the work to do)")
 	assignee := fs.String("assignee", "", "assignee agent id (defaults to current agent)")
-	parent := fs.String("parent", "", "parent goal id (defaults to current goal)")
+	// Sub-goals are SLEEVED (DESIGN.v2.md 决策 3-6): creation no longer
+	// defaults to a child of the current goal — an agent-created goal is an
+	// independent item, not a fan-out child (a defaulted parent used to make
+	// every agent-created goal a sub-goal that blocks its parent).
+	parent := fs.String("parent", "", "parent goal id (explicit sub-goal; NOT defaulted)")
 	status := fs.String("status", "active", "goal status")
 	fs.Parse(args)
 	if *title == "" {
@@ -173,9 +175,6 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	}
 	if *assignee == "" {
 		fail("--assignee is required (or AGENTWORK_AGENT_ID must be set)")
-	}
-	if *parent == "" {
-		*parent = goalID
 	}
 	body := map[string]string{
 		"title":           *title,

@@ -1475,7 +1475,7 @@ func buildPrompt(title, desc, handoff string) string {
 		// explicit, completable instruction so the run reaches a terminal state.
 		body = "Complete this sub-task. Do the work it implies, then finish your turn."
 	}
-	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, agentwork-cli reference, how to hand off / fan out / request approval)."
+	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, agentwork-cli reference, how to delegate via mention / hand off / request approval)."
 	if handoff != "" {
 		// A handoff/wakeup note scopes THIS turn. It is placed AHEAD of the
 		// original description, which is now *context* (not a fresh to-do
@@ -1515,15 +1515,6 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString(" to communicate intent — structured side effects via the CLI are the only way.\n\n")
 	b.WriteString("This goal's id is the value of AGENTWORK_GOAL_ID.\n\n")
 
-	b.WriteString("### Sub-goals (fan out then wait)\n")
-	b.WriteString("- Create a sub-goal that another agent works on:\n")
-	b.WriteString("  agentwork-cli goal create --title \"<title>\" [--description \"<what to do>\"] --assignee <other-agent-id>\n")
-	b.WriteString("  (parent defaults to the current goal.)\n")
-	b.WriteString("- Once you have created all the sub-goals you want to fan out, wait for them:\n")
-	b.WriteString("  agentwork-cli goal wait\n")
-	b.WriteString("  Then END YOUR TURN. When every sub-goal reaches a terminal state, the system")
-	b.WriteString(" re-runs THIS goal with a wakeup note summarizing what each sub-goal produced.\n\n")
-
 	b.WriteString("### Hand off the current goal\n")
 	b.WriteString("- agentwork-cli goal assign <to-agent-id> [--note \"scoping instruction\"]\n")
 	b.WriteString("  Hands the goal's ownership to that agent. Your current run keeps running to")
@@ -1545,8 +1536,9 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("- agentwork-cli squad list    # all squads\n\n")
 
 	b.WriteString("### Team roster\n")
-	b.WriteString("If a task falls outside your role, delegate it — create a sub-goal for a")
-	b.WriteString(" teammate whose role best matches, or hand off the goal entirely.\n\n")
+	b.WriteString("If a task falls outside your role, delegate it — mention the teammate whose")
+	b.WriteString(" role best matches in a comment (see @mention above) so they pick it up on")
+	b.WriteString(" this goal, or hand off the goal entirely.\n\n")
 	var n int
 	for rows.Next() {
 		var id, name, desc string

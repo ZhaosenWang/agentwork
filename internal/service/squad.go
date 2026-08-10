@@ -289,8 +289,10 @@ func (s *SquadService) agentName(ctx context.Context, agentID string) string {
 // squad_briefing.go). Wording is plain so it's easy to tune.
 
 const squadOperatingProtocolHeader = `You are the LEADER of a squad. Work flows through you: dispatch to teammates by
-assigning sub-goals to the member whose role best matches the work, do not do
-it all yourself. Members are NOT auto-fanned-out; you delegate explicitly.
+mentioning them in this goal's comments (agentwork-cli goal comment with a
+mention URI — see AGENTWORK.md) so they pick the work up as runs on this
+goal, do not do it all yourself. Members are NOT auto-dispatched; you
+delegate explicitly.
 `
 
 const squadParentStatusOwned = `You own this goal's status. When the overall objective is achieved, move it to
@@ -299,6 +301,6 @@ parent to done once the whole objective is met.
 `
 
 const squadParentStatusNotOwned = `You were @mentioned to help on a goal someone else owns. Do NOT change this
-goal's status — advise or delegate by creating sub-goals, but leave status
-changes to the owner.
+goal's status — advise or delegate by mentioning teammates in comments, but
+leave status changes to the owner.
 `

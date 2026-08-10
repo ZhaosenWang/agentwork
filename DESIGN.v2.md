@@ -344,6 +344,7 @@ v2 新增：
 | 决策3-3 | **提交排除属域（checks.excludes）**：平台提交 agent 改动时排除的路径由域声明（processor 从仓库 .gitignore/依赖目录编译 + 人确认），**平台零写死**——"仓库该忽略什么"是仓库的领地，平台硬编码 node_modules 等目录既追不上新依赖形式、又可能误排除用户故意跟踪的目录 |
 | 决策3-4 | **issue 适配器多 provider（github/gitcode）**：Git 托管平台各说各话（API 形态、webhook 签名头、close 语义不同）——`internal/issue` 定义 Provider 接口（list/comment/close），域级 `issue_provider` 选实现；source_ref 带 provider 前缀；webhook 端点按 provider 分（X-Hub-Signature-256 / X-GitCode-Signature-256 / X-GitCode-Token）；轮询兜底不依赖任何平台特性 |
 | 决策3-5 | **远程操作身份 bot 分离**：git_credentials 是平台的远程操作身份（issue 评论/close + git push 都以此账号出现——托管平台 API 硬约束：评论作者 = 认证 token 属主，无法伪装）。配置专用 agentwork-bot 账号的 token（GitHub/GitCode 一致），人的身份保持干净；commit 身份已由 git_identity 独立（"agentwork[bot]"） |
+| 决策3-6 | **子 goal 机制休眠（2026-08-10 定案）**：代码与状态机（blocked/wake/wait-children）保留，但从 agent 引导（AGENTWORK.md、squad briefing、CLI usage）中移除子 goal 与 wait——协作统一走 mention（同 goal 协作 run），agent 创建的 goal 不再默认成为子 goal。理由：子 goal 服务"单 goal 内并行拆活"，两个前提（可靠拆分、合并冲突自修复）当前均未满足——leader 实测 wait 死锁（无子 goal 时永久 blocked，仅可 Cancel）；实际协作（写完→审查→审批）是顺序流，mention 全覆盖；愿景中的并行是平台层面多 goal（issue 轮询天然多 goal），已成立。恢复条件：出现真实并行拆活需求（如大 issue 拆活）+ 冲突自修复落地后，重新启用并补全子 goal 独立交付语义 |
 
 ---
 
@@ -360,7 +361,7 @@ v2 新增：
 - 成本追踪
 - worktree 生命周期清理的数值（保留天数）
 - 健康度学习引擎（连批 20 次建议删门；连拒 3 次建议收紧）
-- squad 子 goal 独立合入 main，父 goal 只做协调汇总（方向已定，实现后置）
+- squad 子 goal 独立合入 main，父 goal 只做协调汇总（方向已定，实现后置）——子 goal 机制休眠中（决策 3-6），激活时一并实现
 - 审批时提示"review 期间有 N 条未执行 mention，是否执行"（决策 2-3 的代价缓解）
 - 远程 CI 集成时配套"CI 红 → 自动 revert"回滚规则（决策 2-7）
 - 域类型只实现 repo；文档/配置/知识库/backlog 等资产域后置
