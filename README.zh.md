@@ -105,6 +105,7 @@ Goal。
 | `goal wait` | 将当前 Goal 标记为等待子 Goal 完成 |
 | `agent list` | 列出所有 Agent（JSON） |
 | `squad list` | 列出所有 Squad（JSON） |
+| `stats` | Goal/Run 状态统计（JSON）：goal 总数 + 按状态计数（`backlog`/`active`/`blocked`/`done`/`failed`/`cancelled`，来自 `GET /goals`），run 总数 + 按状态计数（`queued`/`running`/`completed`/`failed`/`cancelled`，遍历每个 goal 的 `GET /goals/{id}/runs` 聚合） |
 
 守护进程为每个 Agent 子进程设置以下环境变量：
 `AGENTWORK_SERVER_URL`、`AGENTWORK_GOAL_ID`、`AGENTWORK_RUN_ID`、

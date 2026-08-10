@@ -43,6 +43,8 @@ func main() {
 		agentCmd(serverURL, os.Args[2:])
 	case "squad":
 		squadCmd(serverURL, os.Args[2:])
+	case "stats":
+		statsCmd(serverURL, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -67,6 +69,10 @@ Subcommands:
                                              the daemon re-runs it once all children finish
   agent list                                 list all agents (JSON)
   squad list                                 list all squads (JSON)
+  stats                                      goal/run status statistics (JSON): goal totals
+                                             + counts per status (backlog/active/blocked/done/
+                                             failed/cancelled) and run totals + counts per status
+                                             (queued/running/completed/failed/cancelled)
 
 Environment (injected by daemon):
   AGENTWORK_SERVER_URL   server base URL (default http://127.0.0.1:7373)
@@ -217,6 +223,102 @@ func squadCmd(serverURL string, args []string) {
 	}
 }
 
+// ── stats ──
+
+// cliGoal is the minimal goal shape `stats` needs from GET /goals.
+type cliGoal struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+}
+
+// cliRun is the minimal run shape `stats` needs from GET /goals/{id}/runs.
+type cliRun struct {
+	Status string `json:"status"`
+}
+
+// knownGoalStatuses / knownRunStatuses are the status dimensions `stats`
+// reports. Every known status is always present in the output (zero-filled),
+// so the JSON is self-describing; unknown statuses the server may return are
+// still counted under their own key.
+var (
+	knownGoalStatuses = []string{"backlog", "active", "blocked", "done", "failed", "cancelled"}
+	knownRunStatuses  = []string{"queued", "running", "completed", "failed", "cancelled"}
+)
+
+// statusBucket is a total plus per-status counts for one dimension.
+type statusBucket struct {
+	Total    int            `json:"total"`
+	ByStatus map[string]int `json:"by_status"`
+}
+
+// statsOutput is the JSON shape emitted by `stats`.
+type statsOutput struct {
+	Goals statusBucket `json:"goals"`
+	Runs  statusBucket `json:"runs"`
+}
+
+// newStatusBucket initializes a bucket with zero counts for every known status.
+func newStatusBucket(known []string) statusBucket {
+	byStatus := make(map[string]int, len(known))
+	for _, s := range known {
+		byStatus[s] = 0
+	}
+	return statusBucket{ByStatus: byStatus}
+}
+
+// bucketGoals tallies a goal list into a statusBucket.
+func bucketGoals(goals []cliGoal) statusBucket {
+	b := newStatusBucket(knownGoalStatuses)
+	b.Total = len(goals)
+	for _, g := range goals {
+		b.ByStatus[g.Status]++
+	}
+	return b
+}
+
+// bucketRuns tallies a run list into a statusBucket.
+func bucketRuns(runs []cliRun) statusBucket {
+	b := newStatusBucket(knownRunStatuses)
+	b.Total = len(runs)
+	for _, r := range runs {
+		b.ByStatus[r.Status]++
+	}
+	return b
+}
+
+// runsListURL builds the GET /goals/{id}/runs URL.
+func runsListURL(serverURL, goalID string) string {
+	return serverURL + "/goals/" + goalID + "/runs"
+}
+
+// statsCmd implements `stats`: goal stats come from GET /goals; run stats are
+// aggregated by fanning out to GET /goals/{id}/runs for every goal and
+// summing the per-status counts. Output is a single JSON object, matching the
+// JSON output style of the other commands.
+func statsCmd(serverURL string, args []string) {
+	fs := flag.NewFlagSet("stats", flag.ExitOnError)
+	fs.Parse(args)
+
+	var goals []cliGoal
+	if err := getJSON(goalListURL(serverURL, 0), &goals); err != nil {
+		fail("%v", err)
+	}
+
+	var allRuns []cliRun
+	for _, g := range goals {
+		var runs []cliRun
+		if err := getJSON(runsListURL(serverURL, g.ID), &runs); err != nil {
+			fail("%v", err)
+		}
+		allRuns = append(allRuns, runs...)
+	}
+
+	out := statsOutput{Goals: bucketGoals(goals), Runs: bucketRuns(allRuns)}
+	if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+		fail("encode stats: %v", err)
+	}
+}
+
 // ── HTTP helpers ──
 
 func get(url string) {
@@ -230,6 +332,25 @@ func get(url string) {
 		fail("GET %s: HTTP %d: %s", url, resp.StatusCode, body)
 	}
 	io.Copy(os.Stdout, resp.Body)
+}
+
+// getJSON performs GET and decodes the JSON body into v. Mirrors get's
+// failure mode: transport errors and non-2xx responses are returned as
+// errors (the caller decides how to surface them).
+func getJSON(url string, v any) error {
+	resp, err := httpClient.Get(url)
+	if err != nil {
+		return fmt.Errorf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GET %s: HTTP %d: %s", url, resp.StatusCode, body)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return fmt.Errorf("GET %s: decode: %v", url, err)
+	}
+	return nil
 }
 
 func post(url string, body any) {
