@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -231,6 +232,73 @@ func TestBucketRuns(t *testing.T) {
 		if b.ByStatus[s] != n {
 			t.Errorf("ByStatus[%q] = %d, want %d", s, b.ByStatus[s], n)
 		}
+	}
+}
+
+// captureStdout runs fn with os.Stdout swapped for a pipe and returns
+// everything written to stdout.
+func captureStdout(t *testing.T, fn func()) []byte {
+	t.Helper()
+	old := os.Stdout
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stdout = pw
+	fn()
+	_ = pw.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(pr)
+	return out
+}
+
+// TestGoalListJSONFlag: goal list accepts --json and always emits JSON (the
+// default output format — the CLI's native format, since agents parse
+// stdout). --json works alone or combined with --limit, which still sends
+// ?limit=N to GET /goals.
+func TestGoalListJSONFlag(t *testing.T) {
+	var limitParam string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/goals" {
+			http.NotFound(w, r)
+			return
+		}
+		limitParam = r.URL.Query().Get("limit")
+		_ = json.NewEncoder(w).Encode([]cliGoal{
+			{ID: "g1", Status: "active"},
+			{ID: "g2", Status: "done"},
+		})
+	}))
+	defer srv.Close()
+
+	cases := []struct {
+		name      string
+		args      []string
+		wantIDs   []string
+		wantLimit string
+	}{
+		{"--json alone", []string{"--json"}, []string{"g1", "g2"}, ""},
+		{"default is JSON", nil, []string{"g1", "g2"}, ""},
+		{"--json with --limit", []string{"--json", "--limit", "1"}, []string{"g1", "g2"}, "1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := captureStdout(t, func() { goalList(srv.URL, c.args) })
+			var got []cliGoal
+			if err := json.Unmarshal(out, &got); err != nil {
+				t.Fatalf("goal list output is not valid JSON: %v\n%s", err, out)
+			}
+			var ids []string
+			for _, g := range got {
+				ids = append(ids, g.ID)
+			}
+			if !slices.Equal(ids, c.wantIDs) {
+				t.Fatalf("goal ids = %v, want %v", ids, c.wantIDs)
+			}
+			if limitParam != c.wantLimit {
+				t.Fatalf("limit query param = %q, want %q", limitParam, c.wantLimit)
+			}
+		})
 	}
 }
 

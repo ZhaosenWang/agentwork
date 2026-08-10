@@ -58,7 +58,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `agentwork-cli — agent-side tool (called by agents during task execution)
 
 Subcommands:
-  goal list [--limit N] [--status S]       list goals (JSON); --limit caps to N most recent (default all);
+  goal list [--limit N] [--status S] [--json]  list goals (JSON — the default format; --json requests
+                                             it explicitly); --limit caps to N most recent (default all);
                                              --status keeps only goals whose status equals S (exact match)
   goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
   goal create --title T [--description D] [--assignee A] [--parent P] [--status S]
@@ -106,16 +107,24 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 	}
 }
 
-// goalList implements `goal list [--limit N] [--status S]`. --limit truncates
-// to the N most recent goals; absent (or 0) means all. --status filters to
-// goals whose status exactly matches S. The server's /goals endpoint only
-// supports ?limit, so the status filter is applied client-side, and --limit
-// then truncates the filtered list to the N most recent matches.
+// goalList implements `goal list [--limit N] [--status S] [--json]`. --limit
+// truncates to the N most recent goals; absent (or 0) means all. --status
+// filters to goals whose status exactly matches S. The server's /goals
+// endpoint only supports ?limit, so the status filter is applied
+// client-side, and --limit then truncates the filtered list to the N most
+// recent matches. Output is JSON — the CLI's native format (agents parse
+// stdout), so it is also the default; --json is the explicit selector for
+// that format.
 func goalList(serverURL string, args []string) {
 	fs := flag.NewFlagSet("goal list", flag.ExitOnError)
 	limit := fs.Int("limit", 0, "max number of goals to return (0 = all)")
 	status := fs.String("status", "", "only list goals with this status (exact match)")
+	jsonOut := fs.Bool("json", false, "output goals as JSON (the default output format)")
 	fs.Parse(args)
+	// JSON is both the default and the only format; --json pins it
+	// explicitly for scripted callers. GET /goals always responds with
+	// JSON, so the body is streamed through unchanged.
+	_ = jsonOut
 	if *status == "" {
 		get(goalListURL(serverURL, *limit))
 		return

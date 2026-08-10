@@ -98,7 +98,7 @@ Goal。
 
 | 命令 | 说明 |
 |---|---|
-| `goal list [--limit N] [--status S]` | 列出 Goal（JSON）；`--limit N` 限制为最近 N 条（默认全部）；`--status S` 只保留状态等于 S 的 Goal（精确匹配） |
+| `goal list [--limit N] [--status S] [--json]` | 列出 Goal（JSON —— 默认格式；`--json` 显式指定）；`--limit N` 限制为最近 N 条（默认全部）；`--status S` 只保留状态等于 S 的 Goal（精确匹配） |
 | `goal create --title T [--description D] [--assignee A] [--parent P] [--status S]` | 创建子 Goal |
 | `goal assign <目标-agent-id> [--note N]` | 将当前 Goal 交接给另一个 Agent |
 | `goal comment --text T [--role R]` | 发表评论；可包含 `[@Name](mention://agent/<id>)` 来在该 Agent 上创建 Run |
