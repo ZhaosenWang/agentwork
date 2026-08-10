@@ -29,6 +29,111 @@ func TestGoalListURL(t *testing.T) {
 	}
 }
 
+// TestFilterGoalsByStatus: keeps only goals whose status matches, preserves
+// order, and passes each goal object through byte-for-byte.
+func TestFilterGoalsByStatus(t *testing.T) {
+	goals := []json.RawMessage{
+		json.RawMessage(`{"id":"a","status":"active","title":"A"}`),
+		json.RawMessage(`{"id":"b","status":"done","title":"B"}`),
+		json.RawMessage(`{"id":"c","status":"active","title":"C"}`),
+	}
+	got := filterGoalsByStatus(goals, "active")
+	if len(got) != 2 {
+		t.Fatalf("filtered %d goals, want 2", len(got))
+	}
+	if string(got[0]) != `{"id":"a","status":"active","title":"A"}` {
+		t.Errorf("first goal altered: %s", got[0])
+	}
+	if string(got[1]) != `{"id":"c","status":"active","title":"C"}` {
+		t.Errorf("second goal altered: %s", got[1])
+	}
+	if got := filterGoalsByStatus(goals, "nope"); len(got) != 0 {
+		t.Errorf("unknown status: filtered %d goals, want 0", len(got))
+	}
+}
+
+// TestGoalListStatusEndToEnd drives goalList --status against a fake daemon:
+// the request hits bare /goals (no limit param) and the emitted JSON contains
+// only matching goals with their full fields intact.
+func TestGoalListStatusEndToEnd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/goals" {
+			http.NotFound(w, r)
+			return
+		}
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			t.Errorf("unexpected limit param %q with --status", raw)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]string{
+			{"id": "g1", "title": "one", "status": "active"},
+			{"id": "g2", "title": "two", "status": "done"},
+			{"id": "g3", "title": "three", "status": "active"},
+		})
+	}))
+	defer srv.Close()
+
+	old := os.Stdout
+	pr, pw, _ := os.Pipe()
+	os.Stdout = pw
+	goalList(srv.URL, []string{"--status", "active"})
+	_ = pw.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(pr)
+
+	var got []map[string]string
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d goals, want 2", len(got))
+	}
+	if got[0]["id"] != "g1" || got[1]["id"] != "g3" {
+		t.Errorf("unexpected goals: %v", got)
+	}
+	if got[0]["title"] != "one" || got[1]["title"] != "three" {
+		t.Errorf("goal fields lost: %v", got)
+	}
+}
+
+// TestGoalListStatusLimitEndToEnd drives goalList --status --limit N: the
+// request hits bare /goals and only the N most recent matches are emitted.
+func TestGoalListStatusLimitEndToEnd(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/goals" {
+			http.NotFound(w, r)
+			return
+		}
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			t.Errorf("unexpected limit param %q with --status", raw)
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]string{
+			{"id": "g1", "title": "one", "status": "active"},
+			{"id": "g2", "title": "two", "status": "done"},
+			{"id": "g3", "title": "three", "status": "active"},
+		})
+	}))
+	defer srv.Close()
+
+	old := os.Stdout
+	pr, pw, _ := os.Pipe()
+	os.Stdout = pw
+	goalList(srv.URL, []string{"--status", "active", "--limit", "1"})
+	_ = pw.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(pr)
+
+	var got []map[string]string
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d goals, want 1", len(got))
+	}
+	if got[0]["id"] != "g1" {
+		t.Errorf("got goal %q, want g1", got[0]["id"])
+	}
+}
+
 // TestRunsListURL: GET /goals/{id}/runs URL building.
 func TestRunsListURL(t *testing.T) {
 	cases := []struct {
