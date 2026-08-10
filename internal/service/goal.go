@@ -159,6 +159,27 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 		newID(), g.ID, g.CreatedByType, g.CreatedByID, "created", "{}", g.CreatedAt); err != nil {
 		return nil, fmt.Errorf("insert activity: %w", err)
 	}
+	// The creation instruction lands in the comment feed AS A MENTION — the
+	// same coordination shape an agent produces: [@Name](mention://agent|squad
+	// /<id>) + instruction. Assigning a goal IS the first mention, so the
+	// feed's timeline is uniform: "@dev-team 给 test-repo 添加 …" renders as a
+	// highlighted chip, exactly like an agent-to-agent handoff. Written
+	// directly (not via CommentService.Create) so creation never
+	// dispatch-triggers: the assignee's run is enqueued by the caller, and a
+	// description that mentions other agents must not double-trigger at
+	// creation.
+	if g.Description != "" && (g.AssigneeType == "agent" || g.AssigneeType == "squad") {
+		label, err := s.assigneeLabel(ctx, tx, g.AssigneeType, g.AssigneeID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve assignee label: %w", err)
+		}
+		content := "[" + label + "](mention://" + g.AssigneeType + "/" + g.AssigneeID + ") " + g.Description
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
+			newID(), g.ID, g.CreatedByType, g.CreatedByID, content, g.CreatedAt); err != nil {
+			return nil, fmt.Errorf("insert creation comment: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -1121,6 +1142,25 @@ func (s *GoalService) buildWakeupNoteInTx(ctx context.Context, tx *sql.Tx, paren
 	}
 	rows.Close()
 	return b.String(), rows.Err()
+}
+
+// assigneeLabel resolves an assignee's display name for the creation comment
+// (agent name / squad name).
+func (s *GoalService) assigneeLabel(ctx context.Context, tx *sql.Tx, atype, aid string) (string, error) {
+	var name string
+	var err error
+	switch atype {
+	case "agent":
+		err = tx.QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, aid).Scan(&name)
+	case "squad":
+		err = tx.QueryRowContext(ctx, `SELECT name FROM squad WHERE id=?`, aid).Scan(&name)
+	default:
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // mustExist is a tiny existence-check helper shared by the services.
