@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useMemo } from "react";
-import { useGoalRuns, useGoalRunMessages } from "@/lib/queries";
+import { useGoalRuns, useGoalRunMessages, useAgents } from "@/lib/queries";
 import { useWSEvent } from "@/lib/ws";
 import { Badge, Empty } from "@/components/ui";
 import type { Run } from "@/lib/types";
@@ -9,7 +9,11 @@ import type { ChatMessage } from "@/lib/api";
 
 export function GoalRuns({ goalId }: { goalId: string }) {
   const { data: runs, isLoading, refetch } = useGoalRuns(goalId);
+  const { data: agents } = useAgents();
   const [showPast, setShowPast] = useState(false);
+
+  // Agent id → name (the runs table reads who is working, not a hex id).
+  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
 
   // Refresh on run events
   useWSEvent("run:enqueued", () => refetch());
@@ -42,7 +46,7 @@ export function GoalRuns({ goalId }: { goalId: string }) {
             {activeRuns.length > 0 && (
               <div>
                 <div className="text-xs font-medium text-zinc-500 mb-2">活跃运行</div>
-                <RunTable runs={activeRuns} goalId={goalId} />
+                <RunTable runs={activeRuns} goalId={goalId} agentName={agentName} />
               </div>
             )}
 
@@ -55,7 +59,7 @@ export function GoalRuns({ goalId }: { goalId: string }) {
                 >
                   {showPast ? "▾" : "▸"} 历史运行（{pastRuns.length}）
                 </button>
-                {showPast && <RunTable runs={pastRuns} goalId={goalId} />}
+                {showPast && <RunTable runs={pastRuns} goalId={goalId} agentName={agentName} />}
               </div>
             )}
           </div>
@@ -65,7 +69,7 @@ export function GoalRuns({ goalId }: { goalId: string }) {
   );
 }
 
-function RunTable({ runs, goalId }: { runs: Run[]; goalId: string }) {
+function RunTable({ runs, goalId, agentName }: { runs: Run[]; goalId: string; agentName: (id: string) => string }) {
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-xs">
@@ -82,7 +86,7 @@ function RunTable({ runs, goalId }: { runs: Run[]; goalId: string }) {
         </thead>
         <tbody>
           {runs.map((r) => (
-            <RunRow key={r.id} run={r} goalId={goalId} />
+            <RunRow key={r.id} run={r} goalId={goalId} agentName={agentName} />
           ))}
         </tbody>
       </table>
@@ -93,7 +97,7 @@ function RunTable({ runs, goalId }: { runs: Run[]; goalId: string }) {
 // RunRow shows one run; clicking the chevron opens the LIVE interaction
 // stream (chat_message — what the agent is doing right now), refreshed on
 // every run:event over the WS.
-function RunRow({ run, goalId }: { run: Run; goalId: string }) {
+function RunRow({ run, goalId, agentName }: { run: Run; goalId: string; agentName: (id: string) => string }) {
   const [open, setOpen] = useState(false);
   const { data: messages, refetch } = useGoalRunMessages(goalId, run.id);
   useWSEvent("run:event", () => {
@@ -103,7 +107,7 @@ function RunRow({ run, goalId }: { run: Run; goalId: string }) {
   return (
     <>
       <tr className="border-b border-zinc-50 hover:bg-zinc-50/50">
-        <td className="py-1.5 px-2 text-zinc-700 font-mono text-xs">{run.agent_id?.slice(0, 8) ?? "-"}</td>
+        <td className="py-1.5 px-2 text-zinc-700 font-medium text-xs">{run.agent_id ? agentName(run.agent_id) : "-"}</td>
         <td className="py-1.5 px-2"><Badge status={run.status} /></td>
         <td className="py-1.5 px-2 text-zinc-500">#{run.attempt}</td>
         <td className="py-1.5 px-2 text-zinc-500 max-w-[200px] truncate">{run.result_summary || "-"}</td>
