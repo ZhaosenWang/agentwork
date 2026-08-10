@@ -730,6 +730,73 @@ func (s *GoalService) IssueSource(ctx context.Context, goalID string) (ref, toke
 	return ref, token, ref != "", nil
 }
 
+// Reopen restarts a failed/cancelled goal (DESIGN.v2.md §13: the failed-goal
+// human take-over path): back to active with the reason as handoff_note, and
+// a fresh run on the current assignee (attempt resets — a reopen is a new
+// human-directed cycle, like a reject).
+func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal, error) {
+	g, err := s.Get(ctx, goalID)
+	if err != nil {
+		return nil, err
+	}
+	if g.Status != "failed" && g.Status != "cancelled" {
+		return nil, NewValidationError("only failed or cancelled goals can be reopened")
+	}
+	note := "Reopened"
+	if reason != "" {
+		note += ": " + reason
+	}
+	if _, err := s.st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='active', handoff_note=?, review_request='' WHERE id=? AND status IN ('failed','cancelled')`,
+		note, goalID); err != nil {
+		return nil, fmt.Errorf("reopen goal: %w", err)
+	}
+	if _, err := s.st.DB().ExecContext(ctx,
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'reopened',?,?)`,
+		newID(), goalID, "human", "", "{}", now()); err != nil {
+		return nil, fmt.Errorf("insert activity: %w", err)
+	}
+	// Fresh run on the current assignee (human-assigned goals stay manual).
+	if g.AssigneeType == "agent" || g.AssigneeType == "squad" {
+		agentID, isLeader, squadID, err := s.runSvc.resolveLeader(ctx, g.AssigneeType, g.AssigneeID)
+		if err != nil {
+			return nil, err
+		}
+		if agentID != "" {
+			if err := s.runSvc.EnqueueExisting(ctx, goalID, agentID, 1, isLeader, squadID); err != nil {
+				return nil, fmt.Errorf("enqueue after reopen: %w", err)
+			}
+		}
+	}
+	return s.Get(ctx, goalID)
+}
+
+// ParkForManualReview parks an active goal in review because the platform
+// found something only a human can resolve — e.g. unattributed worktree
+// changes at run start (DESIGN.v2.md §4, C4: a run must not start on a
+// worktree carrying changes nobody can account for). The human's
+// approve/reject then flows through the normal review path.
+func (s *GoalService) ParkForManualReview(ctx context.Context, goalID, reason string) error {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='review', review_request=? WHERE id=? AND status='active'`,
+		reason, goalID)
+	if err != nil {
+		return fmt.Errorf("park goal for manual review: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return NewValidationError("goal is not active — cannot park for manual review")
+	}
+	if _, err := s.st.DB().ExecContext(ctx,
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'parked_review',?,?)`,
+		newID(), goalID, "system", "", `{"reason":"worktree-unattributed"}`, now()); err != nil {
+		return fmt.Errorf("insert activity: %w", err)
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
+		"goal_id": goalID, "reason": reason,
+	}})
+	return nil
+}
+
 // resolveGateRule names the rule that actually parked the goal in review:
 //   - the named run's gates_hit[0] (the IM card carries the evidence run),
 //   - else the goal's latest completed run's gates_hit[0] (the Web panel),

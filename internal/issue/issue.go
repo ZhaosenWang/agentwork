@@ -228,6 +228,12 @@ func (p *Poller) CreateGoalForIssue(ctx context.Context, domainID, assigneeID, p
 		SourceRef:     ref,
 	})
 	if err != nil {
+		// A unique-source_ref violation means the webhook and the poll raced
+		// and the other side won — that IS the idempotent outcome, not an
+		// error (the caller must not surface it as a failed delivery).
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return false, nil
+		}
 		return false, fmt.Errorf("create goal for %s: %w", ref, err)
 	}
 	if _, err := p.runSvc.EnqueueForGoal(ctx, *g); err != nil {

@@ -54,6 +54,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/wait", h.waitGoal)
 	mux.HandleFunc("POST /goals/{id}/review", h.resolveGoalReview)
 	mux.HandleFunc("POST /goals/{id}/request-approval", h.requestGoalApproval)
+	mux.HandleFunc("POST /goals/{id}/reopen", h.reopenGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
@@ -238,6 +239,16 @@ func (h *Handlers) resolveGoalReview(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Goal.ResolveReview(r.Context(), r.PathValue("id"), "", body.Decision, body.Reason)
 	writeJSON(w, out, err)
 }
+// reopenGoal restarts a failed/cancelled goal (the human take-over path).
+func (h *Handlers) reopenGoal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	out, err := h.Goal.Reopen(r.Context(), r.PathValue("id"), body.Reason)
+	writeJSON(w, out, err)
+}
+
 func (h *Handlers) listRuns(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Run.List(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)

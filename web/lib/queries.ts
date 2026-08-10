@@ -16,6 +16,7 @@ import {
   cancelGoal,
   waitGoalChildren,
   resolveGoalReview,
+  reopenGoal,
   listGoalRuns,
   listGoalComments,
   createGoalComment,
@@ -155,6 +156,15 @@ export function useWaitGoalChildren() {
   return useMutation({
     mutationFn: waitGoalChildren,
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
+  });
+}
+export function useReopenGoal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => reopenGoal(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.goals });
+    },
   });
 }
 export function useResolveGoalReview() {

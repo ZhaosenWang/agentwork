@@ -355,3 +355,40 @@ func TestBuildEvidence(t *testing.T) {
 		t.Fatalf("evidence must carry the agent summary: %s", ev)
 	}
 }
+
+// TestUnattributedDirty: the C4 gate — AGENTWORK.md and domain-declared
+// excludes are expected (not blocking); anything else dirty at run start is
+// reported for the manual-review park.
+func TestUnattributedDirty(t *testing.T) {
+	dir := newTestRepo(t)
+	ctx := context.Background()
+	excludes := []string{"**/node_modules/**"}
+
+	if d := unattributedDirty(ctx, dir, excludes); d != "" {
+		t.Fatalf("clean worktree must be clean, got %q", d)
+	}
+	// AGENTWORK.md only → expected, not dirty.
+	if err := os.WriteFile(filepath.Join(dir, "AGENTWORK.md"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if d := unattributedDirty(ctx, dir, excludes); d != "" {
+		t.Fatalf("AGENTWORK.md must be expected, got %q", d)
+	}
+	// node_modules (excluded) → expected.
+	if err := os.MkdirAll(filepath.Join(dir, "web", "node_modules"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "web", "node_modules", "x.js"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if d := unattributedDirty(ctx, dir, excludes); d != "" {
+		t.Fatalf("excluded deps must be expected, got %q", d)
+	}
+	// A real manual edit → reported.
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\n// edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if d := unattributedDirty(ctx, dir, excludes); d == "" || !strings.Contains(d, "main.go") {
+		t.Fatalf("manual edit must be reported, got %q", d)
+	}
+}

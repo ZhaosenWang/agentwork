@@ -211,6 +211,49 @@ func checkGuards(ctx context.Context, dir, baseSHA string, checks service.Checks
 	return report.String(), true
 }
 
+// unattributedDirty lists the worktree's dirty paths that no one can
+// account for (DESIGN.v2.md §4, C4): the platform-injected AGENTWORK.md and
+// the domain-declared excludes (checks.excludes — dependency dirs the
+// platform's own setup materializes) are EXPECTED; everything else is
+// returned ('' = clean enough to start a run). Called at run start, BEFORE
+// the agent touches anything — a human's manual edits must not be swept
+// into the goal's commits.
+func unattributedDirty(ctx context.Context, dir string, excludes []string) string {
+	// -uall expands untracked DIRECTORIES into individual files: plain
+	// porcelain reports "?? web/" for an untracked dir, whose internals the
+	// excludes must be matched against (node_modules lives INSIDE web/).
+	status, err := gitRun(ctx, dir, "status", "--porcelain", "-uall")
+	if err != nil {
+		return "" // cannot tell — let the run proceed and surface via commit
+	}
+	var dirty []string
+	for _, line := range strings.Split(status, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// " M path" / "?? path" — take the path part (after the 2-char status).
+		path := line
+		if len(line) > 3 {
+			path = strings.TrimSpace(line[3:])
+		}
+		if path == "AGENTWORK.md" {
+			continue // platform-injected coordination guide
+		}
+		excluded := false
+		for _, e := range excludes {
+			if globMatch(e, path) {
+				excluded = true
+				break
+			}
+		}
+		if !excluded {
+			dirty = append(dirty, line)
+		}
+	}
+	return strings.Join(dirty, "\n")
+}
+
 // changedPaths returns the changed paths relative to HEAD, INCLUDING
 // untracked files (git diff alone hides untracked files — the agent's work is
 // typically uncommitted when guards run; use git status --porcelain).

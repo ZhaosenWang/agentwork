@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"context"
 	"testing"
 	"time"
@@ -356,3 +357,56 @@ func TestWakeRunawayGuarded(t *testing.T) {
 
 // Ensure the test binary doesn't time out on the background bus goroutines.
 var _ = time.Second
+// TestReopenFailedGoal: the human take-over path — failed/cancelled → active
+// with a fresh run (attempt resets), exactly like a reject iteration.
+func TestReopenFailedGoal(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='failed' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := gs.Reopen(ctx, g.ID, "重试一下")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got.Status != "active" || got.HandoffNote == "" {
+		t.Fatalf("reopened goal must be active with a note, got %+v", got)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) == 0 || runs[len(runs)-1].Status != "queued" || runs[len(runs)-1].Attempt != 1 {
+		t.Fatalf("reopen must enqueue a fresh run at attempt 1, got %+v", runs)
+	}
+	// Done goals cannot be reopened.
+	if _, err := gs.Reopen(ctx, g.ID, "x"); err == nil {
+		t.Fatal("active goal must not be reopenable")
+	}
+}
+
+// TestParkForManualReview: the C4 path — a worktree with unattributed changes
+// parks the active goal in review (the human resolves, then the normal review
+// flow takes over).
+func TestParkForManualReview(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := gs.ParkForManualReview(ctx, g.ID, "worktree 有未归因改动"); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	got, _ := gs.Get(ctx, g.ID)
+	if got.Status != "review" || !strings.Contains(got.ReviewRequest, "未归因") {
+		t.Fatalf("parked goal must be in review with the reason, got %+v", got)
+	}
+}

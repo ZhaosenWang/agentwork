@@ -114,6 +114,19 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
 
       <div className="text-xs text-gray-600 space-y-1">
         <p><span className="font-medium">验收策略（NL）：</span>{d.policy_text || "（未填写——用一句话描述这个域怎么算“干对了”）"}</p>
+        {d.metrics_baseline && d.metrics_baseline !== "{}" && d.metrics_baseline !== "" && (
+          <p>
+            <span className="font-medium">演进基线（决策 2-15）：</span>
+            {(() => {
+              try {
+                const m = JSON.parse(d.metrics_baseline);
+                return `测试 ${m.test_count ?? "?"} 个 · 覆盖率 ${m.coverage ?? "?"}%`;
+              } catch {
+                return d.metrics_baseline;
+              }
+            })()}
+          </p>
+        )}
         {hasChecks && (
           <p>
             <span className="font-medium">编译产物：</span>

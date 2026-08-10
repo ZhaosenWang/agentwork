@@ -154,7 +154,10 @@ func compilePrompt(d *Domain, policyText string) string {
     {"name": "diff_excludes", "when": "<人话描述>", "pattern": "<glob，如 *.secret>"}
   ]
 }`)
-	b.WriteString("\n\n另把验证强度（strong|medium|weak）写入当前工作目录的 strength.txt——判断依据：verify 命令是否真实覆盖了任务的关键风险（echo ok / true 之类是 weak）。\n\n规则：\n")
+	b.WriteString("\n\n另把验证强度（strong|medium|weak）写入当前工作目录的 strength.txt——判断依据：verify 命令是否真实覆盖了任务的关键风险（echo ok / true 之类是 weak）。\n\n")
+	b.WriteString("再统计当前仓库的演进指标基线，写入当前工作目录的 metrics.json（文件即结果）：\n")
+	b.WriteString(`{"test_count": <测试用例数>, "coverage": <测试覆盖率百分比，数值>}`)
+	b.WriteString("\n（用实际可运行的命令统计：go test -cover ./... 的输出、npm test 的 jest 报告等；无法统计就写 0/null。这是平台自举证明的数据层——基线 vs 后续演进。）\n\n规则：\n")
 	b.WriteString("- setup 是验证环境准备：平台在干净 worktree 上执行验证，依赖不会自己存在。识别技术栈，把需要的依赖安装写进 setup（必须幂等：npm install / pip install -r requirements.txt / go mod download 这类；已安装时秒级跳过）。go/cargo 这类自动拉依赖的可留空。\n")
 	b.WriteString("- excludes 是提交排除：平台在 run 结束后把 agent 的改动提交到 goal 分支（git add），setup 安装的依赖目录（node_modules 等）若仓库的 .gitignore 没覆盖，会被误提交进分支。读仓库的 .gitignore 和实际依赖目录，把需要排除的路径写进 excludes（glob，如 **/node_modules/**）。仓库 .gitignore 已覆盖的可省略。\n")
 	b.WriteString("- verify 里的命令必须真实存在且可执行（结合该仓库技术栈推断），且假定 setup 已执行完\n")

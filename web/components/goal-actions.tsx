@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { useAgents, useSquads, useAssignGoal, useCancelGoal, useWaitGoalChildren, useDeleteGoal, useResolveGoalReview, useGoalRuns } from "@/lib/queries";
+import { useAgents, useSquads, useAssignGoal, useCancelGoal,
+  useReopenGoal, useWaitGoalChildren, useDeleteGoal, useResolveGoalReview, useGoalRuns } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import type { Goal } from "@/lib/types";
 
@@ -10,6 +11,7 @@ export function GoalActions({ goal }: { goal: Goal }) {
   const cancel = useCancelGoal();
   const wait = useWaitGoalChildren();
   const deleteGoal = useDeleteGoal();
+  const reopen = useReopenGoal();
   const [showAssign, setShowAssign] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
 
@@ -30,6 +32,12 @@ export function GoalActions({ goal }: { goal: Goal }) {
       {canWait && (
         <Button variant="outline" onClick={() => wait.mutate(goal.id)} disabled={wait.isPending}>
           {wait.isPending ? "…" : "等待子 Goal"}
+        </Button>
+      )}
+
+      {(goal.status === "failed" || goal.status === "cancelled") && (
+        <Button variant="outline" onClick={() => reopen.mutate(goal.id)} disabled={reopen.isPending}>
+          {reopen.isPending ? "重开中…" : "重开（失败/取消后人工接手）"}
         </Button>
       )}
 

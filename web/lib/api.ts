@@ -56,6 +56,8 @@ export const cancelGoal = (id: string) =>
   api<Goal>(`/goals/${id}/cancel`, { method: "POST" });
 export const waitGoalChildren = (id: string) =>
   api<void>(`/goals/${id}/wait`, { method: "POST" });
+export const reopenGoal = (id: string, reason?: string) =>
+  api<Goal>(`/goals/${id}/reopen`, { method: "POST", body: JSON.stringify({ reason: reason ?? "" }) });
 export const resolveGoalReview = (
   id: string,
   body: { decision: "approve" | "reject" | "redirect"; reason?: string }

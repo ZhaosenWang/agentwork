@@ -731,6 +731,46 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
 		return
 	}
+	// Worktree cleanliness (DESIGN.v2.md §4, C4): a run must not start on a
+	// worktree carrying changes nobody can account for — the daemon would
+	// sweep a human's manual edits into the goal's commits. AGENTWORK.md
+	// (platform-injected) and the domain-declared excludes are EXPECTED; a
+	// cancelled previous run's leftovers are attributable (the checkpoint
+	// resume model relies on them). Anything else dirty at run start parks
+	// the goal in review for the human.
+	//
+	// Two escape hatches keep this from deadlocking:
+	//   - a prior cancelled run → the dirt is that run's leftovers (resume);
+	//   - the goal was just REJECTED → the dirt is what the agent must fix
+	//     this round (the human told it to, via the review decision note) —
+	//     blocking the run would trap the goal in park→reject forever.
+	checks, timeout, baseline := d.loadDomainChecks(ctx, domainID)
+	if dirty := unattributedDirty(ctx, runRowWorkdir, checks.Excludes); dirty != "" {
+		var priorCancelled int
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='cancelled'`, q.GoalID).Scan(&priorCancelled)
+		var handoff string
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT handoff_note FROM goal WHERE id=?`, q.GoalID).Scan(&handoff)
+		justRejected := strings.HasPrefix(handoff, "Review decision: reject")
+		if priorCancelled == 0 && !justRejected {
+			reason := "worktree 有未归因的改动（可能是手动编辑）：\n" + dirty + "\n请检查 worktree 后批准继续或驳回。"
+			if err := d.goalSvc.ParkForManualReview(ctx, q.GoalID, reason); err != nil {
+				log.Printf("daemon: park %s for manual review: %v", q.GoalID, err)
+			}
+			// The run is parked WITHOUT the cancelled auto-retry path: the goal
+			// is already in review (park set it) and a retry would re-park and
+			// burn attempts. Stamp the run terminal directly — no Finish, no
+			// reconcile (the goal layer already moved).
+			if _, err := d.st.DB().ExecContext(ctx,
+				`UPDATE run SET status='cancelled', finished_at=? WHERE id=?`, nowStr(), q.RunID); err != nil {
+				log.Printf("daemon: park run %s terminal: %v", q.RunID, err)
+			}
+			return
+		}
+		log.Printf("daemon: worktree dirty for %s but attributable (cancelled leftovers or reject round) — continuing", q.GoalID)
+	}
+
 	// The run's diff baseline: guards and evidence measure this run's changes
 	// as baseSHA..HEAD (the agent may commit itself, and the daemon commits
 	// leftover work at run end — both land in HEAD).
@@ -908,7 +948,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// branch, and uncommitted work would deliver nothing). The
 			// domain's declared excludes (checks.excludes, compiled + owner-
 			// confirmed) keep dependency dirs out of the branch.
-			checks, timeout, baseline := d.loadDomainChecks(ctx, domainID)
 			if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID), checks.Excludes); err != nil {
 				d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
 				return
@@ -1109,9 +1148,27 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		// (Regression: the old UPDATE was gated on checks_compiled_at='',
 		// which made a recompile AFTER freezing a silent no-op — the new
 		// product was discarded and runs kept verifying with the old policy.)
+		//
+		// The evolution-metrics baseline (decision 2-15) is recorded alongside
+		// (metrics.json — test count / coverage the processor measured at
+		// compile time). Only the FIRST compile stamps the baseline: later
+		// recompiles refresh the policy, not the evolution baseline.
+		baseline := "{}"
+		if raw, err := os.ReadFile(filepath.Join(runRowWorkdir, "metrics.json")); err == nil {
+			var m struct {
+				TestCount int     `json:"test_count"`
+				Coverage  float64 `json:"coverage"`
+			}
+			if json.Unmarshal(raw, &m) == nil && (m.TestCount > 0 || m.Coverage > 0) {
+				b, _ := json.Marshal(map[string]any{"test_count": m.TestCount, "coverage": m.Coverage})
+				baseline = string(b)
+			}
+		}
 		if _, err := d.st.DB().ExecContext(ctx,
-			`UPDATE domain SET checks=?, verification_strength=?, checks_compiled_at='' WHERE id=?`,
-			string(checksJSON), strength, domainID); err != nil {
+			`UPDATE domain SET checks=?, verification_strength=?, checks_compiled_at='',
+			        metrics_baseline=CASE WHEN metrics_baseline='{}' OR metrics_baseline='' THEN ? ELSE metrics_baseline END
+			 WHERE id=?`,
+			string(checksJSON), strength, baseline, domainID); err != nil {
 			d.failProcessorRun(ctx, q, "store compiled checks: "+err.Error())
 			return
 		}
