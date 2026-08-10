@@ -467,11 +467,14 @@ func (c *Connector) updateCardProcessed(messageID, goalID, decision string) {
 	if err != nil {
 		return
 	}
+	// The message-update API (PATCH /im/v1/messages/:message_id) takes ONLY
+	// content — a message's type is immutable and msg_type in the body is
+	// rejected (code 230001, "invalid msg_type"; regression found the first
+	// time a Feishu approval card was actually updated).
 	resp, err := n.client.Im.Message.Update(context.Background(),
 		larkim.NewUpdateMessageReqBuilder().
 			MessageId(messageID).
 			Body(larkim.NewUpdateMessageReqBodyBuilder().
-				MsgType("interactive").
 				Content(content).
 				Build()).
 			Build())
