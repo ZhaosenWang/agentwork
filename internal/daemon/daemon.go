@@ -544,10 +544,15 @@ func (d *Daemon) lockDomain(domainID string) func() {
 // domain's default branch is the same one the main worktree sits on. A bare
 // repo has no main worktree, so every branch is free to be checked out in any
 // goal worktree. (git worktree add works against bare repos, git 2.5+.)
-// Credentials: git_credentials is not yet wired into the clone (M0
-// single-user; the caller's global git config / URL-embedded credentials
-// apply).
-func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL string) error {
+//
+// Credentials (M4): the domain's git_credentials (a platform token) is
+// injected into the HTTPS clone URL as the username — the machine-identity
+// convention GitHub, GitLab and Gitee all accept. The credentialed URL
+// persists in the bare repo's origin config, so EVERY later fetch/push
+// (agent branches AND deliver's main push) inherits it — one credential
+// configures the whole repo lifecycle. SSH repos keep their own auth
+// (keys); git_credentials is a no-op there.
+func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL, gitCredentials string) error {
 	repo := domainRepoPath(domainID)
 	if _, err := os.Stat(filepath.Join(repo, "HEAD")); err == nil {
 		return nil
@@ -555,7 +560,8 @@ func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL string) 
 	if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "git", "clone", "--bare", gitURL, repo)
+	cloneURL := gitCloneURL(gitURL, gitCredentials)
+	cmd := exec.CommandContext(ctx, "git", "clone", "--bare", cloneURL, repo)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git clone --bare %s: %w: %s", gitURL, err, string(out))
 	}
@@ -571,11 +577,22 @@ func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL string) 
 	return nil
 }
 
+// gitCloneURL injects the domain's credentials into an HTTPS clone URL: the
+// token acts as the username (machine-identity convention). A URL that
+// already carries credentials (the owner embedded them explicitly) is left
+// untouched; SSH URLs are returned as-is.
+func gitCloneURL(gitURL, credentials string) string {
+	if credentials == "" || !strings.HasPrefix(gitURL, "https://") || strings.Contains(gitURL, "@") {
+		return gitURL
+	}
+	return "https://" + credentials + "@" + strings.TrimPrefix(gitURL, "https://")
+}
+
 // ensureGoalWorktree lazily allocates (decision 2-18) and syncs the goal's
 // worktree: fetches the shared repo (under the domain lock) and, if the
 // worktree does not exist yet, creates it on a fresh branch from the domain's
 // default branch. Returns the worktree path.
-func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitURL, defaultBranch string) (string, error) {
+func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitURL, gitCredentials, defaultBranch string) (string, error) {
 	wt := goalWorktreePath(domainID, goalID)
 	if _, err := os.Stat(filepath.Join(wt, ".git")); err == nil {
 		return wt, nil
@@ -583,7 +600,7 @@ func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitUR
 	unlock := d.lockDomain(domainID)
 	defer unlock()
 
-	if err := d.ensureSharedRepo(ctx, domainID, gitURL); err != nil {
+	if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
 		return "", err
 	}
 	repo := domainRepoPath(domainID)
@@ -726,7 +743,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, "run's goal has no domain — cannot allocate a worktree")
 		return
 	}
-	runRowWorkdir, err := d.ensureGoalWorktree(ctx, domainID, q.GoalID, gitURL, defaultBranch)
+	runRowWorkdir, err := d.ensureGoalWorktree(ctx, domainID, q.GoalID, gitURL, gitCredentials, defaultBranch)
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
 		return

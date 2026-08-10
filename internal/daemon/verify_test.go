@@ -392,3 +392,26 @@ func TestUnattributedDirty(t *testing.T) {
 		t.Fatalf("manual edit must be reported, got %q", d)
 	}
 }
+
+// TestGitCloneURL: the credential injection is the generic git-layer
+// capability (M4) — token as HTTPS username, SSH untouched, an already-
+// credentialed URL never overridden.
+func TestGitCloneURL(t *testing.T) {
+	cases := []struct{ url, cred, want string }{
+		{"https://github.com/yusheng-g/agentwork.git", "ghp_abc123",
+			"https://ghp_abc123@github.com/yusheng-g/agentwork.git"},
+		{"https://github.com/yusheng-g/agentwork.git", "", // no cred → unchanged
+			"https://github.com/yusheng-g/agentwork.git"},
+		{"git@github.com:yusheng-g/agentwork.git", "ghp_abc123", // SSH → keys, no injection
+			"git@github.com:yusheng-g/agentwork.git"},
+		{"https://user:pass@github.com/yusheng-g/agentwork.git", "ghp_abc123", // explicit creds win
+			"https://user:pass@github.com/yusheng-g/agentwork.git"},
+		{"http://gitlab.example.com/x/y.git", "glpat-1", // http (non-tls) untouched
+			"http://gitlab.example.com/x/y.git"},
+	}
+	for _, tc := range cases {
+		if got := gitCloneURL(tc.url, tc.cred); got != tc.want {
+			t.Errorf("gitCloneURL(%q, %q) = %q, want %q", tc.url, tc.cred, got, tc.want)
+		}
+	}
+}

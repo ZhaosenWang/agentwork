@@ -34,10 +34,10 @@ func (d *Daemon) onGoalApproved(ctx context.Context, e events.Event) {
 }
 
 func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
-	var domainID, defaultBranch, gitURL string
+	var domainID, defaultBranch, gitURL, gitCredentials string
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT d.id, d.default_branch, d.git_url FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
-		Scan(&domainID, &defaultBranch, &gitURL)
+		`SELECT d.id, d.default_branch, d.git_url, d.git_credentials FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
+		Scan(&domainID, &defaultBranch, &gitURL, &gitCredentials)
 	if err != nil {
 		d.finishDeliver(ctx, goalID, false, "deliver: goal has no domain: "+err.Error())
 		return
@@ -46,7 +46,7 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// Wrong config fails loudly with the branch name — the owner fixes the
 	// domain, no silent fallbacks.
 	repo := domainRepoPath(domainID)
-	if _, err := d.ensureGoalWorktree(ctx, domainID, goalID, gitURL, defaultBranch); err != nil {
+	if _, err := d.ensureGoalWorktree(ctx, domainID, goalID, gitURL, gitCredentials, defaultBranch); err != nil {
 		d.finishDeliver(ctx, goalID, false, "deliver: prepare worktree: "+err.Error())
 		return
 	}
