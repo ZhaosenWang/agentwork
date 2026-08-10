@@ -154,7 +154,18 @@ func (s *RunService) EnqueueExisting(ctx context.Context, goalID, agentID string
 // Per DESIGN.zh.md §5.3 this enqueues on the mentioned agent (NOT the goal's
 // current assignee) and does NOT cancel any in-flight run.
 func (s *RunService) EnqueueForMention(ctx context.Context, goalID, agentID, triggerCommentID string) (*Run, error) {
-	return s.enqueue(ctx, goalID, agentID, 1, false, "", triggerCommentID)
+	squadID := resolveGoalSquad(ctx, s.st, goalID)
+	return s.enqueue(ctx, goalID, agentID, 1, false, squadID, triggerCommentID)
+}
+
+// resolveGoalSquad returns the squad ID if this goal was originally assigned
+// to a squad (determined by inspecting past leader runs), otherwise "".
+func resolveGoalSquad(ctx context.Context, st *store.Store, goalID string) string {
+	var squadID string
+	_ = st.DB().QueryRowContext(ctx,
+		`SELECT squad_id FROM run WHERE goal_id=? AND is_leader_run=1 AND squad_id!='' ORDER BY queued_at DESC LIMIT 1`,
+		goalID).Scan(&squadID)
+	return squadID
 }
 
 func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, error) {
@@ -263,10 +274,12 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 	}
 	// Re-read the minimal context the goal layer needs to reconcile.
 	var rc goalRunContext
+	var leaderFlag int
 	err := s.st.DB().QueryRowContext(ctx,
 		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary
 		 FROM run WHERE id=?`, runID).
-		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary)
+		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &leaderFlag, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary)
+	rc.IsLeaderRun = leaderFlag != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

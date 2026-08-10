@@ -20,6 +20,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -72,10 +73,24 @@ type Daemon struct {
 	squadSvc  *service.SquadService
 	schedSvc  *service.ScheduleService
 
-	mu      sync.Mutex
-	workers map[string]*agentWorker // agentID → per-agent scheduler
-	stopped bool
-	ctx     context.Context
+	mu         sync.Mutex
+	workers    map[string]*agentWorker // agentID → per-agent scheduler
+	stopped    bool
+	ctx        context.Context
+
+	// Active run cancellation: when a handoff happens via @mention, the
+	// handing-off agent's run is cancelled so it can't keep working and
+	// accidentally steal the goal back. Keyed by goalID to allow O(1)
+	// lookup when a handoff event arrives.
+	runMu       sync.Mutex
+	activeRuns  map[string]*activeRun // goalID → active run
+}
+
+// activeRun is a running task that can be cancelled on handoff.
+type activeRun struct {
+	runID  string
+	agentID string
+	cancel context.CancelFunc
 }
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.
@@ -95,10 +110,12 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		st: st, bus: bus, addr: addr,
 		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
-		workers: make(map[string]*agentWorker),
+		workers:    make(map[string]*agentWorker),
+		activeRuns: make(map[string]*activeRun),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
+	bus.Subscribe("handoff:completed", d.onHandoffCompleted)
 	return d
 }
 
@@ -162,6 +179,30 @@ func (d *Daemon) onAgentCreated(ctx context.Context, e events.Event) {
 	}
 	d.ensureWorker(a.ID, a.MaxConcurrent)
 	log.Printf("daemon: worker ready for agent %s", a.ID)
+}
+
+// onHandoffCompleted cancels the handing-off agent's active run when a
+// handoff happens via @mention, so the agent can't keep working and steal
+// the goal back before the next agent gets a chance to run.
+func (d *Daemon) onHandoffCompleted(ctx context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]any)
+	if !ok {
+		return
+	}
+	goalID, _ := m["goal_id"].(string)
+	fromAgentID, _ := m["from_agent_id"].(string)
+	if goalID == "" || fromAgentID == "" {
+		return
+	}
+
+	d.runMu.Lock()
+	ar, ok := d.activeRuns[goalID]
+	if ok && ar.agentID == fromAgentID {
+		log.Printf("daemon: cancelling run %s (agent %s handed off goal %s)", ar.runID, fromAgentID, goalID)
+		ar.cancel()
+		delete(d.activeRuns, goalID)
+	}
+	d.runMu.Unlock()
 }
 
 func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
@@ -336,10 +377,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 
 	d.ensureWorker(q.AgentID, maxConcurrent)
 
-	// Per-run working directory.
-	runRowWorkdir := filepath.Join(workdirBase, q.RunID)
+	// Per-goal working directory (shared across workflow stages so each
+	// agent sees previous stages' artifacts).
+	runRowWorkdir := filepath.Join(workdirBase, q.GoalID)
 	if workdirBase == "" {
-		runRowWorkdir = filepath.Join(os.TempDir(), "agentwork", q.RunID)
+		runRowWorkdir = filepath.Join(os.TempDir(), "agentwork", q.GoalID)
 	}
 	if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("mkdir workdir: %v", err))
@@ -356,6 +398,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		if b, err := d.squadSvc.BuildLeaderBriefing(ctx, squadID, owns); err == nil {
 			briefing = b
 		}
+	} else if !isLeaderRun {
+		// Non-leader run: if the goal belongs to a squad, inject the squad
+		// instructions so the agent understands team workflow (roles,
+		// handoff expectations) and doesn't just mark the goal done alone.
+		briefing = d.buildMemberSquadBriefing(ctx, q.GoalID, q.AgentID)
 	}
 	if err := d.injectAgentProfile(runRowWorkdir, systemPrompt, roster, briefing); err != nil {
 		log.Printf("daemon: inject agent profile for run %s: %v", q.RunID, err)
@@ -377,11 +424,29 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	for k, v := range agentEnv {
 		taskEnv = append(taskEnv, k+"="+v)
 	}
-	selfBin, _ := os.Executable()
+	selfBin, err := os.Executable()
+		if err != nil {
+			log.Printf("daemon: os.Executable failed: %v, falling back to CWD", err)
+			if cwd, e := os.Getwd(); e == nil {
+				selfBin = filepath.Join(cwd, "agentwork-daemon")
+			}
+		}
 	binDir := filepath.Dir(selfBin)
+	if !filepath.IsAbs(binDir) {
+		if abs, e := filepath.Abs(binDir); e == nil {
+			binDir = abs
+		}
+	}
 	cliPath := filepath.Join(binDir, "agentwork-cli")
 	if _, err := os.Stat(cliPath); err != nil {
-		log.Printf("daemon: agentwork-cli not found at %s; agent tool calls will fail", cliPath)
+		log.Printf("daemon: agentwork-cli not found at %s, searching PATH", cliPath)
+		if found, e := exec.LookPath("agentwork-cli"); e == nil && found != "" {
+			binDir = filepath.Dir(found)
+			cliPath = found
+			log.Printf("daemon: agentwork-cli found via PATH at %s", cliPath)
+		} else {
+			log.Printf("daemon: agentwork-cli NOT found anywhere — agent tool calls will fail")
+		}
 	}
 	addr := d.addr
 	if addr == "" {
@@ -393,6 +458,10 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 	serverURL := "http://" + net.JoinHostPort("127.0.0.1", port)
+	// Strip the inherited PATH from taskEnv and replace it with one that
+	// includes the agentwork-cli directory, so the agent subprocess can
+	// find agentwork-cli regardless of its working directory.
+	taskEnv = filterEnvPrefix(taskEnv, "PATH=")
 	taskEnv = append(taskEnv,
 		"AGENTWORK_SERVER_URL="+serverURL,
 		"AGENTWORK_GOAL_ID="+q.GoalID,   // product-plane id (CLI comments/handoff)
@@ -402,6 +471,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	)
 
 	// Open the transport (stdio/ws/tcp); the backend speaks the protocol.
+		// Write .agentwork-env so agentwork-cli can discover its context even
+	// when running inside a sandboxed bash subprocess that doesn't inherit
+	// custom env vars.
+	d.writeAgentEnvFile(runRowWorkdir, serverURL, q.GoalID, q.RunID, q.AgentID, cliPath)
+
 	spec := runtime.Spec{
 		Transport:  transport,
 		Executable: execPath,
@@ -431,6 +505,17 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	var inFlightTools atomic.Int32
 	promptCtx, promptCancel := context.WithCancel(ctx)
 	defer promptCancel()
+
+	// Register this run so a handoff can cancel it.
+	d.runMu.Lock()
+	d.activeRuns[q.GoalID] = &activeRun{runID: q.RunID, agentID: q.AgentID, cancel: promptCancel}
+	d.runMu.Unlock()
+	defer func() {
+		d.runMu.Lock()
+		delete(d.activeRuns, q.GoalID)
+		d.runMu.Unlock()
+	}()
+
 	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID)
 
 	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{Conn: conn, Cwd: runRowWorkdir, Prompt: prompt})
@@ -540,6 +625,58 @@ func (d *Daemon) finishRun(ctx context.Context, q *service.ClaimedRow, status, s
 	}
 }
 
+// buildMemberSquadBriefing returns squad instructions for a non-leader agent
+// working on a squad-assigned goal. Gives the agent enough team context to know
+// its role and who to hand off to next, without the leader protocol.
+func (d *Daemon) buildMemberSquadBriefing(ctx context.Context, goalID, agentID string) string {
+	// Find the squad this goal belongs to. After a handoff the goal's
+	// current assignee may be an agent, not the squad itself — check the
+	// most recent leader run's squad_id instead.
+	var squadID string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT squad_id FROM run WHERE goal_id=? AND is_leader_run=1 AND squad_id!='' ORDER BY queued_at DESC LIMIT 1`,
+		goalID).Scan(&squadID)
+	if err != nil || squadID == "" {
+		return ""
+	}
+	// Load squad context: instructions + roster.
+	sq, err := d.squadSvc.Get(ctx, squadID)
+	if err != nil || sq == nil {
+		return ""
+	}
+	members, _ := d.squadSvc.ListMembers(ctx, squadID)
+
+	var b strings.Builder
+	b.WriteString("## Team Context\n\n")
+	b.WriteString(fmt.Sprintf("You are working on a goal assigned to squad **%s**.\n\n", sq.Name))
+
+	// Show the agent's role.
+	for _, m := range members {
+		if m.MemberType == "agent" && m.MemberID == agentID && m.Role != "" {
+			fmt.Fprintf(&b, "Your role: **%s**\n\n", m.Role)
+			break
+		}
+	}
+
+	// Team instructions are the shared workflow.
+	if strings.TrimSpace(sq.Instructions) != "" {
+		b.WriteString("### Team Instructions\n\n")
+		b.WriteString(sq.Instructions)
+		b.WriteString("\n\n")
+	}
+
+	b.WriteString("### Important\n")
+	b.WriteString("- Do ONLY the work for your role.\n")
+	b.WriteString("- When your work is done and PASSES: @mention the NEXT role to hand off.\n")
+	b.WriteString("- When your work finds ISSUES: @mention the PREVIOUS role to fix them.\n")
+	b.WriteString("- Only call `goal done` if the instructions say you are the FINAL role and\n")
+	b.WriteString("  all issues are resolved. This submits the goal for human review.\n")
+	b.WriteString("- If `agentwork-cli` is not found, read `.agentwork-env` for the `cli_path`\n")
+	b.WriteString("  and use that full path for all agentwork-cli commands.\n")
+
+	return b.String()
+}
+
 // goalOwnsSquadStatus mirrors multica's ownsIssueStatus: a leader run may only
 // push the goal to done when the goal is assigned to THIS squad (DESIGN.zh.md
 // §5.4). A guest @mentioned squad gets the "do NOT change status" briefing.
@@ -590,18 +727,22 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("This goal's id is the value of AGENTWORK_GOAL_ID.\n\n")
 
 	b.WriteString("### Completing this goal\n")
-	b.WriteString("- When the work is done:\n")
+	b.WriteString("- When the work is done, submit for human review (NOT marked done directly):\n")
 	b.WriteString("    agentwork-cli goal done --summary \"what was accomplished\"\n")
+	b.WriteString("  This sets the goal to review (待审核). A human must approve it after review.\n")
 	b.WriteString("- When the goal cannot be completed:\n")
 	b.WriteString("    agentwork-cli goal fail --summary \"reason for failure\"\n")
-	b.WriteString("  Either command posts a system comment in the goal's thread and transitions the goal.\n\n")
+	b.WriteString("  Either command posts a system comment in the goal's thread.\n\n")
+	b.WriteString("### Finding agentwork-cli\n")
+	b.WriteString("- Try `agentwork-cli` first. If that fails, read `.agentwork-env` for the\n")
+	b.WriteString("  `cli_path` key, then use that full path, e.g.:\n")
+	b.WriteString("    CLI=$(grep -o '\"cli_path\":\"[^\"]*\"' .agentwork-env | cut -d'\"' -f4)\n")
+	b.WriteString("    $CLI agent list\n")
+	b.WriteString("- All coordination commands below can be run via the resolved CLI path.\n\n")
 
 	b.WriteString("### Handing off to another agent via @mention\n")
-	b.WriteString("- @mention the agent in a comment to TRANSFER OWNERSHIP of the goal:\n")
+	b.WriteString("- @mention in a comment TRANSFERS OWNERSHIP of the goal:\n")
 	b.WriteString("    agentwork-cli goal comment --text \"[@Name](mention://agent/<AGENT-UUID>) <context>\"\n")
-	b.WriteString("- The mention REASSIGNS the goal to them and enqueues a run. Your current run\n")
-	b.WriteString("  result will be discarded — @mention means \"I'm done, you take over.\"\n")
-	b.WriteString("- @mention a squad (mention://squad/<uuid>) to hand off to the squad leader.\n")
 	b.WriteString("- The mention MUST be a structured Markdown link with a mention:// URI; bare\n")
 	b.WriteString("  `@handle` prose does NOT trigger anything. Resolve UUIDs with:\n")
 	b.WriteString("  `agentwork-cli agent list` / `agentwork-cli squad list`.\n\n")
@@ -662,6 +803,24 @@ func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster, briefing stri
 	}
 	b.WriteString(roster)
 	return os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(b.String()), 0o644)
+}
+
+// writeAgentEnvFile writes a JSON config file to the workdir so agentwork-cli
+// can discover its context even when custom env vars are not propagated to
+// bash subprocesses (e.g., sandboxed tool execution). Also records the full
+// path to the CLI binary so the agent can find it.
+func (d *Daemon) writeAgentEnvFile(workdir, serverURL, goalID, runID, agentID, cliPath string) {
+	payload, _ := json.Marshal(map[string]string{
+		"server_url": serverURL,
+		"goal_id":    goalID,
+		"run_id":     runID,
+		"agent_id":   agentID,
+		"cli_path":   cliPath,
+	})
+	path := filepath.Join(workdir, ".agentwork-env")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		log.Printf("daemon: write .agentwork-env: %v", err)
+	}
 }
 
 // runIdleWatchdog cancels a Prompt if the agent emits nothing for idleWindow
@@ -786,4 +945,16 @@ func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, p
 		next.Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), r.ScheduleID); err != nil {
 		log.Printf("daemon: schedule %s advance next_run_at: %v", r.ScheduleID, err)
 	}
+}
+// filterEnvPrefix removes all entries starting with prefix from an
+// os.Environ-style slice. Used to deduplicate PATH (and similar) before
+// appending a replacement.
+func filterEnvPrefix(env []string, prefix string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			out = append(out, e)
+		}
+	}
+	return out
 }

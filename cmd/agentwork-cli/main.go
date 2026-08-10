@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -24,17 +25,62 @@ const (
 
 var httpClient = &http.Client{Timeout: httpTimeout}
 
+// agentEnv holds the runtime context for agentwork-cli, resolved from
+// env vars or the .agentwork-env file (for sandboxed environments where
+// custom env vars don't propagate).
+type agentEnv struct {
+	ServerURL string `json:"server_url"`
+	GoalID    string `json:"goal_id"`
+	RunID     string `json:"run_id"`
+	AgentID   string `json:"agent_id"`
+}
+
+func loadEnvFile() *agentEnv {
+	// Search from CWD upwards for .agentwork-env.
+	dir, err := os.Getwd()
+	if err != nil {
+		return nil
+	}
+	for {
+		p := filepath.Join(dir, ".agentwork-env")
+		if data, err := os.ReadFile(p); err == nil {
+			var e agentEnv
+			if json.Unmarshal(data, &e) == nil && e.ServerURL != "" {
+				return &e
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
 	}
+	// Resolve config: env vars first, then .agentwork-env file for sandboxed
+	// environments where custom env vars may not propagate to bash subprocesses.
+	envFile := loadEnvFile()
 	serverURL := os.Getenv("AGENTWORK_SERVER_URL")
+	if serverURL == "" && envFile != nil {
+		serverURL = envFile.ServerURL
+	}
 	if serverURL == "" {
 		serverURL = defaultServerURL
 	}
 	goalID := os.Getenv("AGENTWORK_GOAL_ID")
+	if goalID == "" && envFile != nil {
+		goalID = envFile.GoalID
+	}
 	agentID := os.Getenv("AGENTWORK_AGENT_ID")
+	if agentID == "" && envFile != nil {
+		agentID = envFile.AgentID
+	}
 
 	switch os.Args[1] {
 	case "goal":
@@ -63,7 +109,7 @@ Subcommands:
   goal comment --text T [--role R]           post a comment on the current goal; --text may
                                              contain a structured mention [@Name](mention://agent/<id>)
                                              to hand off work to that agent
-  goal done --summary S                      mark the current goal as done; posts a system comment
+  goal done --summary S                      submit the goal for human review; posts a system comment
   goal fail --summary S                      mark the current goal as failed; posts a system comment
   agent list                                 list all agents (JSON)
   squad list                                 list all squads (JSON)

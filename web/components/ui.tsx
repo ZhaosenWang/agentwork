@@ -35,6 +35,7 @@ const STATUS_COLORS: Record<string, string> = {
   // Goal statuses
   backlog: "bg-zinc-100 text-zinc-600",
   active: "bg-blue-50 text-blue-700 ring-1 ring-blue-200",
+  review: "bg-amber-50 text-amber-700 ring-1 ring-amber-200",
   done: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200",
   failed: "bg-red-50 text-red-700 ring-1 ring-red-200",
   cancelled: "bg-zinc-100 text-zinc-400",

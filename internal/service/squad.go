@@ -21,7 +21,7 @@ type Squad struct {
 	Name         string `json:"name"`
 	Description  string `json:"description"`
 	LeaderID     string `json:"leader_id"`
-	Instructions string `json:"instructions"`
+	Instructions string `json:"instructions"` // Markdown: team conventions, roles, handoff expectations injected into agent prompts
 	CreatedAt    string `json:"created_at"`
 }
 
@@ -127,6 +127,22 @@ func (s *SquadService) AddMember(ctx context.Context, squadID, memberType, membe
 	return &m, nil
 }
 
+// UpdateMemberRole updates the role of an existing squad member.
+func (s *SquadService) UpdateMemberRole(ctx context.Context, squadID, memberID, role string) error {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE squad_member SET role=? WHERE squad_id=? AND member_id=?`, role, squadID, memberID)
+	if err != nil {
+		return fmt.Errorf("update member role: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "squad:member_updated", Payload: map[string]string{
+		"squad_id": squadID, "member_id": memberID, "role": role,
+	}})
+	return nil
+}
+
 func (s *SquadService) ListMembers(ctx context.Context, squadID string) ([]SquadMember, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
 		`SELECT id,squad_id,member_type,member_id,role,created_at FROM squad_member WHERE squad_id=? ORDER BY created_at`, squadID)
@@ -146,8 +162,6 @@ func (s *SquadService) ListMembers(ctx context.Context, squadID string) ([]Squad
 }
 
 func (s *SquadService) Delete(ctx context.Context, id string) error {
-	// On delete, goals assigned to this squad fall back to human (a squadless
-	// goal must not dispatch). The leader agent and members are untouched.
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -170,6 +184,24 @@ func (s *SquadService) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// UpdateInstructions persists squad instructions (team conventions, roles,
+// handoff expectations). These are injected into every squad leader run's
+// prompt so the agent understands how the team works together.
+func (s *SquadService) UpdateInstructions(ctx context.Context, squadID, instructions string) error {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE squad SET instructions=? WHERE id=?`, instructions, squadID)
+	if err != nil {
+		return fmt.Errorf("update squad instructions: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "squad:instructions_updated", Payload: map[string]string{
+		"squad_id": squadID, "instructions": instructions,
+	}})
+	return nil
+}
+
 // ── Briefing ──
 
 // rosterRow is one line in a leader's roster, describing a squad member.
@@ -182,9 +214,9 @@ type rosterRow struct {
 	Type   string // "agent" | "human"
 }
 
-// BuildLeaderBriefing assembles the "Squad Operating Protocol + Roster +
-// Instructions" block injected into a leader run's opening prompt. Mirrors
-// multica's squad_briefing.go structure (per DESIGN.zh.md §5.4).
+// BuildLeaderBriefing assembles the "Squad Operating Protocol + Instructions +
+// Roster" block injected into a leader run's opening prompt. Mirrors multica's
+// squad_briefing.go structure (per DESIGN.zh.md §5.4).
 //
 // ownsStatus gates whether the briefing grants the parent goal's status
 // authority: a squad that OWNS the goal (assignee_type==squad &&
@@ -212,14 +244,17 @@ func (s *SquadService) BuildLeaderBriefing(ctx context.Context, squadID string, 
 	}
 	b.WriteString("\n")
 
-	b.WriteString("### Roster\n\n")
-	b.WriteString(s.renderRoster(ctx, sq, rows))
-
+	// Squad instructions are the single source of team conventions:
+	// roles, handoff expectations, workflow, rules — all in one place.
 	if strings.TrimSpace(sq.Instructions) != "" {
 		b.WriteString("\n## Squad Instructions\n\n")
 		b.WriteString(sq.Instructions)
 		b.WriteString("\n")
 	}
+
+	b.WriteString("\n### Roster\n\n")
+	b.WriteString(s.renderRoster(ctx, sq, rows))
+
 	return b.String(), nil
 }
 
@@ -291,6 +326,11 @@ func (s *SquadService) agentName(ctx context.Context, agentID string) string {
 const squadOperatingProtocolHeader = `You are the LEADER of a squad. Work flows through you: hand off work to
 teammates by @mentioning them in comments or using goal assign. Members are NOT
 auto-fanned-out; you delegate explicitly.
+
+CRITICAL: Do ONLY the work assigned to your role. After you @mention a teammate
+to hand off work, STOP and end your turn immediately. Do NOT continue doing
+their work yourself — trust your teammates to handle their part. The workflow
+is: each member does their role's work, then hands off to the next role.
 `
 
 const squadParentStatusOwned = `You own this goal's status. When the overall objective is achieved, mark it

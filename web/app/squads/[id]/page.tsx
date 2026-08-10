@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { useSquads, useAgents, useSquadMembers, useAddSquadMember, useGoalEvents } from "@/lib/queries";
+import { useSquads, useAgents, useSquadMembers, useAddSquadMember, useUpdateSquadInstructions, useUpdateSquadMember, useGoalEvents } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
 import type { SquadMember } from "@/lib/types";
 
@@ -15,7 +15,12 @@ export default function SquadDetailPage() {
   const { data: agents } = useAgents();
   const { data: members, isLoading } = useSquadMembers(id);
   const addMember = useAddSquadMember();
+  const updateInstructions = useUpdateSquadInstructions();
+  const updateMemberRole = useUpdateSquadMember();
   const [showAdd, setShowAdd] = useState(false);
+  const [editingInstructions, setEditingInstructions] = useState(false);
+  const [instructionsText, setInstructionsText] = useState("");
+  const [editingRole, setEditingRole] = useState<{ memberId: string; role: string } | null>(null);
 
   const squad = squads?.find((s) => s.id === id);
   const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
@@ -52,12 +57,82 @@ export default function SquadDetailPage() {
             <p className="text-sm text-zinc-600">{squad.description}</p>
           </div>
         )}
-        {squad.instructions && (
-          <div>
-            <span className="text-xs text-zinc-400 block mb-1">Instructions</span>
-            <p className="text-sm text-zinc-600 whitespace-pre-wrap">{squad.instructions}</p>
-          </div>
-        )}
+      </div>
+
+      {/* Instructions editor */}
+      <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">
+        <div className="px-4 py-2.5 border-b border-zinc-100 flex items-center justify-between">
+          <span className="text-xs font-medium text-zinc-500 uppercase tracking-wide">
+            Instructions
+          </span>
+          {!editingInstructions ? (
+            <Button variant="outline" onClick={() => {
+              setInstructionsText(squad.instructions || "");
+              setEditingInstructions(true);
+            }}>
+              编辑
+            </Button>
+          ) : (
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setEditingInstructions(false)}>取消</Button>
+              <Button
+                onClick={() => {
+                  updateInstructions.mutate(
+                    { squadId: id, instructions: instructionsText },
+                    { onSuccess: () => setEditingInstructions(false) }
+                  );
+                }}
+                disabled={updateInstructions.isPending}
+              >
+                {updateInstructions.isPending ? "…" : "保存"}
+              </Button>
+            </div>
+          )}
+        </div>
+        <div className="p-4">
+          {!editingInstructions ? (
+            <div>
+              {squad.instructions ? (
+                <div className="text-sm text-zinc-600 bg-zinc-50 rounded-lg p-4 whitespace-pre-wrap max-h-64 overflow-y-auto">
+                  {squad.instructions}
+                </div>
+              ) : (
+                <p className="text-sm text-zinc-400">
+                  未配置 Instructions。在这里用自然语言描述团队的工作方式：角色分工、工作约定、交接流程等。
+                  所有 squad leader 执行任务时都会在 prompt 中看到这些内容。
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <Field label="Instructions（Markdown）" hint="用自然语言描述团队的工作方式。例如：角色分工、工作约定、交接流程、注意事项等。Leader agent 执行任务时会注入到 prompt 中。">
+                <textarea
+                  value={instructionsText}
+                  onChange={(e) => setInstructionsText(e.target.value)}
+                  className={inputCls}
+                  rows={16}
+                  placeholder={`## 团队工作方式
+
+### 角色分工
+- **开发者 (Alice)**：负责实现功能、写代码
+- **审查者 (Bob)**：负责代码审查
+- **测试者 (Carol)**：负责验证功能
+
+### 工作约定
+1. 开发者完成任务后，@mention 审查者进行代码审查
+2. 审查者通过则 @mention 测试者，需修改则 @mention 回开发者
+3. 测试通过后，@mention 开发者标记目标完成
+
+### 注意事项
+- 每个交接都要在评论中说明完成了什么、下一步需要什么`}
+                />
+              </Field>
+              {updateInstructions.isError && (
+                <p className="text-sm text-red-500">{String(updateInstructions.error)}</p>
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Members */}
@@ -94,7 +169,18 @@ export default function SquadDetailPage() {
                     <td className="px-3 py-2 text-zinc-700">
                       {m.member_type === "agent" ? (agentName(m.member_id) || m.member_id) : m.member_id}
                     </td>
-                    <td className="px-3 py-2 text-zinc-500">{m.role || "-"}</td>
+                    <td className="px-3 py-2 text-zinc-500">
+                      <span className="flex items-center gap-1">
+                        {m.role || "-"}
+                        <button
+                          onClick={() => setEditingRole({ memberId: m.member_id, role: m.role || "" })}
+                          className="text-[10px] text-zinc-400 hover:text-blue-500 ml-1"
+                          title="编辑角色"
+                        >
+                          ✎
+                        </button>
+                      </span>
+                    </td>
                     <td className="px-3 py-2 text-zinc-400 text-xs">{new Date(m.created_at).toLocaleString()}</td>
                   </tr>
                 ))}
@@ -111,6 +197,42 @@ export default function SquadDetailPage() {
           agents={agents}
           onClose={() => setShowAdd(false)}
         />
+      )}
+
+      {/* Edit role dialog */}
+      {editingRole && (
+        <Dialog
+          title="编辑角色"
+          onClose={() => setEditingRole(null)}
+          footer={
+            <>
+              <Button variant="outline" onClick={() => setEditingRole(null)}>取消</Button>
+              <Button
+                onClick={() => {
+                  updateMemberRole.mutate(
+                    { squadId: id, memberId: editingRole.memberId, role: editingRole.role },
+                    { onSuccess: () => setEditingRole(null) }
+                  );
+                }}
+                disabled={updateMemberRole.isPending}
+              >
+                {updateMemberRole.isPending ? "…" : "保存"}
+              </Button>
+            </>
+          }
+        >
+          <Field label="角色名称" hint="角色用于标识成员在团队中的职责，如：开发者、审查者、测试者。">
+            <input
+              value={editingRole.role}
+              onChange={(e) => setEditingRole({ ...editingRole, role: e.target.value })}
+              className={inputCls}
+              placeholder="例如：开发者、审查者、测试者"
+            />
+          </Field>
+          {updateMemberRole.isError && (
+            <p className="text-sm text-red-500">{String(updateMemberRole.error)}</p>
+          )}
+        </Dialog>
       )}
     </div>
   );
@@ -174,7 +296,7 @@ function AddMemberDialog({
           </Field>
         )}
         <Field label="角色">
-          <input value={role} onChange={(e) => setRole(e.target.value)} className={inputCls} placeholder="member, reviewer 等" />
+          <input value={role} onChange={(e) => setRole(e.target.value)} className={inputCls} placeholder="开发者、审查者 等" />
         </Field>
         {addMember.isError && (
           <p className="text-sm text-red-500">{String(addMember.error)}</p>

@@ -39,6 +39,8 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/cancel", h.cancelGoal)
 	mux.HandleFunc("POST /goals/{id}/done", h.doneGoal)
 	mux.HandleFunc("POST /goals/{id}/fail", h.failGoal)
+	mux.HandleFunc("POST /goals/{id}/approve", h.approveGoal)
+	mux.HandleFunc("POST /goals/{id}/reject", h.rejectGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
@@ -49,6 +51,8 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /squads/{id}", h.deleteSquad)
 	mux.HandleFunc("POST /squads/{id}/members", h.addSquadMember)
 	mux.HandleFunc("GET /squads/{id}/members", h.listSquadMembers)
+	mux.HandleFunc("PUT /squads/{id}/members/{memberId}", h.updateSquadMember)
+	mux.HandleFunc("PUT /squads/{id}/instructions", h.updateSquadInstructions)
 
 	mux.HandleFunc("GET /schedules", h.listSchedules)
 	mux.HandleFunc("POST /schedules", h.createSchedule)
@@ -180,7 +184,37 @@ func (h *Handlers) doneGoal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := h.Goal.MarkDone(r.Context(), r.PathValue("id"), body.AgentID, body.Summary); err != nil {
+	if err := h.Goal.SubmitForReview(r.Context(), r.PathValue("id"), body.AgentID, body.Summary); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) approveGoal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Goal.Approve(r.Context(), r.PathValue("id"), body.Summary); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handlers) rejectGoal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Goal.Reject(r.Context(), r.PathValue("id"), body.Reason); err != nil {
 		writeJSON(w, nil, err)
 		return
 	}
@@ -261,6 +295,34 @@ func (h *Handlers) addSquadMember(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) listSquadMembers(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Squad.ListMembers(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
+}
+func (h *Handlers) updateSquadMember(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Squad.UpdateMemberRole(r.Context(), r.PathValue("id"), r.PathValue("memberId"), body.Role); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+func (h *Handlers) updateSquadInstructions(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Instructions string `json:"instructions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := h.Squad.UpdateInstructions(r.Context(), r.PathValue("id"), body.Instructions); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ── schedule ──

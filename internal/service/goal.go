@@ -21,7 +21,7 @@ type Goal struct {
 	Description   string `json:"description"`
 	AssigneeType  string `json:"assignee_type"` // agent | squad | human
 	AssigneeID    string `json:"assignee_id"`
-	Status        string `json:"status"` // backlog|active|done|failed|cancelled
+	Status        string `json:"status"`        // backlog|active|done|failed|cancelled
 	HandoffNote   string `json:"handoff_note"`
 	CreatedByType string `json:"created_by_type"` // human | agent
 	CreatedByID   string `json:"created_by_id"`
@@ -31,14 +31,14 @@ type Goal struct {
 // goalRunContext is what ReconcileOnRunEnd reasons about. Carried separately
 // so the reconciliation logic is testable without a live run row.
 type goalRunContext struct {
-	RunID        string
-	GoalID       string
-	AgentID      string
-	IsLeaderRun  bool
-	SquadID      string
-	Status       string // run's terminal status: completed|failed
-	Attempt      int
-	Summary      string
+	RunID       string
+	GoalID      string
+	AgentID     string
+	IsLeaderRun bool
+	SquadID     string
+	Status      string // run's terminal status: completed|failed
+	Attempt     int
+	Summary     string
 }
 
 const maxAttempts = 3
@@ -208,8 +208,7 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 
 // Cancel marks a non-terminal goal cancelled. Like handoff, this does not kill
 // in-flight runs: correctness comes from ReconcileOnRunEnd seeing goal.status
-// cancelled and discarding the result. (Killing the process is a resource
-// optimization, not a correctness requirement.)
+// cancelled and discarding the result.
 func (s *GoalService) Cancel(ctx context.Context, goalID string) (*Goal, error) {
 	res, err := s.st.DB().ExecContext(ctx,
 		`UPDATE goal SET status='cancelled' WHERE id=? AND status NOT IN ('done','failed','cancelled')`,
@@ -268,9 +267,7 @@ func (s *GoalService) Delete(ctx context.Context, goalID string) error {
 // self-consistent without an external authority (DESIGN.zh.md §7).
 //
 //	agent-assigned goal: the run's agent must equal the goal's assignee.
-//	squad-assigned goal: the run must be a leader run whose agent is that
-//	  squad's current leader. (A leader change, if ever supported, orphaning
-//	  the prior leader's in-flight run is handled here for free.)
+//	squad-assigned goal: the run must be a leader run whose squad matches.
 //	human-assigned goal: never has an agent-run owner — fall through to false.
 func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunContext, g Goal) (bool, error) {
 	switch g.AssigneeType {
@@ -280,12 +277,8 @@ func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 		if !rc.IsLeaderRun || rc.SquadID != g.AssigneeID {
 			return false, nil
 		}
-		var leaderID string
-		err := tx.QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, rc.SquadID).Scan(&leaderID)
-		if err != nil {
-			return false, fmt.Errorf("load squad leader: %w", err)
-		}
-		return rc.AgentID == leaderID, nil
+		// Squad leader run: always valid (team rules govern delegation).
+		return true, nil
 	default:
 		return false, nil // human-assigned
 	}
@@ -301,7 +294,7 @@ func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 //
 //	run.agent != current assignee  → discard (handoff/reassign orphaned run)
 //	goal.status == cancelled       → discard
-//	run completed → goal → done
+//	run completed → goal → review (human approval required for done)
 //	run failed, attempts left → enqueue a retry run (attempt+1)
 //	run failed, attempts exhausted → goal → failed
 func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) error {
@@ -344,10 +337,13 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 
 	switch rc.Status {
 	case "completed":
+		// All completed runs push the goal to review (待审核). Only a
+		// human can approve review → done. This applies uniformly to
+		// single-agent goals and squad member runs.
 		if res, err := tx.ExecContext(ctx,
-			`UPDATE goal SET status='done', handoff_note='' WHERE id=? AND status NOT IN ('done','failed','cancelled')`,
+			`UPDATE goal SET status='review', handoff_note='' WHERE id=? AND status NOT IN ('done','failed','cancelled','review')`,
 			rc.GoalID); err != nil {
-			return fmt.Errorf("promote goal done: %w", err)
+			return fmt.Errorf("promote goal to review: %w", err)
 		} else if n, _ := res.RowsAffected(); n == 0 {
 			break
 		}
@@ -381,27 +377,11 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 	return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit)
 }
 
-// commitAndEmit commits the transaction and, only on success, publishes the
-// collected events and runs the after-commit callbacks. This keeps the
-// "bus.Publish after commit" invariant: a rolled-back transaction (commit
-// error) emits nothing.
-func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []events.Event, after []func()) error {
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	for _, e := range evs {
-		s.bus.Publish(ctx, e)
-	}
-	for _, f := range after {
-		f()
-	}
-	return nil
-}
-
-// MarkDone transitions the goal to done and posts a system comment. Only the
-// current assignee's agent may call this (authorization via agentID match).
-func (s *GoalService) MarkDone(ctx context.Context, goalID, agentID, summary string) error {
-	return s.markTerminal(ctx, goalID, agentID, "done", summary)
+// SubmitForReview transitions the goal to review (待审核). Agents can only
+// submit for review, not mark done directly. Only a human can approve or reject.
+// Authorization: the current assignee's agent may submit.
+func (s *GoalService) SubmitForReview(ctx context.Context, goalID, agentID, summary string) error {
+	return s.markTerminal(ctx, goalID, agentID, "review", summary)
 }
 
 // MarkFailed transitions the goal to failed and posts a system comment.
@@ -409,18 +389,80 @@ func (s *GoalService) MarkFailed(ctx context.Context, goalID, agentID, summary s
 	return s.markTerminal(ctx, goalID, agentID, "failed", summary)
 }
 
+// Approve promotes a goal from review to done. Human-only.
+func (s *GoalService) Approve(ctx context.Context, goalID, summary string) error {
+	return s.humanReviewAction(ctx, goalID, "done", "approved", summary)
+}
+
+// Reject sends a goal back from review to active. Human-only.
+func (s *GoalService) Reject(ctx context.Context, goalID, reason string) error {
+	return s.humanReviewAction(ctx, goalID, "active", "rejected", reason)
+}
+
+func (s *GoalService) humanReviewAction(ctx context.Context, goalID, targetStatus, action, note string) error {
+	g, err := s.Get(ctx, goalID)
+	if err != nil {
+		return err
+	}
+	if g.Status != "review" {
+		return NewValidationError("goal must be in review status to " + action)
+	}
+
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE goal SET status=? WHERE id=?`, targetStatus, goalID); err != nil {
+		return fmt.Errorf("%s goal: %w", action, err)
+	}
+
+	commentID := newID()
+	ts := now()
+	label := map[string]string{"done": "Approved.", "active": "Rejected. Reason: "}[targetStatus]
+	content := label + note
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,?,?,?)`,
+		commentID, goalID, "human", "", nil, content, ts); err != nil {
+		return fmt.Errorf("insert comment: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,?,?,?)`,
+		newID(), goalID, "human", "", action, "{}", ts); err != nil {
+		return fmt.Errorf("insert activity: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	topic := "goal:finished"
+	if targetStatus == "active" {
+		topic = "goal:rejected"
+	}
+	s.bus.Publish(ctx, events.Event{Topic: topic, Payload: map[string]any{
+		"goal_id": goalID, "status": targetStatus, "summary": content,
+	}})
+	s.bus.Publish(ctx, events.Event{Topic: "comment:created", Payload: Comment{
+		ID: commentID, GoalID: goalID, AuthorType: "human",
+		Content: content, CreatedAt: ts,
+	}})
+	return nil
+}
+
 func (s *GoalService) markTerminal(ctx context.Context, goalID, agentID, status, summary string) error {
 	g, err := s.Get(ctx, goalID)
 	if err != nil {
 		return err
 	}
-	// Only the assigned agent (or squad leader, via the CLI env) may mark the goal
-	// terminal. Human-assigned goals skip this check (no agent runs them).
+	// Only the assigned agent (or squad leader) may submit for review / mark failed.
 	if g.AssigneeType == "agent" && g.AssigneeID != agentID {
 		return NewValidationError("only the current assignee may mark the goal as " + status)
 	}
-	if g.Status == "done" || g.Status == "failed" || g.Status == "cancelled" {
-		return NewValidationError("goal is already terminal")
+	if g.Status == "done" || g.Status == "failed" || g.Status == "cancelled" || g.Status == "review" {
+		return NewValidationError("goal is already terminal or under review")
 	}
 
 	tx, err := s.st.DB().BeginTx(ctx, nil)
@@ -434,10 +476,12 @@ func (s *GoalService) markTerminal(ctx context.Context, goalID, agentID, status,
 		return fmt.Errorf("mark goal %s: %w", status, err)
 	}
 
-	// Insert system comment recording the completion
 	commentID := newID()
 	ts := now()
-	label := map[string]string{"done": "Goal completed.", "failed": "Goal failed."}[status]
+	label := map[string]string{
+		"review": "Goal submitted for review.",
+		"failed": "Goal failed.",
+	}[status]
 	content := fmt.Sprintf("%s Summary: %s", label, summary)
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,?,?,?)`,
@@ -472,6 +516,23 @@ func mustExist(ctx context.Context, st *store.Store, query, id, label string) er
 	}
 	if n == 0 {
 		return NewValidationError(fmt.Sprintf("%s %q does not exist", label, id))
+	}
+	return nil
+}
+
+// commitAndEmit commits the transaction and, only on success, publishes the
+// collected events and runs the after-commit callbacks. This keeps the
+// "bus.Publish after commit" invariant: a rolled-back transaction (commit
+// error) emits nothing.
+func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []events.Event, after []func()) error {
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, e := range evs {
+		s.bus.Publish(ctx, e)
+	}
+	for _, f := range after {
+		f()
 	}
 	return nil
 }

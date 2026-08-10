@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS squad (
     name         TEXT NOT NULL UNIQUE,
     description  TEXT NOT NULL DEFAULT '',
     leader_id    TEXT NOT NULL REFERENCES agent(id),  -- must be an agent
-    instructions TEXT NOT NULL DEFAULT '',            -- extra briefing for leader runs
+    instructions TEXT NOT NULL DEFAULT '',            -- Markdown: team conventions, roles, handoff expectations injected into agent prompts
     created_at   TEXT NOT NULL
 );
 
@@ -205,3 +205,6 @@ CREATE TABLE IF NOT EXISTS schedule_run (
 
 CREATE INDEX IF NOT EXISTS idx_schedule_run_schedule ON schedule_run(schedule_id, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_run_planned ON schedule_run(schedule_id, planned_at);
+
+-- Migration: instructions column already exists. Future schema additions
+-- should append ALTER TABLE statements to the migrations slice in store.go.

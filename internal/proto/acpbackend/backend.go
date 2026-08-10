@@ -51,7 +51,10 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			results <- proto.Result{Status: proto.StatusFailed, Output: withStderr("initialize: " + err.Error()), Err: err}
 			return
 		}
-		newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{Cwd: spec.Cwd})
+		newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{
+			Cwd:        spec.Cwd,
+			McpServers: []acp.McpServer{}, // non-nil so JSON marshals as [] not null
+		})
 		if err != nil {
 			results <- proto.Result{Status: proto.StatusFailed, Output: withStderr("new session: " + err.Error()), Err: err}
 			return

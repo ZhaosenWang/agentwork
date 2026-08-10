@@ -192,7 +192,13 @@ func (s *CommentService) performHandoff(ctx context.Context, c Comment, current 
 	if err := s.insertSystemComment(ctx, c.GoalID, content); err != nil {
 		return err
 	}
-	// 3. Enqueue a run for the new assignee
+	// 3. Cancel the handing-off agent's active run so it can't keep working
+	//    and accidentally steal the goal back.
+	s.bus.Publish(ctx, events.Event{Topic: "handoff:completed", Payload: map[string]any{
+		"goal_id":       c.GoalID,
+		"from_agent_id": c.AuthorID,
+	}})
+	// 4. Enqueue a run for the new assignee
 	if newType == "agent" {
 		_, err := s.runSvc.EnqueueForMention(ctx, c.GoalID, newID, c.ID)
 		return err
@@ -255,8 +261,6 @@ func (s *CommentService) enqueueLeaderRunForMention(ctx context.Context, squadID
 		return err
 	}
 	// Leader runs via mention: enqueue on the leader agent with isLeader + squadID.
-	// We reuse enqueue directly (its own tx) — mention-triggered runs may run
-	// concurrently with the current assignee's run, which is intended.
 	_, err = s.runSvc.enqueue(ctx, goalID, leaderID, 1, true, squadID, triggerCommentID)
 	return err
 }

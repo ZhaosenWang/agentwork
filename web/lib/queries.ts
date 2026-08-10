@@ -14,6 +14,8 @@ import {
   deleteGoal,
   assignGoal,
   cancelGoal,
+  approveGoal,
+  rejectGoal,
   listGoalRuns,
   listGoalComments,
   createGoalComment,
@@ -22,6 +24,7 @@ import {
   deleteSquad,
   addSquadMember,
   listSquadMembers,
+  updateSquadInstructions,
   listSchedules,
   createSchedule,
   deleteSchedule,
@@ -118,6 +121,22 @@ export function useCancelGoal() {
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
   });
 }
+export function useApproveGoal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string; summary: string }) =>
+      approveGoal(id, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
+  });
+}
+export function useRejectGoal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string; reason: string }) =>
+      rejectGoal(id, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
+  });
+}
 // ── Run hooks ──
 export function useGoalRuns(goalId: string) {
   return useQuery({
@@ -173,6 +192,30 @@ export function useAddSquadMember() {
   return useMutation({
     mutationFn: ({ squadId, ...body }: { squadId: string; member_type: string; member_id: string; role?: string }) =>
       addSquadMember(squadId, body),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.squadMembers(vars.squadId) });
+    },
+  });
+}
+export function useUpdateSquadInstructions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ squadId, instructions }: { squadId: string; instructions: string }) =>
+      updateSquadInstructions(squadId, instructions),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.squad(vars.squadId) });
+    },
+  });
+}
+export function useUpdateSquadMember() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ squadId, memberId, role }: { squadId: string; memberId: string; role: string }) =>
+      fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:7373"}/squads/${squadId}/members/${memberId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role }),
+      }).then((res) => { if (!res.ok) throw new Error(String(res.status)); }),
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: qk.squadMembers(vars.squadId) });
     },

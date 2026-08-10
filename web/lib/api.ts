@@ -56,6 +56,10 @@ export const doneGoal = (id: string, body: { agent_id: string; summary: string }
   api<void>(`/goals/${id}/done`, { method: "POST", body: JSON.stringify(body) });
 export const failGoal = (id: string, body: { agent_id: string; summary: string }) =>
   api<void>(`/goals/${id}/fail`, { method: "POST", body: JSON.stringify(body) });
+export const approveGoal = (id: string, body: { summary: string }) =>
+  api<void>(`/goals/${id}/approve`, { method: "POST", body: JSON.stringify(body) });
+export const rejectGoal = (id: string, body: { reason: string }) =>
+  api<void>(`/goals/${id}/reject`, { method: "POST", body: JSON.stringify(body) });
 
 // ── Run ──
 export const listGoalRuns = (goalId: string) =>
@@ -86,6 +90,8 @@ export const addSquadMember = (
 ) => api<SquadMember>(`/squads/${squadId}/members`, { method: "POST", body: JSON.stringify(body) });
 export const listSquadMembers = (squadId: string) =>
   api<SquadMember[]>(`/squads/${squadId}/members`);
+export const updateSquadInstructions = (squadId: string, instructions: string) =>
+  api<void>(`/squads/${squadId}/instructions`, { method: "PUT", body: JSON.stringify({ instructions }) });
 
 // ── Schedule ──
 export const listSchedules = () => api<Schedule[]>("/schedules");

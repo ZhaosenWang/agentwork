@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -61,6 +62,42 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 
+	// Best-effort migrations for columns added in schema updates. SQLite
+	// raises an error for duplicate columns; we ignore those and only
+	// report unexpected failures.
+	//
+	// Phase 1: add columns (for older databases missing them).
+	addMigrations := []string{}
+	for _, m := range addMigrations {
+		if _, err := db.Exec(m); err != nil {
+			errStr := err.Error()
+			if contains(errStr, "duplicate column") || contains(errStr, "already exists") {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "store: migration warning: %v\n", err)
+		}
+	}
+
+	// Phase 2: drop columns that were added in earlier versions but are
+	// no longer used (workflow DAG removed in favor of instructions).
+	// SQLite DROP COLUMN is supported since 3.35.0 (2021).
+	dropMigrations := []string{
+		`ALTER TABLE goal DROP COLUMN current_stages`,
+		`ALTER TABLE goal DROP COLUMN stage_data`,
+		`ALTER TABLE squad DROP COLUMN workflow`,
+		`ALTER TABLE squad DROP COLUMN team_rules`,
+	}
+	for _, m := range dropMigrations {
+		if _, err := db.Exec(m); err != nil {
+			errStr := err.Error()
+			// "no such column" is expected for new databases or already-cleaned databases.
+			if contains(errStr, "no such column") {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "store: cleanup warning: %v\n", err)
+		}
+	}
+
 	return &Store{db: db}, nil
 }
 
@@ -72,3 +109,8 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // Ping verifies the connection is alive.
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
+// contains reports whether s contains substr (case-insensitive).
+func contains(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}

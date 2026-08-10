@@ -28,6 +28,7 @@ export interface Agent {
 export type GoalStatus =
   | "backlog"
   | "active"
+  | "review"
   | "done"
   | "failed"
   | "cancelled";
@@ -80,7 +81,7 @@ export interface Squad {
   name: string;
   description: string;
   leader_id: string;
-  instructions: string;
+  instructions: string; // Markdown: team conventions, roles, handoff expectations
   created_at: string;
 }
 
@@ -115,7 +116,7 @@ export type WSTopic =
   | "run:enqueued" | "run:coalesced" | "run:discarded" | "run:event"
   | "comment:created"
   | "agent:created" | "agent:deleted"
-  | "squad:created" | "squad:deleted" | "squad:member_added"
+  | "squad:created" | "squad:deleted" | "squad:member_added" | "squad:instructions_updated"
   | "schedule:created" | "schedule:fired";
 
 export interface WSEvent {
