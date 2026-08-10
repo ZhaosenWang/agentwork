@@ -607,6 +607,21 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	if g.Status != "review" {
 		return nil, NewValidationError("goal is not in review")
 	}
+	// Duplicate-decision guard: an approve recorded for this review cycle must
+	// not be re-approved — the human clicking "批准" again (the page shows no
+	// feedback while the async deliver runs) would pile up gate_decision rows
+	// and corrupt the health data. EXCEPTION: a FAILED deliver annotates
+	// review_request ("deliver: ...") and the human must be able to retry the
+	// approval — that is the designed retry path.
+	if decision == "approve" {
+		var lastDecision, lastAt string
+		err := s.st.DB().QueryRowContext(ctx,
+			`SELECT decision, decided_at FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, goalID).
+			Scan(&lastDecision, &lastAt)
+		if err == nil && lastDecision == "approve" && !strings.HasPrefix(g.ReviewRequest, "deliver:") {
+			return nil, NewValidationError("goal already approved — waiting for the deliver step (or check the deliver result)")
+		}
+	}
 	ts := now()
 	// gate_rule is WHICH rule actually parked the goal — resolved from the
 	// evidence run's gates_hit (the daemon records the fired gate names

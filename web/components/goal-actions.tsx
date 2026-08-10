@@ -69,6 +69,14 @@ function ReviewPanel({ goal }: { goal: Goal }) {
   const { data: runs } = useGoalRuns(goal.id);
   const [reason, setReason] = useState("");
   const [showRejectForm, setShowRejectForm] = useState(false);
+  const [justResolved, setJustResolved] = useState<string | null>(null);
+
+  // The deliver step runs ASYNC after approve — the goal stays in review
+  // until merge+re-verify+push finishes (or fails back). Give the human
+  // immediate feedback instead of a dead button (the regression: approving
+  // showed no change and got clicked 4 times).
+  const resolveOutcome =
+    justResolved ?? (goal.review_request?.startsWith("deliver:") ? "deliver_failed" : null);
 
   // Latest run's evidence (diff stats + verify output + agent summary).
   const lastRun = runs?.filter((r) => r.status === "completed" || r.status === "failed").at(-1);
@@ -104,12 +112,32 @@ function ReviewPanel({ goal }: { goal: Goal }) {
         </p>
       )}
 
+      {resolveOutcome === "approved" && (
+        <p className="text-sm text-emerald-700 font-medium">✅ 已批准——平台正在合入（merge + 复验 + push），完成后此卡自动关闭。</p>
+      )}
+      {resolveOutcome === "rejected" && (
+        <p className="text-sm text-amber-800 font-medium">↩️ 已驳回——agent 将带你的理由重新执行。</p>
+      )}
+      {resolveOutcome === "deliver_failed" && (
+        <p className="text-sm text-red-700 font-medium">⚠️ 上次合入失败（冲突/验证红）——可重新批准重试合入，或驳回让 agent 修。</p>
+      )}
+
       {!showRejectForm ? (
         <div className="flex gap-2">
-          <Button onClick={() => resolve.mutate({ id: goal.id, decision: "approve" })} disabled={resolve.isPending}>
-            {resolve.isPending ? "处理中…" : "批准并自动合入"}
+          <Button
+            onClick={() =>
+              resolve.mutate(
+                { id: goal.id, decision: "approve" },
+                { onSuccess: () => setJustResolved("approved") }
+              )
+            }
+            disabled={resolve.isPending || resolveOutcome === "approved"}
+          >
+            {resolve.isPending ? "处理中…" : resolveOutcome === "approved" ? "已批准，合入中…" : "批准并自动合入"}
           </Button>
-          <Button variant="outline" onClick={() => setShowRejectForm(true)}>驳回</Button>
+          <Button variant="outline" onClick={() => setShowRejectForm(true)} disabled={resolveOutcome === "approved"}>
+            驳回
+          </Button>
         </div>
       ) : (
         <form
@@ -117,7 +145,7 @@ function ReviewPanel({ goal }: { goal: Goal }) {
             e.preventDefault();
             resolve.mutate(
               { id: goal.id, decision: "reject", reason },
-              { onSuccess: () => { setShowRejectForm(false); setReason(""); } }
+              { onSuccess: () => { setShowRejectForm(false); setReason(""); setJustResolved("rejected"); } }
             );
           }}
           className="space-y-2"
