@@ -955,6 +955,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		)
 	}
 
+	// Execution-environment proxy (DESIGN.md 决策 4-8): the run's handler
+	// answers the agent's fs/terminal RPCs — the worktree always stays on
+	// the platform machine, and leftover terminals are killed
+	// unconditionally at session close (defer).
+	env := newRunEnvironment(q.RunID, q.GoalID, q.AgentID, runRowWorkdir, serverURL, binDir)
+	defer env.tm.cleanup()
+
 	// Open the transport (stdio/ws/tcp); the backend speaks the protocol.
 	spec := runtime.Spec{
 		Transport:  transport,
@@ -1042,9 +1049,9 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	var inFlightTools atomic.Int32
 	promptCtx, promptCancel := context.WithTimeout(ctx, time.Duration(maxRunDuration)*time.Second)
 	defer promptCancel()
-	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID)
+	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID, env.tm.activeCount)
 
-	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{Conn: conn, Cwd: runRowWorkdir, Prompt: prompt})
+	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{Conn: conn, Cwd: runRowWorkdir, Prompt: prompt, ClientHandler: env})
 	if err != nil {
 		conn.Close()
 		d.failRun(ctx, q, fmt.Sprintf("execute: %v", err))
@@ -1735,8 +1742,12 @@ func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster, briefing stri
 }
 
 // runIdleWatchdog cancels a Prompt if the agent emits nothing for idleWindow
-// (or idleToolWindow while a tool is in flight). It ticks at window/2.
-func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.Int64, inFlightTools *atomic.Int32, cancel context.CancelFunc, runID string) {
+// (or idleToolWindow while a tool is in flight or a terminal command is
+// running). Terminal polling (Agent→Client RPC) never appears on the event
+// stream — an agent waiting on `npm test` is silent to the daemon, so an
+// in-flight terminal widens the budget exactly like an in-flight tool.
+// It ticks at window/2.
+func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.Int64, inFlightTools *atomic.Int32, cancel context.CancelFunc, runID string, activeTerms func() int) {
 	interval := idleWindow / 2
 	if interval <= 0 {
 		interval = idleWindow
@@ -1749,7 +1760,7 @@ func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.In
 			return
 		case <-ticker.C:
 			threshold := idleWindow
-			if inFlightTools.Load() > 0 {
+			if inFlightTools.Load() > 0 || (activeTerms != nil && activeTerms() > 0) {
 				threshold = idleToolWindow
 			}
 			last := time.Unix(0, lastActivity.Load())

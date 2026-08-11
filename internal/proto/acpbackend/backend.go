@@ -84,6 +84,11 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 		}
 		fwd := &eventForwarder{events: events}
 		sess.SetEventHandler(fwd)
+		// Execution-environment proxy (DESIGN.md 决策 4-8): the run's
+		// handler answers the agent's fs/terminal RPCs.
+		if spec.ClientHandler != nil {
+			sess.SetClientRequestHandler(spec.ClientHandler)
+		}
 		go fwd.pump()
 
 		if _, err := sess.Prompt(ctx, acp.PromptRequest{

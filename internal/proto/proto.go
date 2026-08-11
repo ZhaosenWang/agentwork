@@ -13,6 +13,8 @@ import (
 	"context"
 	"errors"
 	"io"
+
+	"github.com/eushing/agentwork/internal/acp"
 )
 
 // ErrUnsupportedProvider is returned when no backend is registered for a
@@ -45,6 +47,12 @@ type ExecuteSpec struct {
 	Conn   Conn
 	Cwd    string // working directory for the run
 	Prompt string // the pre-built opening prompt
+	// ClientHandler is the run's Agent→Client RPC handler (execution
+	// environment proxy, DESIGN.md 决策 4-8). The type comes from the acp
+	// package because the handler methods carry acp request types — proto
+	// depends on acp for this one type, and backends without Agent→Client
+	// RPCs (jsonl/jsonrpc) leave it nil.
+	ClientHandler acp.ClientRequestHandler
 }
 
 // EventType discriminates one stream event. Mirrors the ACP update shapes but
