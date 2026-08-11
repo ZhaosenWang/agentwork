@@ -183,32 +183,3 @@
 // Unrecognised requests receive -32601 (Method not found); unrecognised
 // notifications are silently ignored.
 package acp
-
-import (
-	"encoding/json"
-	"fmt"
-)
-
-// idString normalises a JSON-RPC id value to a plain Go string suitable for
-// map keying. Handles string ids ("foo" → "foo"), number ids (42 → "42"),
-// and null/absent ids (→ "").
-func idString(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return string(raw)
-	}
-	if v == nil {
-		return ""
-	}
-	switch x := v.(type) {
-	case string:
-		return x
-	case float64:
-		return fmt.Sprintf("%.0f", x)
-	default:
-		return fmt.Sprint(v)
-	}
-}
