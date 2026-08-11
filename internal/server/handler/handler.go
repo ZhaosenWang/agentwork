@@ -58,6 +58,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/reopen", h.reopenGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/runs/{runId}/messages", h.listRunMessages)
+	mux.HandleFunc("GET /goals/{id}/timeline", h.goalTimeline)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
 
@@ -275,6 +276,13 @@ func (h *Handlers) reopenGoal(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) listRuns(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Run.List(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+
+// goalTimeline returns the goal's execution flow — runs, human/system
+// actions, and gate decisions merged in time order (see GoalService.Timeline).
+func (h *Handlers) goalTimeline(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Goal.Timeline(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
 }
 

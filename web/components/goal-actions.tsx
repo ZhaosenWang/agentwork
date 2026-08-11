@@ -24,19 +24,17 @@ export function GoalActions({ goal }: { goal: Goal }) {
 
       {!isTerminal && (
         <Button variant="danger" onClick={() => cancel.mutate(goal.id)} disabled={cancel.isPending}>
-          {cancel.isPending ? "取消中…" : "取消 Goal"}
+          {cancel.isPending ? "取消中…" : "取消"}
         </Button>
       )}
 
       {(goal.status === "failed" || goal.status === "cancelled") && (
         <Button variant="outline" onClick={() => reopen.mutate(goal.id)} disabled={reopen.isPending}>
-          {reopen.isPending ? "重开中…" : "重开（失败/取消后人工接手）"}
+          {reopen.isPending ? "重开中…" : "重开"}
         </Button>
       )}
 
-      <Button variant="ghost" onClick={() => setShowDelete(true)}>
-        删除
-      </Button>
+      <Button variant="danger" onClick={() => setShowDelete(true)}>删除</Button>
 
       {goal.status === "review" && <ReviewPanel goal={goal} />}
 

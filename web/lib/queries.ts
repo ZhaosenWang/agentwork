@@ -20,6 +20,7 @@ import {
   listGoalRuns,
   listGoalRunMessages,
   listGoalComments,
+  listGoalTimeline,
   createGoalComment,
   listSquads,
   createSquad,
@@ -54,6 +55,7 @@ export const qk = {
   goal: (id: string) => ["goals", id] as const,
   goalRuns: (goalId: string) => ["goals", goalId, "runs"] as const,
   goalComments: (goalId: string) => ["goals", goalId, "comments"] as const,
+  goalTimeline: (goalId: string) => ["goals", goalId, "timeline"] as const,
   squads: ["squads"] as const,
   squad: (id: string) => ["squads", id] as const,
   squadMembers: (squadId: string) => ["squads", squadId, "members"] as const,
@@ -188,10 +190,11 @@ export function useGoalRuns(goalId: string) {
     queryFn: () => listGoalRuns(goalId),
   });
 }
-export function useGoalRunMessages(goalId: string, runId: string) {
+export function useGoalRunMessages(goalId: string, runId: string, enabled = true) {
   return useQuery({
     queryKey: ["goal-runs", runId, "messages"],
     queryFn: () => listGoalRunMessages(goalId, runId),
+    enabled: enabled && !!runId,
   });
 }
 
@@ -200,6 +203,12 @@ export function useGoalComments(goalId: string) {
   return useQuery({
     queryKey: qk.goalComments(goalId),
     queryFn: () => listGoalComments(goalId),
+  });
+}
+export function useGoalTimeline(goalId: string) {
+  return useQuery({
+    queryKey: qk.goalTimeline(goalId),
+    queryFn: () => listGoalTimeline(goalId),
   });
 }
 export function useCreateGoalComment() {

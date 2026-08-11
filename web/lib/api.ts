@@ -1,4 +1,4 @@
-import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks } from "./types";
+import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7373";
 
@@ -78,6 +78,8 @@ export const listGoalRunMessages = (goalId: string, runId: string) =>
 // ── Comment ──
 export const listGoalComments = (goalId: string) =>
   api<Comment[]>(`/goals/${goalId}/comments`);
+export const listGoalTimeline = (goalId: string) =>
+  api<TimelineItem[]>(`/goals/${goalId}/timeline`);
 export const createGoalComment = (
   goalId: string,
   body: { author_type: string; author_id: string; content: string; parent_id?: string }

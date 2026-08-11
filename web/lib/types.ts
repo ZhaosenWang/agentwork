@@ -186,3 +186,26 @@ export interface WSEvent {
   topic: WSTopic;
   payload: Record<string, unknown>;
 }
+
+// TimelineItem is one event in a goal's execution flow — a run segment (an
+// agent's turn), an action point (created/handoff/review entry/…), or a gate
+// decision (approve/reject). Served by GET /goals/{id}/timeline, merged and
+// time-ordered by the backend.
+export interface TimelineItem {
+  at: string;                    // RFC3339 — the event's point in time
+  kind: "run" | "action" | "decision";
+  run_id?: string;               // run: the run row (for detail fetch)
+  agent_id?: string;             // run: the executing agent
+  run_status?: string;           // run: queued|running|completed|failed|cancelled
+  attempt?: number;              // run: machine-retry counter
+  started_at?: string;           // run: execution window
+  finished_at?: string;
+  actor_type?: string;           // action: human|agent|system
+  actor_id?: string;             // action: which agent/human ('' for system)
+  action?: string;               // action: created|handoff|entered_review|…
+  detail?: string;
+  gate_rule?: string;            // decision: which rule fired
+  decision?: string;             // decision: approve|reject|redirect
+  reason?: string;               // decision: the human's words
+  review_duration_s?: number;    // decision: seconds spent in review
+}

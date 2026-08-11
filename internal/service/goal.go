@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -215,6 +216,115 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 		out = append(out, g)
 	}
 	return out, rows.Err()
+}
+
+// TimelineItem is one event in a goal's execution flow: a run segment
+// (an agent's turn), an action point (created / handoff / review entry /
+// reopened / commented / cancelled), or a gate decision (approve / reject).
+// The frontend renders the merged, time-ordered stream as the goal's
+// execution timeline — who handled it, for how long, and who holds it now.
+type TimelineItem struct {
+	At         string `json:"at"`                   // RFC3339 — the event's point in time
+	Kind       string `json:"kind"`                 // run | action | decision
+	RunID      string `json:"run_id,omitempty"`     // run: the run row (for detail fetch)
+	AgentID    string `json:"agent_id,omitempty"`   // run: the executing agent
+	RunStatus  string `json:"run_status,omitempty"` // run: queued|running|completed|failed|cancelled
+	Attempt    int    `json:"attempt,omitempty"`    // run: machine-retry counter
+	StartedAt  string `json:"started_at,omitempty"` // run: execution window
+	FinishedAt string `json:"finished_at,omitempty"`
+	ActorType  string `json:"actor_type,omitempty"` // action: human|agent|system
+	ActorID    string `json:"actor_id,omitempty"`
+	Action     string `json:"action,omitempty"` // action: created|handoff|entered_review|requested_review|parked_review|reopened|cancelled|commented|mention_cycle_failed
+	Detail     string `json:"detail,omitempty"`
+	GateRule   string `json:"gate_rule,omitempty"`   // decision: which rule fired
+	Decision   string `json:"decision,omitempty"`    // decision: approve|reject|redirect
+	Reason     string `json:"reason,omitempty"`      // decision: the human's words
+	ReviewDurS int    `json:"review_duration_s,omitempty"` // decision: seconds spent in review
+}
+
+// Timeline merges the goal's runs (execution segments), activity log
+// (human/system action points), and gate decisions (checkpoint verdicts)
+// into one time-ordered execution flow. The current holder is derived by the
+// frontend from the goal's status plus the latest non-terminal run.
+func (s *GoalService) Timeline(ctx context.Context, goalID string) ([]TimelineItem, error) {
+	items := []TimelineItem{}
+
+	// 1. runs — execution segments (an agent's turn on the goal).
+	rrows, err := s.st.DB().QueryContext(ctx,
+		`SELECT id, agent_id, status, attempt, queued_at, started_at, finished_at
+		 FROM run WHERE goal_id=? AND goal_id<>''`, goalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rrows.Close()
+	for rrows.Next() {
+		var it TimelineItem
+		var q, st, fin sql.NullString
+		if err := rrows.Scan(&it.RunID, &it.AgentID, &it.RunStatus, &it.Attempt, &q, &st, &fin); err != nil {
+			return nil, err
+		}
+		it.Kind = "run"
+		// NOTE: the columns hold "" (Go zero value), not NULL — judge by
+		// non-empty, never by sql.NullString.Valid (empty string is Valid).
+		it.StartedAt, it.FinishedAt = st.String, fin.String
+		// The segment's anchor: started_at once begun, queued_at before that.
+		it.At = q.String
+		if st.String != "" {
+			it.At = st.String
+		}
+		items = append(items, it)
+	}
+	if err := rrows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 2. activity log — human/system action points.
+	arows, err := s.st.DB().QueryContext(ctx,
+		`SELECT actor_type, actor_id, action, detail, created_at
+		 FROM activity_log WHERE goal_id=?`, goalID)
+	if err != nil {
+		return nil, err
+	}
+	defer arows.Close()
+	for arows.Next() {
+		var it TimelineItem
+		var det sql.NullString
+		if err := arows.Scan(&it.ActorType, &it.ActorID, &it.Action, &det, &it.At); err != nil {
+			return nil, err
+		}
+		it.Kind = "action"
+		it.Detail = det.String
+		items = append(items, it)
+	}
+	if err := arows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 3. gate decisions — human checkpoint verdicts (approve / reject).
+	drows, err := s.st.DB().QueryContext(ctx,
+		`SELECT gate_rule, decision, reason, decided_by, decided_at, review_duration
+		 FROM gate_decision WHERE goal_id=?`, goalID)
+	if err != nil {
+		return nil, err
+	}
+	defer drows.Close()
+	for drows.Next() {
+		var it TimelineItem
+		var rsn sql.NullString
+		if err := drows.Scan(&it.GateRule, &it.Decision, &rsn, &it.ActorType, &it.At, &it.ReviewDurS); err != nil {
+			return nil, err
+		}
+		it.Kind = "decision"
+		it.ActorID = "" // decided_by is "human"; the frontend renders the human node
+		it.Reason = rsn.String
+		items = append(items, it)
+	}
+	if err := drows.Err(); err != nil {
+		return nil, err
+	}
+
+	sort.SliceStable(items, func(i, j int) bool { return items[i].At < items[j].At })
+	return items, nil
 }
 
 func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {

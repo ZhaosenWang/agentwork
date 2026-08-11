@@ -6,6 +6,7 @@ import { useGoal, useGoals, useAgents, useSquads, useGoalEvents } from "@/lib/qu
 import { GoalActions } from "@/components/goal-actions";
 import { GoalComments } from "@/components/goal-comments";
 import { GoalRuns } from "@/components/goal-runs";
+import { GoalStatusBar, GoalTimeline } from "@/components/goal-timeline";
 import { Badge, Empty } from "@/components/ui";
 import type { Goal } from "@/lib/types";
 
@@ -41,6 +42,7 @@ export default function GoalDetailPage() {
         <div className="flex items-center gap-3 mt-3">
           <h1 className="text-lg font-semibold text-zinc-900">{goal.title}</h1>
           <Badge status={goal.status} />
+          <GoalStatusBar goalId={id} goalStatus={goal.status} />
         </div>
         <p className="text-sm text-zinc-500 mt-1">
           分配给：{assigneeLabel}
@@ -61,8 +63,11 @@ export default function GoalDetailPage() {
         )}
       </div>
 
-      {/* Actions */}
-      <GoalActions goal={goal} />
+      {/* Actions + 执行流入口 */}
+      <div className="flex items-start gap-2 flex-wrap">
+        <GoalActions goal={goal} />
+        <GoalTimeline goalId={id} goalStatus={goal.status} />
+      </div>
 
       {/* Comments */}
       <GoalComments goalId={id} />

@@ -13,7 +13,7 @@ const BTN_VARIANTS: Record<ButtonVariant, string> = {
     "border border-zinc-300 bg-white text-zinc-700 hover:border-indigo-300 hover:text-indigo-700 hover:bg-indigo-50/50",
   ghost: "text-zinc-600 hover:bg-indigo-50/60 hover:text-indigo-700",
   danger:
-    "border border-red-200 bg-white text-red-600 hover:bg-red-50 hover:border-red-300",
+    "bg-gradient-to-b from-red-500 to-rose-600 text-white shadow-sm shadow-red-500/25 hover:shadow-md hover:shadow-red-500/30 hover:-translate-y-px",
 };
 
 export function Button({
@@ -24,7 +24,7 @@ export function Button({
   return (
     <button
       className={cn(
-        "inline-flex items-center justify-center px-3 py-1.5 text-sm font-medium rounded-lg transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:translate-y-0 disabled:hover:shadow-none",
+        "inline-flex items-center justify-center px-3 py-1.5 text-sm font-medium rounded-full transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:translate-y-0 disabled:hover:shadow-none",
         BTN_VARIANTS[variant],
         className
       )}
