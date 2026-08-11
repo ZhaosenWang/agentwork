@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useAgents, useSquads, useAssignGoal, useCancelGoal,
-  useReopenGoal, useWaitGoalChildren, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments } from "@/lib/queries";
+  useReopenGoal, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Goal } from "@/lib/types";
@@ -10,7 +10,6 @@ import type { Goal } from "@/lib/types";
 export function GoalActions({ goal }: { goal: Goal }) {
   const assign = useAssignGoal();
   const cancel = useCancelGoal();
-  const wait = useWaitGoalChildren();
   const deleteGoal = useDeleteGoal();
   const reopen = useReopenGoal();
   const [showAssign, setShowAssign] = useState(false);
@@ -18,7 +17,6 @@ export function GoalActions({ goal }: { goal: Goal }) {
 
   const isTerminal =
     goal.status === "done" || goal.status === "failed" || goal.status === "cancelled";
-  const canWait = goal.status === "active";
 
   return (
     <div className="flex gap-2 flex-wrap items-center">
@@ -27,12 +25,6 @@ export function GoalActions({ goal }: { goal: Goal }) {
       {!isTerminal && (
         <Button variant="danger" onClick={() => cancel.mutate(goal.id)} disabled={cancel.isPending}>
           {cancel.isPending ? "取消中…" : "取消 Goal"}
-        </Button>
-      )}
-
-      {canWait && (
-        <Button variant="outline" onClick={() => wait.mutate(goal.id)} disabled={wait.isPending}>
-          {wait.isPending ? "…" : "等待子 Goal"}
         </Button>
       )}
 
@@ -59,9 +51,9 @@ export function GoalActions({ goal }: { goal: Goal }) {
         />
       )}
 
-      {(assign.isError || cancel.isError || wait.isError || deleteGoal.isError) && (
+      {(assign.isError || cancel.isError || deleteGoal.isError) && (
         <p className="text-sm text-red-500 w-full">
-          {String(assign.error ?? cancel.error ?? wait.error ?? deleteGoal.error)}
+          {String(assign.error ?? cancel.error ?? deleteGoal.error)}
         </p>
       )}
     </div>
