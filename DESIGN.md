@@ -150,6 +150,7 @@ agent 干完（run 到终态）
 - **squad 审查 checkpoint（决策 4-4）**：squad 拥有的 goal 进 review 时，平台自动给 `role=reviewer` 成员（排除 leader 自审）发系统 mention 并 enqueue 审查 run——审查是平台机制，不是 agent 自觉；审查 run 为 guest run，意见只活在评论里供审批参考。脏 worktree 停靠（平台问题而非完工）不触发审查。**审查/协作 run 的结果由平台兜底落 feed**：agent 未自觉评论时，run 的总结自动写为 agent 评论（与失败留痕对称）——审查结论不能只躺在 result_summary。
 - **评论区语义（决策 4-6）**：评论区是 goal 的**协作交流区**——只承载"人的话"与协作动作（创建指令、改派 handoff note、审批理由、重开理由、人/agent 对话、mention 触发），作者为 human / agent / 必要的系统提示。**系统内部状态不入评论**（run 终态、进入审批、合入、超时）——状态史由活动日志 + 执行流承载，评论不是日志。**评论 = 团队上下文的对话层**：每个 run 的 prompt 注入该 goal 的**完整评论 feed**（不限作者、不限条数）——被 mention 拉进来的 agent 必须看到别人对它说了什么，协作链不能断。
 - **评论注入压缩（决策 4-7，规划未实现）**：全量注入的代价随评论增长，平台负责压缩（平台机制，不是 agent 自觉）——预算制分层：**保真层**（触发评论原文、approve/reject/handoff 等决策记录）永不进摘要；**保留层**（最近 ~4K 估算 token 的活跃对话）原文注入；**背景层**（更早评论）由平台维护的累积摘要承载。摘要由平台内部调度的 processor run（run_type=summary，专用 summarizer agent）生成，不占干活 agent 的并发槽；触发 = 未摘要窗口达压缩阈值（~8K 估算 token），每次把最老的压进累积摘要、回落到保留预算，一次处理量恒定。估算 token 用启发式（CJK×1.2 + 非CJK×0.28，纯平台代码，误差 ±30% 只影响触发时机，不破坏保真不变量）。失败：重试事件驱动（新评论到达才再试，连续 3 次失败后降级常驻），**摘要失败不影响 goal 状态**——降级为机械压缩（最近保留层原文 + 更早「作者: 首句」），纯平台代码永远可用；恢复 = 新评论到达重置计数。不设迁移/回填：开发期直接 wipe。
+- **client 文件系统代理（决策 4-8，规划未实现）**：ACP 协议中 agent 的 fs/terminal 操作是 **Agent→Client RPC**（fs/read_text_file、fs/write_text_file、terminal/create|output|wait_for_exit|kill|release）——**worktree 永远在 agentwork（client 侧），agent 经协议访问，不依赖共享文件系统**。现状：SDK 的 ClientRequestHandler 分派已就绪但从未接线（SetClientRequestHandler 零调用者，agent→client RPC 一律返回 "not configured"）——stdio 下 worktree 共享纯粹是 cwd 巧合（agent 是 daemon 子进程），远程 agent（ws/tcp）必然退回自己的本地 fs，改动对 daemon 不可见、verify 对空气跑。接线后：远程 agent 的读写/终端操作全部落回本机 worktree——verify/guards/commitRunChanges/evidence 的 diff 即 agent 真实改动，AGENTWORK.md 注入经读 RPC 返回，setup 依赖天然同机。路径安全 = **混合策略**：worktree 内可读写 + 系统路径只读（agent 要读 /etc、工具链），写操作严格锁 worktree。stdio 一并切换，统一"agent 的 fs 是代理 fs"语义（不能 stdio 靠巧合、远程靠代理两套心智）。**遗留问题**：ws/tcp 无 env 通道，AGENTWORK_*（run id / server url）传不进远程 agent——run 上下文显式写进 prompt + agent 端配置 SERVER_URL。
 
 ### 数值守卫（状态机不变量，不是提示词请求）
 
@@ -410,6 +411,7 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策4-5 | **策略缺陷客观检测**：verify 命令 exit 127（POSIX command not found）→ 自动标注"疑似验收策略问题"系统评论——owner 修策略而非 agent 白烧重试（替代字符串匹配） |
 | 决策4-6 | **评论区语义**：评论区 = 协作交流区，只承载人的话与协作动作（创建/改派/审批理由/重开/对话/mention）；系统内部状态不入评论（状态史归活动日志 + 执行流）。评论 = 团队上下文的对话层——每个 run 注入完整评论 feed（不限作者、不限条数） |
 | 决策4-7 | **评论注入压缩（规划未实现）**：全量注入随评论增长由平台负责压缩——预算制分层：决策记录/触发评论永不进摘要（保真层）、最近 ~4K 估算 token 原文（保留层）、更早的进平台累积摘要（背景层）。摘要 = 平台调度的 processor run（run_type=summary），触发 = 未摘要窗口达 ~8K 估算 token，每次压最老的到回落保留预算；估算 token = 启发式（CJK×1.2 + 非CJK×0.28，±30% 只影响触发时机）。失败：事件驱动重试（新评论才再试，连续 3 次降级常驻），摘要失败不影响 goal 状态，降级 = 机械压缩（保留层原文 + 更早「作者: 首句」） |
+| 决策4-8 | **client 文件系统代理（规划未实现）**：ACP 的 fs/terminal 是 Agent→Client RPC——worktree 永远在 agentwork，agent 经协议访问（SDK 分派已就绪、从未接线，stdio 的共享只是 cwd 巧合）。接线后远程 agent（ws/tcp）读写落回本机 worktree，verify/commit/evidence 即真实改动；路径混合策略（worktree 可读写 + 系统路径只读），写严格锁 worktree；stdio 同切统一语义。遗留：ws/tcp 无 env 通道，run 上下文走 prompt + agent 端配 SERVER_URL |
 
 ---
 
