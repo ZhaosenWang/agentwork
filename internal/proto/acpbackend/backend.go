@@ -73,7 +73,20 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			return summary
 		}
 
-		if _, err := sess.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1}); err != nil {
+		// Declare the execution-environment capabilities in the handshake:
+		// an agent only uses the client's fs/terminal RPCs when the client
+		// advertises them (initialize clientCapabilities). Without this the
+		// agent silently falls back to its own tools in its own environment
+		// — a live remote run proved it (the agent listed its own
+		// shell/read/write and reported no client tools).
+		initReq := acp.InitializeRequest{ProtocolVersion: 1}
+		if spec.ClientHandler != nil {
+			initReq.ClientCapabilities = acp.ClientCapabilities{
+				FS:       acp.FileSystemCapabilities{ReadTextFile: true, WriteTextFile: true},
+				Terminal: true,
+			}
+		}
+		if _, err := sess.Initialize(ctx, initReq); err != nil {
 			results <- proto.Result{Status: proto.StatusFailed, Output: withStderr("initialize: " + err.Error()), Err: err}
 			return
 		}

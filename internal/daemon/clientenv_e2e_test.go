@@ -29,11 +29,15 @@ type fakeACPAgent struct {
 	termExit    *int
 	termSignal  *string
 	rpcErrs     []string
+
+	// Handshake observation.
+	clientCaps acp.ClientCapabilities
 }
 
 func (a *fakeACPAgent) SetClientRequester(r acp.ClientRequester) { a.requester = r }
 
 func (a *fakeACPAgent) OnInitialize(ctx context.Context, req acp.InitializeRequest) (*acp.InitializeResponse, error) {
+	a.clientCaps = req.ClientCapabilities
 	return &acp.InitializeResponse{ProtocolVersion: 1, AgentCapabilities: acp.AgentCapabilities{}}, nil
 }
 func (a *fakeACPAgent) OnNewSession(ctx context.Context, req acp.NewSessionRequest) (*acp.NewSessionResponse, error) {
@@ -174,6 +178,11 @@ func TestExecuteFullRoundTrip(t *testing.T) {
 	// The agent's turn completed — assert what it observed.
 	if len(agent.rpcErrs) > 0 {
 		t.Fatalf("agent RPC errors: %v", agent.rpcErrs)
+	}
+	// The handshake must advertise the execution-environment capabilities —
+	// an agent only uses client fs/terminal RPCs when they are declared.
+	if !agent.clientCaps.Terminal || !agent.clientCaps.FS.ReadTextFile || !agent.clientCaps.FS.WriteTextFile {
+		t.Fatalf("client capabilities not declared in handshake: %+v", agent.clientCaps)
 	}
 	if agent.readContent != "hello worktree" {
 		t.Fatalf("fs read through proxy: want %q, got %q", "hello worktree", agent.readContent)

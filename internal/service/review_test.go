@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/eushing/agentwork/internal/events"
@@ -295,7 +296,7 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 	}
 
 	// Mention B during review: comment lands, no run triggered.
-	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 这里还有问题" }); err != nil {
+	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 这里还有问题"}); err != nil {
 		t.Fatalf("comment: %v", err)
 	}
 	runs, _ := rs.List(ctx, g.ID)
@@ -315,7 +316,7 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 	if _, err := gs.MarkDelivered(ctx, g.ID, true, "merged", nil); err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
-	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 现在可以做了" }); err != nil {
+	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 现在可以做了"}); err != nil {
 		t.Fatalf("comment 2: %v", err)
 	}
 	reopened, _ := gs.Get(ctx, g.ID)
@@ -472,4 +473,79 @@ func TestGuestRunResultLandsInFeed(t *testing.T) {
 		t.Fatalf("completed guest run must land its summary as the agent's comment, got %+v", comments)
 	}
 	_ = c
+}
+
+// TestAssigneeRunResultLandsInFeed: the report-feed fallback covers EVERY
+// completed run, not just mention-triggered guests — an assignee run whose
+// agent never commented (e.g. a remote agent without agentwork-cli) must
+// still land its delivery summary in the feed. A live remote run surfaced
+// the gap: the feed showed only the human's reject with no context of what
+// was rejected.
+func TestAssigneeRunResultLandsInFeed(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	enqueueFirst(t, rs, g)
+
+	runs, _ := rs.List(ctx, g.ID)
+	// The assignee's own run completes with a full report — no trigger
+	// comment (not a guest run).
+	if err := rs.Finish(ctx, runs[0].ID, "completed", "完成：创建了 hello_ws.txt，验证通过。完整汇报如下……"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	comments, _ := cs.List(ctx, g.ID)
+	var found bool
+	for _, cc := range comments {
+		if cc.AuthorType == "agent" && cc.AuthorID == agentA && strings.Contains(cc.Content, "验证通过") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("assignee run report must land in the feed in full, got %+v", comments)
+	}
+}
+
+// TestAgentOwnCommentPlusReport: the report is the run's delivery record —
+// it lands even when the agent commented itself. The agent's voluntary
+// comment is additional conversation; neither hides the other ("搞定" must
+// not hide the full report, nor a report hide its words).
+func TestAgentOwnCommentPlusReport(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	enqueueFirst(t, rs, g)
+
+	// The agent comments itself during its run (CLI comment with run_id).
+	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "agent", AuthorID: agentA, Content: "我自觉汇报一下"}); err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+
+	runs, _ := rs.List(ctx, g.ID)
+	if err := rs.Finish(ctx, runs[0].ID, "completed", "完整交付总结……"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	comments, _ := cs.List(ctx, g.ID)
+	var sawVoluntary, sawReport bool
+	for _, cc := range comments {
+		if cc.AuthorType != "agent" || cc.AuthorID != agentA {
+			continue
+		}
+		if strings.Contains(cc.Content, "我自觉汇报一下") {
+			sawVoluntary = true
+		}
+		if strings.Contains(cc.Content, "完整交付总结") {
+			sawReport = true
+		}
+	}
+	if !sawVoluntary || !sawReport {
+		t.Fatalf("both the agent's words AND the run's report must be in the feed (voluntary=%v report=%v): %+v", sawVoluntary, sawReport, comments)
+	}
 }

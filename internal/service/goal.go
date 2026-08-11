@@ -23,14 +23,14 @@ type Goal struct {
 	Title           string `json:"title"`
 	Description     string `json:"description"`
 	ParentID        string `json:"parent_id"`
-	DomainID        string `json:"domain_id"` // owning domain (required for agent/squad goals — v2)
+	DomainID        string `json:"domain_id"`     // owning domain (required for agent/squad goals — v2)
 	AssigneeType    string `json:"assignee_type"` // agent | squad | human
 	AssigneeID      string `json:"assignee_id"`
 	Status          string `json:"status"` // backlog|active|done|failed|blocked|review|cancelled
 	HandoffNote     string `json:"handoff_note"`
-	ReviewRequest   string `json:"review_request"` // gate trigger reason / deliver-failure note
+	ReviewRequest   string `json:"review_request"`   // gate trigger reason / deliver-failure note
 	HumanIterations int    `json:"human_iterations"` // reject iterations (separate from run.attempt)
-	CreatedByType   string `json:"created_by_type"` // human | agent
+	CreatedByType   string `json:"created_by_type"`  // human | agent
 	CreatedByID     string `json:"created_by_id"`
 	CreatedAt       string `json:"created_at"`
 	WakeCount       int    `json:"wake_count"` // bumped each blocked→active wakeup; bounded to break runaway re-fan-out
@@ -236,9 +236,9 @@ type TimelineItem struct {
 	ActorID    string `json:"actor_id,omitempty"`
 	Action     string `json:"action,omitempty"` // action: created|handoff|entered_review|requested_review|parked_review|reopened|cancelled|commented|mention_cycle_failed
 	Detail     string `json:"detail,omitempty"`
-	GateRule   string `json:"gate_rule,omitempty"`   // decision: which rule fired
-	Decision   string `json:"decision,omitempty"`    // decision: approve|reject|redirect
-	Reason     string `json:"reason,omitempty"`      // decision: the human's words
+	GateRule   string `json:"gate_rule,omitempty"`         // decision: which rule fired
+	Decision   string `json:"decision,omitempty"`          // decision: approve|reject|redirect
+	Reason     string `json:"reason,omitempty"`            // decision: the human's words
 	ReviewDurS int    `json:"review_duration_s,omitempty"` // decision: seconds spent in review
 }
 
@@ -579,6 +579,32 @@ func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 //	run completed, sub-goals inflight → leave; child-done flow owns the wake
 //	run failed, attempts left → enqueue a retry run (attempt+1)
 //	run failed, attempts exhausted → goal → failed
+//
+// insertRunResultComment lands a completed run's report in the feed as the
+// agent's comment — the delivery summary is what the human rejects/approves
+// against, and "review is a platform mechanism, not agent self-discipline"
+// (decision 4-4): the platform writes the run's report regardless of what
+// the agent said. Covers EVERY completed run — guest and assignee alike (a
+// live remote run surfaced the gap: the agent had no client tools and never
+// commented, so the feed showed only the human's reject with no context of
+// what was rejected — "我驳回了空气"). The report is kept in FULL: it is the
+// agent's words; an 800-char cut loses exactly the context a reject
+// decision needs. NO dedupe: the report is the run's delivery record (a
+// platform guarantee), and an agent's own voluntary comment is additional
+// conversation — they do not exclude each other (an agent saying "搞定" must
+// not hide the full report, nor a report hide its words).
+func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) error {
+	if rc.Status != "completed" || strings.TrimSpace(rc.Summary) == "" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
+		newID(), rc.GoalID, "agent", rc.AgentID, strings.TrimSpace(rc.Summary), now()); err != nil {
+		return fmt.Errorf("insert run-result comment: %w", err)
+	}
+	return nil
+}
+
 func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) error {
 	// Events are collected here and published ONLY after the tx commits, so a
 	// failed commit can never leave the bus with an event whose DB change
@@ -630,22 +656,11 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 				return fmt.Errorf("insert guest-failure comment: %w", err)
 			}
 		}
-		// A COMPLETED collaboration run (mention-triggered review/help) must
-		// land its result in the feed too — the reviewer's verdict is the
-		// checkpoint evidence, and "review is a platform mechanism, not agent
-		// self-discipline" (decision 4-4): the platform falls back to writing
-		// the run's summary as the agent's comment when the agent did not
-		// comment itself. Symmetric with the failure trace above.
-		if rc.Status == "completed" && rc.TriggerCommentID != "" && strings.TrimSpace(rc.Summary) != "" {
-			summary := strings.TrimSpace(rc.Summary)
-			if len(summary) > 800 {
-				summary = summary[:800] + "…"
-			}
-			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
-				newID(), rc.GoalID, "agent", rc.AgentID, summary, now()); err != nil {
-				return fmt.Errorf("insert guest-result comment: %w", err)
-			}
+		// A COMPLETED run's report lands in the feed here (orphaned/guest
+		// branch). Owned runs get the same fallback in the completed case
+		// below — see insertRunResultComment.
+		if err := insertRunResultComment(ctx, tx, rc); err != nil {
+			return err
 		}
 		pendingEvents = append(pendingEvents, events.Event{Topic: "run:discarded", Payload: map[string]any{
 			"run_id": rc.RunID, "goal_id": rc.GoalID, "reason": "orphaned",
@@ -662,6 +677,13 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 
 	switch rc.Status {
 	case "completed":
+		// The run's report lands in the feed as the agent's comment — the
+		// human's reject/approve reads it (the reject context the feed
+		// lacked. Fallback only: a self-commenting agent
+		// gets no duplicate.
+		if err := insertRunResultComment(ctx, tx, rc); err != nil {
+			return err
+		}
 		// A completed run that passed machine verification has reached the
 		// acceptance-judgment step (D2: inside this transaction). If the
 		// goal's domain has checkpoint gates, the goal parks in review and
@@ -827,18 +849,19 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 }
 
 // ResolveReview handles a human checkpoint decision (DESIGN.md §4/§5):
-//   approve  → record the gate_decision, keep the goal in review, publish
-//              goal:approved — the daemon runs the deliver step (merge +
-//              re-verify + push) and closes with MarkDelivered.
-//   reject/redirect → record the gate_decision, bump human_iterations (the
-//              reject counter, SEPARATE from run.attempt), move the goal back
-//              to active with the reason as handoff_note, and enqueue a new
-//              run on the current assignee — the agent continues in the same
-//              worktree, working from the decision note.
+//
+//	approve  → record the gate_decision, keep the goal in review, publish
+//	           goal:approved — the daemon runs the deliver step (merge +
+//	           re-verify + push) and closes with MarkDelivered.
+//	reject/redirect → record the gate_decision, bump human_iterations (the
+//	           reject counter, SEPARATE from run.attempt), move the goal back
+//	           to active with the reason as handoff_note, and enqueue a new
+//	           run on the current assignee — the agent continues in the same
+//	           worktree, working from the decision note.
 //
 // runID links the decision to the evidence run the human judged (the audit
 // chain, gate_decision.run_id). The Web resolves the goal without naming a
-// run ('' — its review panel shows the latest completed run); the IM
+// run (” — its review panel shows the latest completed run); the IM
 // approval card carries the run id in the button value, so the decision
 // lands on exactly the run whose evidence the card displayed.
 func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision, reason string) (*Goal, error) {
@@ -1132,7 +1155,7 @@ func (s *GoalService) resolveGateRule(ctx context.Context, goalID, runID, review
 // source (DESIGN.md §13): a gate approved every time is a candidate for
 // removal; one rejected repeatedly is a candidate for tightening.
 type GateStat struct {
-	Rule     string `json:"rule"`     // gate_rule as recorded (merge, diff_contains, ...)
+	Rule     string `json:"rule"` // gate_rule as recorded (merge, diff_contains, ...)
 	Total    int    `json:"total"`
 	Approved int    `json:"approved"`
 	Rejected int    `json:"rejected"`
@@ -1166,9 +1189,10 @@ func (s *GoalService) GateStats(ctx context.Context) ([]GateStat, error) {
 
 // MarkDelivered closes the deliver step (DESIGN.md §7), called by the
 // daemon after its deterministic merge + re-verify + push:
-//   success → review → done (handoff_note cleared, parent woken)
-//   failure → stays in review with the reason annotated (review_request),
-//             so the human can retry deliver or reject the change back.
+//
+//	success → review → done (handoff_note cleared, parent woken)
+//	failure → stays in review with the reason annotated (review_request),
+//	          so the human can retry deliver or reject the change back.
 //
 // fixCommits ("<full sha> <title>") is the fix evidence the daemon collected;
 // the goal layer passes it through verbatim to the delivered event — the

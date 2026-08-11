@@ -159,8 +159,26 @@ func (e *runEnvironment) HandleReleaseTerminal(ctx context.Context, req acp.Rele
 	return &acp.ReleaseTerminalResponse{}, nil
 }
 
-// HandleRequestPermission is unsupported: approval is always human
-// (DESIGN.md — 管家/agent 不能自动 approve).
+// HandleRequestPermission auto-approves tool execution. This is the ACP
+// CLIENT's tool-permission model, NOT the platform's approval checkpoint:
+// the execution-environment proxy's trust boundary is daemon-user
+// permissions — exactly like a stdio subprocess — so the agent's tools
+// (fs/terminal RPCs) run without a client-side permission gate. Rejecting
+// here blocked every remote agent's write/shell (a live 8787-ws run
+// surfaced it). Platform approvals (goal review / approve) remain human,
+// see DESIGN.md.
 func (e *runEnvironment) HandleRequestPermission(ctx context.Context, req acp.RequestPermissionRequest) (*acp.RequestPermissionResponse, error) {
-	return nil, fmt.Errorf("request_permission: not supported — approval is a human action")
+	// Prefer an allow-always option, else fall back to the first offered.
+	for _, o := range req.Options {
+		if o.Kind == acp.PermissionAllowAlways {
+			id := o.OptionID
+			return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{OptionID: &id}}, nil
+		}
+	}
+	if len(req.Options) > 0 {
+		id := req.Options[0].OptionID
+		return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{OptionID: &id}}, nil
+	}
+	// No options offered: an empty outcome (neither selected nor cancelled).
+	return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{}}, nil
 }
