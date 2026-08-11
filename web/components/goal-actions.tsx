@@ -93,51 +93,80 @@ function ReviewPanel({ goal }: { goal: Goal }) {
     try { evidence = JSON.parse(lastRun.evidence); } catch { /* not JSON */ }
   }
 
+  const agentComments = recentComments.filter((c) => c.author_type === "agent");
+  const otherComments = recentComments.filter((c) => c.author_type !== "agent");
+
   return (
-    <div className="rounded-2xl border border-amber-300/80 bg-amber-50/70 p-4 space-y-3 w-full shadow-sm shadow-amber-500/5">
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-xs font-mono bg-amber-200 px-2 py-0.5 rounded">等待审批</span>
-        {goal.review_request && <span className="text-sm text-amber-900">{goal.review_request}</span>}
-        {goal.human_iterations > 0 && (
-          <span className="text-xs text-amber-700">已驳回 {goal.human_iterations} 次</span>
+    <div className="rounded-2xl border border-amber-300/80 bg-amber-50/70 w-full shadow-sm shadow-amber-500/5 overflow-hidden">
+      {/* 卡点原因（独立行，小字两行排） */}
+      <div className="px-4 py-3 border-b border-amber-200/60 space-y-1.5">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-mono bg-amber-200 px-2 py-0.5 rounded">等待审批</span>
+          {goal.human_iterations > 0 && (
+            <span className="text-xs text-amber-700">已驳回 {goal.human_iterations} 次</span>
+          )}
+        </div>
+        {goal.review_request && (
+          <p className="text-xs text-amber-900/80 leading-relaxed">{goal.review_request}</p>
         )}
       </div>
 
-      {evidence && (
-        <details className="text-xs">
-          <summary className="cursor-pointer text-amber-800">证据包（{lastRun?.id.slice(0, 8)}）</summary>
-          <pre className="mt-2 whitespace-pre-wrap bg-amber-100 p-2 rounded text-amber-900 max-h-64 overflow-auto">
-            {String(evidence.diff_stat ?? "")}
-            {"\n"}
-            {String(evidence.verify ?? "")}
-          </pre>
-        </details>
-      )}
-      {lastRun?.result_summary && (
-        <div className="text-xs text-amber-800">
-          <div className="font-medium text-amber-900 mb-0.5">Agent 汇报</div>
-          <Markdown content={lastRun.result_summary.slice(0, 500)} agentName={agentName} />
-        </div>
-      )}
-
-      {/* 最新交流（审查意见 / 人的话）——审批不离上下文 */}
-      {recentComments.length > 0 && (
-        <div className="space-y-1.5 text-xs">
-          <div className="text-[11px] font-medium text-amber-700 uppercase tracking-wide">最新交流</div>
-          {recentComments.map((c) => {
-            const author =
-              c.author_type === "human" ? "你" :
-              c.author_type === "system" ? "系统" :
-              agentName(c.author_id);
-            return (
-              <div key={c.id} className="bg-amber-100/60 rounded-lg p-2">
-                <span className="font-medium text-amber-900">{author}</span>
-                <Markdown content={c.content} agentName={agentName} className="text-amber-800 mt-0.5" />
+      <div className="p-4 space-y-3">
+        {/* 审查意见：最新 agent 评论置顶（白底卡片与琥珀底区分——审批先看它） */}
+        {agentComments.length > 0 && (
+          <div className="bg-white rounded-xl border border-zinc-200/80 p-3 space-y-2">
+            <div className="text-[11px] font-medium text-zinc-500 uppercase tracking-wide">审查意见</div>
+            {agentComments.map((c) => (
+              <div key={c.id}>
+                <span className="font-medium text-zinc-800 text-xs">{agentName(c.author_id)}</span>
+                <div className="max-h-48 overflow-y-auto mt-1">
+                  <Markdown content={c.content} agentName={agentName} className="text-zinc-700" />
+                </div>
               </div>
-            );
-          })}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+
+        {/* Agent 汇报（折叠，默认收起——长文不占审批视线） */}
+        {lastRun?.result_summary && (
+          <details className="text-xs" open={agentComments.length === 0}>
+            <summary className="cursor-pointer font-medium text-amber-900">Agent 汇报</summary>
+            <div className="mt-1.5 max-h-56 overflow-y-auto">
+              <Markdown content={lastRun.result_summary.slice(0, 500)} agentName={agentName} className="text-amber-800" />
+            </div>
+          </details>
+        )}
+
+        {/* 证据包（折叠） */}
+        {evidence && (
+          <details className="text-xs">
+            <summary className="cursor-pointer text-amber-800">证据包（{lastRun?.id.slice(0, 8)}）</summary>
+            <pre className="mt-2 whitespace-pre-wrap bg-amber-100 p-2 rounded text-amber-900 max-h-64 overflow-auto">
+              {String(evidence.diff_stat ?? "")}
+              {"\n"}
+              {String(evidence.verify ?? "")}
+            </pre>
+          </details>
+        )}
+
+        {/* 其他交流（人的话 / 系统消息，折叠） */}
+        {otherComments.length > 0 && (
+          <details className="text-xs">
+            <summary className="cursor-pointer font-medium text-amber-900">其他交流（{otherComments.length}）</summary>
+            <div className="mt-1.5 space-y-1.5">
+              {otherComments.map((c) => {
+                const author =
+                  c.author_type === "human" ? "你" : "系统";
+                return (
+                  <div key={c.id} className="bg-amber-100/60 rounded-lg p-2">
+                    <span className="font-medium text-amber-900">{author}</span>
+                    <Markdown content={c.content} agentName={agentName} className="text-amber-800 mt-0.5" />
+                  </div>
+                );
+              })}
+            </div>
+          </details>
+        )}
 
       {resolveOutcome === "approved" && (
         <p className="text-sm text-emerald-700 font-medium">✅ 已批准——平台正在合入（merge + 复验 + push），完成后此卡自动关闭。</p>
@@ -193,6 +222,7 @@ function ReviewPanel({ goal }: { goal: Goal }) {
         </form>
       )}
       {resolve.isError && <p className="text-sm text-red-500">{String(resolve.error)}</p>}
+      </div>
     </div>
   );
 }

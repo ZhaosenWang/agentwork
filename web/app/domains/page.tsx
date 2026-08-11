@@ -427,11 +427,12 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const [issueAssignee, setIssueAssignee] = useState("");
   const [issueProvider, setIssueProvider] = useState("github");
   const [gitCredentials, setGitCredentials] = useState("");
+  const [gitIdentity, setGitIdentity] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     create.mutate(
-      { name, git_url: gitUrl, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: issueRepo, issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: issueProvider, git_credentials: gitCredentials },
+      { name, git_url: gitUrl, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: issueRepo, issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: issueProvider, git_credentials: gitCredentials, git_identity: gitIdentity },
       {
         onSuccess: (d) => {
           if (policyText.trim() && processorAgent) {
@@ -462,6 +463,9 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
         </Field>
         <Field label="Git 仓库地址" hint="agentwork 会 clone 它作为共享仓库，每个 Goal 一个独立 worktree">
           <input value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} className={inputCls} placeholder="https://github.com/you/repo.git" required />
+        </Field>
+        <Field label="Git 身份（commit 作者，可选）" hint='格式：名字 &lt;邮箱&gt;，如 agentwork[bot] &lt;bot@local&gt;——不填默认 agentwork[bot]'>
+          <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
         </Field>
         <Field label="自然语言验收要求（可选，创建后可再编译）" hint="例如：测试必须通过，改动要带测试">
           <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="用一句话描述这个域怎么算“干对了”…" />
