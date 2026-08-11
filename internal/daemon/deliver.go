@@ -215,7 +215,7 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// checkpoint by design).
 	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
 	if checksFrozen {
-		verifyReport, ok := runVerification(ctx, wt, checks, timeout)
+		verifyReport, ok, _ := runVerification(ctx, wt, checks, timeout)
 		if !ok {
 			// Verification red after merge: reset the default branch, hand the
 			// worktree back to the goal branch, and report.

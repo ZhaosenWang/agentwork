@@ -100,42 +100,53 @@ func (d *Daemon) loadDomainChecks(ctx context.Context, domainID string) (checks 
 // verification ends the run failed (invariant 14: the goal layer only sees
 // 'completed' runs that passed machine verification). A setup failure is
 // attributed as environment preparation, separate from the judgment.
-func runVerification(ctx context.Context, dir string, checks service.Checks, timeout int) (string, bool) {
-	var report strings.Builder
+//
+// policyIssue reports an OBJECTIVE policy defect via the standard signal:
+// POSIX exit code 127 ("command not found") — the shell returns it for a
+// missing command AND a missing script path, no text parsing involved. The
+// platform flags it so the owner fixes the policy instead of the agent
+// burning retries against an impossible check.
+func runVerification(ctx context.Context, dir string, checks service.Checks, timeout int) (report string, ok bool, policyIssue bool) {
+	var b strings.Builder
 	for _, cmd := range checks.Setup {
-		report.WriteString("$ " + cmd + "\n")
-		out, err := runVerifiedCmd(ctx, dir, cmd, timeout)
-		report.WriteString(out)
-		if err != nil {
-			report.WriteString("\n[setup failed: " + err.Error() + "]\n")
-			return report.String(), false
+		b.WriteString("$ " + cmd + "\n")
+		out, code := runVerifiedCmd(ctx, dir, cmd, timeout)
+		b.WriteString(out)
+		if code != 0 {
+			b.WriteString(fmt.Sprintf("\n[setup failed (exit %d)]\n", code))
+			return b.String(), false, code == 127
 		}
 	}
 	for _, cmd := range checks.Verify {
-		report.WriteString("$ " + cmd + "\n")
-		out, err := runVerifiedCmd(ctx, dir, cmd, timeout)
-		report.WriteString(out)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				report.WriteString(fmt.Sprintf("\n[verify timed out after %ds]\n", timeout))
-			} else {
-				report.WriteString("\n[verify failed: " + err.Error() + "]\n")
-			}
-			return report.String(), false
+		b.WriteString("$ " + cmd + "\n")
+		out, code := runVerifiedCmd(ctx, dir, cmd, timeout)
+		b.WriteString(out)
+		if code != 0 {
+			b.WriteString(fmt.Sprintf("\n[verify failed (exit %d)]\n", code))
+			return b.String(), false, code == 127
 		}
 	}
-	return report.String(), true
+	return b.String(), true, false
 }
 
 // runVerifiedCmd runs one command under verify_timeout and returns its
-// combined output + error.
-func runVerifiedCmd(ctx context.Context, dir, cmd string, timeout int) (string, error) {
+// combined output and exit code (0 = ok; -1 = timeout; -2 = could not start).
+func runVerifiedCmd(ctx context.Context, dir, cmd string, timeout int) (string, int) {
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 	c := exec.CommandContext(cctx, "sh", "-c", cmd)
 	c.Dir = dir
 	out, err := c.CombinedOutput()
-	return string(out), err
+	if err == nil {
+		return string(out), 0
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return string(out), -1
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return string(out), ee.ExitCode()
+	}
+	return string(out), -2
 }
 
 var coverRe = regexp.MustCompile(`coverage: ([0-9.]+)% of statements`)

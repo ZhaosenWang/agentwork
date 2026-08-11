@@ -37,6 +37,32 @@ func newTestRepo(t *testing.T) string {
 
 // TestCommitRunChanges: a dirty tree is committed deterministically; a clean
 // tree is a no-op.
+// TestPolicyIssueViaExit127: objective policy defects are detected by the
+// STANDARD signal (POSIX exit 127 = command not found) — no text parsing —
+// while genuine work failures (non-zero exits) are not flagged.
+func TestPolicyIssueViaExit127(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	// A missing command → exit 127 → policy issue.
+	_, ok, policy := runVerification(ctx, dir, service.Checks{Verify: []string{"definitely-not-a-real-cmd-xyz"}}, 30)
+	if ok || !policy {
+		t.Fatalf("missing command must fail with policyIssue=true, ok=%v policy=%v", ok, policy)
+	}
+
+	// A missing script path → exit 127 → policy issue.
+	_, ok, policy = runVerification(ctx, dir, service.Checks{Verify: []string{"./no-such-script.sh"}}, 30)
+	if ok || !policy {
+		t.Fatalf("missing script must fail with policyIssue=true, ok=%v policy=%v", ok, policy)
+	}
+
+	// A genuine work failure (non-zero exit) → failed but NOT a policy issue.
+	_, ok, policy = runVerification(ctx, dir, service.Checks{Verify: []string{"sh -c 'exit 1'"}}, 30)
+	if ok || policy {
+		t.Fatalf("work failure must fail with policyIssue=false, ok=%v policy=%v", ok, policy)
+	}
+}
+
 func TestCommitRunChanges(t *testing.T) {
 	dir := newTestRepo(t)
 	ctx := context.Background()
@@ -107,7 +133,7 @@ func TestRunVerification(t *testing.T) {
 	dir := newTestRepo(t)
 	ctx := context.Background()
 
-	report, ok := runVerification(ctx, dir, service.Checks{
+	report, ok, _ := runVerification(ctx, dir, service.Checks{
 		Verify: []string{"test -f main.go", "echo hello"},
 	}, 30)
 	if !ok {
@@ -117,7 +143,7 @@ func TestRunVerification(t *testing.T) {
 		t.Fatalf("report should include command output:\n%s", report)
 	}
 
-	report, ok = runVerification(ctx, dir, service.Checks{
+	report, ok, _ = runVerification(ctx, dir, service.Checks{
 		Verify: []string{"test -f missing.go"},
 	}, 30)
 	if ok {
@@ -139,7 +165,7 @@ func TestRunVerificationSetup(t *testing.T) {
 	ctx := context.Background()
 
 	// Setup creates a file verify depends on; verify passes only after setup.
-	report, ok := runVerification(ctx, dir, service.Checks{
+	report, ok, _ := runVerification(ctx, dir, service.Checks{
 		Setup:  []string{"echo prepared > prepared.txt"},
 		Verify: []string{"test -f prepared.txt"},
 	}, 30)
@@ -151,7 +177,7 @@ func TestRunVerificationSetup(t *testing.T) {
 	}
 
 	// Setup failure: attributed as setup, verify NOT run.
-	report, ok = runVerification(ctx, dir, service.Checks{
+	report, ok, _ = runVerification(ctx, dir, service.Checks{
 		Setup:  []string{"exit 3"},
 		Verify: []string{"echo should-not-run > ran.txt"},
 	}, 30)
@@ -166,7 +192,7 @@ func TestRunVerificationSetup(t *testing.T) {
 	}
 
 	// Empty setup = no preparation needed; verify runs directly.
-	report, ok = runVerification(ctx, dir, service.Checks{Verify: []string{"true"}}, 30)
+	report, ok, _ = runVerification(ctx, dir, service.Checks{Verify: []string{"true"}}, 30)
 	if !ok {
 		t.Fatalf("empty setup must pass, report:\n%s", report)
 	}

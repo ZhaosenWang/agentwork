@@ -959,6 +959,36 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// human-agent dialogue channel — the agent starts with the latest
 	// conversation, nothing stored).
 	prompt := buildPrompt(title, desc, handoff)
+
+	// The domain's acceptance policy in NL (the "what counts as done" the
+	// OWNER defined) — the agent works toward it instead of finding out at
+	// verification time. Only the NL intent is injected; the compiled checks
+	// (verify commands / guard patterns) stay invisible — an agent that sees
+	// the exact patterns can satisfy the check instead of the intent
+	// (triangle separation: define stays with the human, execute with the
+	// agent, judge with the machine+human).
+	var policyText string
+	_ = d.st.DB().QueryRowContext(ctx,
+		`SELECT d.policy_text FROM goal g JOIN domain d ON d.id=g.domain_id WHERE g.id=?`, q.GoalID).Scan(&policyText)
+	if s := strings.TrimSpace(policyText); s != "" {
+		prompt += "\n\n## 验收策略（这个域的完成标准，由域所有者定义）\n" + s +
+			"\n\n机器会按此验收你的改动——干活时对照它，避免返工。"
+	}
+
+	// The verification-failure feedback loop: a RETRY run (attempt > 1, the
+	// previous run failed machine verification) must know WHY it failed —
+	// otherwise it blindly re-runs the same work and likely fails again.
+	// The last failed run's report (verify/guards output) is injected with
+	// an explicit "fix, don't redo" framing.
+	if q.Attempt > 1 {
+		var lastFail string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT result_summary FROM run WHERE goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`,
+			q.GoalID).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
+			prompt += "\n\n## 上一轮失败原因（机器验证未通过——据此修改现有代码，不要从零重做）\n" + truncateIn(lastFail, 1500)
+		}
+	}
+
 	// Goal comments (the human's words on this goal) are injected too —
 	// otherwise a comment is invisible to the agent until a reject carries
 	// it in the note (the regression the user hit: "添加评论没啥作用").
@@ -1094,8 +1124,14 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// still carries the diff + agent summary for that checkpoint.
 			verifyReport, guardReport := "", ""
 			if checksFrozen {
-				verifyReport, ok := runVerification(ctx, runRowWorkdir, checks, timeout)
+				verifyReport, ok, policyIssue := runVerification(ctx, runRowWorkdir, checks, timeout)
 				if !ok {
+					// Objective policy defect (POSIX exit 127 — missing command /
+					// script)? Flag it once — the owner fixes the policy instead
+					// of the agent burning retries against an impossible check.
+					if policyIssue {
+						d.annotatePolicyIssue(ctx, q.GoalID)
+					}
 					d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)
 					return
 				}
@@ -1201,10 +1237,44 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	}
 	d.ensureWorker(agentID, maxConcurrent)
 
-	// Scratch workdir for the compile run (no repo — the processor works from
-	// the prompt alone and writes its result files here).
+	// Workdir: compile runs work ON THE REAL REPO — a worktree of the domain's
+	// shared bare repo, so the processor compiles against what the repo
+	// actually is, not a guess from an empty scratch dir (the regression: an
+	// empty dir produced "pip install -r requirements.txt" for a zero-
+	// dependency repo and every verification failed). Intake runs keep the
+	// scratch dir (no repo involved).
 	runRowWorkdir := filepath.Join(workspaceRoot(), "proc", q.RunID)
-	if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
+	if runType == "compile" {
+		var gitURL, gitCredentials, defaultBranch string
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT git_url, git_credentials, default_branch FROM domain WHERE id=?`, domainID).
+			Scan(&gitURL, &gitCredentials, &defaultBranch)
+		if gitURL == "" {
+			d.failProcessorRun(ctx, q, "compile run: domain has no git_url")
+			return
+		}
+		unlock := d.lockDomain(domainID)
+		if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
+			unlock()
+			d.failProcessorRun(ctx, q, "prepare compile repo: "+err.Error())
+			return
+		}
+		repo := domainRepoPath(domainID)
+		if defaultBranch == "" {
+			defaultBranch = "main"
+		}
+		if out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", runRowWorkdir, "origin/"+defaultBranch).CombinedOutput(); err != nil {
+			unlock()
+			d.failProcessorRun(ctx, q, "compile worktree add: "+err.Error()+": "+string(out))
+			return
+		}
+		unlock()
+		defer func() {
+			unlock := d.lockDomain(domainID)
+			_, _ = exec.CommandContext(context.Background(), "git", "-C", repo, "worktree", "remove", "--force", runRowWorkdir).CombinedOutput()
+			unlock()
+		}()
+	} else if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
 		d.failProcessorRun(ctx, q, "mkdir workdir: "+err.Error())
 		return
 	}
@@ -1499,6 +1569,24 @@ func (d *Daemon) leaderSquadFor(ctx context.Context, goalID, agentID string) (st
 		return "", false
 	}
 	return aid, leaderID == agentID
+}
+
+// annotatePolicyIssue posts ONE system comment flagging an objective
+// acceptance-policy defect (a verify command/script that does not exist —
+// POSIX exit 127) — deduped per goal so the retry chain does not spam the
+// same finding. The owner sees it in the feed and fixes the policy; the run
+// still fails normally (a report is not a waiver).
+func (d *Daemon) annotatePolicyIssue(ctx context.Context, goalID string) {
+	var n int
+	_ = d.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system' AND content LIKE '疑似验收策略问题%'`, goalID).Scan(&n)
+	if n > 0 {
+		return
+	}
+	content := "⚠️ 疑似验收策略问题：验证命令/脚本不存在（POSIX exit 127）——请检查域的验收策略，修正后重开任务；agent 无法绕过该检查。"
+	_, _ = d.st.DB().ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
+		uuid.NewString(), goalID, content, nowStr())
 }
 
 // agentTriggeredRunCount counts the goal's runs triggered by AGENT-authored

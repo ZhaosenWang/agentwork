@@ -30,12 +30,36 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 	events := make(chan proto.Event, 256)
 	results := make(chan proto.Result, 1)
 
+	// Context cancellation must BREAK a blocking read: the agent process can
+	// hang on a network call with no output, and the idle/maxRunDuration
+	// watchdog's ctx cancellation would otherwise never interrupt the read
+	// blocked on the transport — the run would sit 'running' forever (a live
+	// 10-hour hang: opencode stuck on a model API request, watchdog fired,
+	// read never returned). Closing the transport makes the read return EOF →
+	// Prompt errors → the drain reports cancelled (ctx.Err() != nil).
+	//
+	// The waiter watches `done` (closed when the drain exits), NOT `results`:
+	// consuming a value from the buffered results channel would STEAL the
+	// drain's single result and the daemon would see "backend closed result
+	// channel" (a failed run for a completed turn — the regression this
+	// waiter caused).
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+			// Turn finished normally — nothing to break.
+		}
+	}()
+
 	// One drain goroutine drives the turn to completion. It runs the ACP
 	// handshake, the Prompt, and then closes both channels with a Result.
 	// The eventForwarder's pump goroutine closes `events` (after draining its
 	// queue); `results` closes here.
 	go func() {
 		defer close(results)
+		defer close(done)
 
 		// On any failure path, surface the agent's captured stderr (stdio
 		// transport) so a bad-args / missing-config agent isn't reported as a

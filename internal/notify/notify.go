@@ -16,12 +16,15 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
-	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -29,6 +32,10 @@ import (
 // Notifier fans milestone events out to the Feishu long connection. The long
 // connection itself is managed by the Connector (its SDK client is shared
 // here for outbound sends); Notifier only maps events → messages and sends.
+//
+// Outbound delivery owns its tenant_access_token explicitly (the SDK's token
+// manager proved unreliable past expiry — 99991663 on the daily digest after
+// a night of uptime). token/tokenExp are guarded by mu.
 type Notifier struct {
 	appID, appSecret string
 	client           *lark.Client
@@ -38,6 +45,10 @@ type Notifier struct {
 	// send overrides the SDK delivery path (tests inject a mock; nil = the
 	// lark client path). Kept unexported on purpose.
 	send func(text string) error
+
+	mu       sync.Mutex
+	token    string
+	tokenExp time.Time
 }
 
 // New creates a Notifier for a Feishu enterprise app (appID/appSecret).
@@ -223,28 +234,101 @@ func (n *Notifier) SendCard(cardJSON string) error {
 }
 
 func (n *Notifier) createMessage(msgType, content string) error {
-	if n.client == nil {
-		return fmt.Errorf("notify: client not initialized (Start not called)")
-	}
 	if n.receiveID == "" {
 		return fmt.Errorf("notify: no receive target configured")
 	}
-	resp, err := n.client.Im.Message.Create(context.Background(),
-		larkim.NewCreateMessageReqBuilder().
-			ReceiveIdType(n.receiveIDType).
-			Body(larkim.NewCreateMessageReqBodyBuilder().
-				MsgType(msgType).
-				ReceiveId(n.receiveID).
-				Content(content).
-				Build()).
-			Build())
+	token, err := n.tenantToken()
+	if err != nil {
+		return err
+	}
+	body, _ := json.Marshal(map[string]string{
+		"receive_id": n.receiveID,
+		"msg_type":   msgType,
+		"content":    content,
+	})
+	req, err := http.NewRequest(http.MethodPost,
+		"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type="+n.receiveIDType,
+		strings.NewReader(string(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("feishu send: %w", err)
 	}
-	if !resp.Success() {
-		return fmt.Errorf("feishu send failed: code=%d msg=%s", resp.Code, resp.Msg)
+	defer resp.Body.Close()
+	var out struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("feishu send: parse response: %w", err)
+	}
+	if out.Code != 0 {
+		// A stale token is worth ONE refresh-retry (the token lives 2h and the
+		// daemon runs for days — a refresh race must not fail the message).
+		if out.Code == 99991663 {
+			n.mu.Lock()
+			n.token = ""
+			n.tokenExp = time.Time{}
+			n.mu.Unlock()
+			if token2, err := n.tenantToken(); err == nil {
+				req.Header.Set("Authorization", "Bearer "+token2)
+				resp2, err := http.DefaultClient.Do(req)
+				if err == nil {
+					defer resp2.Body.Close()
+					var out2 struct {
+						Code int    `json:"code"`
+						Msg  string `json:"msg"`
+					}
+					if err := json.NewDecoder(resp2.Body).Decode(&out2); err == nil && out2.Code == 0 {
+						return nil
+					}
+				}
+			}
+		}
+		return fmt.Errorf("feishu send failed: code=%d msg=%s", out.Code, out.Msg)
 	}
 	return nil
+}
+
+// tenantToken returns a valid tenant_access_token, fetching or refreshing it
+// from app_id/app_secret when missing or near expiry. The token lives ~2h;
+// the SDK's own token manager proved unreliable past expiry (99991663 on the
+// daily digest after a night uptime), so the notifier owns it explicitly.
+func (n *Notifier) tenantToken() (string, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.token != "" && time.Now().Before(n.tokenExp.Add(-5*time.Minute)) {
+		return n.token, nil
+	}
+	body, _ := json.Marshal(map[string]string{
+		"app_id":     n.appID,
+		"app_secret": n.appSecret,
+	})
+	resp, err := http.Post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+		"application/json; charset=utf-8", strings.NewReader(string(body)))
+	if err != nil {
+		return "", fmt.Errorf("feishu token: %w", err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Code                 int    `json:"code"`
+		Msg                  string `json:"msg"`
+		TenantAccessToken    string `json:"tenant_access_token"`
+		Expire               int    `json:"expire"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("feishu token: parse: %w", err)
+	}
+	if out.Code != 0 || out.TenantAccessToken == "" {
+		return "", fmt.Errorf("feishu token: code=%d msg=%s", out.Code, out.Msg)
+	}
+	n.token = out.TenantAccessToken
+	n.tokenExp = time.Now().Add(time.Duration(out.Expire) * time.Second)
+	return n.token, nil
 }
 
 func escapeJSON(s string) string {
