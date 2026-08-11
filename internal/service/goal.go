@@ -853,24 +853,26 @@ func (s *GoalService) IssueSource(ctx context.Context, goalID string) (ref, toke
 	return ref, token, ref != "", nil
 }
 
-// Reopen restarts a failed/cancelled goal (DESIGN.v2.md §13: the failed-goal
-// human take-over path): back to active with the reason as handoff_note, and
-// a fresh run on the current assignee (attempt resets — a reopen is a new
+// Reopen restarts a terminal goal — failed/cancelled (the failed-goal human
+// take-over path, DESIGN.v2.md §13) AND done (the comment-triggered reopen:
+// a mention on a done goal is "this task is not over" — an追加需求, GitHub's
+// reopen-and-comment): back to active with the reason as handoff_note, and a
+// fresh run on the current assignee (attempt resets — a reopen is a new
 // human-directed cycle, like a reject).
 func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal, error) {
 	g, err := s.Get(ctx, goalID)
 	if err != nil {
 		return nil, err
 	}
-	if g.Status != "failed" && g.Status != "cancelled" {
-		return nil, NewValidationError("only failed or cancelled goals can be reopened")
+	if g.Status != "failed" && g.Status != "cancelled" && g.Status != "done" {
+		return nil, NewValidationError("only done, failed, or cancelled goals can be reopened")
 	}
 	note := "Reopened"
 	if reason != "" {
 		note += ": " + reason
 	}
 	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE goal SET status='active', handoff_note=?, review_request='' WHERE id=? AND status IN ('failed','cancelled')`,
+		`UPDATE goal SET status='active', handoff_note=?, review_request='' WHERE id=? AND status IN ('done','failed','cancelled')`,
 		note, goalID); err != nil {
 		return nil, fmt.Errorf("reopen goal: %w", err)
 	}

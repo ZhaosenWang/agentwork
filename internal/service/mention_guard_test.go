@@ -137,6 +137,111 @@ func TestReviewDurationRecorded(t *testing.T) {
 	}
 }
 
+// TestTerminalMentionReopensGoal: a HUMAN comment with an action mention on a
+// terminal goal (done/failed/cancelled) reopens it — GitHub's
+// reopen-and-comment — and the mention then triggers normally.
+func TestTerminalMentionReopensGoal(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	agentB := seedAgent(t, st, "B")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "work", Description: "do it", DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	r := enqueueFirst(t, rs, g)
+	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "done" {
+		t.Fatalf("goal should be done, got %q", after.Status)
+	}
+
+	// Human comment with an action mention → auto-reopen + mention run.
+	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "human", AuthorID: "ui", Content: "[@B](mention://agent/" + agentB + ") 追加需求"}); err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+	reopened, _ := gs.Get(ctx, g.ID)
+	if reopened.Status != "active" {
+		t.Fatalf("mention on terminal goal must reopen it, got %q", reopened.Status)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	found := false
+	for _, run := range runs {
+		if run.AgentID == agentB && (run.Status == "queued" || run.Status == "running") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the mention must trigger a run on the mentioned agent after reopen")
+	}
+}
+
+// TestTerminalPlainCommentLandsOnly: a HUMAN comment WITHOUT a mention on a
+// terminal goal lands only — no reopen, no run (a stray remark must not burn
+// a cycle).
+func TestTerminalPlainCommentLandsOnly(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "work", Description: "do it", DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	r := enqueueFirst(t, rs, g)
+	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "human", AuthorID: "ui", Content: "做得不错"}); err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "done" {
+		t.Fatalf("plain comment must NOT reopen a terminal goal, got %q", after.Status)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	for _, run := range runs {
+		if run.Status == "queued" || run.Status == "running" {
+			t.Fatalf("plain comment must not trigger runs, found %s", run.Status)
+		}
+	}
+}
+
+// TestTerminalAgentMentionNoReopen: an AGENT comment on a terminal goal does
+// not trigger the reopen (only the human's words reopen — an agent has no
+// business speaking on a finished goal).
+func TestTerminalAgentMentionNoReopen(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	agentB := seedAgent(t, st, "B")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "work", Description: "do it", DomainID: domID, AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	r := enqueueFirst(t, rs, g)
+	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "agent", AuthorID: agentA, Content: "[@B](mention://agent/" + agentB + ") 帮忙"}); err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "done" {
+		t.Fatalf("agent comment must NOT reopen a terminal goal, got %q", after.Status)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	for _, run := range runs {
+		if run.AgentID == agentB && (run.Status == "queued" || run.Status == "running") {
+			t.Fatalf("agent comment must not trigger runs on a terminal goal, found %s", run.Status)
+		}
+	}
+}
+
 // TestGuestFailedRunLeavesTrace: a mention-triggered (guest) run that FAILS
 // leaves a system trace in the feed — the human waiting at a checkpoint sees
 // "the collaboration run failed" instead of an empty request.

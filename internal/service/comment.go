@@ -144,12 +144,34 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 	// Dispatch mentions AFTER the comment is durably stored. @all suppresses
 	// auto-trigger entirely (no runs); other mentions enqueue runs.
 	// State freeze (DESIGN.v2.md §4, decision 2-3): mentions only trigger on
-	// an ACTIVE goal. While the goal is in review (or blocked / terminal), a
-	// mention lands as a comment — no run — so the branch state under the
-	// human's decision is never mutated underneath the approval, and a
-	// finished goal never gets new work. The comment stays in the feed (never
-	// lost); the human decides whether to act on it (approve/reject already
-	// IS that decision for the review window).
+	// an ACTIVE goal. While the goal is in review (or blocked), a mention
+	// lands as a comment — no run — so the branch state under the human's
+	// decision is never mutated underneath the approval. The comment stays in
+	// the feed (never lost); the human decides whether to act on it.
+	//
+	// COMMENT-TRIGGERED REOPEN (GitHub's reopen-and-comment): a HUMAN comment
+	// on a TERMINAL goal (done/failed/cancelled) that carries an action
+	// mention (agent/squad) reopens the goal — "this task is not over" — and
+	// the mention then triggers normally. A plain comment without a mention
+	// lands only (terminal goals take no silent new work; a stray remark must
+	// not burn a run).
+	isTerminal := g.Status == "done" || g.Status == "failed" || g.Status == "cancelled"
+	hasActionMention := false
+	for _, m := range ParseMentions(c.Content) {
+		if m.Type == "agent" || m.Type == "squad" {
+			hasActionMention = true
+			break
+		}
+	}
+	if isTerminal && c.AuthorType == "human" && hasActionMention {
+		if _, err := s.goalSvc.Reopen(ctx, c.GoalID, "评论触发重开："+c.Content); err == nil {
+			// Reopened → the goal is active now; the mention dispatch below
+			// proceeds against the fresh state.
+			if g2, err := s.goalSvc.Get(ctx, c.GoalID); err == nil {
+				g = g2
+			}
+		}
+	}
 	if HasMentionAll(c.Content) || g.Status != "active" {
 		// @all: notify humans only (TBD: no inbox in MVP) and suppress triggers.
 		// non-active: comment lands, triggers suppressed.
