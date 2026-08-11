@@ -7,10 +7,13 @@ import { cn } from "@/lib/utils";
 type ButtonVariant = "primary" | "ghost" | "danger" | "outline";
 
 const BTN_VARIANTS: Record<ButtonVariant, string> = {
-  primary: "bg-zinc-900 text-white hover:bg-zinc-700",
-  outline: "border border-zinc-300 bg-white text-zinc-700 hover:bg-zinc-50",
-  ghost: "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900",
-  danger: "border border-red-200 bg-white text-red-600 hover:bg-red-50",
+  primary:
+    "bg-gradient-to-b from-indigo-600 to-violet-600 text-white shadow-sm shadow-indigo-500/25 hover:shadow-md hover:shadow-indigo-500/30 hover:-translate-y-px",
+  outline:
+    "border border-zinc-300 bg-white text-zinc-700 hover:border-indigo-300 hover:text-indigo-700 hover:bg-indigo-50/50",
+  ghost: "text-zinc-600 hover:bg-indigo-50/60 hover:text-indigo-700",
+  danger:
+    "border border-red-200 bg-white text-red-600 hover:bg-red-50 hover:border-red-300",
 };
 
 export function Button({
@@ -21,7 +24,7 @@ export function Button({
   return (
     <button
       className={cn(
-        "inline-flex items-center justify-center px-3 py-1.5 text-sm font-medium rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed",
+        "inline-flex items-center justify-center px-3 py-1.5 text-sm font-medium rounded-lg transition-all duration-150 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:translate-y-0 disabled:hover:shadow-none",
         BTN_VARIANTS[variant],
         className
       )}
@@ -31,29 +34,44 @@ export function Button({
 }
 
 // ── Badge ──
+// pill 形 + 状态圆点：同一状态一个主色，圆点给"活着"的提示。
 const STATUS_COLORS: Record<string, string> = {
   // Goal statuses
-  backlog: "bg-zinc-100 text-zinc-600",
-  active: "bg-blue-50 text-blue-700 ring-1 ring-blue-200",
-  blocked: "bg-amber-50 text-amber-700 ring-1 ring-amber-200",
-  done: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200",
-  failed: "bg-red-50 text-red-700 ring-1 ring-red-200",
-  cancelled: "bg-zinc-100 text-zinc-400",
+  backlog: "bg-zinc-100 text-zinc-600 dot-zinc",
+  active: "bg-blue-50 text-blue-700 dot-blue",
+  blocked: "bg-amber-50 text-amber-700 dot-amber",
+  review: "bg-purple-50 text-purple-700 dot-purple",
+  done: "bg-emerald-50 text-emerald-700 dot-emerald",
+  failed: "bg-red-50 text-red-700 dot-red",
+  cancelled: "bg-zinc-100 text-zinc-400 dot-zinc",
   // Run statuses
-  queued: "bg-zinc-100 text-zinc-600",
-  running: "bg-green-50 text-green-700 ring-1 ring-green-200",
-  completed: "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200",
+  queued: "bg-zinc-100 text-zinc-600 dot-zinc",
+  running: "bg-green-50 text-green-700 dot-green",
+  completed: "bg-emerald-50 text-emerald-700 dot-emerald",
+};
+
+const STATUS_DOTS: Record<string, string> = {
+  "dot-zinc": "bg-zinc-400",
+  "dot-blue": "bg-blue-500",
+  "dot-amber": "bg-amber-500",
+  "dot-purple": "bg-purple-500",
+  "dot-emerald": "bg-emerald-500",
+  "dot-red": "bg-red-500",
+  "dot-green": "bg-green-500",
 };
 
 export function Badge({ status, className }: { status: string; className?: string }) {
+  const colors = STATUS_COLORS[status] ?? "bg-zinc-100 text-zinc-600 dot-zinc";
+  const dot = STATUS_DOTS[colors.split(" ").find((c) => c.startsWith("dot-")) ?? "dot-zinc"] ?? "bg-zinc-400";
   return (
     <span
       className={cn(
-        "inline-flex items-center px-2 py-0.5 text-xs font-medium rounded",
-        STATUS_COLORS[status] ?? "bg-zinc-100 text-zinc-600",
+        "inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-medium rounded-full",
+        colors.replace(/ dot-\S+/, ""),
         className
       )}
     >
+      <span className={cn("h-1.5 w-1.5 rounded-full", dot, status === "running" && "animate-pulse")} />
       {status}
     </span>
   );
@@ -79,7 +97,7 @@ export function Field({
 }
 
 export const inputCls =
-  "w-full px-3 py-2 border border-zinc-300 rounded-md text-sm bg-white text-zinc-900 placeholder:text-zinc-400 focus:border-zinc-500 focus:ring-2 focus:ring-zinc-200 outline-none transition";
+  "w-full px-3 py-2 border border-zinc-300 rounded-lg text-sm bg-white text-zinc-900 placeholder:text-zinc-400 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 outline-none transition";
 
 // ── Dialog ──
 export function Dialog({
@@ -106,7 +124,7 @@ export function Dialog({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-md bg-white rounded-xl shadow-2xl border border-zinc-200 flex flex-col max-h-[90vh]"
+        className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-zinc-200 flex flex-col max-h-[90vh] page-enter"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-100">
@@ -177,9 +195,10 @@ export function PageHeader({
 }
 
 // ── Empty state ──
-export function Empty({ children }: { children: React.ReactNode }) {
+export function Empty({ children, icon = "🌱" }: { children: React.ReactNode; icon?: string }) {
   return (
-    <div className="flex flex-col items-center justify-center py-16 text-center">
+    <div className="flex flex-col items-center justify-center py-14 text-center">
+      <span className="text-3xl mb-2 opacity-70">{icon}</span>
       <p className="text-sm text-zinc-400">{children}</p>
     </div>
   );

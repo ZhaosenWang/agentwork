@@ -9,6 +9,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/proto"
@@ -29,11 +30,36 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 	events := make(chan proto.Event, 256)
 	results := make(chan proto.Result, 1)
 
+	// Context cancellation must BREAK a blocking read: the agent process can
+	// hang on a network call with no output, and the idle/maxRunDuration
+	// watchdog's ctx cancellation would otherwise never interrupt the read
+	// blocked on the transport — the run would sit 'running' forever (a live
+	// 10-hour hang: opencode stuck on a model API request, watchdog fired,
+	// read never returned). Closing the transport makes the read return EOF →
+	// Prompt errors → the drain reports cancelled (ctx.Err() != nil).
+	//
+	// The waiter watches `done` (closed when the drain exits), NOT `results`:
+	// consuming a value from the buffered results channel would STEAL the
+	// drain's single result and the daemon would see "backend closed result
+	// channel" (a failed run for a completed turn — the regression this
+	// waiter caused).
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-done:
+			// Turn finished normally — nothing to break.
+		}
+	}()
+
 	// One drain goroutine drives the turn to completion. It runs the ACP
 	// handshake, the Prompt, and then closes both channels with a Result.
+	// The eventForwarder's pump goroutine closes `events` (after draining its
+	// queue); `results` closes here.
 	go func() {
-		defer close(events)
 		defer close(results)
+		defer close(done)
 
 		// On any failure path, surface the agent's captured stderr (stdio
 		// transport) so a bad-args / missing-config agent isn't reported as a
@@ -58,6 +84,7 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 		}
 		fwd := &eventForwarder{events: events}
 		sess.SetEventHandler(fwd)
+		go fwd.pump()
 
 		if _, err := sess.Prompt(ctx, acp.PromptRequest{
 			SessionID: newResp.SessionID,
@@ -77,6 +104,7 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 		// requiring the daemon to replay the event stream. Collected by the
 		// eventForwarder during the turn.
 		results <- proto.Result{Status: proto.StatusCompleted, Output: fwd.lastAssistantText(), SessionID: string(newResp.SessionID)}
+		fwd.close()
 	}()
 
 	return &proto.Run{Events: events, Result: results}, nil
@@ -88,19 +116,66 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 // stream. Accumulation is append-only; lastAssistantText returns the full text
 // once the turn is done. Guarded because the drain reader goroutine invokes the
 // callbacks concurrently with the Execute goroutine reading the result.
+//
+// Delivery: ACP callbacks push into a mutex-guarded queue (non-blocking,
+// never drops), and a pump goroutine forwards the queue to the events
+// channel (blocking send — the daemon consumes). The pump is the ONLY
+// closer of `events`: it closes once the forwarder is closed AND the queue
+// is drained, so a late ACP callback can never send on a closed channel
+// (the old select-default push silently dropped events AND raced the
+// close — a real panic window).
 type eventForwarder struct {
-	events   chan<- proto.Event
-	mu       sync.Mutex
-	msg      strings.Builder
+	events  chan<- proto.Event
+	mu      sync.Mutex
+	queue   []proto.Event
+	closed  bool
+	msg     strings.Builder
 	truncate int
 }
 
 const assistantOutputCap = 8 * 1024 // keep Result.Output from growing unbounded
 
+// push enqueues an event. Non-blocking and lossless (bounded by memory, not
+// by the consumer's speed). After close, pushes are dropped.
 func (f *eventForwarder) push(e proto.Event) {
-	select {
-	case f.events <- e:
-	default:
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		return
+	}
+	f.queue = append(f.queue, e)
+	f.mu.Unlock()
+}
+
+// close marks the forwarder closed; the pump drains the remaining queue and
+// then closes the events channel.
+func (f *eventForwarder) close() {
+	f.mu.Lock()
+	f.closed = true
+	f.mu.Unlock()
+}
+
+// pump forwards queued events to the events channel until closed-and-empty,
+// then closes it. Started once per Execute.
+func (f *eventForwarder) pump() {
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		f.mu.Lock()
+		if len(f.queue) == 0 {
+			if f.closed {
+				f.mu.Unlock()
+				close(f.events)
+				return
+			}
+			f.mu.Unlock()
+			<-ticker.C
+			continue
+		}
+		e := f.queue[0]
+		f.queue = f.queue[1:]
+		f.mu.Unlock()
+		f.events <- e
 	}
 }
 
@@ -163,5 +238,3 @@ func (f *eventForwarder) OnModeUpdate(acp.SessionModeId)                   {}
 func (f *eventForwarder) OnConfigOptionUpdate([]acp.SessionConfigOption)    {}
 func (f *eventForwarder) OnUsageUpdate(int, int, *acp.Cost)                 {}
 func (f *eventForwarder) OnSessionInfo(string, map[string]any)              {}
-
-var _ = json.Marshal

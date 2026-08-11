@@ -2,7 +2,7 @@
 // the different agent wire protocols (ACP, JSONL streams, JSON-RPC). The
 // daemon hands a Backend an already-open transport (built by runtime.Open)
 // plus the run's prompt; the Backend speaks its protocol, streams Events,
-// and delivers one terminal Result. See DESIGN.zh.md §6.
+// and delivers one terminal Result. See DESIGN.md
 //
 // Transports (stdio/ws/tcp) are wired by internal/runtime; protocols
 // (acp/jsonl/jsonrpc) are implemented here. Adding a protocol = adding a

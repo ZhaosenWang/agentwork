@@ -1,6 +1,6 @@
 // Package jsonlbackend is a stub for the single-direction JSONL-stream
 // protocol used by claude (`--output-format stream-json`) and opencode
-// (`run --format json`). See DESIGN.zh.md §6.
+// (`run --format json`). See DESIGN.md
 //
 // NOT IMPLEMENTED for MVP. Execute returns a "not implemented" Result so a
 // misconfigured runtime surfaces a clean failure instead of hanging. The acp

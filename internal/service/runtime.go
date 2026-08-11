@@ -13,7 +13,7 @@ import (
 // Runtime is a launch spec for a protocol-speaking agent. transport selects
 // how the daemon connects (stdio spawns executable+args; ws/tcp dials
 // endpoint). provider selects which backend speaks the wire protocol
-// (acp|jsonl|jsonrpc). See DESIGN.zh.md §6.
+// (acp|jsonl|jsonrpc). See DESIGN.md
 type Runtime struct {
 	ID         string            `json:"id"`
 	Name       string            `json:"name"`
@@ -85,7 +85,7 @@ func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Runtime
+	out := []Runtime{}
 	for rows.Next() {
 		var r Runtime
 		var argsJSON, envJSON string

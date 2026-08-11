@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,8 @@ func main() {
 		squadCmd(serverURL, os.Args[2:])
 	case "stats":
 		statsCmd(serverURL, os.Args[2:])
+	case "issue":
+		issueCmd(serverURL, goalID, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -52,6 +55,39 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
+}
+
+// issueCmd lets the agent reply to the issue behind its current goal (M4-B):
+// the platform owns the GitHub token and executes the comment — the agent
+// only produces the structured side effect.
+func issueCmd(serverURL, goalID string, args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli issue comment --text \"...\"")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("issue comment", flag.ExitOnError)
+	text := fs.String("text", "", "comment body")
+	_ = fs.Parse(args)
+	if *text == "" {
+		fail("--text is required")
+	}
+	if goalID == "" {
+		fail("AGENTWORK_GOAL_ID not set — this command must run inside a goal's run")
+	}
+	body, err := json.Marshal(map[string]string{"goal_id": goalID, "text": *text})
+	if err != nil {
+		fail(err.Error())
+	}
+	resp, err := http.Post(serverURL+"/issue-comments", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		fail("issue comment: " + err.Error())
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		fail(fmt.Sprintf("issue comment failed: %s: %s", resp.Status, strings.TrimSpace(string(raw))))
+	}
+	fmt.Println("issue comment posted")
 }
 
 func usage() {
@@ -62,19 +98,22 @@ Subcommands:
                                              it explicitly); --limit caps to N most recent (default all);
                                              --status keeps only goals whose status equals S (exact match)
   goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
-  goal create --title T [--description D] [--assignee A] [--parent P] [--status S]
-                                             create a sub-goal (parent defaults to current goal)
+  goal create --title T [--description D] [--assignee A] [--status S]
+                                             create a goal
   goal comment --text T [--role R]           post a comment on the current goal; --text may
                                              contain a structured mention [@Name](mention://agent/<id>)
                                              to enqueue a run on that agent
-  goal wait                                  mark the current goal as waiting for its sub-goals;
-                                             the daemon re-runs it once all children finish
+  goal request-approval --reason R           park the current goal in review and ask the
+                                             human to decide (behavior gate)
   agent list                                 list all agents (JSON)
   squad list                                 list all squads (JSON)
   stats                                      goal/run status statistics (JSON): goal totals
                                              + counts per status (backlog/active/blocked/done/
                                              failed/cancelled) and run totals + counts per status
                                              (queued/running/completed/failed/cancelled)
+  issue comment --text T                     reply to the GitHub issue behind the current
+                                             goal (the platform owns the token; only for
+                                             issue-sourced goals, M4-B)
 
 Environment (injected by daemon):
   AGENTWORK_SERVER_URL   server base URL (default http://127.0.0.1:7373)
@@ -101,6 +140,8 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 		goalComment(serverURL, goalID, args[1:])
 	case "wait":
 		goalWait(serverURL, goalID, args[1:])
+	case "request-approval":
+		goalRequestApproval(serverURL, goalID, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown goal subcommand %q\n", args[0])
 		os.Exit(2)
@@ -190,7 +231,11 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	title := fs.String("title", "", "goal title (required)")
 	description := fs.String("description", "", "goal description (the work to do)")
 	assignee := fs.String("assignee", "", "assignee agent id (defaults to current agent)")
-	parent := fs.String("parent", "", "parent goal id (defaults to current goal)")
+	// Sub-goals are SLEEVED (DESIGN.md 决策 3-6): creation no longer
+	// defaults to a child of the current goal — an agent-created goal is an
+	// independent item, not a fan-out child (a defaulted parent used to make
+	// every agent-created goal a sub-goal that blocks its parent).
+	parent := fs.String("parent", "", "parent goal id (explicit sub-goal; NOT defaulted)")
 	status := fs.String("status", "active", "goal status")
 	fs.Parse(args)
 	if *title == "" {
@@ -201,9 +246,6 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	}
 	if *assignee == "" {
 		fail("--assignee is required (or AGENTWORK_AGENT_ID must be set)")
-	}
-	if *parent == "" {
-		*parent = goalID
 	}
 	body := map[string]string{
 		"title":           *title,
@@ -238,6 +280,26 @@ func goalWait(serverURL, goalID string, args []string) {
 		fail("AGENTWORK_GOAL_ID not set")
 	}
 	postNoBody(serverURL+"/goals/"+goalID+"/wait", nil)
+}
+
+// goalRequestApproval parks the current goal in review and asks the human
+// (behavior gate, DESIGN.md §5). The agent uses this when it hits a
+// decision it must not make alone.
+func goalRequestApproval(serverURL, goalID string, args []string) {
+	if goalID == "" {
+		fail("AGENTWORK_GOAL_ID not set")
+	}
+	reason := ""
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--reason" && i+1 < len(args) {
+			reason = args[i+1]
+			i++
+		}
+	}
+	if reason == "" {
+		fail("--reason is required")
+	}
+	post(serverURL+"/goals/"+goalID+"/request-approval", map[string]string{"reason": reason})
 }
 
 // ── agent / squad ──

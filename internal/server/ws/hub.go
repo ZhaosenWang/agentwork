@@ -19,12 +19,14 @@ import (
 // frontend.
 var topics = []string{
 	"goal:created", "goal:assigned", "goal:finished", "goal:retrying", "goal:retry_failed",
-	"goal:waiting", "goal:deleted",
-	"run:enqueued", "run:coalesced", "run:discarded", "run:event",
+	"goal:waiting", "goal:deleted", "goal:reviewing", "goal:approved", "goal:review_resolved",
+	"goal:delivered", "goal:deliver_failed",
+	"run:enqueued", "run:coalesced", "run:discarded", "run:event", "run:cancelled",
 	"comment:created",
 	"agent:created", "agent:deleted",
 	"squad:created", "squad:deleted", "squad:member_added",
 	"schedule:created", "schedule:fired",
+	"domain:created", "domain:deleted", "domain:compiled", "domain:compile_failed",
 }
 
 // Hub owns the set of active WS clients and fans out bus events to them.

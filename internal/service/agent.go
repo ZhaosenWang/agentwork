@@ -22,7 +22,6 @@ type Agent struct {
 	RuntimeID     string            `json:"runtime_id"`
 	SystemPrompt  string            `json:"system_prompt"`
 	Model         string            `json:"model"`
-	WorkdirBase   string            `json:"workdir_base"`
 	Env           map[string]string `json:"env"`
 	MaxConcurrent int               `json:"max_concurrent"`
 	CreatedAt     string            `json:"created_at"`
@@ -60,9 +59,9 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 	a.CreatedAt = now()
 	envJSON, _ := json.Marshal(a.Env)
 	_, err = s.st.DB().ExecContext(ctx,
-		`INSERT INTO agent (id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, a.WorkdirBase, string(envJSON), a.MaxConcurrent, a.CreatedAt)
+		`INSERT INTO agent (id,name,description,runtime_id,system_prompt,model,env,max_concurrent,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, string(envJSON), a.MaxConcurrent, a.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert agent: %w", err)
 	}
@@ -75,17 +74,17 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,env,max_concurrent,created_at
 		 FROM agent ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Agent
+	out := []Agent{}
 	for rows.Next() {
 		var a Agent
 		var envJSON string
-		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &a.WorkdirBase, &envJSON, &a.MaxConcurrent, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &a.MaxConcurrent, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(envJSON), &a.Env)
@@ -98,9 +97,9 @@ func (s *AgentService) Get(ctx context.Context, id string) (*Agent, error) {
 	var a Agent
 	var envJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,workdir_base,env,max_concurrent,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,env,max_concurrent,created_at
 		 FROM agent WHERE id=?`, id).
-		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &a.WorkdirBase, &envJSON, &a.MaxConcurrent, &a.CreatedAt)
+		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &a.MaxConcurrent, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

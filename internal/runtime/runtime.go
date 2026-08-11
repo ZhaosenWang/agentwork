@@ -35,6 +35,12 @@ type Spec struct {
 	Args       []string          // stdio only
 	Endpoint   string            // ws/tcp only
 	Env        map[string]string // stdio only (layered onto the passed env)
+	// Cwd is the subprocess's working directory. CRITICAL for agents that
+	// anchor on the PROCESS cwd rather than the ACP session cwd (opencode
+	// creates its instance in the process directory — without this, a run
+	// whose daemon was started from build/ would write files THERE instead
+	// of the goal's worktree).
+	Cwd string // stdio only
 }
 
 // Open opens a transport connection per the spec and returns a bare Conn.
@@ -63,6 +69,9 @@ func openStdio(ctx context.Context, spec Spec, taskEnv []string) (proto.Conn, er
 		env = append(env, k+"="+v)
 	}
 	cmd := exec.CommandContext(ctx, spec.Executable, spec.Args...)
+	if spec.Cwd != "" {
+		cmd.Dir = spec.Cwd
+	}
 	cmd.Env = env
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Target, Bot, Terminal, Users, Clock } from "lucide-react";
+import { Target, Bot, Terminal, Users, Clock, Boxes, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
@@ -11,13 +11,15 @@ const NAV_ITEMS = [
   { href: "/runtimes", label: "Runtime", icon: Terminal },
   { href: "/squads", label: "Squad", icon: Users },
   { href: "/schedules", label: "Schedule", icon: Clock },
+  { href: "/domains", label: "Domain", icon: Boxes },
+  { href: "/settings", label: "Settings", icon: Settings },
 ];
 
 export function Nav() {
   const pathname = usePathname();
   return (
-    <nav className="w-56 shrink-0 border-r border-zinc-200 bg-white flex flex-col gap-0.5 p-3">
-      <div className="px-3 py-3 text-sm font-bold text-zinc-900 tracking-tight">
+    <nav className="w-56 shrink-0 border-r border-zinc-200/80 bg-white/80 backdrop-blur-sm flex flex-col gap-0.5 p-3">
+      <div className="px-3 py-3.5 text-base font-bold tracking-tight bg-gradient-to-r from-indigo-600 to-violet-600 bg-clip-text text-transparent">
         agentwork
       </div>
       {NAV_ITEMS.map((item) => {
@@ -28,10 +30,10 @@ export function Nav() {
             key={item.href}
             href={item.href}
             className={cn(
-              "px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center gap-2.5",
+              "px-3 py-2 rounded-lg text-sm font-medium transition-all duration-150 flex items-center gap-2.5",
               active
-                ? "bg-zinc-900 text-white"
-                : "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900"
+                ? "bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-sm shadow-indigo-500/25"
+                : "text-zinc-600 hover:bg-indigo-50/70 hover:text-indigo-700"
             )}
           >
             <Icon className="h-4 w-4" />

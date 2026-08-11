@@ -34,13 +34,17 @@ func newTestHandlers(t *testing.T) (*Handlers, *store.Store, string) {
 	if err != nil {
 		t.Fatalf("seed agent: %v", err)
 	}
+	dom, err := service.NewDomainService(st, events.NewBus()).Create(ctx, service.Domain{Name: "handler-test", GitURL: "https://example.com/handler.git"})
+	if err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
 
 	h := &Handlers{Goal: gs}
 	mux := http.NewServeMux()
 	h.Mount(mux)
 
 	for _, title := range []string{"oldest", "middle", "newest"} {
-		if _, err := gs.Create(ctx, service.Goal{Title: title, AssigneeType: "agent", AssigneeID: agent.ID, Status: "active"}); err != nil {
+		if _, err := gs.Create(ctx, service.Goal{Title: title, AssigneeType: "agent", AssigneeID: agent.ID, Status: "active", DomainID: dom.ID}); err != nil {
 			t.Fatalf("create goal %q: %v", title, err)
 		}
 	}

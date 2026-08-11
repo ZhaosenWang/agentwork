@@ -16,6 +16,7 @@ import (
 
 	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/proto/acpbackend"
 	"github.com/eushing/agentwork/internal/proto/jsonlbackend"
@@ -41,6 +42,20 @@ func main() {
 
 	bus := events.NewBus()
 
+	// IM connection (DESIGN.md decision 2-14): the Web UI drives the Feishu
+	// connect flow — one-click app registration via QR scan, then the first
+	// bot message captures the receive target. Credentials persist to SQLite;
+	// the daemon auto-reconnects on startup. No environment configuration.
+	settingsSvc := service.NewSettingsService(st)
+	qs := notify.NewSQLQueryStore(st) // M3: card evidence / digest / intake queries
+	imConn := notify.NewConnector(settingsSvc, bus)
+	imConn.SetQueryStore(qs)
+	go func() {
+		if err := imConn.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("notify: feishu connector ended: %v", err)
+		}
+	}()
+
 	// Services. wired together explicitly to avoid a constructor-order cycle:
 	// GoalService <-> RunService hold cross-references (reconcile enqueues
 	// retries/wakes; run finish delegates to reconcile).
@@ -54,6 +69,15 @@ func main() {
 
 	squadSvc := service.NewSquadService(st, bus)
 	schedSvc := service.NewScheduleService(st, bus)
+	domainSvc := service.NewDomainService(st, bus)
+	domainSvc.SetRunService(runSvc)
+
+	// M3 IM: the approval-card callbacks resolve through the goal layer; the
+	// owner's inbound messages become intake parse runs on the configured
+	// global parser agent (app_settings platform.intake_agent).
+	imConn.SetGoalService(goalSvc)
+	intakeSvc := notify.NewIntakeService(qs, settingsSvc, runSvc)
+	imConn.SetIntakeService(intakeSvc)
 
 	// Protocol backends registered by provider name (runtime.provider selects).
 	protoReg := proto.NewRegistry()
@@ -61,14 +85,14 @@ func main() {
 	protoReg.Register("jsonl", jsonlbackend.New())
 	protoReg.Register("jsonrpc", jsonrpcbackend.New())
 
-	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, squadSvc, schedSvc)
+	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, squadSvc, schedSvc, imConn, qs, intakeSvc)
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("daemon: %v", err)
 		}
 	}()
 
-	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc)
+	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc, domainSvc, imConn)
 	if err := srv.ListenAndServe(ctx, *addr); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("server: %v", err)
 	}

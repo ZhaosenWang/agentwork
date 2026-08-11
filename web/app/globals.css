@@ -18,11 +18,30 @@ html {
   color-scheme: light;
 }
 
+/* 页面背景：zinc 底 + 顶部一道 indigo 光晕，平铺感换成有呼吸的层次。 */
 body {
-  background: var(--background);
+  background:
+    radial-gradient(1100px 380px at 18% -12%, rgba(99, 102, 241, 0.09), transparent 65%),
+    radial-gradient(900px 320px at 88% -8%, rgba(168, 85, 247, 0.07), transparent 60%),
+    var(--background);
   color: var(--foreground);
   font-family: var(--font-geist-sans), system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+/* 页面进入：轻微上浮淡入，不夸张但去除"啪一下出现"的生硬。 */
+@keyframes fade-rise {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.page-enter {
+  animation: fade-rise 0.25s ease-out;
 }
 
 /* Restore Tailwind v3 default border color so bare `border` = zinc-200,
@@ -46,8 +65,8 @@ body {
   textarea:focus,
   select:focus {
     outline: none;
-    border-color: #3f3f46;
-    box-shadow: 0 0 0 3px rgba(63, 63, 70, 0.08);
+    border-color: #6366f1;
+    box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.14);
   }
   input::placeholder,
   textarea::placeholder {

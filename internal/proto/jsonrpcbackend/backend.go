@@ -1,5 +1,5 @@
 // Package jsonrpcbackend is a stub for the bidirectional JSON-RPC 2.0 protocol
-// used by codex (`app-server --listen stdio`). See DESIGN.zh.md §6.
+// used by codex (`app-server --listen stdio`). See DESIGN.md
 //
 // NOT IMPLEMENTED for MVP. Wire = implementing the pending-request map,
 // server→client notification handling, `turn/completed` detection with

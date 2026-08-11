@@ -14,23 +14,28 @@ import (
 // Run is one execution of a goal by one agent (the execution plane). It has
 // NO authority over goal status: on a terminal status the daemon calls
 // GoalService.ReconcileOnRunEnd, which is the sole path that advances a goal.
-// See DESIGN.zh.md §2/§7.
+// See DESIGN.md §9.
 type Run struct {
-	ID              string `json:"id"`
-	GoalID          string `json:"goal_id"`
-	AgentID         string `json:"agent_id"`
-	SessionID       string `json:"session_id"`
-	Workdir         string `json:"workdir"`
-	Status          string `json:"status"`
-	Attempt         int    `json:"attempt"`
-	ResultSummary   string `json:"result_summary"`
+	ID               string `json:"id"`
+	GoalID           string `json:"goal_id"`
+	AgentID          string `json:"agent_id"`
+	RunKind          string `json:"run_kind"` // worker|processor (platform-internal)
+	RunType          string `json:"run_type"` // processor tasks: compile|intake (M3)
+	DomainID         string `json:"domain_id"`
+	Prompt           string `json:"prompt"` // processor runs only
+	SessionID        string `json:"session_id"`
+	Workdir          string `json:"workdir"`
+	Status           string `json:"status"`
+	Attempt          int    `json:"attempt"`
+	ResultSummary    string `json:"result_summary"`
+	Evidence         string `json:"evidence"` // JSON: diff stats + verify output + summary
 	TriggerCommentID string `json:"trigger_comment_id"`
-	IsLeaderRun     bool   `json:"is_leader_run"`
-	SquadID         string `json:"squad_id"`
-	QueuedAt        string `json:"queued_at"`
-	StartedAt       string `json:"started_at"`
-	FinishedAt      string `json:"finished_at"`
-	CreatedAt       string `json:"created_at"`
+	IsLeaderRun      bool   `json:"is_leader_run"`
+	SquadID          string `json:"squad_id"`
+	QueuedAt         string `json:"queued_at"`
+	StartedAt        string `json:"started_at"`
+	FinishedAt       string `json:"finished_at"`
+	CreatedAt        string `json:"created_at"`
 }
 
 type RunService struct {
@@ -69,7 +74,7 @@ func (s *RunService) resolveLeader(ctx context.Context, assigneeType, assigneeID
 }
 
 // hasPending reports whether goalID already has a queued/running run on agentID,
-// for the per-(goal,agent) pending coalesce (DESIGN.zh.md §9.5).
+// for the per-(goal,agent) pending coalesce (DESIGN.md).
 func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID string) (bool, error) {
 	var n int
 	err := tx.QueryRowContext(ctx,
@@ -86,9 +91,16 @@ func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID
 // the same tx so it sees the caller's un-committed state (this is what keeps
 // a parent-wake flipping blocked→active + enqueue one atomic operation, and
 // what stops two parallel child-dones from double-enqueuing the parent).
-func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, error) {
+//
+// The run event (enqueued/coalesced) is RETURNED, not published: publishing
+// inside the tx would violate the "bus.Publish after commit" invariant (a
+// rolled-back tx must not emit). The caller publishes after its commit.
+// Note: EnqueueExistingTx (the parent-wake path inside a goal tx) does not
+// publish — the goal layer's commitAndEmit covers goal events; the run event
+// for that path is a known M2 refinement.
+func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, *events.Event, error) {
 	if pending, err := s.hasPending(ctx, tx, goalID, agentID); err != nil {
-		return nil, err
+		return nil, nil, err
 	} else if pending {
 		// Coalesce: a queued/running run for this (goal,agent) already exists
 		// (possibly just advanced to active by this same tx). Don't duplicate.
@@ -96,10 +108,10 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		_ = tx.QueryRowContext(ctx,
 			`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND status IN ('queued','running') ORDER BY queued_at LIMIT 1`,
 			goalID, agentID).Scan(&id)
-		s.bus.Publish(ctx, events.Event{Topic: "run:coalesced", Payload: map[string]any{
+		ev := &events.Event{Topic: "run:coalesced", Payload: map[string]any{
 			"goal_id": goalID, "agent_id": agentID,
-		}})
-		return &Run{ID: id, GoalID: goalID, AgentID: agentID}, nil
+		}}
+		return &Run{ID: id, GoalID: goalID, AgentID: agentID}, ev, nil
 	}
 	ts := now()
 	leaderFlag := 0
@@ -119,13 +131,13 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		CreatedAt:       ts,
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO run (id,goal_id,agent_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.GoalID, r.AgentID, "", "", r.Status, r.Attempt, r.ResultSummary, r.TriggerCommentID, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
-		return nil, fmt.Errorf("insert run: %w", err)
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Attempt, r.ResultSummary, r.TriggerCommentID, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
+		return nil, nil, fmt.Errorf("insert run: %w", err)
 	}
-	s.bus.Publish(ctx, events.Event{Topic: "run:enqueued", Payload: r})
-	return &r, nil
+	ev := &events.Event{Topic: "run:enqueued", Payload: r}
+	return &r, ev, nil
 }
 
 // EnqueueForGoal creates the first run for a goal based on its current
@@ -153,10 +165,63 @@ func (s *RunService) EnqueueExisting(ctx context.Context, goalID, agentID string
 
 // EnqueueForMention creates a run on an explicitly-mentioned agent for the
 // same goal, sourced from a comment. trigger_comment_id records provenance.
-// Per DESIGN.zh.md §5.3 this enqueues on the mentioned agent (NOT the goal's
+// Per DESIGN.md §2 this enqueues on the mentioned agent (NOT the goal's
 // current assignee) and does NOT cancel any in-flight run.
 func (s *RunService) EnqueueForMention(ctx context.Context, goalID, agentID, triggerCommentID string) (*Run, error) {
 	return s.enqueue(ctx, goalID, agentID, 1, false, "", triggerCommentID)
+}
+
+// EnqueueProcessorRun creates a platform-internal processor run (DESIGN.md
+// §8): no goal, a fixed prompt, associated with a domain being processed
+// (compile) or carrying the platform context for the task (intake, M3).
+// runType discriminates the processor task (compile|intake); the daemon's
+// runProcessorTask dispatches on it. Coalesces: if the same (run_type,
+// domain/agent) already has a queued/running processor run, it is returned
+// instead of duplicating (a second compile of the same domain would race the
+// first; a backlog of intake runs on the same agent would duplicate work).
+func (s *RunService) EnqueueProcessorRun(ctx context.Context, runType, domainID, agentID, prompt string) (*Run, error) {
+	if runType == "" {
+		runType = "compile" // default: the original processor task
+	}
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var existing string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM run WHERE run_kind='processor' AND run_type=? AND domain_id=? AND agent_id=? AND status IN ('queued','running') LIMIT 1`,
+		runType, domainID, agentID).Scan(&existing)
+	if err == nil {
+		return &Run{ID: existing, DomainID: domainID, AgentID: agentID, Status: "queued"}, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("check pending processor run: %w", err)
+	}
+
+	ts := now()
+	r := Run{
+		ID:       newID(),
+		DomainID: domainID,
+		AgentID:  agentID,
+		RunKind:  "processor",
+		RunType:  runType,
+		Prompt:   prompt,
+		Status:   "queued",
+		QueuedAt: ts,
+		CreatedAt: ts,
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,prompt,session_id,workdir,status,attempt,result_summary,evidence,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, "", r.AgentID, r.RunKind, r.RunType, r.DomainID, r.Prompt, "", "", r.Status, 1, "", "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
+		return nil, fmt.Errorf("insert processor run: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &r, nil
 }
 
 func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, error) {
@@ -165,20 +230,26 @@ func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attemp
 		return nil, err
 	}
 	defer tx.Rollback()
-	r, err := s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, triggerCommentID)
+	r, ev, err := s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, triggerCommentID)
 	if err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	// Publish only after commit (invariant 13): a rolled-back tx emits nothing.
+	if ev != nil {
+		s.bus.Publish(ctx, *ev)
+	}
 	return r, nil
 }
 
 // EnqueueExistingTx is the same-package atomic variant for a caller that
 // already holds a transaction (e.g. the parent-wake path in GoalService, which
-// flips blocked→active and enqueues in one tx).
-func (s *RunService) EnqueueExistingTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID string) (*Run, error) {
+// flips blocked→active and enqueues in one tx). The run event is RETURNED —
+// the caller's tx owns the publish-after-commit contract and publishes after
+// its commit (invariant 13).
+func (s *RunService) EnqueueExistingTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID string) (*Run, *events.Event, error) {
 	return s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, "")
 }
 
@@ -192,9 +263,16 @@ type ClaimedRow struct {
 
 // Claim atomically claims the oldest queued run for one of the ready
 // (has-worker, not crashed/deleted) agents AND has a free concurrency slot.
-// Per DESIGN.zh.md §7 the claim avoids the old global head-of-line blocking by
+// Per DESIGN.md the claim avoids the old global head-of-line blocking by
 // letting the daemon pass the set of agents with free capacity and claiming
 // only within that set. Returns (nil, nil) when nothing is claimable.
+//
+// PER-GOAL SERIALIZATION: a goal's runs are strictly sequential — a queued
+// run is not claimed while ANOTHER run of the same goal is running (the
+// worktree is exclusive to one run at a time; a mention-triggered run
+// arriving mid-run must WAIT, not race the worktree — the worktree-cleanliness
+// gate used to cancel it instead, which silently dropped the review step).
+// Processor runs (goal_id='') are unaffected.
 func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedRow, error) {
 	if len(readyAgents) == 0 {
 		return nil, nil
@@ -215,6 +293,10 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 		   SELECT r.id FROM run r
 		   JOIN agent a ON a.id = r.agent_id
 		   WHERE r.status='queued' AND r.agent_id IN (`+placeholders+`)
+		     AND NOT EXISTS (
+		       SELECT 1 FROM run r2
+		       WHERE r2.goal_id != '' AND r2.goal_id = r.goal_id AND r2.status='running'
+		     )
 		   ORDER BY r.queued_at
 		   LIMIT 1
 		 )
@@ -267,9 +349,9 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 	// Re-read the minimal context the goal layer needs to reconcile.
 	var rc goalRunContext
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary
+		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary, trigger_comment_id
 		 FROM run WHERE id=?`, runID).
-		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary)
+		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary, &rc.TriggerCommentID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -297,21 +379,49 @@ func (s *RunService) NotifyChildDone(ctx context.Context, childGoalID string) {
 
 func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,goal_id,agent_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
+		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
 		 FROM run WHERE goal_id=? ORDER BY queued_at`, goalID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Run
+	out := []Run{}
 	for rows.Next() {
 		var r Run
 		var leaderFlag int
-		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.SessionID, &r.Workdir, &r.Status, &r.Attempt, &r.ResultSummary, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.SessionID, &r.Workdir, &r.Status, &r.Attempt, &r.ResultSummary, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		r.IsLeaderRun = leaderFlag != 0
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// RunMessage is one row of a run's interaction stream (chat_message) — the
+// Web run detail's "what is the agent doing right now" view.
+type RunMessage struct {
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	ToolCalls string `json:"tool_calls"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ListMessages returns the run's persisted interaction stream, oldest first.
+func (s *RunService) ListMessages(ctx context.Context, runID string) ([]RunMessage, error) {
+	rows, err := s.st.DB().QueryContext(ctx,
+		`SELECT role, content, tool_calls, created_at FROM chat_message WHERE run_id=? ORDER BY created_at`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RunMessage{}
+	for rows.Next() {
+		var m RunMessage
+		if err := rows.Scan(&m.Role, &m.Content, &m.ToolCalls, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
 	}
 	return out, rows.Err()
 }

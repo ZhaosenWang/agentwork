@@ -1,6 +1,6 @@
 # agentwork
 
-> [English](README.md) | [Design](DESIGN.md) | [设计 (中文)](DESIGN.zh.md)
+> [English](README.md) | [Design](DESIGN.md) | [设计](DESIGN.md)
 
 多协议 AI Agent 任务管理与调度平台。统一管理 CLI Agent（Claude Code、Codex、
 OpenCode、自定义 Agent）—— 创建 Goal、分配给 Agent 或 Squad，由守护进程自动调度

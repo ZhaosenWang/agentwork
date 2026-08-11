@@ -1,4 +1,4 @@
-import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule } from "./types";
+import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7373";
 
@@ -38,6 +38,7 @@ export const createGoal = (body: {
   title: string;
   description?: string;
   parent_id?: string;
+  domain_id?: string;
   assignee_type?: string;
   assignee_id?: string;
   status?: string;
@@ -55,10 +56,24 @@ export const cancelGoal = (id: string) =>
   api<Goal>(`/goals/${id}/cancel`, { method: "POST" });
 export const waitGoalChildren = (id: string) =>
   api<void>(`/goals/${id}/wait`, { method: "POST" });
+export const reopenGoal = (id: string, reason?: string) =>
+  api<Goal>(`/goals/${id}/reopen`, { method: "POST", body: JSON.stringify({ reason: reason ?? "" }) });
+export const resolveGoalReview = (
+  id: string,
+  body: { decision: "approve" | "reject" | "redirect"; reason?: string }
+) => api<Goal>(`/goals/${id}/review`, { method: "POST", body: JSON.stringify(body) });
 
 // ── Run ──
 export const listGoalRuns = (goalId: string) =>
   api<Run[]>(`/goals/${goalId}/runs`);
+export interface ChatMessage {
+  role: string; // user|assistant|tool|system
+  content: string;
+  tool_calls: string; // JSON
+  created_at: string;
+}
+export const listGoalRunMessages = (goalId: string, runId: string) =>
+  api<ChatMessage[]>(`/goals/${goalId}/runs/${runId}/messages`);
 
 // ── Comment ──
 export const listGoalComments = (goalId: string) =>
@@ -86,6 +101,73 @@ export const addSquadMember = (
 export const listSquadMembers = (squadId: string) =>
   api<SquadMember[]>(`/squads/${squadId}/members`);
 
+// ── Domain ──
+export const listDomains = () => api<Domain[]>("/domains");
+export const getDomain = (id: string) => api<Domain>(`/domains/${id}`);
+export const createDomain = (body: {
+  name: string;
+  git_url: string;
+  type?: string;
+  default_branch?: string;
+  git_identity?: string;
+  git_credentials?: string;
+  policy_text?: string;
+  processor_agent_id?: string;
+  issue_repo?: string;
+  issue_assignee?: string;
+  issue_assignee_type?: string;
+  issue_provider?: string;
+}) => api<Domain>("/domains", { method: "POST", body: JSON.stringify(body) });
+
+// updateDomain edits a domain's mutable config (issue handler etc.).
+export const updateDomain = (id: string, body: {
+  git_url?: string;
+  default_branch?: string;
+  git_identity?: string;
+  git_credentials?: string;
+  issue_repo?: string;
+  issue_assignee?: string;
+  issue_assignee_type?: string;
+  issue_provider?: string;
+}) => api<Domain>(`/domains/${id}`, { method: "PUT", body: JSON.stringify(body) });
+export const deleteDomain = (id: string) =>
+  api<void>(`/domains/${id}`, { method: "DELETE" });
+export const compileDomainPolicy = (
+  id: string,
+  body: { policy_text: string; processor_agent_id: string }
+) => api<Run>(`/domains/${id}/compile`, { method: "POST", body: JSON.stringify(body) });
+export const freezeDomainChecks = (
+  id: string,
+  body: { checks: Checks; verification_strength: string }
+) => api<Domain>(`/domains/${id}/checks`, { method: "POST", body: JSON.stringify(body) });
+
+// ── Gate health (M2) ──
+export const getGateStats = () => api<import("./types").GateStat[]>("/gate-decisions/stats");
+
+// ── IM (Feishu connect) ──
+export interface ImStatus {
+  status: string; // idle | waiting_qr | waiting_message | connected | failed
+  receive_id: string;
+  app_id: string;
+  error: string;
+  qr: { url: string; img_base64: string; expires_at: number };
+}
+export const getImStatus = () => api<ImStatus>("/im/feishu/status");
+export const connectFeishu = () =>
+  api<{ qr: { url: string; img_base64: string; expires_at: number }; status: string }>("/im/feishu/connect", { method: "POST" });
+export const disconnectFeishu = () =>
+  api<void>("/im/feishu/connect", { method: "DELETE" });
+
+// ── Platform settings (M3: IM inbound parser agent + digest time) ──
+export interface PlatformSettings {
+  intake_agent: string; // agent id: who parses the owner's IM messages
+  digest_time: string; // HH:MM local, '' = 09:00 default
+  webhook_secret: string; // platform webhook secret, shared across providers ('' = polling only)
+}
+export const getPlatformSettings = () => api<PlatformSettings>("/settings/platform");
+export const savePlatformSettings = (body: PlatformSettings) =>
+  api<PlatformSettings>("/settings/platform", { method: "PUT", body: JSON.stringify(body) });
+
 // ── Schedule ──
 export const listSchedules = () => api<Schedule[]>("/schedules");
 export const getSchedule = (id: string) => api<Schedule>(`/schedules/${id}`);
@@ -100,3 +182,5 @@ export const createSchedule = (body: {
 }) => api<Schedule>("/schedules", { method: "POST", body: JSON.stringify(body) });
 export const deleteSchedule = (id: string) =>
   api<void>(`/schedules/${id}`, { method: "DELETE" });
+export const setScheduleEnabled = (id: string, enabled: boolean) =>
+  api<Schedule>(`/schedules/${id}/enabled`, { method: "PUT", body: JSON.stringify({ enabled }) });

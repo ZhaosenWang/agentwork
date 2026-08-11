@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useSchedules, useAgents, useSquads, useCreateSchedule, useDeleteSchedule, useGoalEvents } from "@/lib/queries";
+import { useSchedules, useAgents, useSquads, useCreateSchedule, useDeleteSchedule, useSetScheduleEnabled, useGoalEvents } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import type { Schedule } from "@/lib/types";
 
@@ -12,6 +12,7 @@ export default function SchedulesPage() {
   const { data: squads } = useSquads();
   const createSchedule = useCreateSchedule();
   const deleteSchedule = useDeleteSchedule();
+  const setEnabled = useSetScheduleEnabled();
   const [showForm, setShowForm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
@@ -42,7 +43,7 @@ export default function SchedulesPage() {
                 <th className="px-4 py-3">时区</th>
                 <th className="px-4 py-3">下次触发</th>
                 <th className="px-4 py-3">创建时间</th>
-                <th className="px-4 py-3 w-20"></th>
+                <th className="px-4 py-3 w-28"></th>
               </tr>
             </thead>
             <tbody>
@@ -60,7 +61,16 @@ export default function SchedulesPage() {
                   <td className="px-4 py-3 text-zinc-400 text-xs">
                     {new Date(s.created_at).toLocaleString("zh-CN")}
                   </td>
-                  <td className="px-4 py-3 text-right">
+                  <td className="px-4 py-3 text-right space-x-3">
+                    <button
+                      onClick={() => setEnabled.mutate({ id: s.id, enabled: !s.enabled })}
+                      disabled={setEnabled.isPending}
+                      className={`text-xs transition-colors ${
+                        s.enabled ? "text-emerald-600 hover:text-emerald-700" : "text-zinc-400 hover:text-zinc-600"
+                      }`}
+                    >
+                      {s.enabled ? "启用中" : "已停用"}
+                    </button>
                     <button
                       onClick={() => setDeleteTarget(s.id)}
                       className="text-xs text-zinc-400 hover:text-red-600 transition-colors"

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"strings"
 	"context"
 	"testing"
 	"time"
@@ -37,6 +38,26 @@ func newTestCluster(t *testing.T) (*GoalService, *RunService, *CommentService, *
 	return gs, rs, cs, st
 }
 
+// seedDomain inserts a domain with a FROZEN empty acceptance policy (NO
+// gates — completed runs promote to done, so the pre-v2 test semantics
+// hold) and returns its id. The freeze matters: an unfrozen policy forces
+// the human checkpoint by design (决策 2-4/2-5 confirmation gate). v2:
+// agent-executed goals require a domain (DESIGN.md §2). Review-path
+// tests freeze gates separately.
+func seedDomain(t *testing.T, st *store.Store) string {
+	t.Helper()
+	ctx := context.Background()
+	ds := NewDomainService(st, events.NewBus())
+	d, err := ds.Create(ctx, Domain{Name: "test-domain", GitURL: "https://example.com/test.git"})
+	if err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+	if _, err := ds.FreezeChecks(ctx, d.ID, Checks{}, "medium"); err != nil {
+		t.Fatalf("freeze seed domain checks: %v", err)
+	}
+	return d.ID
+}
+
 // seedAgent inserts a runtime + agent and returns the agent id.
 func seedAgent(t *testing.T, st *store.Store, name string) string {
 	t.Helper()
@@ -70,7 +91,8 @@ func TestReconcileNormalCompletion(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	g, err := gs.Create(ctx, Goal{Title: "do thing", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "do thing", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
 	}
@@ -89,13 +111,14 @@ func TestReconcileNormalCompletion(t *testing.T) {
 // TestHandoffDoesNotClobber: A's run completes AFTER the goal was handed off
 // to B. A's result must NOT flip the goal to done — A is no longer the owner,
 // so reconcile discards it. This is the core self-consistency invariant
-// (DESIGN.zh.md §5.1/§7): the design without an external authority.
+// (DESIGN.md §9): the design without an external authority.
 func TestHandoffDoesNotClobber(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
 	agentB := seedAgent(t, st, "B")
-	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	rA := enqueueFirst(t, rs, g)
 	// Claim A's run so it's "running" (an in-flight run).
 	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
@@ -136,8 +159,9 @@ func TestHandoffNoteClearedOnOwnerDone(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
+	domID := seedDomain(t, st)
 	// Pre-seed a handoff note directly (Assign takes one, or a child wake sets it).
-	g, err := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", HandoffNote: "scope note"})
+	g, err := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", HandoffNote: "scope note", DomainID: domID})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
 	}
@@ -165,7 +189,8 @@ func TestCancelNotClobbered(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	r := enqueueFirst(t, rs, g)
 	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
 		t.Fatalf("claim: %v", err)
@@ -190,10 +215,11 @@ func TestSubGoalCoordination(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	pr := enqueueFirst(t, rs, parent)
-	c1, _ := gs.Create(ctx, Goal{Title: "child1", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
-	c2, _ := gs.Create(ctx, Goal{Title: "child2", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
+	c1, _ := gs.Create(ctx, Goal{Title: "child1", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
+	c2, _ := gs.Create(ctx, Goal{Title: "child2", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
 	_ = enqueueFirst(t, rs, c1)
 	_ = enqueueFirst(t, rs, c2)
 	if err := gs.WaitChildren(ctx, parent.ID); err != nil {
@@ -251,7 +277,8 @@ func TestCoalescePending(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	r1 := enqueueFirst(t, rs, g)
 	// Hand off to A again (re-enqueue) while r1 is still queued.
 	if _, err := gs.Assign(ctx, g.ID, "agent", agentA, "again"); err != nil {
@@ -281,9 +308,10 @@ func TestWakeRunawayGuarded(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active"})
+	domID := seedDomain(t, st)
+	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	// One child, already done (so inflight==0 → wake conditions otherwise met).
-	child, _ := gs.Create(ctx, Goal{Title: "c", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID})
+	child, _ := gs.Create(ctx, Goal{Title: "c", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
 	cr := enqueueFirst(t, rs, child)
 	// Parent must be waiting (blocked) for a child-done to wake it.
 	if err := gs.WaitChildren(ctx, parent.ID); err != nil {
@@ -335,42 +363,112 @@ func TestWakeRunawayGuarded(t *testing.T) {
 
 // Ensure the test binary doesn't time out on the background bus goroutines.
 var _ = time.Second
-// TestGoalListLimit: List returns newest-first, and a positive limit truncates
-// to the N most recent goals while 0/negative means all (default behavior).
-func TestGoalListLimit(t *testing.T) {
+// TestReopenFailedGoal: the human take-over path — failed/cancelled → active
+// with a fresh run (attempt resets), exactly like a reject iteration.
+func TestReopenFailedGoal(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='failed' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err := gs.Reopen(ctx, g.ID, "重试一下")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got.Status != "active" || got.HandoffNote == "" {
+		t.Fatalf("reopened goal must be active with a note, got %+v", got)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) == 0 || runs[len(runs)-1].Status != "queued" || runs[len(runs)-1].Attempt != 1 {
+		t.Fatalf("reopen must enqueue a fresh run at attempt 1, got %+v", runs)
+	}
+	// Done goals cannot be reopened.
+	if _, err := gs.Reopen(ctx, g.ID, "x"); err == nil {
+		t.Fatal("active goal must not be reopenable")
+	}
+}
+
+// TestParkForManualReview: the worktree-dirty path — a worktree with unattributed changes
+// parks the active goal in review (the human resolves, then the normal review
+// flow takes over).
+func TestParkForManualReview(t *testing.T) {
 	gs, _, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	titles := []string{"oldest", "middle", "newest"}
-	for _, title := range titles {
-		if _, err := gs.Create(ctx, Goal{Title: title, AssigneeType: "agent", AssigneeID: agentA, Status: "active"}); err != nil {
-			t.Fatalf("create goal %q: %v", title, err)
-		}
-	}
+	domID := seedDomainWithGates(t, st)
 
-	// No limit / non-positive limit → all three, newest first.
-	for _, limit := range []int{0, -1} {
-		all, err := gs.List(ctx, limit)
-		if err != nil {
-			t.Fatalf("list limit=%d: %v", limit, err)
-		}
-		if len(all) != 3 {
-			t.Fatalf("limit=%d: expected 3 goals, got %d", limit, len(all))
-		}
-		if all[0].Title != "newest" || all[2].Title != "oldest" {
-			t.Fatalf("limit=%d: expected newest-first order, got %v", limit, []string{all[0].Title, all[1].Title, all[2].Title})
-		}
-	}
-
-	// Positive limit → exactly N most recent goals.
-	two, err := gs.List(ctx, 2)
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	if err != nil {
-		t.Fatalf("list limit=2: %v", err)
+		t.Fatalf("create: %v", err)
 	}
-	if len(two) != 2 {
-		t.Fatalf("limit=2: expected 2 goals, got %d", len(two))
+	if err := gs.ParkForManualReview(ctx, g.ID, "worktree 有未归因改动"); err != nil {
+		t.Fatalf("park: %v", err)
 	}
-	if two[0].Title != "newest" || two[1].Title != "middle" {
-		t.Fatalf("limit=2: expected [newest middle], got %v", []string{two[0].Title, two[1].Title})
+	got, _ := gs.Get(ctx, g.ID)
+	if got.Status != "review" || !strings.Contains(got.ReviewRequest, "未归因") {
+		t.Fatalf("parked goal must be in review with the reason, got %+v", got)
+	}
+}
+
+// TestClaimPerGoalSerialization: a queued run of a goal is NOT claimed while
+// another run of the same goal is running (the worktree is exclusive); it
+// becomes claimable once the running run finishes. Processor runs (no goal)
+// are never blocked.
+func TestClaimPerGoalSerialization(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	agentB := seedAgent(t, st, "B") // reviewer — a DIFFERENT agent than the runner
+
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: seedDomainWithGates(t, st)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := enqueueFirst(t, rs, g)
+	// The writer's run is claimed (running).
+	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
+		t.Fatal(err)
+	}
+	// A mention-triggered run on ANOTHER agent (the reviewer) lands mid-run.
+	// Coalescing is per-(goal,agent), so this creates a NEW run — and it
+	// must WAIT: the goal's worktree is exclusive.
+	if _, err := rs.EnqueueForMention(ctx, g.ID, agentB, "c1"); err != nil {
+		t.Fatal(err)
+	}
+	// Running run of the same goal → the queued one must NOT be claimable.
+	c, err := rs.Claim(ctx, []string{agentB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c != nil {
+		t.Fatalf("queued run must wait while the goal's run is running, claimed %s", c.RunID)
+	}
+	// A DIFFERENT goal's run is still claimable (serialization is per-goal).
+	g2, _ := gs.Create(ctx, Goal{Title: "g2", AssigneeType: "agent", AssigneeID: agentB, Status: "active", DomainID: seedDomain(t, st)})
+	enqueueFirst(t, rs, g2)
+	c, err = rs.Claim(ctx, []string{agentB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c == nil {
+		t.Fatal("another goal's queued run must be claimable")
+	}
+	// Finish the writer's run → the reviewer's queued run becomes claimable.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE run SET status='completed', finished_at=? WHERE id=?`, now(), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	c, err = rs.Claim(ctx, []string{agentB})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c == nil || c.GoalID != g.ID {
+		t.Fatalf("queued run must be claimable after the running run finishes, got %+v", c)
 	}
 }

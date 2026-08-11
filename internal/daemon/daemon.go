@@ -10,23 +10,28 @@
 // State authority is NOT here: when a run reaches a terminal status the daemon
 // calls RunService.Finish, which stamps the run row then hands the outcome to
 // GoalService.ReconcileOnRunEnd — the sole place that advances goal.status.
-// See DESIGN.zh.md §7.
+// See DESIGN.md
 package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/issue"
+	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/runtime"
 	"github.com/eushing/agentwork/internal/service"
@@ -41,6 +46,32 @@ const dispatchTickInterval = 500 * time.Millisecond
 
 // scheduleTickInterval is how often the daemon scans schedule for due firings.
 const scheduleTickInterval = 5 * time.Second
+
+// worktreeCleanupInterval is how often the daemon sweeps expired goal
+// worktrees (M1: every 6h).
+const worktreeCleanupInterval = 6 * time.Hour
+
+// digestTickInterval is how often the daemon checks whether the daily digest
+// is due (M3: once a minute; the digest fires at most once per day).
+const digestTickInterval = time.Minute
+
+// digestDefaultTime is the daily digest time (HH:MM, local) when the owner
+// has not configured notify.digest_time (DESIGN.md §11 M3).
+const digestDefaultTime = "09:00"
+
+// issuePollInterval is the default issue-trigger latency (M4-B: the trigger
+// is a poll — no public webhook on a single-user machine). Default 30s so an
+// issue becomes a goal quickly; the owner can raise it via app_settings
+// (platform.issue_poll_interval, seconds) for many tracked repos + rate
+// limits. issuePollMinInterval is the tick floor (rate-limit protection).
+const (
+	issuePollInterval    = 30 * time.Second
+	issuePollMinInterval = 15 * time.Second
+)
+
+// worktreeRetentionDays is how long a terminal goal's worktree is kept after
+// its last run (DESIGN.md §13 — M1 value: 7 days; kept for review/debug).
+const worktreeRetentionDays = 7
 
 // workerQueueDepth bounds how many queued runs one agent's worker holds before
 // back-pressuring the dispatcher.
@@ -71,11 +102,20 @@ type Daemon struct {
 	runSvc    *service.RunService
 	squadSvc  *service.SquadService
 	schedSvc  *service.ScheduleService
+	im        *notify.Connector // M3: daily digest + intake replies (the notifier
+	// is born when the long connection connects; fetch it live)
+	qs        notify.QueryStore // M3: digest aggregation (may be nil)
+	issuePoll *issue.Poller     // M4-B: open issues → goals
+	issueCloser *issue.Closer   // M4-B: delivered goal → close its issue
+	intakeSvc   *notify.IntakeService // M4-B: multi-domain clarification draft store
+	lastIssuePoll time.Time     // last poll time (the interval is configurable)
 
-	mu      sync.Mutex
-	workers map[string]*agentWorker // agentID → per-agent scheduler
-	stopped bool
-	ctx     context.Context
+	mu          sync.Mutex
+	workers     map[string]*agentWorker // agentID → per-agent scheduler
+	domainLocks map[string]*domainLock  // per-domain git lock (fetch + deliver)
+	msgBuffers  map[string]*msgBuffer   // runID → aggregated text row (persistEvent)
+	stopped     bool
+	ctx         context.Context
 }
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.
@@ -90,15 +130,48 @@ type agentWorker struct {
 	maxConc    int
 }
 
-func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, squadSvc *service.SquadService, schedSvc *service.ScheduleService) *Daemon {
+// New wires the daemon. im + qs are the M3 IM surfaces: the connector is the
+// owner of the notifier (born when the long connection connects), qs feeds
+// the daily digest and intake queries. Both may be nil (notify not wired).
+func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, im *notify.Connector, qs notify.QueryStore, intakeSvc *notify.IntakeService) *Daemon {
 	d := &Daemon{
 		st: st, bus: bus, addr: addr,
 		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
-		workers: make(map[string]*agentWorker),
+		im:          im,
+		qs:          qs,
+		intakeSvc:   intakeSvc,
+		issuePoll:   issue.NewPoller(st, goalSvc, runSvc),
+		issueCloser: issue.NewCloser(st),
+		workers:     make(map[string]*agentWorker),
+		msgBuffers:  make(map[string]*msgBuffer),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
+	bus.Subscribe("goal:approved", d.onGoalApproved)
+	// Squad review checkpoint: a squad-owned goal parking in review triggers
+	// the squad's role=reviewer members (the squad's own rule, enforced by
+	// the platform — not by the leader's discretion).
+	bus.Subscribe("goal:reviewing", d.onGoalReviewing)
+	// M4-B: a delivered issue-sourced goal closes its GitHub issue (the
+	// work is merged — the issue is done). The fix commits (structured, from
+	// the deliver) travel into the close comment so the issue records WHAT
+	// was done with clickable links.
+	bus.Subscribe("goal:delivered", func(_ context.Context, e events.Event) {
+		m, ok := e.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		goalID, _ := m["goal_id"].(string)
+		note, _ := m["note"].(string)
+		var commits []string
+		if raw, ok := m["commits"].([]string); ok {
+			commits = raw
+		}
+		if goalID != "" {
+			d.issueCloser.OnDelivered(context.Background(), goalID, note, commits)
+		}
+	})
 	return d
 }
 
@@ -111,10 +184,24 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if n > 0 {
 		log.Printf("daemon: recovered %d stuck running run(s)", n)
 	}
+	// Decision 2-9, trigger side: an approve followed by a crash leaves the
+	// goal in review with the approve recorded and no deliver — re-run the
+	// deliver (its merge/push idempotency makes the replay safe).
+	if n, err := d.recoverPendingDelivers(ctx); err != nil {
+		log.Printf("daemon: recover pending delivers: %v", err)
+	} else if n > 0 {
+		log.Printf("daemon: re-delivering %d goal(s) whose approve never delivered", n)
+	}
 	dispatchTick := time.NewTicker(dispatchTickInterval)
 	scheduleTick := time.NewTicker(scheduleTickInterval)
+	cleanupTick := time.NewTicker(worktreeCleanupInterval)
+	digestTick := time.NewTicker(digestTickInterval)
+	issueTick := time.NewTicker(issuePollInterval)
 	defer dispatchTick.Stop()
 	defer scheduleTick.Stop()
+	defer cleanupTick.Stop()
+	defer digestTick.Stop()
+	defer issueTick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -125,8 +212,123 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.dispatchOnce(ctx)
 		case <-scheduleTick.C:
 			d.dispatchSchedules(ctx)
+		case <-cleanupTick.C:
+			d.cleanupWorktrees(ctx)
+		case <-digestTick.C:
+			d.dispatchDigest(ctx)
+		case <-issueTick.C:
+			d.dispatchIssues(ctx)
 		}
 	}
+}
+
+// dispatchIssues polls tracked repos for new open issues and turns them into
+// goals (M4-B). The interval bounds how quickly a new issue reaches the
+// queue — no public webhook needed on a single-user machine. The ticker
+// fires at the minimum interval; the effective interval (default 30s,
+// app_settings platform.issue_poll_interval in seconds, floor 15s) gates the
+// actual poll.
+func (d *Daemon) dispatchIssues(ctx context.Context) {
+	interval := issuePollInterval
+	var raw string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT value FROM app_settings WHERE key='platform.issue_poll_interval'`).Scan(&raw); err == nil && raw != "" {
+		if sec, err := strconv.Atoi(raw); err == nil && sec >= int(issuePollMinInterval/time.Second) {
+			interval = time.Duration(sec) * time.Second
+		}
+	}
+	d.mu.Lock()
+	now := time.Now()
+	if now.Sub(d.lastIssuePoll) < interval {
+		d.mu.Unlock()
+		return
+	}
+	d.lastIssuePoll = now
+	d.mu.Unlock()
+
+	n, err := d.issuePoll.Poll(ctx)
+	if err != nil {
+		log.Printf("daemon: issue poll: %v", err)
+		return
+	}
+	if n > 0 {
+		log.Printf("daemon: issue poll created %d goal(s)", n)
+	}
+}
+
+// ── daily digest (M3-3) ──
+
+// dispatchDigest fires the daily summary card once per day, at the
+// configured digest time (app_settings notify.digest_time, default 09:00).
+// The already-sent marker (notify.digest_last_sent, date) makes the fire
+// idempotent across daemon restarts.
+func (d *Daemon) dispatchDigest(ctx context.Context) {
+	notifier := d.imNotifier()
+	if notifier == nil || d.qs == nil {
+		return
+	}
+	now := time.Now()
+	today := now.Format("2006-01-02")
+	var last string
+	_ = d.st.DB().QueryRowContext(ctx,
+		`SELECT value FROM app_settings WHERE key='notify.digest_last_sent'`).Scan(&last)
+	if last == today {
+		return
+	}
+	hhmm := digestDefaultTime
+	// The digest time lives in the platform.m3 settings blob (M3 settings
+	// page: 设置 → 平台设置).
+	var blob string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT value FROM app_settings WHERE key='platform.m3'`).Scan(&blob); err == nil && blob != "" {
+		var st struct {
+			DigestTime string `json:"digest_time"`
+		}
+		if json.Unmarshal([]byte(blob), &st) == nil && st.DigestTime != "" {
+			hhmm = st.DigestTime
+		}
+	}
+	t, err := time.Parse("15:04", hhmm)
+	if err != nil {
+		log.Printf("daemon: digest time %q: %v", hhmm, err)
+		return
+	}
+	digestAt := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
+	if now.Before(digestAt) {
+		return // not due yet today
+	}
+	// Window: yesterday 00:00 → today 00:00 (the digest is a morning summary;
+	// a goal finishing this morning belongs to TOMORROW's digest).
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	card, err := notify.BuildDigestCard(ctx, d.qs, dayStart.Add(-24*time.Hour), dayStart, now)
+	if err != nil {
+		log.Printf("daemon: digest build: %v", err)
+		return
+	}
+	if err := notifier.SendCard(card); err != nil {
+		log.Printf("daemon: digest send: %v", err)
+		return
+	}
+	if _, err := d.st.DB().ExecContext(ctx,
+		`INSERT INTO app_settings (key,value,updated_at) VALUES ('notify.digest_last_sent',?,?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
+		today, nowStr()); err != nil {
+		log.Printf("daemon: digest marker: %v", err)
+	}
+	log.Printf("daemon: daily digest sent (%s)", today)
+}
+
+// Poller exposes the issue poller for the server's webhook wiring (M4-B:
+// both triggers share the same create-goal path).
+func (d *Daemon) Poller() *issue.Poller { return d.issuePoll }
+
+// imNotifier returns the live milestone pusher (nil before the long
+// connection is up — digest and intake replies then no-op).
+func (d *Daemon) imNotifier() *notify.Notifier {
+	if d.im == nil {
+		return nil
+	}
+	return d.im.Notifier()
 }
 
 // recoverWorkers rebuilds per-agent workers for every agent in the DB —
@@ -239,7 +441,7 @@ func (d *Daemon) stopAll() {
 // dispatchOnce claims queued runs only for agents whose worker has free
 // concurrency slots, then routes each to its agent's worker. This is the fix
 // for the old global head-of-line blocking: a saturated agent can no longer
-// stall other agents' dispatch (DESIGN.zh.md §7).
+// stall other agents' dispatch (DESIGN.md).
 func (d *Daemon) dispatchOnce(ctx context.Context) {
 	d.mu.Lock()
 	if d.stopped {
@@ -301,11 +503,266 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 		case w.queue <- q:
 			claimed++
 		default:
-			// Worker queue full; the claim is already 'running'. Bail and let
-			// the next tick re-evaluate. (Rare; bounded by queueDepth.)
-			log.Printf("daemon: worker queue full for agent %s", q.AgentID)
+			// Worker queue full (rare — bounded by workerQueueDepth): the
+			// claim already stamped the run 'running', so bailing would leave
+			// a dead run that never reaches a worker (stuck until restart).
+			// Return it to queued — the next tick re-claims it, attempt
+			// untouched.
+			log.Printf("daemon: worker queue full for agent %s — returning run %s to queued", q.AgentID, q.RunID)
+			if _, err := d.st.DB().ExecContext(ctx,
+				`UPDATE run SET status='queued', started_at='' WHERE id=?`, q.RunID); err != nil {
+				log.Printf("daemon: requeue overflow run %s: %v", q.RunID, err)
+			}
 			return
 		}
+	}
+}
+
+// ── worktree model (DESIGN.md §6) ──
+//
+// Layout:
+//
+//	{workspaceRoot}/domains/{domainID}/repo/     shared repo (cloned once)
+//	{workspaceRoot}/domains/{domainID}/wt-{goalID}/  per-goal worktree
+//
+// The domain owns the shared repo; each goal gets its own worktree + branch,
+// so multiple goals develop the same repo in parallel without interference.
+// Worktrees are allocated lazily (decision 2-18): the first run of a goal
+// creates it; later runs of the same goal reuse it — which is what makes
+// checkpoint resume (A5) work: the file-state is physically still there.
+// git operations on the shared repo (fetch, and every deliver) are
+// serialized per domain (decision 2-10): concurrent fetches would collide on
+// index.lock.
+
+// workspaceRoot is where domain repos and goal worktrees live.
+func workspaceRoot() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "agentwork-workspaces")
+	}
+	return filepath.Join(home, ".agentwork", "workspaces")
+}
+
+func domainRepoPath(domainID string) string {
+	return filepath.Join(workspaceRoot(), "domains", domainID, "repo")
+}
+
+func goalWorktreePath(domainID, goalID string) string {
+	return filepath.Join(workspaceRoot(), "domains", domainID, "wt-"+goalID)
+}
+
+// goalBranchName is the branch a goal's worktree works on.
+func goalBranchName(goalID string) string {
+	if len(goalID) > 8 {
+		goalID = goalID[:8]
+	}
+	return "feat-" + goalID
+}
+
+// domainLocks serializes git write operations per domain (fetch + deliver —
+// decision 2-10). fetch and deliver on different domains run concurrently.
+type domainLock struct {
+	mu  sync.Mutex
+	ref int
+}
+
+func (d *Daemon) lockDomain(domainID string) func() {
+	d.mu.Lock()
+	if d.domainLocks == nil {
+		d.domainLocks = make(map[string]*domainLock)
+	}
+	l := d.domainLocks[domainID]
+	if l == nil {
+		l = &domainLock{}
+		d.domainLocks[domainID] = l
+	}
+	l.ref++
+	d.mu.Unlock()
+
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		d.mu.Lock()
+		l.ref--
+		if l.ref == 0 {
+			delete(d.domainLocks, domainID)
+		}
+		d.mu.Unlock()
+	}
+}
+
+// ensureSharedRepo clones the domain repo ONCE as a BARE repository. Bare is
+// the correct shape for the worktree model: a regular clone's main worktree
+// holds one branch checked out, and git refuses to check that branch out in
+// any other worktree ("already checked out") — which breaks deliver when the
+// domain's default branch is the same one the main worktree sits on. A bare
+// repo has no main worktree, so every branch is free to be checked out in any
+// goal worktree. (git worktree add works against bare repos, git 2.5+.)
+//
+// Credentials (M4): the domain's git_credentials (a platform token) is
+// injected into the HTTPS clone URL as the username — the machine-identity
+// convention GitHub, GitLab and Gitee all accept. The credentialed URL
+// persists in the bare repo's origin config, so EVERY later fetch/push
+// (agent branches AND deliver's main push) inherits it — one credential
+// configures the whole repo lifecycle. SSH repos keep their own auth
+// (keys); git_credentials is a no-op there.
+func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL, gitCredentials string) error {
+	repo := domainRepoPath(domainID)
+	if _, err := os.Stat(filepath.Join(repo, "HEAD")); err == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(repo), 0o755); err != nil {
+		return err
+	}
+	cloneURL := gitCloneURL(gitURL, gitCredentials)
+	cmd := exec.CommandContext(ctx, "git", "clone", "--bare", cloneURL, repo)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git clone --bare %s: %w: %s", gitURL, err, string(out))
+	}
+	// A bare clone mirrors remote branches into LOCAL refs/heads/ (its
+	// remote.origin.fetch is "+refs/heads/*:refs/heads/*") and creates NO
+	// refs/remotes/origin/* — so resolveDefaultBranch, worktree add
+	// (origin/<branch>), and deliver would all fail to find the remote's
+	// branches. Point the fetch refspec at refs/remotes/origin/* instead so
+	// the rest of the code sees the usual remote-tracking namespace.
+	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*").CombinedOutput(); err != nil {
+		return fmt.Errorf("git config remote.origin.fetch: %w: %s", err, string(out))
+	}
+	return nil
+}
+
+// gitCloneURL injects the domain's credentials into an HTTPS clone URL. The
+// username convention differs PER HOST (surfaced by the first live GitCode
+// run: the agent's push with the token as username was rejected, while the
+// oauth2: prefix — the GitLab PAT format GitCode speaks — worked):
+//
+//	github.com → token as the username (machine-identity convention)
+//	gitcode.com → oauth2:TOKEN (GitLab-style PAT)
+//
+// Unknown hosts fall back to token-as-username. A URL that already carries
+// credentials (the owner embedded them explicitly) is left untouched; SSH
+// URLs are returned as-is.
+func gitCloneURL(gitURL, credentials string) string {
+	if credentials == "" || !strings.HasPrefix(gitURL, "https://") || strings.Contains(gitURL, "@") {
+		return gitURL
+	}
+	cred := credentials
+	if strings.Contains(gitURL, "gitcode.com") {
+		cred = "oauth2:" + credentials
+	}
+	return "https://" + cred + "@" + strings.TrimPrefix(gitURL, "https://")
+}
+
+// ensureGoalWorktree lazily allocates (decision 2-18) and syncs the goal's
+// worktree: fetches the shared repo (under the domain lock) and, if the
+// worktree does not exist yet, creates it on a fresh branch from the domain's
+// default branch. Returns the worktree path.
+func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitURL, gitCredentials, defaultBranch string) (string, error) {
+	wt := goalWorktreePath(domainID, goalID)
+	if _, err := os.Stat(filepath.Join(wt, ".git")); err == nil {
+		return wt, nil
+	}
+	unlock := d.lockDomain(domainID)
+	defer unlock()
+
+	if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
+		return "", err
+	}
+	repo := domainRepoPath(domainID)
+	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git fetch: %w: %s", err, string(out))
+	}
+	// Create the branch from the domain's configured default branch
+	// (DESIGN.md §6: the domain owns default_branch). If origin/
+	// {defaultBranch} does not exist, the error names it — the domain config
+	// is wrong and the owner fixes it. No silent fallbacks.
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "-b", goalBranchName(goalID), wt, "origin/"+defaultBranch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// The branch may already exist from an earlier run (resume path).
+		if exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", wt, goalBranchName(goalID)).Run() != nil {
+			return "", fmt.Errorf("git worktree add: %w: %s", err, string(out))
+		}
+	}
+	return wt, nil
+}
+
+// gitRun runs a git command in dir and returns its combined output.
+func gitRun(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// mustGitRun is gitRun for callers that need the (trimmed) output and can
+// tolerate a failure returning "" (baseline lookups — an empty baseline is
+// handled by the callers).
+func mustGitRun(ctx context.Context, dir string, args ...string) string {
+	out, _ := gitRun(ctx, dir, args...)
+	return strings.TrimSpace(out)
+}
+
+// insertFiredGoal inserts the schedule-fired goal row inside the caller's
+// transaction. Extracted as its own function because its column/value
+// mapping regressed twice (excess VALUES were silently accepted and wrote
+// 'active' into assignee_id with status left empty) — the regression test
+// calls THIS, not a copy.
+func insertFiredGoal(ctx context.Context, tx *sql.Tx, goalID, title, desc, domainID, assigneeType, assigneeID, scheduleID, ts string) error {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO goal (id,title,description,domain_id,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
+		 VALUES (?,?,?,?,?,?,'active','','system',?,?)`,
+		goalID, title, desc, domainID, assigneeType, assigneeID, scheduleID, ts)
+	return err
+}
+
+// ── worktree lifecycle (M1) ──
+
+// cleanupWorktrees removes worktrees of goals that reached a terminal state
+// more than worktreeRetentionDays ago. The goal's branch stays in the shared
+// repo (history is preserved); only the checkout is reclaimed.
+func (d *Daemon) cleanupWorktrees(ctx context.Context) {
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT g.id, g.domain_id, MAX(r.finished_at)
+		 FROM goal g JOIN run r ON r.goal_id = g.id
+		 WHERE g.status IN ('done','failed','cancelled')
+		 GROUP BY g.id, g.domain_id`)
+	if err != nil {
+		log.Printf("daemon: cleanup worktrees: query: %v", err)
+		return
+	}
+	type row struct{ goalID, domainID, finished string }
+	var found []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.goalID, &r.domainID, &r.finished); err != nil {
+			continue
+		}
+		found = append(found, r)
+	}
+	rows.Close()
+
+	cutoff := time.Now().Add(-worktreeRetentionDays * 24 * time.Hour)
+	for _, r := range found {
+		if r.domainID == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339Nano, r.finished)
+		if err != nil || t.After(cutoff) {
+			continue
+		}
+		wt := goalWorktreePath(r.domainID, r.goalID)
+		if _, err := os.Stat(wt); err != nil {
+			continue
+		}
+		unlock := d.lockDomain(r.domainID)
+		if out, err := gitRun(ctx, domainRepoPath(r.domainID), "worktree", "remove", "--force", wt); err != nil {
+			log.Printf("daemon: cleanup worktree %s: %v %s", r.goalID, err, out)
+		} else {
+			log.Printf("daemon: removed worktree for terminal goal %s (retention expired)", r.goalID)
+		}
+		unlock()
 	}
 }
 
@@ -313,22 +770,26 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 
 // runTask opens a transport, hands it to the protocol backend for one Prompt,
 // drains events into chat_message + WS, and finishes the run (which triggers
-// goal-layer reconciliation).
+// goal-layer reconciliation). Processor runs (no goal — run_kind=processor,
+// e.g. the acceptance-policy compiler) take the runProcessorTask path.
 func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
-	var title, desc, handoff, workdirBase, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
-	var maxConcurrent int
-	var isLeaderRun bool
-	var squadID string
+	if q.GoalID == "" {
+		d.runProcessorTask(ctx, q)
+		return
+	}
+	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
+	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT g.title, g.description, g.handoff_note, a.workdir_base, a.system_prompt,
-		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent,
-		        r2.is_leader_run, r2.squad_id
+		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
+		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
+		        g.source_ref, d.git_credentials
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
+		 LEFT JOIN domain d ON d.id = g.domain_id
 		 JOIN agent a ON a.id = r2.agent_id
 		 JOIN runtime r ON r.id = a.runtime_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &workdirBase, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &isLeaderRun, &squadID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials)
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -336,22 +797,91 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 
 	d.ensureWorker(q.AgentID, maxConcurrent)
 
-	// Per-run working directory.
-	runRowWorkdir := filepath.Join(workdirBase, q.RunID)
-	if workdirBase == "" {
-		runRowWorkdir = filepath.Join(os.TempDir(), "agentwork", q.RunID)
-	}
-	if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
-		d.failRun(ctx, q, fmt.Sprintf("mkdir workdir: %v", err))
+	// Working directory (DESIGN.md §6): the run works in the goal's
+	// worktree — lazily allocated on first run, reused on later runs of the
+	// same goal (this is what makes checkpoint resume work: the file state is
+	// physically still there). Every agent-executed run belongs to a domain
+	// (Create and Assign enforce it), so there is no scratch fallback.
+	if domainID == "" {
+		d.failRun(ctx, q, "run's goal has no domain — cannot allocate a worktree")
 		return
 	}
+	runRowWorkdir, err := d.ensureGoalWorktree(ctx, domainID, q.GoalID, gitURL, gitCredentials, defaultBranch)
+	if err != nil {
+		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
+		return
+	}
+	// Worktree cleanliness (DESIGN.md §4): a run must not start on a
+	// worktree carrying changes nobody can account for — the daemon would
+	// sweep a human's manual edits into the goal's commits. AGENTWORK.md
+	// (platform-injected) and the domain-declared excludes are EXPECTED; a
+	// cancelled previous run's leftovers are attributable (the checkpoint
+	// resume model relies on them). Anything else dirty at run start parks
+	// the goal in review for the human.
+	//
+	// Two escape hatches keep this from deadlocking:
+	//   - a prior cancelled run → the dirt is that run's leftovers (resume);
+	//   - the goal was just REJECTED → the dirt is what the agent must fix
+	//     this round (the human told it to, via the review decision note) —
+	//     blocking the run would trap the goal in park→reject forever.
+	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
+	if dirty := unattributedDirty(ctx, runRowWorkdir, checks.Excludes); dirty != "" {
+		var priorCancelled int
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='cancelled'`, q.GoalID).Scan(&priorCancelled)
+		var handoff string
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT handoff_note FROM goal WHERE id=?`, q.GoalID).Scan(&handoff)
+		justRejected := strings.HasPrefix(handoff, "Review decision: reject")
+		if priorCancelled == 0 && !justRejected {
+			reason := "worktree 有未归因的改动（可能是手动编辑）：\n" + dirty + "\n请检查 worktree 后批准继续或驳回。"
+			if err := d.goalSvc.ParkForManualReview(ctx, q.GoalID, reason); err != nil {
+				log.Printf("daemon: park %s for manual review: %v", q.GoalID, err)
+			}
+			// The run is parked WITHOUT the cancelled auto-retry path: the goal
+			// is already in review (park set it) and a retry would re-park and
+			// burn attempts. Stamp the run terminal directly — no Finish, no
+			// reconcile (the goal layer already moved).
+			if _, err := d.st.DB().ExecContext(ctx,
+				`UPDATE run SET status='cancelled', finished_at=? WHERE id=?`, nowStr(), q.RunID); err != nil {
+				log.Printf("daemon: park run %s terminal: %v", q.RunID, err)
+			}
+			return
+		}
+		log.Printf("daemon: worktree dirty for %s but attributable (cancelled leftovers or reject round) — continuing", q.GoalID)
+	}
+
+	// Environment readiness BEFORE the agent starts (决策 3-1, the setup half):
+	// the acceptance policy's setup commands (dependency installs) prepare the
+	// verification environment — but the agent needs the SAME environment to
+	// self-verify while working (a pytest it cannot import is a blind run).
+	// Run setup up front (idempotent; the verification stage re-runs it to
+	// guarantee the judging environment is fresh). A failed setup here is an
+	// environment failure — the run fails with that attribution, the retry
+	// chain applies as usual.
+	if checksFrozen && len(checks.Setup) > 0 {
+		setupReport, ok := runSetupOnly(ctx, runRowWorkdir, checks, timeout)
+		if !ok {
+			d.finishRun(ctx, q, "failed", "environment setup failed:\n"+setupReport)
+			return
+		}
+	}
+
+	// The run's diff baseline: guards and evidence measure this run's changes
+	// as baseSHA..HEAD (the agent may commit itself, and the daemon commits
+	// leftover work at run end — both land in HEAD).
+	baseSHA := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
 
 	// Inject the agent's identity + team roster / squad briefing into the
 	// workdir so the agent subprocess discovers who it is and who it can hand
-	// off to (AGENTS.md).
+	// off to (AGENTWORK.md).
 	roster := d.buildAgentGuide(ctx, q.AgentID)
+	// Squad briefing is judged DYNAMICALLY — the run's agent must be the
+	// goal's squad owner and its CURRENT leader. A leader mentioned by name
+	// (mention://agent/<leader>) gets the same operating protocol as a leader
+	// run triggered by assignment; authority and protocol stay consistent.
 	briefing := ""
-	if isLeaderRun && squadID != "" {
+	if squadID, isLeader := d.leaderSquadFor(ctx, q.GoalID, q.AgentID); isLeader && squadID != "" {
 		owns := d.goalOwnsSquadStatus(ctx, q.GoalID, squadID)
 		if b, err := d.squadSvc.BuildLeaderBriefing(ctx, squadID, owns); err == nil {
 			briefing = b
@@ -400,6 +930,30 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		"AGENTWORK_AGENT_ID="+q.AgentID,
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
+	// M4-B: issue-sourced goals carry the issue identity so the agent can
+	// reply via `agentwork-cli issue comment` (the platform owns the token);
+	// the LIVE issue comments are fetched at run start and injected into the
+	// prompt — the issue stays the source of truth, nothing is stored.
+	var issueRepo, issueNumber string
+	var issueComments []issue.Comment
+	if sourceRef != "" && gitCredentials != "" {
+		if provider, repo, num, ok := issue.ParseSourceRef(sourceRef); ok {
+			issueRepo, issueNumber = repo, strconv.Itoa(num)
+			if client, err := issue.NewProvider(provider, gitCredentials); err == nil {
+				if comments, err := client.ListComments(ctx, repo, num); err == nil {
+					issueComments = comments
+				} else if err != nil {
+					log.Printf("daemon: issue comments for %s: %v", sourceRef, err)
+				}
+			}
+		}
+	}
+	if issueRepo != "" {
+		taskEnv = append(taskEnv,
+			"AGENTWORK_ISSUE_REPO="+issueRepo,
+			"AGENTWORK_ISSUE_NUMBER="+issueNumber,
+		)
+	}
 
 	// Open the transport (stdio/ws/tcp); the backend speaks the protocol.
 	spec := runtime.Spec{
@@ -408,6 +962,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		Args:       args,
 		Endpoint:   endpoint,
 		Env:        rtEnv,
+		Cwd:        runRowWorkdir, // the goal's worktree — see Spec.Cwd
 	}
 	conn, err := runtime.Open(ctx, spec, taskEnv)
 	if err != nil {
@@ -415,8 +970,81 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 
-	// Prompt the run: title + description + handoff/wakeup note.
+	// Prompt the run: title + description + handoff/wakeup note, plus the
+	// issue comments fetched at run start (M4-B: the issue is the
+	// human-agent dialogue channel — the agent starts with the latest
+	// conversation, nothing stored).
 	prompt := buildPrompt(title, desc, handoff)
+
+	// The domain's acceptance policy in NL (the "what counts as done" the
+	// OWNER defined) — the agent works toward it instead of finding out at
+	// verification time. Only the NL intent is injected; the compiled checks
+	// (verify commands / guard patterns) stay invisible — an agent that sees
+	// the exact patterns can satisfy the check instead of the intent
+	// (triangle separation: define stays with the human, execute with the
+	// agent, judge with the machine+human).
+	var policyText string
+	_ = d.st.DB().QueryRowContext(ctx,
+		`SELECT d.policy_text FROM goal g JOIN domain d ON d.id=g.domain_id WHERE g.id=?`, q.GoalID).Scan(&policyText)
+	if s := strings.TrimSpace(policyText); s != "" {
+		prompt += "\n\n## 验收策略（这个域的完成标准，由域所有者定义）\n" + s +
+			"\n\n机器会按此验收你的改动——干活时对照它，避免返工。"
+	}
+
+	// The verification-failure feedback loop: a RETRY run (attempt > 1, the
+	// previous run failed machine verification) must know WHY it failed —
+	// otherwise it blindly re-runs the same work and likely fails again.
+	// The last failed run's report (verify/guards output) is injected with
+	// an explicit "fix, don't redo" framing.
+	if q.Attempt > 1 {
+		var lastFail string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT result_summary FROM run WHERE goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`,
+			q.GoalID).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
+			prompt += "\n\n## 上一轮失败原因（机器验证未通过——据此修改现有代码，不要从零重做）\n" + truncateIn(lastFail, 1500)
+		}
+	}
+
+	// Goal comments (the human's words on this goal) are injected too —
+	// otherwise a comment is invisible to the agent until a reject carries
+	// it in the note (the regression the user hit: "添加评论没啥作用").
+	// Only human/system comments — the agent's own are already in its
+	// transcript.
+	if rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT author_type, content FROM comment WHERE goal_id=? AND author_type IN ('human','system')
+		 ORDER BY created_at DESC LIMIT 5`, q.GoalID); err == nil {
+		var comments []string
+		for rows.Next() {
+			var at, content string
+			if rows.Scan(&at, &content) == nil && strings.TrimSpace(content) != "" {
+				comments = append(comments, at+"："+content)
+			}
+		}
+		rows.Close()
+		if len(comments) > 0 {
+			var b strings.Builder
+			b.WriteString("\n\n## Goal 评论（人在这个任务上的话）\n")
+			for i := len(comments) - 1; i >= 0; i-- { // 时间正序
+				b.WriteString("- " + comments[i] + "\n")
+			}
+			prompt += b.String()
+		}
+	}
+	if len(issueComments) > 0 {
+		var b strings.Builder
+		b.WriteString("\n\n## Issue 最新交流（来自 GitHub）\n")
+		for _, cm := range issueComments {
+			fmt.Fprintf(&b, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
+		}
+		prompt += b.String()
+	}
+	// Mention-cycle hint (soft tier): the goal's agent-triggered churn is
+	// above the hint threshold — tell the agents to stop circular handoffs
+	// instead of perpetuating them. (The hard tier fails the goal at the
+	// trigger site.)
+	if n, err := d.agentTriggeredRunCount(ctx, q.GoalID); err == nil && n > service.MaxMentionHints {
+		prompt += fmt.Sprintf("\n\n⚠️ 协作警告：agent 之间已互相转移任务 %d 次。请不要再把任务转给其他 agent——自己完成剩余工作，或结束本轮等待人工处理。", n)
+	}
 
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {
@@ -424,12 +1052,19 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, fmt.Sprintf("provider %q: %v", provider, err))
 		return
 	}
-	// The idle watchdog cancels promptCtx to interrupt a hung turn; backend
-	// Execute must run under promptCtx (not the bare ctx) so the cancel takes.
+	// maxRunDuration (DESIGN.md §4, decision 2-6): the run's total time
+	// budget, independent of activity — a run stuck in a tool loop must not
+	// burn forever. The idle watchdog (silence) and this (total time) are
+	// complementary cancellers of the same promptCtx. On timeout the backend
+	// reports StatusCancelled; the run is cancelled WITHOUT consuming attempt
+	// credit, the goal stays active, and the human is notified (M1 notify).
+	if maxRunDuration <= 0 {
+		maxRunDuration = 7200 // default 2h
+	}
 	var lastActivity atomic.Int64
 	lastActivity.Store(time.Now().UnixNano())
 	var inFlightTools atomic.Int32
-	promptCtx, promptCancel := context.WithCancel(ctx)
+	promptCtx, promptCancel := context.WithTimeout(ctx, time.Duration(maxRunDuration)*time.Second)
 	defer promptCancel()
 	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID)
 
@@ -458,6 +1093,9 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	if !ok {
 		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
 	}
+	// The event stream is done — flush the aggregated text buffer so the last
+	// message of the turn is persisted (persistEvent aggregates per-role).
+	d.flushRunMessages(ctx, q.RunID)
 	switch result.Status {
 	case proto.StatusCompleted:
 		// The handoff/wakeup note is consumed by the goal layer (ReconcileOnRunEnd
@@ -466,13 +1104,340 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// run no longer owns the goal, and clearing would wipe the new owner's
 		// note (see P2 in the bug review).
 		_ = d.runSvc.MarkSession(ctx, q.RunID, result.SessionID, runRowWorkdir)
-		d.finishRunOK(ctx, q, result.Output)
+
+		// The run's REPORT is its last assistant message — the agent's final
+		// summary (what it did + how it verified), NOT the full transcript
+		// (which opens with the agent's thinking). The approval card, the
+		// comment feed, and the deliver note all read this; a transcript
+		// opening made Feishu's approval card show "I'm the worker agent…"
+		// instead of the work. Falls back to the backend output.
+		var report string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT content FROM chat_message WHERE run_id=? AND role='assistant' AND content != '' ORDER BY created_at DESC LIMIT 1`,
+			q.RunID).Scan(&report); err != nil || strings.TrimSpace(report) == "" {
+			report = result.Output
+		}
+
+		if domainID != "" {
+			// Make the agent's work durable on the goal branch (the agent is
+			// guided to commit; the daemon guarantees it — deliver merges the
+			// branch, and uncommitted work would deliver nothing). The
+			// domain's declared excludes (checks.excludes, compiled + owner-
+			// confirmed) keep dependency dirs out of the branch.
+			if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID), checks.Excludes); err != nil {
+				d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
+				return
+			}
+			// Machine verification (DESIGN.md §4/§5 (§9 invariant 14)): the
+			// domain's verify commands run BEFORE the run is finished. A red
+			// verify ends the run failed → retry chain. The goal layer only
+			// ever sees 'completed' runs that passed.
+			//
+			// An UNFROZEN policy (checks_compiled_at empty — the owner never
+			// confirmed the compiled checks) runs NOTHING: no setup/verify/
+			// guards against an unconfirmed definition, and no gate evaluation
+			// (the goal layer forces the human checkpoint instead). Evidence
+			// still carries the diff + agent summary for that checkpoint.
+			verifyReport, guardReport := "", ""
+			if checksFrozen {
+				verifyReport, ok, policyIssue := runVerification(ctx, runRowWorkdir, checks, timeout)
+				if !ok {
+					// Objective policy defect (POSIX exit 127 — missing command /
+					// script)? Flag it once — the owner fixes the policy instead
+					// of the agent burning retries against an impossible check.
+					if policyIssue {
+						d.annotatePolicyIssue(ctx, q.GoalID)
+					}
+					d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)
+					return
+				}
+				// Structural guards on the diff (DESIGN.md §5.1), measured as
+				// baseSHA..HEAD — the run's own changes. git status would be empty
+				// here: the daemon just committed the agent's work (and the agent
+				// may have committed itself), so the worktree is clean.
+				guardReport, ok = checkGuards(ctx, runRowWorkdir, baseSHA, checks, baseline)
+				if !ok {
+					d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
+					return
+				}
+				// Gate evaluation (M2 rule engine): merge always fires; diff_*
+				// fire on the run's changed paths. The fired gates are recorded on
+				// the run row — the goal layer reads them in the reconcile
+				// transaction (the daemon computes, the goal layer judges).
+				gatesHit := evalGates(ctx, runRowWorkdir, baseSHA, checks)
+				if len(gatesHit) > 0 {
+					gatesJSON, _ := json.Marshal(gatesHit)
+					if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET gates_hit=? WHERE id=?`, string(gatesJSON), q.RunID); err != nil {
+						log.Printf("daemon: record gates_hit for run %s: %v", q.RunID, err)
+					}
+				}
+			}
+			// Evidence bundle for the approval card (decision 2-3).
+			ev := buildEvidence(ctx, runRowWorkdir, baseSHA, report, verifyReport, guardReport)
+			if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET evidence=? WHERE id=?`, ev, q.RunID); err != nil {
+				log.Printf("daemon: store evidence for run %s: %v", q.RunID, err)
+			}
+		}
+		d.finishRunOK(ctx, q, report)
 	case proto.StatusCancelled:
+		// decision 2-6 + the "stuck active with no run" hole: a cancelled run
+		// does NOT fail the goal, and does NOT consume attempt credit — the
+		// requeue keeps the SAME attempt (a timeout is not a machine failure).
+		// The convergence rule is separate: only the FIRST cancellation gets an
+		// automatic retry; a second consecutive stall is systemic (the agent
+		// keeps hanging) and surfaces to the owner instead of looping.
+		// Only TIMEOUT cancellations count toward the convergence rule — the
+		// worktree-dirty park and human cancels also mark runs cancelled
+		// (without the watchdog summary) and must not consume the single
+		// automatic retry.
+		var priorCancelled int
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='cancelled' AND result_summary LIKE 'idle watchdog:%'`, q.GoalID).Scan(&priorCancelled)
+		if priorCancelled == 0 {
+			var isLeader int
+			var squadID string
+			_ = d.st.DB().QueryRowContext(ctx, `SELECT is_leader_run, squad_id FROM run WHERE id=?`, q.RunID).Scan(&isLeader, &squadID)
+			if err := d.runSvc.EnqueueExisting(ctx, q.GoalID, q.AgentID, q.Attempt, isLeader != 0, squadID); err != nil {
+				log.Printf("daemon: requeue cancelled run %s: %v", q.RunID, err)
+			}
+		}
 		d.finishRun(ctx, q, "cancelled", "idle watchdog: "+result.Output)
+		// Surface the stall so the notify layer can tell the owner a task
+		// stalled (cancelled runs leave the goal active with no pending run —
+		// the human decides, per decision 2-6).
+		d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
+			"run_id": q.RunID, "goal_id": q.GoalID, "reason": "idle watchdog: " + result.Output,
+		}})
 	case proto.StatusFailed, proto.StatusAborted:
 		d.finishRun(ctx, q, "failed", result.Output)
 	}
 }
+
+// runProcessorTask executes a platform-internal processor run: opens the
+// agent's transport, sends the run's fixed prompt, drains events, and then
+// collects the FILE-based result — the compiled checks.json + strength.txt —
+// from the run workdir and stores it on the associated domain in an UNFROZEN
+// state (checks_compiled_at stays ''), publishing domain:compiled so the
+// frontend can show the owner confirmation card. Structured output is read
+// from files, never parsed from agent stdout (DESIGN.md §5.3, §9).
+func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
+	var prompt, runType, domainID, agentID string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT r2.prompt, r2.run_type, r2.domain_id, r2.agent_id FROM run r2 WHERE r2.id=?`, q.RunID).
+		Scan(&prompt, &runType, &domainID, &agentID)
+	if err != nil {
+		log.Printf("daemon: processor run %s: load config: %v", q.RunID, err)
+		d.failProcessorRun(ctx, q, "load config: "+err.Error())
+		return
+	}
+	// The intake pipeline (M3-4) has no domain — its coalesce key is the
+	// inbound message id (see IntakeService.Enqueue).
+	if runType == "intake" {
+		d.runIntakeTask(ctx, q, prompt, agentID)
+		return
+	}
+	if prompt == "" || domainID == "" {
+		d.failProcessorRun(ctx, q, "processor run missing prompt or domain_id")
+		return
+	}
+
+	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
+	var maxConcurrent int
+	err = d.st.DB().QueryRowContext(ctx,
+		`SELECT a.system_prompt, r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent
+		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`, agentID).
+		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent)
+	if err != nil {
+		d.failProcessorRun(ctx, q, "load agent runtime: "+err.Error())
+		return
+	}
+	d.ensureWorker(agentID, maxConcurrent)
+
+	// Workdir: compile runs work ON THE REAL REPO — a worktree of the domain's
+	// shared bare repo, so the processor compiles against what the repo
+	// actually is, not a guess from an empty scratch dir (the regression: an
+	// empty dir produced "pip install -r requirements.txt" for a zero-
+	// dependency repo and every verification failed). Intake runs keep the
+	// scratch dir (no repo involved).
+	runRowWorkdir := filepath.Join(workspaceRoot(), "proc", q.RunID)
+	if runType == "compile" {
+		var gitURL, gitCredentials, defaultBranch string
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT git_url, git_credentials, default_branch FROM domain WHERE id=?`, domainID).
+			Scan(&gitURL, &gitCredentials, &defaultBranch)
+		if gitURL == "" {
+			d.failProcessorRun(ctx, q, "compile run: domain has no git_url")
+			return
+		}
+		unlock := d.lockDomain(domainID)
+		if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
+			unlock()
+			d.failProcessorRun(ctx, q, "prepare compile repo: "+err.Error())
+			return
+		}
+		repo := domainRepoPath(domainID)
+		if defaultBranch == "" {
+			defaultBranch = "main"
+		}
+		if out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", runRowWorkdir, "origin/"+defaultBranch).CombinedOutput(); err != nil {
+			unlock()
+			d.failProcessorRun(ctx, q, "compile worktree add: "+err.Error()+": "+string(out))
+			return
+		}
+		unlock()
+		defer func() {
+			unlock := d.lockDomain(domainID)
+			_, _ = exec.CommandContext(context.Background(), "git", "-C", repo, "worktree", "remove", "--force", runRowWorkdir).CombinedOutput()
+			unlock()
+		}()
+	} else if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
+		d.failProcessorRun(ctx, q, "mkdir workdir: "+err.Error())
+		return
+	}
+
+	var args []string
+	_ = json.Unmarshal([]byte(argsJSON), &args)
+	var rtEnv map[string]string
+	_ = json.Unmarshal([]byte(rtEnvJSON), &rtEnv)
+	agentEnv, _ := d.loadAgentEnv(ctx, agentID)
+	taskEnv := os.Environ()
+	for k, v := range agentEnv {
+		taskEnv = append(taskEnv, k+"="+v)
+	}
+	// The processor agent is not a goal worker: no AGENTWORK_GOAL_ID/RUN_ID
+	// injection (it should not call back into the platform), just the server
+	// URL and its own identity for orientation.
+	addr := d.addr
+	if addr == "" {
+		addr = defaultListenAddr
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		d.failProcessorRun(ctx, q, "parse listen addr: "+err.Error())
+		return
+	}
+	taskEnv = append(taskEnv, "AGENTWORK_SERVER_URL=http://"+net.JoinHostPort("127.0.0.1", port))
+
+	conn, err := runtime.Open(ctx, runtime.Spec{
+		Transport: transport, Executable: execPath, Args: args, Endpoint: endpoint, Env: rtEnv,
+		Cwd: runRowWorkdir, // the processor's scratch dir — see Spec.Cwd
+	}, taskEnv)
+	if err != nil {
+		d.failProcessorRun(ctx, q, "open transport: "+err.Error())
+		return
+	}
+	defer conn.Close()
+
+	backend, err := d.protoReg.Get(provider)
+	if err != nil {
+		d.failProcessorRun(ctx, q, "provider "+provider+": "+err.Error())
+		return
+	}
+	run, err := backend.Execute(ctx, proto.ExecuteSpec{Conn: conn, Cwd: runRowWorkdir, Prompt: prompt})
+	if err != nil {
+		d.failProcessorRun(ctx, q, "execute: "+err.Error())
+		return
+	}
+	for ev := range run.Events {
+		d.persistEvent(ctx, q.RunID, ev)
+		d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
+			"run_id": q.RunID, "event": ev,
+		}})
+	}
+	result, ok := <-run.Result
+	if !ok {
+		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
+	}
+	d.flushRunMessages(ctx, q.RunID)
+	switch result.Status {
+	case proto.StatusCompleted:
+		// Read the compiled policy from the run workdir (file = structured
+		// side effect), validate, and store on the domain unfrozen.
+		checksPath := filepath.Join(runRowWorkdir, "checks.json")
+		raw, err := os.ReadFile(checksPath)
+		if err != nil {
+			d.failProcessorRun(ctx, q, "read checks.json: "+err.Error())
+			return
+		}
+		var checks service.Checks
+		if err := json.Unmarshal(raw, &checks); err != nil {
+			d.failProcessorRun(ctx, q, "parse checks.json: "+err.Error())
+			return
+		}
+		if len(checks.Verify) == 0 && len(checks.Guards) == 0 {
+			d.failProcessorRun(ctx, q, "checks.json: no verify or guards produced")
+			return
+		}
+		strength := "medium"
+		if sraw, err := os.ReadFile(filepath.Join(runRowWorkdir, "strength.txt")); err == nil {
+			if v := strings.TrimSpace(string(sraw)); v == "strong" || v == "medium" || v == "weak" {
+				strength = v
+			}
+		}
+		checksJSON, _ := json.Marshal(checks)
+		// The compiled policy ALWAYS lands (a fresh compile cycle replaces
+		// the previous one wholesale — DESIGN.md §5.3), and resets the
+		// freeze stamp: the domain returns to the pending-confirmation state
+		// so the owner's confirmation card reappears with the NEW product.
+		// (Regression: the old UPDATE was gated on checks_compiled_at='',
+		// which made a recompile AFTER freezing a silent no-op — the new
+		// product was discarded and runs kept verifying with the old policy.)
+		//
+		// The evolution-metrics baseline (decision 2-15) is recorded alongside
+		// (metrics.json — test count / coverage the processor measured at
+		// compile time). Only the FIRST compile stamps the baseline: later
+		// recompiles refresh the policy, not the evolution baseline.
+		baseline := "{}"
+		if raw, err := os.ReadFile(filepath.Join(runRowWorkdir, "metrics.json")); err == nil {
+			var m struct {
+				TestCount int     `json:"test_count"`
+				Coverage  float64 `json:"coverage"`
+			}
+			if json.Unmarshal(raw, &m) == nil && (m.TestCount > 0 || m.Coverage > 0) {
+				b, _ := json.Marshal(map[string]any{"test_count": m.TestCount, "coverage": m.Coverage})
+				baseline = string(b)
+			}
+		}
+		if _, err := d.st.DB().ExecContext(ctx,
+			`UPDATE domain SET checks=?, verification_strength=?, checks_compiled_at='',
+			        metrics_baseline=CASE WHEN metrics_baseline='{}' OR metrics_baseline='' THEN ? ELSE metrics_baseline END
+			 WHERE id=?`,
+			string(checksJSON), strength, baseline, domainID); err != nil {
+			d.failProcessorRun(ctx, q, "store compiled checks: "+err.Error())
+			return
+		}
+		if _, err := d.st.DB().ExecContext(ctx,
+			`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
+			result.Output, nowStr(), q.RunID); err != nil {
+			log.Printf("daemon: finish processor run %s: %v", q.RunID, err)
+		}
+		d.bus.Publish(ctx, events.Event{Topic: "domain:compiled", Payload: map[string]any{
+			"domain_id": domainID, "run_id": q.RunID,
+		}})
+		log.Printf("daemon: domain %s acceptance policy compiled (strength=%s)", domainID, strength)
+	case proto.StatusCancelled:
+		d.failProcessorRun(ctx, q, "idle watchdog: "+result.Output)
+	case proto.StatusFailed, proto.StatusAborted:
+		d.failProcessorRun(ctx, q, result.Output)
+	}
+}
+
+// failProcessorRun marks a processor run failed and notifies the frontend that
+// compilation did not complete (manual checks input remains the fallback).
+func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, summary string) {
+	log.Printf("daemon: processor run %s failed: %s", q.RunID, summary)
+	if _, err := d.st.DB().ExecContext(ctx,
+		`UPDATE run SET status='failed', result_summary=?, finished_at=? WHERE id=?`,
+		summary, nowStr(), q.RunID); err != nil {
+		log.Printf("daemon: mark processor run %s failed: %v", q.RunID, err)
+	}
+	d.bus.Publish(ctx, events.Event{Topic: "domain:compile_failed", Payload: map[string]any{
+		"run_id": q.RunID, "error": summary,
+	}})
+}
+
+// nowStr is the daemon-side UTC timestamp helper (service.now is private).
+func nowStr() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
 // trackToolInflight maintains the in-flight-tool counter the idle watchdog
 // reads to decide whether to use idleWindow or the larger idleToolWindow.
@@ -488,18 +1453,64 @@ func (d *Daemon) trackToolInflight(n *atomic.Int32, ev proto.Event) {
 	}
 }
 
+// persistEvent stores one protocol event into chat_message (the run detail
+// view's data source). Consecutive text/thought chunks from the same role
+// are AGGREGATED into one row (an ACP stream emits per-token chunks — a raw
+// per-chunk insert produced 20k+ rows per run and destroyed transcript
+// replay quality); tool events flush the pending buffer first.
 func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event) {
-	role := "assistant"
-	content := ev.Text
-	toolCalls := "[]"
-	if ev.Type == proto.EventThought {
-		role = "thought"
-	} else if ev.Type == proto.EventToolUse || ev.Type == proto.EventToolResult {
-		role = "tool"
-		content = ""
+	switch ev.Type {
+	case proto.EventMessage, proto.EventThought:
+		role := "assistant"
+		if ev.Type == proto.EventThought {
+			role = "thought"
+		}
+		d.mu.Lock()
+		b := d.msgBuffers[runID]
+		if b == nil || b.role != role {
+			d.flushMsgBuffer(ctx, runID)
+			b = &msgBuffer{role: role}
+			d.msgBuffers[runID] = b
+		}
+		b.content += ev.Text
+		d.mu.Unlock()
+	case proto.EventToolUse, proto.EventToolResult:
+		d.mu.Lock()
+		d.flushMsgBuffer(ctx, runID)
+		d.mu.Unlock()
 		tc, _ := json.Marshal(ev)
-		toolCalls = string(tc)
+		d.insertChatMessage(ctx, runID, "tool", "", string(tc))
+	default:
+		d.insertChatMessage(ctx, runID, "assistant", ev.Text, "[]")
 	}
+}
+
+// msgBuffer is the pending aggregated text row for a run (see persistEvent).
+type msgBuffer struct {
+	role    string
+	content string
+}
+
+// flushMsgBuffer writes the pending aggregated text row (if any) for a run.
+// Caller holds d.mu.
+func (d *Daemon) flushMsgBuffer(ctx context.Context, runID string) {
+	b := d.msgBuffers[runID]
+	if b == nil || b.content == "" {
+		return
+	}
+	d.insertChatMessage(ctx, runID, b.role, b.content, "[]")
+	delete(d.msgBuffers, runID)
+}
+
+// flushRunMessages flushes and forgets a run's pending buffer (run end).
+func (d *Daemon) flushRunMessages(ctx context.Context, runID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.flushMsgBuffer(ctx, runID)
+	delete(d.msgBuffers, runID)
+}
+
+func (d *Daemon) insertChatMessage(ctx context.Context, runID, role, content, toolCalls string) {
 	if _, err := d.st.DB().ExecContext(ctx,
 		`INSERT INTO chat_message (id, run_id, role, content, tool_calls, created_at) VALUES (?,?,?,?,?,?)`,
 		uuid.NewString(), runID, role, content, toolCalls, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
@@ -547,8 +1558,8 @@ func (d *Daemon) finishRun(ctx context.Context, q *service.ClaimedRow, status, s
 }
 
 // goalOwnsSquadStatus mirrors multica's ownsIssueStatus: a leader run may only
-// push the goal to done when the goal is assigned to THIS squad (DESIGN.zh.md
-// §5.4). A guest @mentioned squad gets the "do NOT change status" briefing.
+// push the goal to done when the goal is assigned to THIS squad (DESIGN.md
+// §9). A guest @mentioned squad gets the "do NOT change status" briefing.
 func (d *Daemon) goalOwnsSquadStatus(ctx context.Context, goalID, squadID string) bool {
 	var at, aid string
 	err := d.st.DB().QueryRowContext(ctx, `SELECT assignee_type, assignee_id FROM goal WHERE id=?`, goalID).Scan(&at, &aid)
@@ -556,6 +1567,52 @@ func (d *Daemon) goalOwnsSquadStatus(ctx context.Context, goalID, squadID string
 		return false
 	}
 	return at == "squad" && aid == squadID
+}
+
+// leaderSquadFor reports the squad the goal belongs to when the given agent
+// is its CURRENT leader (dynamic — judged at run time, not from a static
+// run mark).
+func (d *Daemon) leaderSquadFor(ctx context.Context, goalID, agentID string) (string, bool) {
+	var atype, aid string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT assignee_type, assignee_id FROM goal WHERE id=?`, goalID).Scan(&atype, &aid)
+	if err != nil || atype != "squad" || aid == "" {
+		return "", false
+	}
+	var leaderID string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT leader_id FROM squad WHERE id=?`, aid).Scan(&leaderID); err != nil {
+		return "", false
+	}
+	return aid, leaderID == agentID
+}
+
+// annotatePolicyIssue posts ONE system comment flagging an objective
+// acceptance-policy defect (a verify command/script that does not exist —
+// POSIX exit 127) — deduped per goal so the retry chain does not spam the
+// same finding. The owner sees it in the feed and fixes the policy; the run
+// still fails normally (a report is not a waiver).
+func (d *Daemon) annotatePolicyIssue(ctx context.Context, goalID string) {
+	var n int
+	_ = d.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system' AND content LIKE '疑似验收策略问题%'`, goalID).Scan(&n)
+	if n > 0 {
+		return
+	}
+	content := "⚠️ 疑似验收策略问题：验证命令/脚本不存在（POSIX exit 127）——请检查域的验收策略，修正后重开任务；agent 无法绕过该检查。"
+	_, _ = d.st.DB().ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
+		uuid.NewString(), goalID, content, nowStr())
+}
+
+// agentTriggeredRunCount counts the goal's runs triggered by AGENT-authored
+// comments (the mention-churn signal; platform system triggers excluded).
+func (d *Daemon) agentTriggeredRunCount(ctx context.Context, goalID string) (int, error) {
+	var n int
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run r JOIN comment c ON c.id = r.trigger_comment_id
+		 WHERE r.goal_id=? AND c.author_type='agent'`, goalID).Scan(&n)
+	return n, err
 }
 
 // buildPrompt assembles the opening prompt for a run turn.
@@ -567,6 +1624,7 @@ func buildPrompt(title, desc, handoff string) string {
 		// explicit, completable instruction so the run reaches a terminal state.
 		body = "Complete this sub-task. Do the work it implies, then finish your turn."
 	}
+	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, agentwork-cli reference, how to delegate via mention / hand off / request approval)."
 	if handoff != "" {
 		// A handoff/wakeup note scopes THIS turn. It is placed AHEAD of the
 		// original description, which is now *context* (not a fresh to-do
@@ -575,20 +1633,21 @@ func buildPrompt(title, desc, handoff string) string {
 		// description's "create a sub-task" steps. If the note reports the work
 		// already complete, the agent ends its turn rather than fanning out
 		// again.
-		return "Task: " + title + "\n\n" +
+		return guide + "\n\n" +
+			"Task: " + title + "\n\n" +
 			"Context (what this goal is about; do NOT blindly redo these steps):\n" + body + "\n\n" +
 			"Scope for THIS run (follow the note; do not redo steps it describes as done):\n> " + handoff + "\n\n" +
 			"If the note reports the work is already complete, do NOT start new work — end your turn immediately.\n"
 	}
-	return fmt.Sprintf("Task: %s\n\n%s", title, body)
+	return guide + "\n\n" + fmt.Sprintf("Task: %s\n\n%s", title, body)
 }
 
 // buildAgentGuide writes the "## Team & Coordination" block that every run's
-// AGENTS.md gets: the roster of teammates plus the full agentwork-cli
+// AGENTWORK.md gets: the roster of teammates plus the full agentwork-cli
 // reference the agent uses to produce structured side effects. This is the
 // agent's only source of truth for how to coordinate — without it the agent
 // doesn't know goal create/wait/comment exist, and it would never guess the
-// mention:// URI format. See DESIGN §5 (coordination primitives).
+// mention:// URI format. See DESIGN.md §2 (coordination primitives).
 func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string {
 	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name, description FROM agent ORDER BY name`)
 	if err != nil {
@@ -604,15 +1663,6 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString(" / AGENTWORK_AGENT_ID). The CLI calls back over the server; do NOT edit files")
 	b.WriteString(" to communicate intent — structured side effects via the CLI are the only way.\n\n")
 	b.WriteString("This goal's id is the value of AGENTWORK_GOAL_ID.\n\n")
-
-	b.WriteString("### Sub-goals (fan out then wait)\n")
-	b.WriteString("- Create a sub-goal that another agent works on:\n")
-	b.WriteString("  agentwork-cli goal create --title \"<title>\" [--description \"<what to do>\"] --assignee <other-agent-id>\n")
-	b.WriteString("  (parent defaults to the current goal.)\n")
-	b.WriteString("- Once you have created all the sub-goals you want to fan out, wait for them:\n")
-	b.WriteString("  agentwork-cli goal wait\n")
-	b.WriteString("  Then END YOUR TURN. When every sub-goal reaches a terminal state, the system")
-	b.WriteString(" re-runs THIS goal with a wakeup note summarizing what each sub-goal produced.\n\n")
 
 	b.WriteString("### Hand off the current goal\n")
 	b.WriteString("- agentwork-cli goal assign <to-agent-id> [--note \"scoping instruction\"]\n")
@@ -635,8 +1685,9 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("- agentwork-cli squad list    # all squads\n\n")
 
 	b.WriteString("### Team roster\n")
-	b.WriteString("If a task falls outside your role, delegate it — create a sub-goal for a")
-	b.WriteString(" teammate whose role best matches, or hand off the goal entirely.\n\n")
+	b.WriteString("If a task falls outside your role, delegate it — mention the teammate whose")
+	b.WriteString(" role best matches in a comment (see @mention above) so they pick it up on")
+	b.WriteString(" this goal, or hand off the goal entirely.\n\n")
 	var n int
 	for rows.Next() {
 		var id, name, desc string
@@ -661,7 +1712,7 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 }
 
 // injectAgentProfile writes the agent's system prompt, team roster, and (for
-// leader runs) squad briefing into {workdir}/AGENTS.md so the subprocess
+// leader runs) squad briefing into {workdir}/AGENTWORK.md so the subprocess
 // discovers its identity via its native config file.
 func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster, briefing string) error {
 	var b strings.Builder
@@ -674,7 +1725,7 @@ func (d *Daemon) injectAgentProfile(workdir, systemPrompt, roster, briefing stri
 		b.WriteString("\n\n")
 	}
 	b.WriteString(roster)
-	return os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(b.String()), 0o644)
+	return os.WriteFile(filepath.Join(workdir, "AGENTWORK.md"), []byte(b.String()), 0o644)
 }
 
 // runIdleWatchdog cancels a Prompt if the agent emits nothing for idleWindow
@@ -713,7 +1764,7 @@ func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.In
 func (d *Daemon) dispatchSchedules(ctx context.Context) {
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	rows, err := d.st.DB().QueryContext(ctx,
-		`SELECT id, title_template, description, assignee_type, assignee_id, cron_expression, timezone, next_run_at
+		`SELECT id, title_template, description, assignee_type, assignee_id, domain_id, cron_expression, timezone, next_run_at
 		 FROM schedule WHERE enabled=1 AND next_run_at != '' AND next_run_at <= ?`, nowStr)
 	if err != nil {
 		log.Printf("daemon: schedule query: %v", err)
@@ -722,7 +1773,7 @@ func (d *Daemon) dispatchSchedules(ctx context.Context) {
 	var due []scheduleDueRow
 	for rows.Next() {
 		var r scheduleDueRow
-		if err := rows.Scan(&r.ScheduleID, &r.TitleTemplate, &r.Description, &r.AssigneeType, &r.AssigneeID, &r.CronExpression, &r.Timezone, &r.NextRunAt); err != nil {
+		if err := rows.Scan(&r.ScheduleID, &r.TitleTemplate, &r.Description, &r.AssigneeType, &r.AssigneeID, &r.DomainID, &r.CronExpression, &r.Timezone, &r.NextRunAt); err != nil {
 			rows.Close()
 			log.Printf("daemon: schedule scan: %v", err)
 			return
@@ -736,7 +1787,7 @@ func (d *Daemon) dispatchSchedules(ctx context.Context) {
 }
 
 type scheduleDueRow struct {
-	ScheduleID, TitleTemplate, Description, AssigneeType, AssigneeID, CronExpression, Timezone, NextRunAt string
+	ScheduleID, TitleTemplate, Description, AssigneeType, AssigneeID, DomainID, CronExpression, Timezone, NextRunAt string
 }
 
 func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
@@ -749,10 +1800,11 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 		return
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO goal (id,title,description,assignee_type,assignee_id,status,handoff_note,created_by_type,created_by_id,created_at)
-		 VALUES (?,?,?,'active',?,'','','system',?,?)`,
-		goalID, r.TitleTemplate, r.Description, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
+	// 11 columns → exactly 11 values: id,title,description,domain_id,
+	// assignee_type,assignee_id as parameters; status='active',
+	// handoff_note='', created_by_type='system' literal; created_by_id=
+	// schedule id, created_at=ts as parameters.
+	if err := insertFiredGoal(ctx, tx, goalID, r.TitleTemplate, r.Description, r.DomainID, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
 		log.Printf("daemon: schedule %s insert goal: %v", r.ScheduleID, err)
 		return
 	}

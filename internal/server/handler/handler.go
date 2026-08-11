@@ -3,12 +3,18 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
+	"github.com/eushing/agentwork/internal/issue"
+	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/service"
 )
 
@@ -20,6 +26,13 @@ type Handlers struct {
 	Comment  *service.CommentService
 	Squad    *service.SquadService
 	Schedule *service.ScheduleService
+	Domain   *service.DomainService
+	Settings *service.SettingsService
+	IM       *notify.Connector
+	// IssueWebhooks are the real-time issue triggers (M4-B), keyed by
+	// provider ("github" | "gitcode"); absent = that provider's webhook
+	// disabled (polling still covers intake).
+	IssueWebhooks map[string]*issue.WebhookHandler
 }
 
 func (h *Handlers) Mount(mux *http.ServeMux) {
@@ -40,7 +53,11 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/assign", h.assignGoal)
 	mux.HandleFunc("POST /goals/{id}/cancel", h.cancelGoal)
 	mux.HandleFunc("POST /goals/{id}/wait", h.waitGoal)
+	mux.HandleFunc("POST /goals/{id}/review", h.resolveGoalReview)
+	mux.HandleFunc("POST /goals/{id}/request-approval", h.requestGoalApproval)
+	mux.HandleFunc("POST /goals/{id}/reopen", h.reopenGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
+	mux.HandleFunc("GET /goals/{id}/runs/{runId}/messages", h.listRunMessages)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
 
@@ -55,6 +72,26 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /schedules", h.createSchedule)
 	mux.HandleFunc("GET /schedules/{id}", h.getSchedule)
 	mux.HandleFunc("DELETE /schedules/{id}", h.deleteSchedule)
+	mux.HandleFunc("PUT /schedules/{id}/enabled", h.setScheduleEnabled)
+
+	mux.HandleFunc("GET /domains", h.listDomains)
+	mux.HandleFunc("POST /domains", h.createDomain)
+	mux.HandleFunc("GET /domains/{id}", h.getDomain)
+	mux.HandleFunc("PUT /domains/{id}", h.updateDomain)
+	mux.HandleFunc("DELETE /domains/{id}", h.deleteDomain)
+	mux.HandleFunc("POST /domains/{id}/checks", h.freezeDomainChecks)
+	mux.HandleFunc("POST /domains/{id}/compile", h.compileDomainPolicy)
+
+	mux.HandleFunc("GET /gate-decisions/stats", h.gateStats)
+
+	mux.HandleFunc("POST /issue-comments", h.createIssueComment)
+	mux.HandleFunc("POST /webhooks/github", h.githubWebhook)
+	mux.HandleFunc("POST /webhooks/gitcode", h.gitcodeWebhook)
+	mux.HandleFunc("GET /settings/platform", h.getPlatformSettings)
+	mux.HandleFunc("PUT /settings/platform", h.putPlatformSettings)
+	mux.HandleFunc("GET /im/feishu/status", h.imStatus)
+	mux.HandleFunc("POST /im/feishu/connect", h.imConnect)
+	mux.HandleFunc("DELETE /im/feishu/connect", h.imDisconnect)
 }
 
 // ── runtime ──
@@ -131,6 +168,7 @@ func (h *Handlers) createGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, out, nil)
 }
+
 // listGoals returns all goals, or the N most recent when ?limit=N is given.
 // limit must be a positive integer if present (0/absent means all).
 func (h *Handlers) listGoals(w http.ResponseWriter, r *http.Request) {
@@ -143,8 +181,15 @@ func (h *Handlers) listGoals(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	out, err := h.Goal.List(r.Context(), limit)
-	writeJSON(w, out, err)
+	out, err := h.Goal.List(r.Context())
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	writeJSON(w, out, nil)
 }
 func (h *Handlers) getGoal(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Goal.Get(r.Context(), r.PathValue("id"))
@@ -190,8 +235,53 @@ func (h *Handlers) waitGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// requestGoalApproval is the behavior gate: the agent parks its own goal in
+// review and asks the human (agentwork-cli goal request-approval).
+func (h *Handlers) requestGoalApproval(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Goal.RequestApproval(r.Context(), r.PathValue("id"), body.Reason)
+	writeJSON(w, out, err)
+}
+
+func (h *Handlers) resolveGoalReview(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Decision string `json:"decision"`
+		Reason   string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Goal.ResolveReview(r.Context(), r.PathValue("id"), "", body.Decision, body.Reason)
+	writeJSON(w, out, err)
+}
+
+// reopenGoal restarts a failed/cancelled goal (the human take-over path).
+func (h *Handlers) reopenGoal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	out, err := h.Goal.Reopen(r.Context(), r.PathValue("id"), body.Reason)
+	writeJSON(w, out, err)
+}
+
 func (h *Handlers) listRuns(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Run.List(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+
+// listRunMessages returns the run's live interaction stream — the Web run
+// detail's "what is the agent doing right now" view.
+func (h *Handlers) listRunMessages(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Run.ListMessages(r.Context(), r.PathValue("runId"))
 	writeJSON(w, out, err)
 }
 
@@ -274,6 +364,271 @@ func (h *Handlers) getSchedule(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) deleteSchedule(w http.ResponseWriter, r *http.Request) {
 	if err := h.Schedule.Delete(r.Context(), r.PathValue("id")); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// setScheduleEnabled toggles a schedule without deleting it (the IM intake
+// "停掉定时任务" flow and the Web toggle share this).
+func (h *Handlers) setScheduleEnabled(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, nil, service.NewValidationError("invalid body: "+err.Error()))
+		return
+	}
+	out, err := h.Schedule.SetEnabled(r.Context(), r.PathValue("id"), body.Enabled)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, out, nil)
+}
+
+// ── domain ──
+
+func (h *Handlers) createDomain(w http.ResponseWriter, r *http.Request) {
+	var d service.Domain
+	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Domain.Create(r.Context(), d)
+	writeJSON(w, out, err)
+}
+func (h *Handlers) listDomains(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Domain.List(r.Context())
+	writeJSON(w, out, err)
+}
+func (h *Handlers) getDomain(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Domain.Get(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+func (h *Handlers) deleteDomain(w http.ResponseWriter, r *http.Request) {
+	if err := h.Domain.Delete(r.Context(), r.PathValue("id")); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// updateDomain edits a domain's mutable configuration (issue handler etc.).
+func (h *Handlers) updateDomain(w http.ResponseWriter, r *http.Request) {
+	var d service.Domain
+	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Domain.Update(r.Context(), r.PathValue("id"), d)
+	writeJSON(w, out, err)
+}
+
+// compileDomainPolicy starts acceptance-policy compilation for a domain
+// (DESIGN.md §5.3): the processor agent compiles the NL intent into
+// checks, which stay UNFROZEN until the owner confirms via FreezeChecks.
+func (h *Handlers) compileDomainPolicy(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PolicyText       string `json:"policy_text"`
+		ProcessorAgentID string `json:"processor_agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Domain.CompilePolicy(r.Context(), r.PathValue("id"), body.PolicyText, body.ProcessorAgentID)
+	writeJSON(w, out, err)
+}
+
+// freezeDomainChecks stores the compiled acceptance policy after the owner
+// confirms the processor agent's output (DESIGN.md §5.3). The confirmation
+// card is the guard that keeps the "define" role with the human.
+func (h *Handlers) freezeDomainChecks(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Checks               service.Checks `json:"checks"`
+		VerificationStrength string         `json:"verification_strength"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Domain.FreezeChecks(r.Context(), r.PathValue("id"), body.Checks, body.VerificationStrength)
+	writeJSON(w, out, err)
+}
+
+// ── gate health (M2) ──
+
+func (h *Handlers) gateStats(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Goal.GateStats(r.Context())
+	writeJSON(w, out, err)
+}
+
+// ── IM (Feishu connect flow — the Web-driven QR connect) ──
+
+// ── issue comments (M4-B) ──
+
+// createIssueComment posts a comment on the issue behind a goal: the goal's
+// source_ref names the repo+number, the domain's git_credentials is the
+// GitHub token — the agent never touches either (the platform executes the
+// structured side effect).
+func (h *Handlers) createIssueComment(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		GoalID string `json:"goal_id"`
+		Text   string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, nil, service.NewValidationError("invalid body: "+err.Error()))
+		return
+	}
+	if body.GoalID == "" || strings.TrimSpace(body.Text) == "" {
+		writeJSON(w, nil, service.NewValidationError("goal_id and text are required"))
+		return
+	}
+	ref, token, isIssue, err := h.Goal.IssueSource(r.Context(), body.GoalID)
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	if !isIssue {
+		writeJSON(w, nil, service.NewValidationError("goal has no issue source"))
+		return
+	}
+	provider, repo, number, ok := issue.ParseSourceRef(ref)
+	if !ok {
+		writeJSON(w, nil, service.NewValidationError("goal source is not an issue ref"))
+		return
+	}
+	if token == "" {
+		writeJSON(w, nil, service.NewValidationError("domain has no git_credentials (the platform token)"))
+		return
+	}
+	client, err := issue.NewProvider(provider, token)
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	if err := client.CreateComment(r.Context(), repo, number, body.Text); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// githubWebhook / gitcodeWebhook are the real-time issue triggers (M4-B):
+// the hosting platform pushes `issues` events; the handler verifies the
+// provider-specific signature and creates the goal immediately (the poller
+// stays as the safety net). Comment events are ignored — the run-start
+// comment fetch covers the dialogue.
+func (h *Handlers) githubWebhook(w http.ResponseWriter, r *http.Request) {
+	h.handleWebhook(w, r, "github", "X-Hub-Signature-256")
+}
+
+func (h *Handlers) gitcodeWebhook(w http.ResponseWriter, r *http.Request) {
+	h.handleWebhook(w, r, "gitcode", "X-GitCode-Signature-256")
+}
+
+func (h *Handlers) handleWebhook(w http.ResponseWriter, r *http.Request, provider, sigHeader string) {
+	wh := h.IssueWebhooks[provider]
+	if wh == nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("webhook %s not configured", provider))
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := wh.Handle(r.Context(), body, r.Header.Get(sigHeader), r.Header.Get("X-GitCode-Token")); err != nil {
+		writeErr(w, http.StatusUnauthorized, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── platform settings (M3: intake agent + digest time) ──
+
+// platformSettingsKey is the JSON blob under which the platform-wide M3
+// settings live (the global inbound parser agent, the daily digest time).
+const platformSettingsKey = "platform.m3"
+
+// webhookSecretKey is the standalone key for the platform webhook secret —
+// shared across providers (github/gitcode endpoints verify with the same
+// secret on a single-user platform). Kept apart from the m3 blob: it is a
+// credential, not a toggle.
+const webhookSecretKey = "platform.webhook_secret"
+
+type platformSettings struct {
+	IntakeAgent string `json:"intake_agent"` // agent id: IM inbound parser ('' = unset)
+	DigestTime  string `json:"digest_time"`  // HH:MM local, '' = default 09:00
+	// WebhookSecret verifies GitHub's X-Hub-Signature-256 ('' = webhook
+	// disabled; polling still covers issue intake).
+	WebhookSecret string `json:"webhook_secret"`
+}
+
+func (h *Handlers) getPlatformSettings(w http.ResponseWriter, r *http.Request) {
+	var out platformSettings
+	if raw, err := h.Settings.Get(r.Context(), platformSettingsKey); err == nil && raw != "" {
+		_ = json.Unmarshal([]byte(raw), &out)
+	}
+	if v, _ := h.Settings.Get(r.Context(), webhookSecretKey); v != "" {
+		out.WebhookSecret = v
+	}
+	writeJSON(w, out, nil)
+}
+
+func (h *Handlers) putPlatformSettings(w http.ResponseWriter, r *http.Request) {
+	var body platformSettings
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, nil, service.NewValidationError("invalid body: "+err.Error()))
+		return
+	}
+	if body.IntakeAgent != "" {
+		if _, err := h.Agent.Get(r.Context(), body.IntakeAgent); err != nil {
+			writeJSON(w, nil, service.NewValidationError("intake agent does not exist"))
+			return
+		}
+	}
+	if body.DigestTime != "" {
+		if _, err := time.Parse("15:04", body.DigestTime); err != nil {
+			writeJSON(w, nil, service.NewValidationError("digest_time must be HH:MM"))
+			return
+		}
+	}
+	// The webhook secret lives on its own key (a credential), the rest in
+	// the m3 blob.
+	if err := h.Settings.Set(r.Context(), webhookSecretKey, body.WebhookSecret); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	body.WebhookSecret = ""
+	raw, _ := json.Marshal(body)
+	if err := h.Settings.Set(r.Context(), platformSettingsKey, string(raw)); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, body, nil)
+}
+
+func (h *Handlers) imStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, h.IM.Status(), nil)
+}
+
+func (h *Handlers) imConnect(w http.ResponseWriter, r *http.Request) {
+	// The registration runs for up to 10 minutes — it MUST outlive this HTTP
+	// request, so it gets its own context, not r.Context() (which is cancelled
+	// when the response returns).
+	_, qr, err := h.IM.StartRegistration(context.Background())
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"qr": qr, "status": h.IM.Status()["status"]}, nil)
+}
+
+func (h *Handlers) imDisconnect(w http.ResponseWriter, r *http.Request) {
+	if err := h.IM.Disconnect(r.Context()); err != nil {
+		writeJSON(w, nil, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
