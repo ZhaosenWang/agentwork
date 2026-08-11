@@ -519,6 +519,7 @@ func (s *GoalService) Delete(ctx context.Context, goalID string) error {
 	defer tx.Rollback()
 	for _, stmt := range []string{
 		`DELETE FROM chat_message WHERE run_id IN (SELECT id FROM run WHERE goal_id=?)`,
+		`DELETE FROM gate_decision WHERE goal_id=?`,
 		`DELETE FROM run WHERE goal_id=?`,
 		`DELETE FROM comment WHERE goal_id=?`,
 		`DELETE FROM activity_log WHERE goal_id=?`,
