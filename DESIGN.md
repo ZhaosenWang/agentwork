@@ -147,7 +147,8 @@ agent 干完（run 到终态）
 - **评论即重开（决策 4-1）**：终态（done/failed/cancelled）+ **human 作者** + 评论含 **action mention**（agent/squad）→ 自动 Reopen 再触发；纯评论仅落库不重开——终态不接受静默新活。agent/system 评论不触发重开。
 - **mention pingpong 上限（决策 4-2）**：计数口径 = `trigger_comment_id` 指向 **agent 作者**评论的 run 数。>4 → 下一 run 注入"停止互相转移任务"警告；≥8 → 强制 failed（协作循环判死，系统评论留痕）。human/system 触发不计。
 - **guest run 失败留痕（决策 4-3）**：协作 run（非 assignee 触发）失败且带 `trigger_comment_id` → 写系统评论（"协作 run 失败：…"），不重试、不动 goal 状态——feed 可见即协作闭环。
-- **squad 审查 checkpoint（决策 4-4）**：squad 拥有的 goal 进 review 时，平台自动给 `role=reviewer` 成员（排除 leader 自审）发系统 mention 并 enqueue 审查 run——审查是平台机制，不是 agent 自觉；审查 run 为 guest run（结果被丢弃），意见只活在评论里供审批参考。脏 worktree 停靠（平台问题而非完工）不触发审查。
+- **squad 审查 checkpoint（决策 4-4）**：squad 拥有的 goal 进 review 时，平台自动给 `role=reviewer` 成员（排除 leader 自审）发系统 mention 并 enqueue 审查 run——审查是平台机制，不是 agent 自觉；审查 run 为 guest run，意见只活在评论里供审批参考。脏 worktree 停靠（平台问题而非完工）不触发审查。**审查/协作 run 的结果由平台兜底落 feed**：agent 未自觉评论时，run 的总结自动写为 agent 评论（与失败留痕对称）——审查结论不能只躺在 result_summary。
+- **评论区语义（决策 4-6）**：评论区是 goal 的**协作交流区**——只承载"人的话"与协作动作（创建指令、改派 handoff note、审批理由、重开理由、人/agent 对话、mention 触发），作者为 human / agent / 必要的系统提示。**系统内部状态不入评论**（run 终态、进入审批、合入、超时）——状态史由活动日志 + 执行流承载，评论不是日志。人的话（handoff note / 审批理由 / 重开理由）必须落 feed：agent 下一轮 run 的 prompt 注入最近 human 评论，feed 完整 = 协作闭环。
 
 ### 数值守卫（状态机不变量，不是提示词请求）
 
@@ -404,8 +405,9 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策4-1 | **评论即重开**：终态 goal + **human 作者** + 评论含 **action mention**（agent/squad）→ 自动 Reopen 再触发（"这个任务还没完"）；纯评论仅落地。agent/system 评论不触发 |
 | 决策4-2 | **mention pingpong 双阈值**：agent 触发 run 数 &gt;4 注入协作警告 / ≥8 强制 failed（协作循环判死）；human/system 触发不计入 |
 | 决策4-3 | **guest run 失败留痕**：协作 run 失败（带 trigger_comment_id）写系统评论，不重试、不动 goal 状态——失败在 feed 可见 |
-| 决策4-4 | **squad 审查 checkpoint 平台化**：goal 进 review 时平台自动 mention role=reviewer 成员（排除 leader 自审）并 enqueue 审查 run；审查意见进审批卡供人决策——审查是机制，不是 agent 自觉 |
+| 决策4-4 | **squad 审查 checkpoint 平台化**：goal 进 review 时平台自动 mention role=reviewer 成员（排除 leader 自审）并 enqueue 审查 run；审查意见进审批卡供人决策——审查是机制，不是 agent 自觉。**协作/审查 run 完成结果平台兜底落 feed**（agent 未自觉评论时自动写为 agent 评论） |
 | 决策4-5 | **策略缺陷客观检测**：verify 命令 exit 127（POSIX command not found）→ 自动标注"疑似验收策略问题"系统评论——owner 修策略而非 agent 白烧重试（替代字符串匹配） |
+| 决策4-6 | **评论区语义**：评论区 = 协作交流区，只承载人的话与协作动作（创建/改派/审批理由/重开/对话/mention）；系统内部状态不入评论（状态史归活动日志 + 执行流）。人的话必须落 feed——agent 下一轮 prompt 注入最近 human 评论 |
 
 ---
 

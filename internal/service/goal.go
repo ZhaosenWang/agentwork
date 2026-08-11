@@ -396,6 +396,27 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 		newID(), goalID, "human", "", string(detail), now()); err != nil {
 		return nil, fmt.Errorf("insert activity: %w", err)
 	}
+	// The handoff note is the human's words — it belongs in the comment
+	// feed (the collaboration surface), not only in the handoff_note field.
+	// Written directly (not via CommentService.Create) so the mention never
+	// double-triggers: the caller already enqueues the new assignee's run.
+	if handoffNote != "" {
+		var label string
+		_ = s.st.DB().QueryRowContext(ctx,
+			`SELECT name FROM agent WHERE id=?`, assigneeID).Scan(&label)
+		if label == "" {
+			_ = s.st.DB().QueryRowContext(ctx,
+				`SELECT name FROM squad WHERE id=?`, assigneeID).Scan(&label)
+		}
+		if label != "" {
+			content := "[@" + label + "](mention://" + assigneeType + "/" + assigneeID + ") " + handoffNote
+			if _, err := s.st.DB().ExecContext(ctx,
+				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,'',NULL,?,?)`,
+				newID(), goalID, "human", content, now()); err != nil {
+				return nil, fmt.Errorf("insert handoff comment: %w", err)
+			}
+		}
+	}
 
 	g.AssigneeType = assigneeType
 	g.AssigneeID = assigneeID
@@ -607,6 +628,23 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
 				newID(), rc.GoalID, content, now()); err != nil {
 				return fmt.Errorf("insert guest-failure comment: %w", err)
+			}
+		}
+		// A COMPLETED collaboration run (mention-triggered review/help) must
+		// land its result in the feed too — the reviewer's verdict is the
+		// checkpoint evidence, and "review is a platform mechanism, not agent
+		// self-discipline" (decision 4-4): the platform falls back to writing
+		// the run's summary as the agent's comment when the agent did not
+		// comment itself. Symmetric with the failure trace above.
+		if rc.Status == "completed" && rc.TriggerCommentID != "" && strings.TrimSpace(rc.Summary) != "" {
+			summary := strings.TrimSpace(rc.Summary)
+			if len(summary) > 800 {
+				summary = summary[:800] + "…"
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
+				newID(), rc.GoalID, "agent", rc.AgentID, summary, now()); err != nil {
+				return fmt.Errorf("insert guest-result comment: %w", err)
 			}
 		}
 		pendingEvents = append(pendingEvents, events.Event{Topic: "run:discarded", Payload: map[string]any{
@@ -871,6 +909,17 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		newID(), goalID, runID, rule, decision, reason, "human", ts, duration); err != nil {
 		return nil, fmt.Errorf("insert gate_decision: %w", err)
 	}
+	// The decision's reason is the human's words — the comment feed is where
+	// the agent's next run reads recent human comments, so the reject reason
+	// must be there (not only in gate_decision / handoff_note).
+	if reason != "" {
+		verb := map[string]string{"approve": "批准", "reject": "驳回", "redirect": "改判"}[decision]
+		if _, err := s.st.DB().ExecContext(ctx,
+			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,'',NULL,?,?)`,
+			newID(), goalID, "human", verb+"："+reason, ts); err != nil {
+			return nil, fmt.Errorf("insert decision comment: %w", err)
+		}
+	}
 
 	switch decision {
 	case "approve":
@@ -990,6 +1039,16 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal,
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'reopened',?,?)`,
 		newID(), goalID, "human", "", "{}", now()); err != nil {
 		return nil, fmt.Errorf("insert activity: %w", err)
+	}
+	// The reopen reason is the human's words — land it in the comment feed
+	// so the conversation stays complete (and the next run's prompt injects
+	// it via the recent-human-comments mechanism).
+	if reason != "" {
+		if _, err := s.st.DB().ExecContext(ctx,
+			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,'',NULL,?,?)`,
+			newID(), goalID, "human", "重开："+reason, now()); err != nil {
+			return nil, fmt.Errorf("insert reopen comment: %w", err)
+		}
 	}
 	// Fresh run on the current assignee (human-assigned goals stay manual).
 	if g.AssigneeType == "agent" || g.AssigneeType == "squad" {

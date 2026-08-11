@@ -365,3 +365,111 @@ func TestReviewRejectBlockedWhileDelivering(t *testing.T) {
 		t.Fatalf("reject after deliver failure must be allowed: %v", err)
 	}
 }
+
+// TestHumanWordsLandInCommentFeed: the review decision's reason is the
+// human's words — it must land in the comment feed (author_type=human),
+// where the agent's next run reads recent human comments. The feed is the
+// collaboration surface; handoff_note / gate_decision are records.
+func TestHumanWordsLandInCommentFeed(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	run := enqueueFirst(t, rs, g)
+	finishWithMergeGate(t, st, rs, run, "ok")
+	if _, err := gs.ResolveReview(ctx, g.ID, run.ID, "reject", "方向不对，把 X 改成 Y"); err != nil {
+		t.Fatalf("reject: %v", err)
+	}
+
+	comments, err := cs.List(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("list comments: %v", err)
+	}
+	var found bool
+	for _, c := range comments {
+		if c.AuthorType == "human" && c.Content == "驳回：方向不对，把 X 改成 Y" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("reject reason must land in the comment feed as a human comment, got %+v", comments)
+	}
+}
+
+// TestReopenReasonInFeed: the reopen reason lands in the comment feed too.
+func TestReopenReasonInFeed(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	enqueueFirst(t, rs, g)
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='failed' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.Reopen(ctx, g.ID, "重试一下"); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	comments, _ := cs.List(ctx, g.ID)
+	var found bool
+	for _, c := range comments {
+		if c.AuthorType == "human" && c.Content == "重开：重试一下" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("reopen reason must land in the feed, got %+v", comments)
+	}
+}
+
+// TestGuestRunResultLandsInFeed: a COMPLETED collaboration run (mention-
+// triggered review/help) must land its result in the feed as the agent's
+// comment — the reviewer's verdict is checkpoint evidence, and the platform
+// falls back to writing the summary when the agent did not comment itself
+// (decision 4-4: review is a platform mechanism, not agent self-discipline).
+func TestGuestRunResultLandsInFeed(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	agentB := seedAgent(t, st, "B") // the reviewer — NOT the assignee
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	enqueueFirst(t, rs, g)
+
+	// Reviewer is mentioned mid-flight (guest run). Its run completes with a
+	// verdict; the platform must surface it in the feed.
+	c, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 请审查"})
+	if err != nil {
+		t.Fatalf("comment: %v", err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	var guest *Run
+	for i := range runs {
+		if runs[i].AgentID == agentB {
+			guest = &runs[i]
+		}
+	}
+	if guest == nil {
+		t.Fatal("mention must enqueue a guest run on the reviewer")
+	}
+	// The guest run is NOT the assignee's — its result is orphaned.
+	if err := rs.Finish(ctx, guest.ID, "completed", "审查结论：改动合理，测试覆盖充分，无问题。"); err != nil {
+		t.Fatalf("finish guest: %v", err)
+	}
+
+	comments, _ := cs.List(ctx, g.ID)
+	var found bool
+	for _, cc := range comments {
+		if cc.AuthorType == "agent" && cc.AuthorID == agentB && cc.Content == "审查结论：改动合理，测试覆盖充分，无问题。" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("completed guest run must land its summary as the agent's comment, got %+v", comments)
+	}
+	_ = c
+}
