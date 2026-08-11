@@ -173,6 +173,11 @@ export function GoalTimeline({ goalId, goalStatus }: { goalId: string; goalStatu
   useWSEvent("run:enqueued", () =>
     qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) })
   );
+  // queued→running: the review window must flip from "等你审批" to
+  // "审查中" the moment the reviewer's run is claimed.
+  useWSEvent("run:claimed", () =>
+    qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) })
+  );
 
   if (!items || items.length === 0) return null;
 
@@ -537,8 +542,9 @@ export function GoalStatusBar({ goalId, goalStatus }: { goalId: string; goalStat
   const { items, active, agentName, nowMs } = useFlow(goalId, goalStatus);
   const qc = useQueryClient();
   useWSEvent("run:enqueued", () => qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) }));
+  useWSEvent("run:claimed", () => qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) }));
 
-  if (active) return <ActiveBadge active={active} agentName={agentName} nowMs={nowMs} />;
+  if (active) return <ActiveBadge active={active} agentName={agentName} nowMs={nowMs} goalStatus={goalStatus} />;
   const meta: Record<string, { icon: string; text: string; cls: string }> = {
     done: { icon: "🏁", text: "已完成", cls: "text-emerald-700" },
     failed: { icon: "❌", text: "失败", cls: "text-red-700" },
@@ -556,10 +562,11 @@ export function GoalStatusBar({ goalId, goalStatus }: { goalId: string; goalStat
   );
 }
 
-function ActiveBadge({ active, agentName, nowMs }: {
+function ActiveBadge({ active, agentName, nowMs, goalStatus }: {
   active: { kind: "run" | "review"; node: TimelineItem };
   agentName: (id: string) => string;
   nowMs: number;
+  goalStatus: string;
 }) {
   if (active.kind === "review") {
     const el = nowMs - new Date(active.node.at).getTime();
@@ -580,10 +587,13 @@ function ActiveBadge({ active, agentName, nowMs }: {
     );
   }
   const el = r.started_at ? nowMs - new Date(r.started_at).getTime() : 0;
+  // In the review window a running run is the reviewer collecting evidence —
+  // label it "审查中", not the generic "正在执行".
+  const verb = goalStatus === "review" ? "审查中" : "正在执行";
   return (
     <span className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-700">
       <span className="h-2 w-2 rounded-full bg-indigo-500 animate-pulse" />
-      {agentName(r.agent_id ?? "")} 正在执行 · 已运行 {dur(nowMs - el, nowMs)}
+      {agentName(r.agent_id ?? "")} {verb} · 已进行 {dur(nowMs - el, nowMs)}
     </span>
   );
 }

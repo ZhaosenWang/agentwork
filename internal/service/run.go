@@ -311,6 +311,14 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	// Publish AFTER commit (invariant 13): the frontend needs to know a run
+	// went queued→running (the review window's "审查中" state depends on it) —
+	// without this event the flow card shows the run as queued/parked while
+	// the agent is already working.
+	s.bus.Publish(ctx, events.Event{Topic: "run:claimed", Payload: map[string]any{
+		"run_id": r.RunID, "goal_id": r.GoalID, "agent_id": r.AgentID,
+		"attempt": r.Attempt, "started_at": now(),
+	}})
 	return &r, nil
 }
 

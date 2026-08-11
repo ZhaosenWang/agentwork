@@ -271,7 +271,12 @@ func goalComment(serverURL, goalID string, args []string) {
 	if goalID == "" {
 		fail("AGENTWORK_GOAL_ID not set")
 	}
-	body := map[string]string{"author_type": *role, "author_id": os.Getenv("AGENTWORK_AGENT_ID"), "content": *text}
+	body := map[string]string{
+		"author_type": *role,
+		"author_id":   os.Getenv("AGENTWORK_AGENT_ID"),
+		"content":     *text,
+		"run_id":      os.Getenv("AGENTWORK_RUN_ID"),
+	}
 	post(serverURL+"/goals/"+goalID+"/comments", body)
 }
 

@@ -39,13 +39,21 @@ export function GoalComments({ goalId }: { goalId: string }) {
     ...liveComments.filter((lc) => !comments?.some((c) => c.id === lc.id)),
   ];
 
+  const [replyTo, setReplyTo] = useState<Comment | null>(null);
+
   const handleSubmit = useCallback((text: string) => {
     if (!text.trim()) return;
     createComment.mutate(
-      { goalId, author_type: "human", author_id: "ui", content: text },
-      {}
+      {
+        goalId,
+        author_type: "human",
+        author_id: "ui",
+        content: text,
+        parent_id: replyTo?.id,
+      },
+      { onSuccess: () => setReplyTo(null) }
     );
-  }, [goalId, createComment]);
+  }, [goalId, createComment, replyTo]);
 
   return (
     <div className="bg-white rounded-2xl border border-zinc-200/80 shadow-sm overflow-hidden">
@@ -65,8 +73,15 @@ export function GoalComments({ goalId }: { goalId: string }) {
               c.author_type === "human" ? "你" :
               c.author_type === "system" ? "系统" :
               agentName(c.author_id);
+            const parent = c.parent_id ? allComments.find((p) => p.id === c.parent_id) : null;
+            const parentAuthor = parent
+              ? (parent.author_type === "human" ? "你" : parent.author_type === "system" ? "系统" : agentName(parent.author_id))
+              : "";
+            const parentText = parent
+              ? parent.content.replace(/\[@[^\]]*\]\(mention:[^)]*\)/g, "").trim().slice(0, 60)
+              : "";
             return (
-              <div key={c.id} className="bg-white rounded-lg border border-zinc-100 p-3">
+              <div key={c.id} className="bg-white rounded-lg border border-zinc-100 p-3 group">
                 <div className="flex items-center gap-2 mb-1">
                   <span className="text-sm font-medium text-zinc-800">{author}</span>
                   <span className="text-xs px-1.5 py-0.5 rounded bg-zinc-100 text-zinc-500">
@@ -75,7 +90,19 @@ export function GoalComments({ goalId }: { goalId: string }) {
                   <span className="text-xs text-zinc-400">
                     {c.created_at ? new Date(c.created_at).toLocaleString("zh-CN") : ""}
                   </span>
+                  <button
+                    type="button"
+                    onClick={() => setReplyTo(replyTo?.id === c.id ? null : c)}
+                    className="ml-auto text-[11px] text-zinc-400 hover:text-indigo-600 opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    {replyTo?.id === c.id ? "取消回复" : "回复"}
+                  </button>
                 </div>
+                {parent && (
+                  <div className="mb-1.5 px-2 py-1 rounded bg-zinc-50 border-l-2 border-zinc-300 text-[11px] text-zinc-500 truncate">
+                    回复 {parentAuthor}：{parentText}
+                  </div>
+                )}
                 <Markdown content={c.content} agentName={agentName} className="text-zinc-600" />
               </div>
             );
@@ -84,6 +111,17 @@ export function GoalComments({ goalId }: { goalId: string }) {
       </div>
 
       {/* Comment input — @ 自动弹出可 mention 列表 */}
+      {replyTo && (
+        <div className="px-4 pt-3 -mb-2 flex items-center gap-2 text-xs text-zinc-500">
+          <span className="bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full px-2 py-0.5">
+            回复 {replyTo.author_type === "human" ? "你" : replyTo.author_type === "system" ? "系统" : agentName(replyTo.author_id)}
+          </span>
+          <span className="truncate text-zinc-400">
+            {replyTo.content.replace(/\[@[^\]]*\]\(mention:[^)]*\)/g, "").trim().slice(0, 40)}
+          </span>
+          <button type="button" onClick={() => setReplyTo(null)} className="ml-auto text-zinc-400 hover:text-zinc-600">✕</button>
+        </div>
+      )}
       <MentionComposer onSubmit={handleSubmit} pending={createComment.isPending} />
 
       {createComment.isError && (

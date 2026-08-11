@@ -122,3 +122,42 @@ func TestCreateNoCommentWithoutDescription(t *testing.T) {
 		t.Fatalf("no description → no creation comment, got %d", len(comments))
 	}
 }
+
+// TestAgentCommentAutoThreadsToTrigger: an agent comment made inside a run
+// (run_id carried from AGENTWORK_RUN_ID) automatically replies to the
+// comment that triggered that run — mention → run → reply chains without
+// any agent cooperation (platform mechanism, decision 4-4 spirit).
+func TestAgentCommentAutoThreadsToTrigger(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	agentB := seedAgent(t, st, "B")
+	domID := seedDomainWithGates(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	enqueueFirst(t, rs, g)
+
+	trigger, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 请审查"})
+	if err != nil {
+		t.Fatalf("trigger comment: %v", err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	var guest *Run
+	for i := range runs {
+		if runs[i].AgentID == agentB {
+			guest = &runs[i]
+		}
+	}
+	if guest == nil || guest.TriggerCommentID != trigger.ID {
+		t.Fatalf("guest run must carry the trigger comment, got %+v", guest)
+	}
+
+	// The agent replies from inside its run — no parent knowledge needed.
+	reply, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "agent", AuthorID: agentB, Content: "审查结论：通过", RunID: guest.ID})
+	if err != nil {
+		t.Fatalf("agent reply: %v", err)
+	}
+	if reply.ParentID != trigger.ID {
+		t.Fatalf("agent reply must auto-thread to the trigger comment, got parent=%q want %q", reply.ParentID, trigger.ID)
+	}
+}

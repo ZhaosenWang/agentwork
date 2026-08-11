@@ -22,6 +22,11 @@ type Comment struct {
 	ParentID   string `json:"parent_id"`
 	Content    string `json:"content"`
 	CreatedAt  string `json:"created_at"`
+	// RunID is a CREATE-ONLY request field: an agent's comment carries the
+	// run it was made in (AGENTWORK_RUN_ID), and the platform threads it as
+	// a REPLY to that run's trigger comment (the mention that started it) —
+	// collaboration conversations chain automatically, no agent cooperation.
+	RunID string `json:"run_id,omitempty"`
 }
 
 type CommentService struct {
@@ -104,6 +109,16 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 	}
 	if c.AuthorType == "" {
 		c.AuthorType = "human"
+	}
+	// Platform threading: an agent comment made inside a run automatically
+	// replies to the comment that triggered that run (mention → run →
+	// reply). The agent never needs to know parent ids.
+	if c.RunID != "" && c.ParentID == "" {
+		var tid string
+		if err := s.st.DB().QueryRowContext(ctx,
+			`SELECT trigger_comment_id FROM run WHERE id=?`, c.RunID).Scan(&tid); err == nil && tid != "" {
+			c.ParentID = tid
+		}
 	}
 	g, err := s.goalSvc.Get(ctx, c.GoalID)
 	if err != nil {
