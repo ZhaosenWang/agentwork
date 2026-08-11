@@ -60,7 +60,7 @@ export function GoalActions({ goal }: { goal: Goal }) {
   );
 }
 
-// ReviewPanel is the human checkpoint (DESIGN.v2.md §4): the goal is parked
+// ReviewPanel is the human checkpoint (DESIGN.md §4): the goal is parked
 // in review — the human decides approve (platform delivers: merge + re-verify
 // + push) or reject (back to the agent with the reason as the next scope).
 // The evidence bundle from the last run is shown so the decision is made on

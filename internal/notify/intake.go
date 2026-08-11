@@ -16,7 +16,7 @@ import (
 // file-as-side-effect — never parsed from agent stdout) the daemon executes
 // and replies to. The parser agent is a global platform setting
 // (platform.intake_agent) — processor agents are platform configuration,
-// same as the acceptance-policy compiler (DESIGN.v2.md §5.3, decision 2-4).
+// same as the acceptance-policy compiler (DESIGN.md §5.3, decision 2-4).
 //
 // Triangle separation holds: the parser only understands intent and names
 // ids; the PLATFORM executes the action (Create/Enqueue/query) and builds

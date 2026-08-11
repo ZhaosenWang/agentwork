@@ -179,7 +179,7 @@ function NewGoalForm({
       body.assignee_id = assigneeId;
       body.status = "active";
     }
-    // v2: agent/squad-executed goals must belong to a domain (DESIGN.v2.md §2).
+    // v2: agent/squad-executed goals must belong to a domain (DESIGN.md §2).
     if (assigneeType === "agent" || assigneeType === "squad") {
       if (!domainId) {
         setDomainErr("请选择所属域——agent 执行的 Goal 必须挂在一个域上（域提供 worktree 与验收策略）");

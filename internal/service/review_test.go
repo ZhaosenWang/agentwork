@@ -9,7 +9,7 @@ import (
 )
 
 // seedDomainWithGates creates a domain whose acceptance policy includes the
-// merge gate — completed runs park the goal in review (DESIGN.v2.md §4).
+// merge gate — completed runs park the goal in review (DESIGN.md §4).
 func seedDomainWithGates(t *testing.T, st *store.Store) string {
 	t.Helper()
 	ctx := context.Background()

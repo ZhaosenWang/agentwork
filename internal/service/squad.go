@@ -14,7 +14,7 @@ import (
 
 // Squad is a routing group: it does no work itself. Assigning a goal to a
 // squad or @mentioning a squad routes only to its leader agent, who delegates
-// by assigning sub-goals. See DESIGN.zh.md §5.4. The leader must be an agent;
+// by assigning sub-goals. See DESIGN.md §2. The leader must be an agent;
 // squads cannot nest.
 type Squad struct {
 	ID           string `json:"id"`
@@ -184,7 +184,7 @@ type rosterRow struct {
 
 // BuildLeaderBriefing assembles the "Squad Operating Protocol + Roster +
 // Instructions" block injected into a leader run's opening prompt. Mirrors
-// multica's squad_briefing.go structure (per DESIGN.zh.md §5.4).
+// multica's squad_briefing.go structure (per DESIGN.md).
 //
 // ownsStatus gates whether the briefing grants the parent goal's status
 // authority: a squad that OWNS the goal (assignee_type==squad &&
@@ -269,7 +269,7 @@ func (s *SquadService) renderRoster(ctx context.Context, sq *Squad, members []Sq
 }
 
 // agentSkillNames is a placeholder: agentwork has no Skill table yet (deferred
-// per DESIGN.zh.md §10). Returns nil so the roster shows "no skills assigned".
+// per DESIGN.md). Returns nil so the roster shows "no skills assigned".
 func (s *SquadService) agentSkillNames(ctx context.Context, agentID string) []string {
 	_ = sort.Strings // reserved for future skill ordering
 	return nil
@@ -285,7 +285,7 @@ func (s *SquadService) agentName(ctx context.Context, agentID string) string {
 }
 
 // Briefing text constants. Echo multica's two-lane owns/guest distinction
-// (briefing injection vs. status authority — DESIGN.zh.md §5.4 + multica
+// (briefing injection vs. status authority — DESIGN.md + multica
 // squad_briefing.go). Wording is plain so it's easy to tune.
 
 const squadOperatingProtocolHeader = `You are the LEADER of a squad. Work flows through you: dispatch to teammates by

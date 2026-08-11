@@ -1,6 +1,6 @@
 # agentwork
 
-> [中文](README.zh.md) | [Design](DESIGN.md) | [设计 (中文)](DESIGN.zh.md)
+> [中文](README.zh.md) | [Design](DESIGN.md) | [设计](DESIGN.md)
 
 A multi-protocol AI agent task management and scheduling platform. Orchestrate
 CLI agents (Claude Code, Codex, OpenCode, custom agents) — create goals, assign

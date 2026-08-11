@@ -160,7 +160,7 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	title := fs.String("title", "", "goal title (required)")
 	description := fs.String("description", "", "goal description (the work to do)")
 	assignee := fs.String("assignee", "", "assignee agent id (defaults to current agent)")
-	// Sub-goals are SLEEVED (DESIGN.v2.md 决策 3-6): creation no longer
+	// Sub-goals are SLEEVED (DESIGN.md 决策 3-6): creation no longer
 	// defaults to a child of the current goal — an agent-created goal is an
 	// independent item, not a fan-out child (a defaulted parent used to make
 	// every agent-created goal a sub-goal that blocks its parent).
@@ -212,7 +212,7 @@ func goalWait(serverURL, goalID string, args []string) {
 }
 
 // goalRequestApproval parks the current goal in review and asks the human
-// (behavior gate, DESIGN.v2.md §5). The agent uses this when it hits a
+// (behavior gate, DESIGN.md §5). The agent uses this when it hits a
 // decision it must not make alone.
 func goalRequestApproval(serverURL, goalID string, args []string) {
 	if goalID == "" {

@@ -42,7 +42,7 @@ func newTestCluster(t *testing.T) (*GoalService, *RunService, *CommentService, *
 // gates — completed runs promote to done, so the pre-v2 test semantics
 // hold) and returns its id. The freeze matters: an unfrozen policy forces
 // the human checkpoint by design (决策 2-4/2-5 confirmation gate). v2:
-// agent-executed goals require a domain (DESIGN.v2.md §2). Review-path
+// agent-executed goals require a domain (DESIGN.md §2). Review-path
 // tests freeze gates separately.
 func seedDomain(t *testing.T, st *store.Store) string {
 	t.Helper()
@@ -111,7 +111,7 @@ func TestReconcileNormalCompletion(t *testing.T) {
 // TestHandoffDoesNotClobber: A's run completes AFTER the goal was handed off
 // to B. A's result must NOT flip the goal to done — A is no longer the owner,
 // so reconcile discards it. This is the core self-consistency invariant
-// (DESIGN.zh.md §5.1/§7): the design without an external authority.
+// (DESIGN.md §9): the design without an external authority.
 func TestHandoffDoesNotClobber(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
@@ -395,7 +395,7 @@ func TestReopenFailedGoal(t *testing.T) {
 	}
 }
 
-// TestParkForManualReview: the C4 path — a worktree with unattributed changes
+// TestParkForManualReview: the worktree-dirty path — a worktree with unattributed changes
 // parks the active goal in review (the human resolves, then the normal review
 // flow takes over).
 func TestParkForManualReview(t *testing.T) {

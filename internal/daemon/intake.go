@@ -24,7 +24,7 @@ import (
 // parser only understands intent and names ids) and replies over IM.
 //
 // Structured output is read from the file, never from agent stdout
-// (DESIGN.v2.md §5.3, §9.3): the parser is a processor agent, same as the
+// (DESIGN.md §5.3, §9): the parser is a processor agent, same as the
 // policy compiler.
 func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, prompt, agentID string) {
 	// Scratch workdir (no repo): the parser works from the prompt alone and

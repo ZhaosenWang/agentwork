@@ -16,7 +16,7 @@ import (
 // Goal is a work item (the product plane). It is the SOLE holder of state
 // authority: any change to its status flows through ReconcileOnRunEnd, which
 // checks whether the reporting run still belongs to the current assignee
-// before touching status. See DESIGN.zh.md §2/§7.
+// before touching status. See DESIGN.md §9.
 type Goal struct {
 	ID              string `json:"id"`
 	Title           string `json:"title"`
@@ -121,7 +121,7 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 		return nil, NewValidationError("assignee_type must be agent, squad, or human")
 	}
 	// v2: agent/squad-executed goals must belong to a domain — the domain owns
-	// the worktree and the acceptance policy (DESIGN.v2.md §2). Human/backlog
+	// the worktree and the acceptance policy (DESIGN.md §2). Human/backlog
 	// goals may be domain-less.
 	if g.AssigneeType != "human" {
 		if g.DomainID == "" {
@@ -237,7 +237,7 @@ func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 	return &g, nil
 }
 
-// Assign changes a goal's assignee (the handoff path). Per DESIGN.zh.md §5.1
+// Assign changes a goal's assignee (the handoff path). Per DESIGN.md
 // this does NOT cancel in-flight runs: when an orphaned run later reports in,
 // ReconcileOnRunEnd sees run.agent != goal.assignee and discards its result
 // without touching goal.status. The new assignee's run is enqueued by the
@@ -408,7 +408,7 @@ func (s *GoalService) Delete(ctx context.Context, goalID string) error {
 
 // ownRunByGoal reports whether the reporting run still belongs to the goal's
 // current assignee. This is the gate that makes handoff/cancel/reassign
-// self-consistent without an external authority (DESIGN.zh.md §7).
+// self-consistent without an external authority (DESIGN.md).
 //
 //	agent-assigned goal: the run's agent must equal the goal's assignee.
 //	squad-assigned goal: the run's agent must be the squad's CURRENT leader
@@ -438,7 +438,7 @@ func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 // run's terminal outcome. It is called by the daemon after a run reaches a
 // terminal status (completed/failed). Everything else — handoff, cancel,
 // wait-children — only changes goal.status directly; they never use a run's
-// result. See DESIGN.zh.md §7.
+// result. See DESIGN.md
 //
 // Rules:
 //
@@ -624,7 +624,7 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 }
 
 // gatesForGoal decides whether a completed run parks the goal in review
-// (DESIGN.v2.md §5, M2 rule engine):
+// (DESIGN.md §5, M2 rule engine):
 //
 //  1. The daemon evaluated the gate rules against the run's diff and
 //     recorded the fired gates on the run row (run.gates_hit) — merge always
@@ -678,7 +678,7 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 	return false, "", nil
 }
 
-// ResolveReview handles a human checkpoint decision (DESIGN.v2.md §4/§5):
+// ResolveReview handles a human checkpoint decision (DESIGN.md §4/§5):
 //   approve  → record the gate_decision, keep the goal in review, publish
 //              goal:approved — the daemon runs the deliver step (merge +
 //              re-verify + push) and closes with MarkDelivered.
@@ -788,7 +788,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		}
 		// Continue on the current assignee. attempt resets to 1: a reject
 		// iteration is a fresh human-directed cycle, not a machine retry —
-		// the reject count lives in goal.human_iterations (DESIGN.v2.md §4).
+		// the reject count lives in goal.human_iterations (DESIGN.md §4).
 		agentID, isLeader, squadID, err := s.runSvc.resolveLeader(ctx, g.AssigneeType, g.AssigneeID)
 		if err != nil {
 			return nil, err
@@ -805,7 +805,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	return s.Get(ctx, goalID)
 }
 
-// RequestApproval is the behavior gate (DESIGN.v2.md §5, M2): an agent that
+// RequestApproval is the behavior gate (DESIGN.md §5, M2): an agent that
 // hits a decision point it must not make alone parks the goal in review and
 // asks the human — via `agentwork-cli goal request-approval --reason "..."`.
 // The in-flight run keeps running; when it reports in, the reconcile sees
@@ -854,7 +854,7 @@ func (s *GoalService) IssueSource(ctx context.Context, goalID string) (ref, toke
 }
 
 // Reopen restarts a terminal goal — failed/cancelled (the failed-goal human
-// take-over path, DESIGN.v2.md §13) AND done (the comment-triggered reopen:
+// take-over path, DESIGN.md §13) AND done (the comment-triggered reopen:
 // a mention on a done goal is "this task is not over" — an追加需求, GitHub's
 // reopen-and-comment): back to active with the reason as handoff_note, and a
 // fresh run on the current assignee (attempt resets — a reopen is a new
@@ -898,7 +898,7 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal,
 
 // ParkForManualReview parks an active goal in review because the platform
 // found something only a human can resolve — e.g. unattributed worktree
-// changes at run start (DESIGN.v2.md §4, C4: a run must not start on a
+// changes at run start (DESIGN.md §4: a run must not start on a
 // worktree carrying changes nobody can account for). The human's
 // approve/reject then flows through the normal review path.
 func (s *GoalService) ParkForManualReview(ctx context.Context, goalID, reason string) error {
@@ -960,7 +960,7 @@ func (s *GoalService) resolveGateRule(ctx context.Context, goalID, runID, review
 }
 
 // GateStat is one gate rule's decision history — the health-learning data
-// source (DESIGN.v2.md §13): a gate approved every time is a candidate for
+// source (DESIGN.md §13): a gate approved every time is a candidate for
 // removal; one rejected repeatedly is a candidate for tightening.
 type GateStat struct {
 	Rule     string `json:"rule"`     // gate_rule as recorded (merge, diff_contains, ...)
@@ -995,7 +995,7 @@ func (s *GoalService) GateStats(ctx context.Context) ([]GateStat, error) {
 	return out, rows.Err()
 }
 
-// MarkDelivered closes the deliver step (DESIGN.v2.md §7), called by the
+// MarkDelivered closes the deliver step (DESIGN.md §7), called by the
 // daemon after its deterministic merge + re-verify + push:
 //   success → review → done (handoff_note cleared, parent woken)
 //   failure → stays in review with the reason annotated (review_request),
@@ -1082,7 +1082,7 @@ func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []event
 // and all its non-terminal sub-goals are now terminal, re-queue a run on the
 // parent's current assignee with a wakeup note summarising the children.
 // Guarded by `WHERE status='blocked'` so a concurrent wake bails (double-wake
-// prevention). Per DESIGN.zh.md §5.2 (dynamic wait set).
+// prevention). Per DESIGN.md (dynamic wait set).
 // wakeParentIfReadyInTx wakes a blocked parent once all its children are
 // terminal. evs collects the run events produced by the wake's enqueue —
 // the caller publishes them after its own commit (invariant 13).

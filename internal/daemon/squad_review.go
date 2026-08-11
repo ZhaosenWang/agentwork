@@ -27,7 +27,7 @@ import (
 // its result is discarded by reconcile like any guest run — the opinions
 // live in the comments, which the approval card and the human read.
 //
-// Note: this fires on EVERY goal:reviewing, including the C4
+// Note: this fires on EVERY goal:reviewing, including the
 // worktree-dirty park and behavior-gate requests — a review request is
 // harmless there (the reviewer sees whatever is in the worktree and says
 // so). The coalesce on (goal, reviewer) keeps re-parks from stacking runs.
@@ -73,7 +73,7 @@ func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) err
 		return nil // not squad-owned — no squad rule applies
 	}
 	// The review-request guard: only reviews of FINISHED work trigger the
-	// squad review. The C4 worktree-dirty park is a platform problem, not
+	// squad review. The worktree-dirty park is a platform problem, not
 	// finished work — the run never started, so a review run would audit a
 	// stale worktree (possibly a human's manual edits) and review nothing.
 	// (A deliver failure re-parks via goal:deliver_failed, not goal:reviewing

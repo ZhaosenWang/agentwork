@@ -57,7 +57,7 @@ func TestEvalGates(t *testing.T) {
 
 // TestEvalGatesBuiltinDeleteBaseline: the platform security baseline fires
 // on any DELETED file regardless of domain policy — deleting is judged by a
-// human, never unattended (DESIGN.v2.md §5.3, built-in and not overridable).
+// human, never unattended (DESIGN.md §5.3, built-in and not overridable).
 func TestEvalGatesBuiltinDeleteBaseline(t *testing.T) {
 	dir := newTestRepo(t)
 	ctx := context.Background()

@@ -10,7 +10,7 @@
 // State authority is NOT here: when a run reaches a terminal status the daemon
 // calls RunService.Finish, which stamps the run row then hands the outcome to
 // GoalService.ReconcileOnRunEnd — the sole place that advances goal.status.
-// See DESIGN.zh.md §7.
+// See DESIGN.md
 package daemon
 
 import (
@@ -56,7 +56,7 @@ const worktreeCleanupInterval = 6 * time.Hour
 const digestTickInterval = time.Minute
 
 // digestDefaultTime is the daily digest time (HH:MM, local) when the owner
-// has not configured notify.digest_time (DESIGN.v2.md §11 M3).
+// has not configured notify.digest_time (DESIGN.md §11 M3).
 const digestDefaultTime = "09:00"
 
 // issuePollInterval is the default issue-trigger latency (M4-B: the trigger
@@ -70,7 +70,7 @@ const (
 )
 
 // worktreeRetentionDays is how long a terminal goal's worktree is kept after
-// its last run (DESIGN.v2.md §13 — M1 value: 7 days; kept for review/debug).
+// its last run (DESIGN.md §13 — M1 value: 7 days; kept for review/debug).
 const worktreeRetentionDays = 7
 
 // workerQueueDepth bounds how many queued runs one agent's worker holds before
@@ -441,7 +441,7 @@ func (d *Daemon) stopAll() {
 // dispatchOnce claims queued runs only for agents whose worker has free
 // concurrency slots, then routes each to its agent's worker. This is the fix
 // for the old global head-of-line blocking: a saturated agent can no longer
-// stall other agents' dispatch (DESIGN.zh.md §7).
+// stall other agents' dispatch (DESIGN.md).
 func (d *Daemon) dispatchOnce(ctx context.Context) {
 	d.mu.Lock()
 	if d.stopped {
@@ -518,7 +518,7 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 	}
 }
 
-// ── worktree model (DESIGN.v2.md §6) ──
+// ── worktree model (DESIGN.md §6) ──
 //
 // Layout:
 //
@@ -673,7 +673,7 @@ func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitUR
 		return "", fmt.Errorf("git fetch: %w: %s", err, string(out))
 	}
 	// Create the branch from the domain's configured default branch
-	// (DESIGN.v2.md §6: the domain owns default_branch). If origin/
+	// (DESIGN.md §6: the domain owns default_branch). If origin/
 	// {defaultBranch} does not exist, the error names it — the domain config
 	// is wrong and the owner fixes it. No silent fallbacks.
 	if defaultBranch == "" {
@@ -797,7 +797,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 
 	d.ensureWorker(q.AgentID, maxConcurrent)
 
-	// Working directory (DESIGN.v2.md §6): the run works in the goal's
+	// Working directory (DESIGN.md §6): the run works in the goal's
 	// worktree — lazily allocated on first run, reused on later runs of the
 	// same goal (this is what makes checkpoint resume work: the file state is
 	// physically still there). Every agent-executed run belongs to a domain
@@ -811,7 +811,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
 		return
 	}
-	// Worktree cleanliness (DESIGN.v2.md §4, C4): a run must not start on a
+	// Worktree cleanliness (DESIGN.md §4): a run must not start on a
 	// worktree carrying changes nobody can account for — the daemon would
 	// sweep a human's manual edits into the goal's commits. AGENTWORK.md
 	// (platform-injected) and the domain-declared excludes are EXPECTED; a
@@ -1052,7 +1052,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, fmt.Sprintf("provider %q: %v", provider, err))
 		return
 	}
-	// maxRunDuration (DESIGN.v2.md §4, decision 2-6): the run's total time
+	// maxRunDuration (DESIGN.md §4, decision 2-6): the run's total time
 	// budget, independent of activity — a run stuck in a tool loop must not
 	// burn forever. The idle watchdog (silence) and this (total time) are
 	// complementary cancellers of the same promptCtx. On timeout the backend
@@ -1128,7 +1128,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
 				return
 			}
-			// Machine verification (DESIGN.v2.md §4/§5, invariant 14): the
+			// Machine verification (DESIGN.md §4/§5 (§9 invariant 14)): the
 			// domain's verify commands run BEFORE the run is finished. A red
 			// verify ends the run failed → retry chain. The goal layer only
 			// ever sees 'completed' runs that passed.
@@ -1151,7 +1151,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 					d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)
 					return
 				}
-				// Structural guards on the diff (DESIGN.v2.md §5.1), measured as
+				// Structural guards on the diff (DESIGN.md §5.1), measured as
 				// baseSHA..HEAD — the run's own changes. git status would be empty
 				// here: the daemon just committed the agent's work (and the agent
 				// may have committed itself), so the worktree is clean.
@@ -1187,7 +1187,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// automatic retry; a second consecutive stall is systemic (the agent
 		// keeps hanging) and surfaces to the owner instead of looping.
 		// Only TIMEOUT cancellations count toward the convergence rule — the
-		// C4 worktree-dirty park and human cancels also mark runs cancelled
+		// worktree-dirty park and human cancels also mark runs cancelled
 		// (without the watchdog summary) and must not consume the single
 		// automatic retry.
 		var priorCancelled int
@@ -1219,7 +1219,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 // from the run workdir and stores it on the associated domain in an UNFROZEN
 // state (checks_compiled_at stays ''), publishing domain:compiled so the
 // frontend can show the owner confirmation card. Structured output is read
-// from files, never parsed from agent stdout (DESIGN.v2.md §5.3, §9.3).
+// from files, never parsed from agent stdout (DESIGN.md §5.3, §9).
 func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	var prompt, runType, domainID, agentID string
 	err := d.st.DB().QueryRowContext(ctx,
@@ -1376,7 +1376,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		}
 		checksJSON, _ := json.Marshal(checks)
 		// The compiled policy ALWAYS lands (a fresh compile cycle replaces
-		// the previous one wholesale — DESIGN.v2.md §5.3), and resets the
+		// the previous one wholesale — DESIGN.md §5.3), and resets the
 		// freeze stamp: the domain returns to the pending-confirmation state
 		// so the owner's confirmation card reappears with the NEW product.
 		// (Regression: the old UPDATE was gated on checks_compiled_at='',
@@ -1558,8 +1558,8 @@ func (d *Daemon) finishRun(ctx context.Context, q *service.ClaimedRow, status, s
 }
 
 // goalOwnsSquadStatus mirrors multica's ownsIssueStatus: a leader run may only
-// push the goal to done when the goal is assigned to THIS squad (DESIGN.zh.md
-// §5.4). A guest @mentioned squad gets the "do NOT change status" briefing.
+// push the goal to done when the goal is assigned to THIS squad (DESIGN.md
+// §9). A guest @mentioned squad gets the "do NOT change status" briefing.
 func (d *Daemon) goalOwnsSquadStatus(ctx context.Context, goalID, squadID string) bool {
 	var at, aid string
 	err := d.st.DB().QueryRowContext(ctx, `SELECT assignee_type, assignee_id FROM goal WHERE id=?`, goalID).Scan(&at, &aid)
@@ -1647,7 +1647,7 @@ func buildPrompt(title, desc, handoff string) string {
 // reference the agent uses to produce structured side effects. This is the
 // agent's only source of truth for how to coordinate — without it the agent
 // doesn't know goal create/wait/comment exist, and it would never guess the
-// mention:// URI format. See DESIGN §5 (coordination primitives).
+// mention:// URI format. See DESIGN.md §2 (coordination primitives).
 func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string {
 	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name, description FROM agent ORDER BY name`)
 	if err != nil {

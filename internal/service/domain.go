@@ -17,7 +17,7 @@ import (
 // The acceptance policy is the SOURCE of "done": the owner defines it in
 // natural language (PolicyText), the processor agent compiles it into
 // executable Checks, and the owner's confirmation freezes it. See
-// DESIGN.v2.md §2/§5 (triangle separation: define ≠ execute ≠ judge).
+// DESIGN.md §5.2 (triangle separation: define ≠ execute ≠ judge).
 type Domain struct {
 	ID                   string `json:"id"`
 	Type                 string `json:"type"` // repo (M0); others deferred
@@ -47,7 +47,7 @@ type Domain struct {
 	CreatedAt            string `json:"created_at"`
 }
 
-// Checks is the compiled acceptance policy (DESIGN.v2.md §5): the frozen,
+// Checks is the compiled acceptance policy (DESIGN.md §5): the frozen,
 // executable interpretation of the domain owner's NL intent. Produced by the
 // processor agent, frozen by the owner's confirmation — never mutated in
 // place after that.
@@ -77,14 +77,14 @@ type Checks struct {
 }
 
 // Guard is a structural constraint — an objective, command-free check on the
-// run's diff (DESIGN.v2.md §5.1, second form).
+// run's diff (DESIGN.md §5.1, second form).
 type Guard struct {
 	Type     string  `json:"type"`      // diff_contains | diff_excludes | coverage_delta
 	Pattern  string  `json:"pattern"`   // glob matched against changed paths (diff_* guards)
 	MinDelta float64 `json:"min_delta"` // required coverage percentage-point delta
 }
 
-// GateRule names a human checkpoint (DESIGN.v2.md §5). Rule kinds (M2):
+// GateRule names a human checkpoint (DESIGN.md §5). Rule kinds (M2):
 //
 //	merge          — every completed run parks the goal in review (M0 default)
 //	diff_contains  — the run's diff must contain a path matching Pattern
@@ -116,7 +116,7 @@ func NewDomainService(st *store.Store, bus *events.Bus) *DomainService {
 func (s *DomainService) SetRunService(rs *RunService) { s.runSvc = rs }
 
 // CompilePolicy kicks off the acceptance-policy compilation for a domain
-// (DESIGN.v2.md §5.3): records the NL intent, enqueues a processor run on the
+// (DESIGN.md §5.3): records the NL intent, enqueues a processor run on the
 // given processor agent. The daemon executes the run, reads checks.json from
 // the run's workdir, and stores the result on the domain in an UNFROZEN state
 // (checks_compiled_at stays ''); the owner's confirmation card then freezes
@@ -143,7 +143,7 @@ func (s *DomainService) CompilePolicy(ctx context.Context, domainID, policyText,
 
 // compilePrompt builds the instruction for the processor agent. The compiled
 // policy goes to {workdir}/checks.json — a FILE, not stdout: the platform
-// reads structured side effects, never agent output (DESIGN.v2.md §5.3, §9.3).
+// reads structured side effects, never agent output (DESIGN.md §5.3, §9).
 func compilePrompt(d *Domain, policyText string) string {
 	var b strings.Builder
 	b.WriteString("你是 agentwork 的验收策略编译器。用户用自然语言描述了这个域的验收要求：\n\n")
@@ -200,7 +200,7 @@ func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 		return nil, NewValidationError("verification_strength must be strong, medium, or weak")
 	}
 	if d.MaxRunDuration == 0 {
-		d.MaxRunDuration = 7200 // 2h (DESIGN.v2.md §4)
+		d.MaxRunDuration = 7200 // 2h (DESIGN.md §4)
 	}
 	if d.VerifyTimeout == 0 {
 		d.VerifyTimeout = 600 // 10min per verify command
@@ -345,7 +345,7 @@ func (s *DomainService) Update(ctx context.Context, id string, d Domain) (*Domai
 
 // FreezeChecks stores the compiled acceptance policy and stamps it frozen.
 // Called after the owner confirms the processor agent's compilation output
-// (DESIGN.v2.md §5.3). Frozen checks are never mutated in place — a fresh
+// (DESIGN.md §5.3). Frozen checks are never mutated in place — a fresh
 // compile cycle replaces them wholesale.
 func (s *DomainService) FreezeChecks(ctx context.Context, id string, checks Checks, strength string) (*Domain, error) {
 	switch strength {

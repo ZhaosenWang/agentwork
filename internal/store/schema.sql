@@ -4,14 +4,14 @@
 -- (they are per-connection pragmas, so setting them here only affects the one
 -- connection that runs this file). Kept here for visibility/documentation.
 --
--- v2 (DESIGN.v2.md): adds the domain layer (asset/evolution domain owning
+-- v2 (DESIGN.md): adds the domain layer (asset/evolution domain owning
 -- acceptance policy + gates) and the review checkpoint state. M0 has no
 -- migration tooling: the DB may be wiped and rebuilt (data is disposable).
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- Two-layer coordination model (see DESIGN.zh.md §4 / DESIGN.v2.md §2):
+-- Two-layer coordination model (see DESIGN.md §2):
 --   domain = an asset/evolution domain (shared repo + acceptance policy).
 --   goal   = a work item (product plane). The SOLE holder of state authority.
 --   run    = one execution of a goal by one agent (execution plane). No
@@ -24,10 +24,10 @@ PRAGMA foreign_keys = ON;
 -- domain: an asset/evolution domain. Owns the shared repo, the acceptance
 -- policy (NL intent + compiled checks), and default gates. M0 implements
 -- type=repo only; other asset types (docs/infra-config/knowledge/backlog)
--- are deferred (DESIGN.v2.md §13). The acceptance policy is defined by the
+-- are deferred (DESIGN.md §13). The acceptance policy is defined by the
 -- domain owner in natural language (policy_text), compiled by the processor
 -- agent into executable checks (checks), and frozen after user confirmation
--- (checks_compiled_at). See DESIGN.v2.md §5 (triangle separation).
+-- (checks_compiled_at). See DESIGN.md §5 (triangle separation).
 CREATE TABLE IF NOT EXISTS domain (
     id                     TEXT PRIMARY KEY,
     type                   TEXT NOT NULL DEFAULT 'repo', -- repo (M0); others deferred
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS runtime (
 -- agent.status/pid columns are deliberately absent here — they belong to the
 -- future long-lived-session model and would be dead columns today.
 -- workdir_base was removed in v2: where a run works is decided by the goal's
--- domain (worktree), never by the agent (DESIGN.v2.md §6).
+-- domain (worktree), never by the agent (DESIGN.md §6).
 CREATE TABLE IF NOT EXISTS agent (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS squad_member (
 -- assignee is polymorphic (agent | squad | human).
 -- parent_id makes a goal a sub-goal (coordination unit), not a sub-run.
 -- domain_id: agent-executed goals must belong to a domain — the domain owns
--- the worktree and the acceptance policy (DESIGN.v2.md §2/§5).
+-- the worktree and the acceptance policy (DESIGN.md §2/§5).
 -- status 'review' (v2): the goal is parked waiting for a human checkpoint
 -- decision (the symmetric partner of 'blocked' = waiting on sub-goals).
 CREATE TABLE IF NOT EXISTS goal (
@@ -151,11 +151,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_source_ref ON goal(source_ref) WHERE s
 -- which checks whether this run still belongs to the current assignee before
 -- touching goal.status. status here is the execution-plane state machine.
 -- run_kind 'processor' marks platform-internal runs (e.g. the NL→checks
--- compiler run) — same scheduling mechanism, no goal (DESIGN.v2.md §8).
+-- compiler run) — same scheduling mechanism, no goal (DESIGN.md §8).
 -- run_type subdivides processor runs by task (M3): compile (NL→checks) and
 -- intake (IM natural-language command parsing). The daemon's
 -- runProcessorTask dispatches on it; more processor task types (digest
--- generation, health analysis — DESIGN.v2.md §13) extend this enum.
+-- generation, health analysis — DESIGN.md §13) extend this enum.
 -- evidence: the gate evidence bundle (diff stats + verify output + summary).
 CREATE TABLE IF NOT EXISTS run (
     id                 TEXT PRIMARY KEY,
@@ -187,7 +187,7 @@ CREATE INDEX IF NOT EXISTS idx_run_status ON run(status);
 
 -- gate_decision: checkpoint decision audit + the health-learning data source
 -- (per-gate approve/reject ratios feed the "suggest dropping/ tightening a
--- gate" loop, DESIGN.v2.md §13). Append-only.
+-- gate" loop, DESIGN.md §13). Append-only.
 CREATE TABLE IF NOT EXISTS gate_decision (
     id              TEXT PRIMARY KEY,
     goal_id         TEXT NOT NULL REFERENCES goal(id),

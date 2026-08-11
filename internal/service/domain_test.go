@@ -64,7 +64,7 @@ func TestCompilePolicyEnqueuesProcessorRun(t *testing.T) {
 
 // TestDomainCRUDAndFreeze covers the domain lifecycle: create with defaults,
 // read back, and freeze the compiled acceptance policy (the owner-confirmed
-// step that keeps the "define" role with the human — DESIGN.v2.md §5.3).
+// step that keeps the "define" role with the human — DESIGN.md §5.3).
 func TestDomainCRUDAndFreeze(t *testing.T) {
 	st := newTestStore(t)
 	svc := NewDomainService(st, events.NewBus())

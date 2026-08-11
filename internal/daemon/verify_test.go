@@ -382,7 +382,7 @@ func TestBuildEvidence(t *testing.T) {
 	}
 }
 
-// TestUnattributedDirty: the C4 gate — AGENTWORK.md and domain-declared
+// TestUnattributedDirty: the worktree-dirty gate — AGENTWORK.md and domain-declared
 // excludes are expected (not blocking); anything else dirty at run start is
 // reported for the manual-review park.
 func TestUnattributedDirty(t *testing.T) {

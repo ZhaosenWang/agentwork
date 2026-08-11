@@ -15,7 +15,7 @@ import { Button, PageHeader } from "@/components/ui";
 // inbound parser agent, the daily digest time). The owner connects Feishu by
 // scanning a QR code (SDK one-click app registration) — after that, tasks
 // can be created from Feishu itself (M3: 入站), and approvals answered from
-// the notification cards (DESIGN.v2.md decision 2-14 / §11 M3).
+// the notification cards (DESIGN.md decision 2-14 / §11 M3).
 export default function SettingsPage() {
   const { data: im, isLoading } = useImStatus();
   const connect = useConnectFeishu();

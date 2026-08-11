@@ -14,7 +14,7 @@ import (
 // Run is one execution of a goal by one agent (the execution plane). It has
 // NO authority over goal status: on a terminal status the daemon calls
 // GoalService.ReconcileOnRunEnd, which is the sole path that advances a goal.
-// See DESIGN.zh.md §2/§7.
+// See DESIGN.md §9.
 type Run struct {
 	ID               string `json:"id"`
 	GoalID           string `json:"goal_id"`
@@ -74,7 +74,7 @@ func (s *RunService) resolveLeader(ctx context.Context, assigneeType, assigneeID
 }
 
 // hasPending reports whether goalID already has a queued/running run on agentID,
-// for the per-(goal,agent) pending coalesce (DESIGN.zh.md §9.5).
+// for the per-(goal,agent) pending coalesce (DESIGN.md).
 func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID string) (bool, error) {
 	var n int
 	err := tx.QueryRowContext(ctx,
@@ -165,13 +165,13 @@ func (s *RunService) EnqueueExisting(ctx context.Context, goalID, agentID string
 
 // EnqueueForMention creates a run on an explicitly-mentioned agent for the
 // same goal, sourced from a comment. trigger_comment_id records provenance.
-// Per DESIGN.zh.md §5.3 this enqueues on the mentioned agent (NOT the goal's
+// Per DESIGN.md §2 this enqueues on the mentioned agent (NOT the goal's
 // current assignee) and does NOT cancel any in-flight run.
 func (s *RunService) EnqueueForMention(ctx context.Context, goalID, agentID, triggerCommentID string) (*Run, error) {
 	return s.enqueue(ctx, goalID, agentID, 1, false, "", triggerCommentID)
 }
 
-// EnqueueProcessorRun creates a platform-internal processor run (DESIGN.v2.md
+// EnqueueProcessorRun creates a platform-internal processor run (DESIGN.md
 // §8): no goal, a fixed prompt, associated with a domain being processed
 // (compile) or carrying the platform context for the task (intake, M3).
 // runType discriminates the processor task (compile|intake); the daemon's
@@ -263,14 +263,14 @@ type ClaimedRow struct {
 
 // Claim atomically claims the oldest queued run for one of the ready
 // (has-worker, not crashed/deleted) agents AND has a free concurrency slot.
-// Per DESIGN.zh.md §7 the claim avoids the old global head-of-line blocking by
+// Per DESIGN.md the claim avoids the old global head-of-line blocking by
 // letting the daemon pass the set of agents with free capacity and claiming
 // only within that set. Returns (nil, nil) when nothing is claimable.
 //
 // PER-GOAL SERIALIZATION: a goal's runs are strictly sequential — a queued
 // run is not claimed while ANOTHER run of the same goal is running (the
 // worktree is exclusive to one run at a time; a mention-triggered run
-// arriving mid-run must WAIT, not race the worktree — the C4 cleanliness
+// arriving mid-run must WAIT, not race the worktree — the worktree-cleanliness
 // gate used to cancel it instead, which silently dropped the review step).
 // Processor runs (goal_id='') are unaffected.
 func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedRow, error) {

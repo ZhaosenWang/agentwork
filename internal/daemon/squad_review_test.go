@@ -186,10 +186,10 @@ func TestSquadReviewDedupWithExistingMention(t *testing.T) {
 	}
 }
 
-// TestSquadReviewSkipsC4Park: the worktree-dirty park is a platform problem
+// TestSquadReviewSkipsWorktreePark: worktree-dirty park is a platform problem
 // (the run never started) — there is no finished work to review, so no
 // review request may fire.
-func TestSquadReviewSkipsC4Park(t *testing.T) {
+func TestSquadReviewSkipsWorktreePark(t *testing.T) {
 	d, st, gs, _, squadSvc := newSquadReviewDaemon(t)
 	ctx := context.Background()
 	goalID, _ := squadWithReviewer(t, d, st, gs, squadSvc, "reviewer")
@@ -208,7 +208,7 @@ func TestSquadReviewSkipsC4Park(t *testing.T) {
 		t.Fatalf("count comments: %v", err)
 	}
 	if n != 0 {
-		t.Fatalf("C4 park → no review request, got %d", n)
+		t.Fatalf("worktree-dirty park → no review request, got %d", n)
 	}
 }
 

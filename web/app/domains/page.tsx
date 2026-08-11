@@ -42,7 +42,7 @@ export default function DomainsPage() {
   );
 }
 
-// DomainCard renders the domain's three lifecycle states (DESIGN.v2.md §5.3):
+// DomainCard renders the domain's three lifecycle states (DESIGN.md §5.3):
 //   1. not compiled   — NL intent entered, no checks yet → "编译" kicks off the
 //                       processor agent.
 //   2. compiled, unfrozen — checks exist, checks_compiled_at == '' → the
@@ -61,7 +61,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const [compiling, setCompiling] = useState(false);
   const [strength, setStrength] = useState(d.verification_strength);
   // Editable copies of the compiled command lists (the confirmation card is
-  // the human's last word: 产物可见、可改、可审 — DESIGN.v2.md §5.3).
+  // the human's last word: 产物可见、可改、可审 — DESIGN.md §5.3).
   // jsonDraft overrides everything when edited (guards/gates included).
   const [editSetup, setEditSetup] = useState<string | null>(null);
   const [editExcludes, setEditExcludes] = useState<string | null>(null);
@@ -258,7 +258,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
 }
 
 // GateHealthTable shows each gate rule's decision history (M2 health data,
-// DESIGN.v2.md §13): a gate approved every time is a candidate for removal;
+// DESIGN.md §13): a gate approved every time is a candidate for removal;
 // one rejected repeatedly for tightening.
 function GateHealthTable() {
   const { data: stats } = useGateStats();

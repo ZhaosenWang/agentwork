@@ -85,7 +85,7 @@ func (d *Daemon) loadDomainChecks(ctx context.Context, domainID string) (checks 
 		`SELECT checks, verify_timeout, metrics_baseline, checks_compiled_at FROM domain WHERE id=?`, domainID).
 		Scan(&checksJSON, &timeout, &baselineJSON, &compiledAt)
 	if timeout <= 0 {
-		timeout = 600 // DESIGN.v2.md §4: default verify_timeout 10min
+		timeout = 600 // DESIGN.md §4: default verify_timeout 10min
 	}
 	_ = json.Unmarshal([]byte(checksJSON), &checks)
 	_ = json.Unmarshal([]byte(baselineJSON), &baseline)
@@ -96,7 +96,7 @@ func (d *Daemon) loadDomainChecks(ctx context.Context, domainID string) (checks 
 // commands (environment preparation — dependency installs, part of the
 // acceptance policy) first, then the verify commands. Each command runs under
 // verify_timeout (a hung command must not keep a run 'running' forever —
-// DESIGN.v2.md §4); any non-zero exit fails verification, and a failed
+// DESIGN.md §4); any non-zero exit fails verification, and a failed
 // verification ends the run failed (invariant 14: the goal layer only sees
 // 'completed' runs that passed machine verification). A setup failure is
 // attributed as environment preparation, separate from the judgment.
@@ -171,7 +171,7 @@ func runVerifiedCmd(ctx context.Context, dir, cmd string, timeout int) (string, 
 var coverRe = regexp.MustCompile(`coverage: ([0-9.]+)% of statements`)
 
 // checkGuards evaluates the structural constraints on the run's diff
-// (DESIGN.v2.md §5.1, second form — objective checks that are not commands):
+// (DESIGN.md §5.1, second form — objective checks that are not commands):
 //
 //	diff_contains / diff_excludes — glob over the changed paths
 //	coverage_delta — coverage reported by a `-cover` verify command vs the
@@ -243,7 +243,7 @@ func checkGuards(ctx context.Context, dir, baseSHA string, checks service.Checks
 }
 
 // unattributedDirty lists the worktree's dirty paths that no one can
-// account for (DESIGN.v2.md §4, C4): the platform-injected AGENTWORK.md and
+// account for (DESIGN.md §4): the platform-injected AGENTWORK.md and
 // the domain-declared excludes (checks.excludes — dependency dirs the
 // platform's own setup materializes) are EXPECTED; everything else is
 // returned ('' = clean enough to start a run). Called at run start, BEFORE
@@ -378,7 +378,7 @@ func runVerifyOutput(ctx context.Context, dir, cmd string, timeout int) (string,
 	return string(out), err
 }
 
-// buildEvidence assembles the checkpoint evidence bundle (DESIGN.v2.md §4,
+// buildEvidence assembles the checkpoint evidence bundle (DESIGN.md §4,
 // decision 2-3): diff stats + changed paths + verify output + agent summary.
 // Stored on run.evidence and shown on the approval card.
 func buildEvidence(ctx context.Context, dir, baseSHA, agentSummary, verifyReport, guardReport string) string {

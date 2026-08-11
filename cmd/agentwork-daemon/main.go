@@ -42,7 +42,7 @@ func main() {
 
 	bus := events.NewBus()
 
-	// IM connection (DESIGN.v2.md decision 2-14): the Web UI drives the Feishu
+	// IM connection (DESIGN.md decision 2-14): the Web UI drives the Feishu
 	// connect flow — one-click app registration via QR scan, then the first
 	// bot message captures the receive target. Credentials persist to SQLite;
 	// the daemon auto-reconnects on startup. No environment configuration.

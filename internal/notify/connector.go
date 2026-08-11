@@ -30,7 +30,7 @@ import (
 // credentials are created → the long connection starts → the owner sends one
 // message to the bot → the receive target is captured → CONNECTED. All state
 // persists to app_settings, so the daemon auto-reconnects on startup with no
-// environment configuration (DESIGN.v2.md decision 2-14; the product
+// environment configuration (DESIGN.md decision 2-14; the product
 // interaction, not env vars).
 type ConnStatus string
 

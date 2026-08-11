@@ -8,7 +8,7 @@ import (
 )
 
 // evalGates evaluates the domain's gate rules against the run's diff
-// (DESIGN.v2.md §5, M2 rule engine). merge always fires; diff_contains /
+// (DESIGN.md §5, M2 rule engine). merge always fires; diff_contains /
 // diff_excludes fire on the changed paths; request never fires here — it is
 // set directly by the agent's `goal request-approval` call. Returns the
 // human-readable fired-gate descriptions, which the daemon records on the
@@ -16,7 +16,7 @@ import (
 func evalGates(ctx context.Context, dir, baseSHA string, checks service.Checks) []string {
 	names := changedPaths(ctx, dir, baseSHA)
 	var hit []string
-	// Platform security baseline (DESIGN.v2.md §5.3 — built-in, cannot be
+	// Platform security baseline (DESIGN.md §5.3 — built-in, cannot be
 	// overridden by domain policy): DELETING files always demands a human
 	// checkpoint. The platform cannot infer intent from a deletion; the
 	// delete is judged by a human before anything leaves the branch. (Other

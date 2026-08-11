@@ -13,7 +13,7 @@ import (
 
 // Comment is a message under a goal. Authors are polymorphic (human/agent/
 // system). content is Markdown and may carry structured mention URIs that the
-// server parses AFTER persistence to trigger runs. See DESIGN.zh.md §5.3.
+// server parses AFTER persistence to trigger runs. See DESIGN.md §2.
 type Comment struct {
 	ID         string `json:"id"`
 	GoalID     string `json:"goal_id"`
@@ -60,7 +60,7 @@ const (
 // Matches multica's parser shape (server/internal/util/mention.go): only
 // structured Markdown URIs, only UUID-ish ids (or literal "all"). Bare `@handle`
 // prose does NOT match — the agent must resolve a UUID and write the link.
-// See DESIGN.zh.md §5.3 ("only structured URIs, only UUID").
+// See DESIGN.md §2 ("only structured URIs, only UUID").
 var MentionRe = regexp.MustCompile(`\[@?(.+?)\]\(mention://(agent|squad|human|all)/([0-9a-fA-F-]+|all)\)`)
 
 // ParseMentions extracts deduplicated mentions from persisted comment body.
@@ -92,7 +92,7 @@ func HasMentionAll(content string) bool {
 }
 
 // Create persists a comment and dispatches any agent/squad mentions it carries.
-// Per DESIGN.zh.md §5.3:
+// Per DESIGN.md:
 //   - @all → suppress auto-trigger (no run enqueued); humans notified later.
 //   - mention://agent/<id> → enqueue a new run on that agent (same goal,
 //     different agent), does NOT cancel the current assignee's in-flight run.
@@ -143,7 +143,7 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 
 	// Dispatch mentions AFTER the comment is durably stored. @all suppresses
 	// auto-trigger entirely (no runs); other mentions enqueue runs.
-	// State freeze (DESIGN.v2.md §4, decision 2-3): mentions only trigger on
+	// State freeze (DESIGN.md §4, decision 2-3): mentions only trigger on
 	// an ACTIVE goal. While the goal is in review (or blocked), a mention
 	// lands as a comment — no run — so the branch state under the human's
 	// decision is never mutated underneath the approval. The comment stays in

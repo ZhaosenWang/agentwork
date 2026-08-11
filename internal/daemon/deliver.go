@@ -10,7 +10,7 @@ import (
 	"github.com/eushing/agentwork/internal/events"
 )
 
-// deliver — the deterministic merge step (DESIGN.v2.md §7). After the human
+// deliver — the deterministic merge step (DESIGN.md §7). After the human
 // approves the checkpoint, the platform merges the goal branch into the
 // domain's default branch, re-verifies the merged state, pushes, and closes
 // via MarkDelivered. The merge is a PLATFORM action, never an agent run —
@@ -109,7 +109,7 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		case <-time.After(5 * time.Second):
 		}
 	}
-	// Deliver INTO the domain's configured default branch (DESIGN.v2.md §7).
+	// Deliver INTO the domain's configured default branch (DESIGN.md §7).
 	// Wrong config fails loudly with the branch name — the owner fixes the
 	// domain, no silent fallbacks.
 	repo := domainRepoPath(domainID)
@@ -208,7 +208,7 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		return
 	}
 
-	// Re-verify the MERGED state (DESIGN.v2.md §7): what enters the default
+	// Re-verify the MERGED state (DESIGN.md §7): what enters the default
 	// branch must be green, not just the branch in isolation. An UNFROZEN
 	// policy runs nothing (the human checkpoint already covered it — the
 	// goal layer only approves a review; unfrozen policies force that

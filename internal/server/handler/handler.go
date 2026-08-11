@@ -404,7 +404,7 @@ func (h *Handlers) updateDomain(w http.ResponseWriter, r *http.Request) {
 }
 
 // compileDomainPolicy starts acceptance-policy compilation for a domain
-// (DESIGN.v2.md §5.3): the processor agent compiles the NL intent into
+// (DESIGN.md §5.3): the processor agent compiles the NL intent into
 // checks, which stay UNFROZEN until the owner confirms via FreezeChecks.
 func (h *Handlers) compileDomainPolicy(w http.ResponseWriter, r *http.Request) {
 	var body struct {
@@ -420,7 +420,7 @@ func (h *Handlers) compileDomainPolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 // freezeDomainChecks stores the compiled acceptance policy after the owner
-// confirms the processor agent's output (DESIGN.v2.md §5.3). The confirmation
+// confirms the processor agent's output (DESIGN.md §5.3). The confirmation
 // card is the guard that keeps the "define" role with the human.
 func (h *Handlers) freezeDomainChecks(w http.ResponseWriter, r *http.Request) {
 	var body struct {

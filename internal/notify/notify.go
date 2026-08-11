@@ -1,4 +1,4 @@
-// Package notify is the IM notification gateway (DESIGN.v2.md §11 M1,
+// Package notify is the IM notification gateway (DESIGN.md §11 M1,
 // decision 2-14): it subscribes to milestone bus events and pushes them to
 // the owner over the Feishu enterprise-app LONG CONNECTION — the larksuite
 // SDK owns authentication, heartbeat, reconnection, and event delivery.
