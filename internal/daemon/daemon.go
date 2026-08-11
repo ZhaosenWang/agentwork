@@ -851,6 +851,22 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		log.Printf("daemon: worktree dirty for %s but attributable (cancelled leftovers or reject round) — continuing", q.GoalID)
 	}
 
+	// Environment readiness BEFORE the agent starts (决策 3-1, the setup half):
+	// the acceptance policy's setup commands (dependency installs) prepare the
+	// verification environment — but the agent needs the SAME environment to
+	// self-verify while working (a pytest it cannot import is a blind run).
+	// Run setup up front (idempotent; the verification stage re-runs it to
+	// guarantee the judging environment is fresh). A failed setup here is an
+	// environment failure — the run fails with that attribution, the retry
+	// chain applies as usual.
+	if checksFrozen && len(checks.Setup) > 0 {
+		setupReport, ok := runSetupOnly(ctx, runRowWorkdir, checks, timeout)
+		if !ok {
+			d.finishRun(ctx, q, "failed", "environment setup failed:\n"+setupReport)
+			return
+		}
+	}
+
 	// The run's diff baseline: guards and evidence measure this run's changes
 	// as baseSHA..HEAD (the agent may commit itself, and the daemon commits
 	// leftover work at run end — both land in HEAD).

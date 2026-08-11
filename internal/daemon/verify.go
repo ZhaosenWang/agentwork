@@ -129,6 +129,25 @@ func runVerification(ctx context.Context, dir string, checks service.Checks, tim
 	return b.String(), true, false
 }
 
+// runSetupOnly runs the acceptance policy's setup commands alone (no verify)
+// — the environment-readiness pass at RUN START (决策 3-1: the agent needs
+// the same environment it will be judged in). Idempotent by the setup
+// commands' own contract; the verification stage re-runs it later. Returns
+// ok=false on any setup failure (environment attribution).
+func runSetupOnly(ctx context.Context, dir string, checks service.Checks, timeout int) (string, bool) {
+	var b strings.Builder
+	for _, cmd := range checks.Setup {
+		b.WriteString("$ " + cmd + "\n")
+		out, code := runVerifiedCmd(ctx, dir, cmd, timeout)
+		b.WriteString(out)
+		if code != 0 {
+			b.WriteString(fmt.Sprintf("\n[setup failed (exit %d)]\n", code))
+			return b.String(), false
+		}
+	}
+	return b.String(), true
+}
+
 // runVerifiedCmd runs one command under verify_timeout and returns its
 // combined output and exit code (0 = ok; -1 = timeout; -2 = could not start).
 func runVerifiedCmd(ctx context.Context, dir, cmd string, timeout int) (string, int) {
