@@ -53,6 +53,10 @@ type ExecuteSpec struct {
 	// depends on acp for this one type, and backends without Agent→Client
 	// RPCs (jsonl/jsonrpc) leave it nil.
 	ClientHandler acp.ClientRequestHandler
+	// McpServers are the MCP servers advertised at session/new — the run's
+	// workspace MCP server (http /mcp/{runID}), so agents that do not
+	// delegate tools to client RPCs still reach the workspace through MCP.
+	McpServers []acp.McpServer
 }
 
 // EventType discriminates one stream event. Mirrors the ACP update shapes but

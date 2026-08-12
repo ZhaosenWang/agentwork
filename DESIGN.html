@@ -406,7 +406,12 @@ AgentWork Client RPC
      ▼
 Goal Workspace / Runtime Context</code></pre>
 
-<p>Client RPC 应成为 AgentWork 的通用执行边界。ACP、其他协议均可以映射到统一的能力模型。</p>
+<p>Client RPC 是 AgentWork 的通用执行边界。现状（决策 4-8 已实现）为<strong>双通道</strong>：</p>
+<ul>
+<li><strong>ACP fs/terminal RPC</strong>——7 个 handler（read/write + terminal×5），握手声明 clientCapabilities。</li>
+<li><strong>MCP 工作区 server</strong>——官方 go-sdk，streamable HTTP 挂在 /mcp/{runID}（GET+POST；GET 是 SSE 订阅，缺失会 405 导致工具不注册），session/new 的 McpServers 注入 URL。</li>
+</ul>
+<p class="small">统一模型：stdio/ws/tcp 同机制（注册 handler、声明能力、注入 Workspace 指引段——只说环境事实与协作契约，不指 agent 工具名）。遗留：fs 敏感文件拦截、MCP capability token（runID 即访问权）列后置。</p>
 
 <h2 id="policy">12. Policy / Verification</h2>
 <h3>12.1 定义、执行、判定分离</h3>

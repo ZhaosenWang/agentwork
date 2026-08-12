@@ -11,6 +11,7 @@ import (
 	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/issue"
+	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/server/handler"
 	"github.com/eushing/agentwork/internal/server/ws"
@@ -72,6 +73,24 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
 		ws.ServeWS(s.hub, w, r)
 	})
+	// Workspace MCP server per run (DESIGN.md 决策 4-8): the run's executor
+	// is registered in the daemon while the run is active; the agent reaches
+	// it at /mcp/{runID} (the URL is advertised in session/new mcpServers).
+	// streamable HTTP: POST for JSON-RPC, GET for the SSE event stream —
+	// opencode subscribes with a GET after initialize; without the GET route
+	// it gets 405 and never registers the MCP tools (a live run proved it:
+	// three POSTs arrived, the GET was missing, no tools appeared).
+	serveMCP := func(w http.ResponseWriter, r *http.Request) {
+		exec := s.d.MCPExecutor(r.PathValue("runID"))
+		if exec == nil {
+			http.Error(w, "no active run with this id", http.StatusNotFound)
+			return
+		}
+		log.Printf("mcp: request on run %s", r.PathValue("runID"))
+		mcp.HTTPHandler(exec).ServeHTTP(w, r)
+	}
+	mux.HandleFunc("POST /mcp/{runID}", serveMCP)
+	mux.HandleFunc("GET /mcp/{runID}", serveMCP)
 	h.Mount(mux)
 
 	go s.hub.Run(ctx)

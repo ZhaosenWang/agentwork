@@ -256,6 +256,16 @@ func normalizeNilSlices(v any) any {
 				}
 			}
 			if omitEmpty && f.IsZero() {
+				// A nil slice with omitempty is still emitted as an empty
+				// array: opencode's zod schema rejects MISSING arrays
+				// ("expected array, received undefined") — e.g.
+				// session/new mcpServers[].headers must be present even
+				// when empty. An empty array is accepted by strict and
+				// lenient servers alike.
+				if f.Kind() == reflect.Slice {
+					out[name] = []any{}
+					continue
+				}
 				continue
 			}
 			out[name] = normalizeNilSlices(f.Interface())

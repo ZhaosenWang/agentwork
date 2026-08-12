@@ -29,8 +29,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/issue"
+	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/runtime"
@@ -114,8 +116,13 @@ type Daemon struct {
 	workers     map[string]*agentWorker // agentID → per-agent scheduler
 	domainLocks map[string]*domainLock  // per-domain git lock (fetch + deliver)
 	msgBuffers  map[string]*msgBuffer   // runID → aggregated text row (persistEvent)
-	stopped     bool
-	ctx         context.Context
+	// mcpExecs maps runID → the run's workspace MCP executor (DESIGN.md
+	// 决策 4-8: agents that don't delegate tools to client RPCs get the
+	// workspace through an MCP server advertised at session/new). Guarded
+	// by mu.
+	mcpExecs map[string]*mcp.Executor
+	stopped  bool
+	ctx      context.Context
 }
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.
@@ -145,6 +152,7 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		issueCloser: issue.NewCloser(st),
 		workers:     make(map[string]*agentWorker),
 		msgBuffers:  make(map[string]*msgBuffer),
+		mcpExecs:    make(map[string]*mcp.Executor),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
@@ -321,6 +329,14 @@ func (d *Daemon) dispatchDigest(ctx context.Context) {
 // Poller exposes the issue poller for the server's webhook wiring (M4-B:
 // both triggers share the same create-goal path).
 func (d *Daemon) Poller() *issue.Poller { return d.issuePoll }
+
+// MCPExecutor returns the workspace MCP executor for a run (nil if the run
+// is not active). The server's /mcp/{runID} route resolves through this.
+func (d *Daemon) MCPExecutor(runID string) *mcp.Executor {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.mcpExecs[runID]
+}
 
 // imNotifier returns the live milestone pusher (nil before the long
 // connection is up — digest and intake replies then no-op).
@@ -955,12 +971,33 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		)
 	}
 
-	// Execution-environment proxy (DESIGN.md 决策 4-8): the run's handler
-	// answers the agent's fs/terminal RPCs — the worktree always stays on
-	// the platform machine, and leftover terminals are killed
+	// Execution-environment proxy (DESIGN.md 决策 4-8): EVERY run gets the
+	// same execution model — the worktree lives on the client side and is
+	// reached through the ACP fs/terminal capabilities the client declares
+	// in the handshake. stdio and remote agents are treated identically:
+	// one mechanism, one behaviour, and the handler path is exercised by
+	// every run's traffic instead of only remote ones. (A stdio agent whose
+	// local tools operate on its cwd — the worktree — is unaffected: same
+	// directory, same result.) Leftover terminals are killed
 	// unconditionally at session close (defer).
 	env := newRunEnvironment(q.RunID, q.GoalID, q.AgentID, runRowWorkdir, serverURL, binDir)
 	defer env.tm.cleanup()
+
+	// Workspace MCP server (DESIGN.md 决策 4-8): every run advertises its
+	// workspace as an MCP server over HTTP at session/new — agents that do
+	// not delegate tools to client fs/terminal RPCs (opencode's tools are
+	// local by design) still get read_file/write_file/run_command bound to
+	// THIS run's worktree + environment. Registered for the run's
+	// lifetime; the /mcp/{runID} route resolves it.
+	mcpExec := mcp.NewExecutor(runRowWorkdir, env.runEnv(nil))
+	d.mu.Lock()
+	d.mcpExecs[q.RunID] = mcpExec
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.mcpExecs, q.RunID)
+		d.mu.Unlock()
+	}()
 
 	// Open the transport (stdio/ws/tcp); the backend speaks the protocol.
 	spec := runtime.Spec{
@@ -982,6 +1019,24 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// human-agent dialogue channel — the agent starts with the latest
 	// conversation, nothing stored).
 	prompt := buildPrompt(title, desc, handoff)
+
+	// Workspace guidance (DESIGN.md 决策 4-8), injected for EVERY run — one
+	// execution model for stdio and remote alike. The worktree lives on the
+	// client side and is reached through the ACP fs/terminal capabilities
+	// the client declared during the handshake. The guidance names only the
+	// ACP protocol capabilities (deterministic); the agent maps them to its
+	// own tools — its toolset is its own business, agentwork states the
+	// environment facts and the collaboration contract.
+	prompt += fmt.Sprintf(`
+## Workspace
+
+Your workspace is provided by the platform:
+
+- Workspace root: %s
+- It contains the repository code and AGENTWORK.md, the coordination guide — read it first via the client's file access
+- The client advertises filesystem access (fs/read_text_file, fs/write_text_file) and command execution (terminal/*) over the ACP protocol. If your toolset calls these client capabilities, it operates on the workspace; commands run on the client machine with the workspace as their working directory
+- Work on the workspace through client capabilities: verification, review and delivery all read the workspace
+`, runRowWorkdir)
 
 	// The domain's acceptance policy in NL (the "what counts as done" the
 	// OWNER defined) — the agent works toward it instead of finding out at
@@ -1051,7 +1106,17 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	defer promptCancel()
 	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID, env.tm.activeCount)
 
-	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{Conn: conn, Cwd: runRowWorkdir, Prompt: prompt, ClientHandler: env})
+	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{
+		Conn:          conn,
+		Cwd:           runRowWorkdir,
+		Prompt:        prompt,
+		ClientHandler: env,
+		McpServers: []acp.McpServer{{
+			Type: "http",
+			Name: "agentwork",
+			URL:  serverURL + "/mcp/" + q.RunID,
+		}},
+	})
 	if err != nil {
 		conn.Close()
 		d.failRun(ctx, q, fmt.Sprintf("execute: %v", err))

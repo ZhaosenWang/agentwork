@@ -87,11 +87,19 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			}
 		}
 		if _, err := sess.Initialize(ctx, initReq); err != nil {
+			// The pump (the ONLY closer of `events`) starts after NewSession;
+			// these pre-session failures must close it themselves or the
+			// daemon's `for ev := range run.Events` blocks forever and the
+			// run never finishes (a live zombie: an agent that stalled
+			// connecting to the advertised MCP server left its run
+			// 'running' indefinitely after the idle watchdog fired).
+			close(events)
 			results <- proto.Result{Status: proto.StatusFailed, Output: withStderr("initialize: " + err.Error()), Err: err}
 			return
 		}
-		newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{Cwd: spec.Cwd})
+		newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{Cwd: spec.Cwd, McpServers: spec.McpServers})
 		if err != nil {
+			close(events)
 			results <- proto.Result{Status: proto.StatusFailed, Output: withStderr("new session: " + err.Error()), Err: err}
 			return
 		}

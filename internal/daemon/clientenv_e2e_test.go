@@ -32,6 +32,8 @@ type fakeACPAgent struct {
 
 	// Handshake observation.
 	clientCaps acp.ClientCapabilities
+	// Session observation: the advertised MCP servers.
+	mcpServers []acp.McpServer
 }
 
 func (a *fakeACPAgent) SetClientRequester(r acp.ClientRequester) { a.requester = r }
@@ -42,6 +44,7 @@ func (a *fakeACPAgent) OnInitialize(ctx context.Context, req acp.InitializeReque
 }
 func (a *fakeACPAgent) OnNewSession(ctx context.Context, req acp.NewSessionRequest) (*acp.NewSessionResponse, error) {
 	a.cwd = req.Cwd
+	a.mcpServers = req.McpServers
 	return &acp.NewSessionResponse{SessionID: "s1"}, nil
 }
 func (a *fakeACPAgent) OnLoadSession(ctx context.Context, req acp.LoadSessionRequest, sender acp.SessionEventSender) (*acp.LoadSessionResponse, error) {
@@ -148,6 +151,9 @@ func TestExecuteFullRoundTrip(t *testing.T) {
 		Cwd:           dir,
 		Prompt:        "do the work",
 		ClientHandler: env,
+		McpServers: []acp.McpServer{{
+			Type: "http", Name: "workspace", URL: "http://127.0.0.1:7373/mcp/run-1",
+		}},
 	})
 	if err != nil {
 		t.Fatalf("execute: %v", err)
@@ -183,6 +189,10 @@ func TestExecuteFullRoundTrip(t *testing.T) {
 	// an agent only uses client fs/terminal RPCs when they are declared.
 	if !agent.clientCaps.Terminal || !agent.clientCaps.FS.ReadTextFile || !agent.clientCaps.FS.WriteTextFile {
 		t.Fatalf("client capabilities not declared in handshake: %+v", agent.clientCaps)
+	}
+	// The workspace MCP server must be advertised at session/new.
+	if len(agent.mcpServers) != 1 || agent.mcpServers[0].Type != "http" || !strings.Contains(agent.mcpServers[0].URL, "/mcp/run-1") {
+		t.Fatalf("workspace MCP server not advertised at session/new: %+v", agent.mcpServers)
 	}
 	if agent.readContent != "hello worktree" {
 		t.Fatalf("fs read through proxy: want %q, got %q", "hello worktree", agent.readContent)
