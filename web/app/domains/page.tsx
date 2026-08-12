@@ -17,18 +17,18 @@ export default function DomainsPage() {
 
   return (
     <div>
-      <PageHeader title="域（资产/演进域）" />
+      <PageHeader title="项目" />
       <p className="text-sm text-gray-500 -mt-3 mb-4">
-        域 = 共享仓库 + 验收策略（NL 意图 → 编译检查 → 卡点）。agent 执行的 Goal 必须属于某个域。
+        项目 = 共享仓库 + 验收策略（NL 意图 → 编译检查 → 卡点）。agent 执行的 Goal 必须属于某个项目。
       </p>
       <div className="mb-4">
-        <Button onClick={() => setShowCreate(true)}>新建域</Button>
+        <Button onClick={() => setShowCreate(true)}>新建项目</Button>
       </div>
 
       {isLoading ? (
         <p className="text-gray-500">加载中…</p>
       ) : !domains?.length ? (
-        <Empty>还没有域——创建一个域并挂上你的代码仓库，agentwork 就能在域里全自动干活。</Empty>
+        <Empty>还没有项目——创建一个项目并挂上你的代码仓库，agentwork 就能在项目里全自动干活。</Empty>
       ) : (
         <div className="space-y-4">
           {domains.map((d) => (
@@ -186,7 +186,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
       {showEdit && <EditDomainDialog domain={d} onClose={() => setShowEdit(false)} />}
 
       <div className="text-xs text-gray-600 space-y-1">
-        <p><span className="font-medium">验收策略（NL）：</span>{d.policy_text || "（未填写——用一句话描述这个域怎么算“干对了”）"}</p>
+        <p><span className="font-medium">验收策略（NL）：</span>{d.policy_text || "（未填写——用一句话描述这个项目怎么算“干对了”）"}</p>
         {d.metrics_baseline && d.metrics_baseline !== "{}" && d.metrics_baseline !== "" && (
           <p>
             <span className="font-medium">演进基线（决策 2-15）：</span>
@@ -290,7 +290,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                   onChange={(e) => setPolicyText(e.target.value)}
                   className={inputCls}
                   rows={3}
-                  placeholder="用一句话描述这个域怎么算“干对了”…"
+                  placeholder="用一句话描述这个项目怎么算“干对了”…"
                 />
               </Field>
               <div className="flex items-center gap-3 flex-wrap">
@@ -599,7 +599,7 @@ function EditDomainDialog({ domain, onClose }: { domain: Domain; onClose: () => 
 
   return (
     <Dialog
-      title={`编辑域：${domain.name}`}
+      title={`编辑项目：${domain.name}`}
       onClose={onClose}
       footer={
         <>
@@ -696,7 +696,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
 
   return (
     <Dialog
-      title="新建域"
+      title="新建项目"
       onClose={onClose}
       footer={
         <>
@@ -718,7 +718,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
           <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
         </Field>
         <Field label="自然语言验收要求（可选，创建后可再编译）" hint="例如：测试必须通过，改动要带测试">
-          <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="用一句话描述这个域怎么算“干对了”…" />
+          <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="用一句话描述这个项目怎么算“干对了”…" />
         </Field>
         <Field label="处理器 agent（可选）">
           <select value={processorAgent} onChange={(e) => setProcessorAgent(e.target.value)} className={inputCls}>

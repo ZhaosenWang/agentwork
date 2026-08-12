@@ -186,7 +186,7 @@ function NewGoalForm({
     // v2: agent/squad-executed goals must belong to a domain (DESIGN.md §2).
     if (assigneeType === "agent" || assigneeType === "squad") {
       if (!domainId) {
-        setDomainErr("请选择所属域——agent 执行的 Goal 必须挂在一个域上（域提供 worktree 与验收策略）");
+        setDomainErr("请选择所属项目——agent 执行的 Goal 必须挂在一个项目上（项目提供 worktree 与验收策略）");
         return;
       }
       body.domain_id = domainId;
@@ -214,7 +214,7 @@ function NewGoalForm({
         <Field label="描述">
           <textarea value={description} onChange={(e) => setDescription(e.target.value)} className={inputCls} rows={3} placeholder="可选描述…" />
         </Field>
-        <Field label="所属域" hint="agent/squad 执行的 Goal 必填">
+        <Field label="所属项目" hint="agent/squad 执行的 Goal 必填">
           <select value={domainId} onChange={(e) => setDomainId(e.target.value)} className={inputCls}>
             <option value="">选择…</option>
             {domains?.map((d) => (
