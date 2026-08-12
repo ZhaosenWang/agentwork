@@ -347,11 +347,14 @@ func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 	return &g, nil
 }
 
-// Assign changes a goal's assignee (the handoff path). Per DESIGN.md
-// this does NOT cancel in-flight runs: when an orphaned run later reports in,
-// ReconcileOnRunEnd sees run.agent != goal.assignee and discards its result
-// without touching goal.status. The new assignee's run is enqueued by the
-// caller (RunService).
+// Assign changes a goal's assignee (the handoff path). The SERVICE layer does
+// NOT cancel in-flight runs — correctness comes from ReconcileOnRunEnd: an
+// orphaned run reporting in later sees run.agent != goal.assignee and its
+// result is discarded without touching goal.status. The DAEMON layer does the
+// resource-level cut (决策 4-9): on the goal:assigned event it terminates the
+// old owner's running run via the runCancels registry, so the new owner's
+// queued run is not deadlocked behind per-goal serialization. The new
+// assignee's run is enqueued by the caller (RunService).
 func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assigneeID, handoffNote string) (*Goal, error) {
 	g, err := s.Get(ctx, goalID)
 	if err != nil {
@@ -914,7 +917,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	// there), NOT hardcoded: the health-learning aggregation (GateStats)
 	// groups by rule, and a diff_contains decision recorded as "merge" would
 	// corrupt the learning data.
-	rule, err := s.resolveGateRule(ctx, goalID, runID, g.ReviewRequest)
+	rule, err := s.resolveGateRule(ctx, goalID, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -1092,10 +1095,9 @@ func (s *GoalService) ParkForManualReview(ctx context.Context, goalID, reason st
 // resolveGateRule names the rule that actually parked the goal in review:
 //   - the named run's gates_hit[0] (the IM card carries the evidence run),
 //   - else the goal's latest completed run's gates_hit[0] (the Web panel),
-//   - else the review_request source (a behavior-gate request is "request"),
 //   - else "merge" (the strength-linkage default gate fires with empty
 //     gates_hit).
-func (s *GoalService) resolveGateRule(ctx context.Context, goalID, runID, reviewRequest string) (string, error) {
+func (s *GoalService) resolveGateRule(ctx context.Context, goalID, runID string) (string, error) {
 	if runID == "" {
 		// The Web panel resolves without naming a run — use the latest
 		// completed run, whose gates_hit the daemon recorded.
@@ -1120,9 +1122,8 @@ func (s *GoalService) resolveGateRule(ctx context.Context, goalID, runID, review
 			}
 		}
 	}
-	if strings.HasPrefix(reviewRequest, "agent 请求审批") {
-		return "request", nil
-	}
+	// No gates_hit recorded — the strength-linkage default gate (weak domain)
+	// or the unfrozen-policy checkpoint fired with empty gates_hit.
 	return "merge", nil
 }
 

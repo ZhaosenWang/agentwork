@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useSchedules, useAgents, useSquads, useCreateSchedule, useDeleteSchedule, useSetScheduleEnabled, useGoalEvents } from "@/lib/queries";
+import { useSchedules, useAgents, useSquads, useDomains, useCreateSchedule, useDeleteSchedule, useSetScheduleEnabled, useGoalEvents } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import type { Schedule } from "@/lib/types";
 
@@ -10,6 +10,7 @@ export default function SchedulesPage() {
   const { data: schedules, isLoading } = useSchedules();
   const { data: agents } = useAgents();
   const { data: squads } = useSquads();
+  const { data: domains } = useDomains();
   const createSchedule = useCreateSchedule();
   const deleteSchedule = useDeleteSchedule();
   const setEnabled = useSetScheduleEnabled();
@@ -18,6 +19,7 @@ export default function SchedulesPage() {
 
   const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
   const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? sid;
+  const domainName = (did: string) => domains?.find((d) => d.id === did)?.name ?? did;
   const assigneeLabel = (s: Schedule) =>
     s.assignee_type === "squad" ? (squadName(s.assignee_id) || s.assignee_id) : (agentName(s.assignee_id) || s.assignee_id);
 
@@ -40,6 +42,7 @@ export default function SchedulesPage() {
                 <th className="px-4 py-3">名称</th>
                 <th className="px-4 py-3">Cron</th>
                 <th className="px-4 py-3">负责人</th>
+                <th className="px-4 py-3">项目</th>
                 <th className="px-4 py-3">时区</th>
                 <th className="px-4 py-3">下次触发</th>
                 <th className="px-4 py-3">创建时间</th>
@@ -54,6 +57,7 @@ export default function SchedulesPage() {
                     <code className="text-xs bg-zinc-100 px-1.5 py-0.5 rounded text-zinc-700">{s.cron_expression}</code>
                   </td>
                   <td className="px-4 py-3 text-zinc-600">{assigneeLabel(s)}</td>
+                  <td className="px-4 py-3 text-zinc-600">{domainName(s.domain_id)}</td>
                   <td className="px-4 py-3 text-zinc-500">{s.timezone || "UTC"}</td>
                   <td className="px-4 py-3 text-zinc-400 text-xs">
                     {s.next_run_at ? new Date(s.next_run_at).toLocaleString("zh-CN") : "-"}
@@ -85,7 +89,7 @@ export default function SchedulesPage() {
         </div>
       )}
 
-      {showForm && <NewScheduleForm agents={agents} squads={squads} onClose={() => setShowForm(false)} />}
+      {showForm && <NewScheduleForm agents={agents} squads={squads} domains={domains} onClose={() => setShowForm(false)} />}
       {deleteTarget && (
         <ConfirmDialog
           title="确认删除"
@@ -102,10 +106,12 @@ export default function SchedulesPage() {
 function NewScheduleForm({
   agents,
   squads,
+  domains,
   onClose,
 }: {
   agents?: { id: string; name: string }[];
   squads?: { id: string; name: string }[];
+  domains?: { id: string; name: string }[];
   onClose: () => void;
 }) {
   const createSchedule = useCreateSchedule();
@@ -114,13 +120,14 @@ function NewScheduleForm({
   const [description, setDescription] = useState("");
   const [assigneeType, setAssigneeType] = useState("agent");
   const [assigneeId, setAssigneeId] = useState("");
+  const [domainId, setDomainId] = useState("");
   const [cronExpression, setCronExpression] = useState("");
   const [timezone, setTimezone] = useState("UTC");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     createSchedule.mutate(
-      { name, title_template: titleTemplate, description, assignee_type: assigneeType, assignee_id: assigneeId, cron_expression: cronExpression, timezone },
+      { name, title_template: titleTemplate, description, assignee_type: assigneeType, assignee_id: assigneeId, domain_id: domainId, cron_expression: cronExpression, timezone },
       { onSuccess: onClose }
     );
   };
@@ -174,6 +181,14 @@ function NewScheduleForm({
             </select>
           </Field>
         )}
+        <Field label="所属项目" hint="必填，每次触发时在此域的仓库上执行（验收策略 + worktree 来自该域）">
+          <select value={domainId} onChange={(e) => setDomainId(e.target.value)} className={inputCls} required>
+            <option value="">选择…</option>
+            {domains?.map((d) => (
+              <option key={d.id} value={d.id}>{d.name}</option>
+            ))}
+          </select>
+        </Field>
         <Field label="Cron 表达式" hint="5 字段 cron: 分 时 日 月 星期（必填）">
           <input value={cronExpression} onChange={(e) => setCronExpression(e.target.value)} className={`${inputCls} font-mono`} required placeholder="0 9 * * 1-5" />
         </Field>

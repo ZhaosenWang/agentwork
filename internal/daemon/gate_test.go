@@ -11,8 +11,7 @@ import (
 )
 
 // TestEvalGates covers the M2 gate rule engine: merge always fires, diff_*
-// fire on the run's changed paths, request never fires here (it is set
-// directly by RequestApproval).
+// fire on the run's changed paths, unknown gate kinds never fire.
 func TestEvalGates(t *testing.T) {
 	dir := newTestRepo(t)
 	ctx := context.Background()
@@ -34,7 +33,7 @@ func TestEvalGates(t *testing.T) {
 			{Name: "merge", When: "每次完成都需审批"},
 			{Name: "diff_contains", When: "动 config 必审", Pattern: "config/*"},
 			{Name: "diff_excludes", When: "不许碰密钥", Pattern: "*.secret"},
-			{Name: "request", When: "agent 请求"},
+			{Name: "bogus", When: "不存在的卡点"},
 		},
 	}
 	hit := evalGates(ctx, dir, base, checks)
@@ -45,7 +44,7 @@ func TestEvalGates(t *testing.T) {
 	if !strings.Contains(joined, "diff_contains") {
 		t.Fatalf("diff_contains config/* must fire on config/prod.yaml: %s", joined)
 	}
-	if strings.Contains(joined, "diff_excludes") || strings.Contains(joined, "request") {
+	if strings.Contains(joined, "diff_excludes") || strings.Contains(joined, "bogus") {
 		t.Fatalf("unrelated gates must not fire: %s", joined)
 	}
 

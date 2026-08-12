@@ -193,6 +193,7 @@ export const createSchedule = (body: {
   description?: string;
   assignee_type?: string;
   assignee_id: string;
+  domain_id: string;
   cron_expression: string;
   timezone?: string;
 }) => api<Schedule>("/schedules", { method: "POST", body: JSON.stringify(body) });

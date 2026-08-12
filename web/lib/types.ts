@@ -53,7 +53,7 @@ export interface Goal {
 }
 
 export interface GateRule {
-  name: string; // merge | diff_contains | diff_excludes | request (M2)
+  name: string; // merge | diff_contains | diff_excludes (M2)
   when: string;
   pattern: string; // diff_* gates: glob over changed paths
 }
@@ -162,6 +162,7 @@ export interface Schedule {
   description: string;
   assignee_type: string; // agent | squad
   assignee_id: string;
+  domain_id: string; // 触发时克隆 goal 所属的域（验收策略 + worktree）
   cron_expression: string;
   timezone: string;
   enabled: boolean;
