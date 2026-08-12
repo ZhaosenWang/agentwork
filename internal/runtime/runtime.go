@@ -21,6 +21,7 @@ import (
 	"net"
 	"os/exec"
 	"sync"
+	"syscall"
 
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/gorilla/websocket"
@@ -73,6 +74,12 @@ func openStdio(ctx context.Context, spec Spec, taskEnv []string) (proto.Conn, er
 		cmd.Dir = spec.Cwd
 	}
 	cmd.Env = env
+	// Process group so Close kills the whole tree: an agent that spawned a
+	// child (model/tool subprocess) would otherwise leave it alive holding
+	// the stdout pipe's write end — the daemon's read loop then never sees
+	// EOF and a cancelled run (idle watchdog / approval cut) sits 'running'
+	// forever (a live approval-cut hang). Same discipline as terminal.go.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return proto.Conn{}, fmt.Errorf("runtime stdio: stdin pipe: %w", err)
@@ -90,7 +97,19 @@ func openStdio(ctx context.Context, spec Spec, taskEnv []string) (proto.Conn, er
 		if wc, ok := stdin.(io.WriteCloser); ok {
 			_ = wc.Close()
 		}
+		// CLOSE THE READ END FIRST: the read loop unblocks on EOF regardless
+		// of what happens to the process tree — a cancellation must never
+		// depend on killing the agent. (Live failure: killing the process
+		// GROUP missed an opencode/node process that re-parented itself, so
+		// cmd.Wait() below blocked forever, the read end stayed open, and the
+		// run sat 'running' silently after a human stop.)
+		if rc, ok := stdout.(io.ReadCloser); ok {
+			_ = rc.Close()
+		}
 		if cmd.Process != nil {
+			// Best-effort group kill (children), then kill the leader
+			// directly so Wait returns even if the group was re-parented.
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 		}

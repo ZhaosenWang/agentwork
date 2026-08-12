@@ -90,7 +90,8 @@ type Guard struct {
 //	diff_contains  — the run's diff must contain a path matching Pattern
 //	diff_excludes  — the run's diff must not contain a path matching Pattern
 //	request        — the agent requests approval mid-run (agentwork-cli
-//	                 goal request-approval); no condition to evaluate
+//	                 (the agent-side request gate is gone, 决策 4-11); no
+//	                 condition to evaluate
 //
 // diff_* conditions are evaluated by the daemon (it owns the git diff) and
 // recorded on the run row (run.gates_hit); the goal layer only reads the

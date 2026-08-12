@@ -44,43 +44,15 @@ func (d *Daemon) onGoalReviewing(_ context.Context, e events.Event) {
 		return
 	}
 	// NOTE: event handlers must NOT use the published event's ctx — it is the
-	// PUBLISHER's ctx (an HTTP request ctx for RequestApproval), cancelled the
-	// moment the publisher returns; every DB query here would fail with
-	// "context canceled" and the cut would silently not happen (a live run
-	// kept running while its goal sat in review waiting for the human). Use
-	// the daemon-lifetime ctx.
-	// A goal entering review must not carry a live agent run. The behavior-gate
-	// path (agent `goal request-approval`) leaves the agent's own run running:
-	// it would keep working — mutating the worktree the approval will judge
-	// (决策 2-3's evidence-pollution hole) — and it would block the review run
-	// behind per-goal serialization (the review run claims only after this one
-	// ends). Cut any running run; the review run enqueued below claims within
-	// a dispatch tick. Gate-hits and parks have no running run — no-op.
-	d.cancelReviewingRuns(d.ctx, goalID)
+	// PUBLISHER's ctx (an HTTP request ctx), cancelled the moment the
+	// publisher returns; every DB query here would fail with "context
+	// canceled". Use the daemon-lifetime ctx.
+	// No agent run needs cutting here (决策 4-11): the gate that parks the
+	// goal fired on the run that just completed, and per-goal serialization
+	// means no other run is live — the review run enqueued below claims
+	// within a dispatch tick.
 	if err := d.maybeTriggerSquadReview(d.ctx, goalID); err != nil {
 		log.Printf("daemon: squad review trigger for %s: %v", goalID, err)
-	}
-}
-
-// cancelReviewingRuns terminates every running run of a goal entering review
-// (reason "approval" — an agent-requested checkpoint, not a stall).
-func (d *Daemon) cancelReviewingRuns(ctx context.Context, goalID string) {
-	rows, err := d.st.DB().QueryContext(ctx,
-		`SELECT id FROM run WHERE goal_id=? AND status='running'`, goalID)
-	if err != nil {
-		log.Printf("daemon: review cancel scan %s: %v", goalID, err)
-		return
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err == nil {
-			ids = append(ids, id)
-		}
-	}
-	for _, id := range ids {
-		d.cancelRun(id, "approval")
 	}
 }
 
@@ -187,4 +159,42 @@ func (d *Daemon) enqueueSquadReview(ctx context.Context, goalID, reviewerID, nam
 		return err
 	}
 	return nil
+}
+
+// onGoalFinished reacts to a goal reaching a terminal state. For CANCELLED
+// goals (human Cancel, 决策 4-12), any still-running run is terminated —
+// a cancelled goal must not keep an agent burning compute on work already
+// decided dead. Done/failed goals have no live runs by construction (the
+// terminal run just finished; per-goal serialization), so they are no-ops.
+func (d *Daemon) onGoalFinished(_ context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]any)
+	if !ok {
+		return
+	}
+	status, _ := m["status"].(string)
+	if status != "cancelled" {
+		return
+	}
+	goalID, _ := m["goal_id"].(string)
+	if goalID == "" {
+		return
+	}
+	rows, err := d.st.DB().QueryContext(d.ctx,
+		`SELECT id FROM run WHERE goal_id=? AND status='running'`, goalID)
+	if err != nil {
+		log.Printf("daemon: cancel scan %s: %v", goalID, err)
+		return
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range ids {
+		log.Printf("daemon: goal cancelled — stopping run %s", id)
+		d.cancelRun(id, "stopped")
+	}
 }

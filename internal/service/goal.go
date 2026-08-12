@@ -810,7 +810,8 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 //     gates still gets a default merge gate — weak verification must not run
 //     unattended.
 //
-// request gates are set directly by RequestApproval, not via this path.
+// (The `request` gate is handled directly at the approval request site; it
+// no longer exists — agents cannot request approval, 决策 4-11.)
 func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunContext) (bool, string, error) {
 	var gatesHitJSON string
 	err := tx.QueryRowContext(ctx, `SELECT gates_hit FROM run WHERE id=?`, rc.RunID).Scan(&gatesHitJSON)
@@ -989,38 +990,6 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	}
 	s.bus.Publish(ctx, events.Event{Topic: "goal:review_resolved", Payload: map[string]any{
 		"goal_id": goalID, "decision": decision,
-	}})
-	return s.Get(ctx, goalID)
-}
-
-// RequestApproval is the behavior gate (DESIGN.md §5, M2): an agent that
-// hits a decision point it must not make alone parks the goal in review and
-// asks the human — via `agentwork-cli goal request-approval --reason "..."`.
-// The in-flight run keeps running; when it reports in, the reconcile sees
-// goal.status=review and does NOT advance it (review is exclusive — both the
-// done and failed promotions exclude it). The human's approve/reject then
-// resolves the goal like any other checkpoint.
-func (s *GoalService) RequestApproval(ctx context.Context, goalID, reason string) (*Goal, error) {
-	if reason == "" {
-		return nil, NewValidationError("reason is required")
-	}
-	res, err := s.st.DB().ExecContext(ctx,
-		`UPDATE goal SET status='review', review_request=? WHERE id=? AND status='active'`,
-		"agent 请求审批: "+reason, goalID)
-	if err != nil {
-		return nil, fmt.Errorf("request approval: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return nil, NewValidationError("goal is not active — cannot request approval")
-	}
-	detail, _ := json.Marshal(map[string]string{"reason": reason})
-	if _, err := s.st.DB().ExecContext(ctx,
-		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'requested_review',?,?)`,
-		newID(), goalID, "agent", "", string(detail), now()); err != nil {
-		return nil, fmt.Errorf("insert activity: %w", err)
-	}
-	s.bus.Publish(ctx, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
-		"goal_id": goalID, "reason": "agent 请求审批: " + reason,
 	}})
 	return s.Get(ctx, goalID)
 }

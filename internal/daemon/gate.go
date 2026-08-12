@@ -9,10 +9,10 @@ import (
 
 // evalGates evaluates the domain's gate rules against the run's diff
 // (DESIGN.md §5, M2 rule engine). merge always fires; diff_contains /
-// diff_excludes fire on the changed paths; request never fires here — it is
-// set directly by the agent's `goal request-approval` call. Returns the
-// human-readable fired-gate descriptions, which the daemon records on the
-// run row (run.gates_hit): the daemon computes, the goal layer judges.
+// diff_excludes fire on the changed paths. (The `request` gate is gone —
+// agents cannot request approval, 决策 4-11.) Returns the human-readable
+// fired-gate descriptions, which the daemon records on the run row
+// (run.gates_hit): the daemon computes, the goal layer judges.
 func evalGates(ctx context.Context, dir, baseSHA string, checks service.Checks) []string {
 	names := changedPaths(ctx, dir, baseSHA)
 	var hit []string
@@ -43,8 +43,6 @@ func evalGates(ctx context.Context, dir, baseSHA string, checks service.Checks) 
 					break
 				}
 			}
-		case "request":
-			// handled by GoalService.RequestApproval directly
 		}
 	}
 	return hit

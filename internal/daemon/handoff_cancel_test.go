@@ -173,12 +173,11 @@ func TestHandoffToHumanCancelsAllRuns(t *testing.T) {
 	}
 }
 
-// TestApprovalCutTerminatesRunningRun: a goal entering review (agent `goal
-// request-approval` publishes goal:reviewing) must not carry a live agent
-// run — it would keep mutating the worktree the approval judges, and it
-// would block the review run behind per-goal serialization. The platform
-// cuts it (reason "approval": normal control flow, not a stall).
-func TestApprovalCutTerminatesRunningRun(t *testing.T) {
+
+// TestCancelStopsRunningRun: cancelling a goal (决策 4-12) terminates its
+// still-running run — a cancelled goal must not keep an agent burning
+// compute. The stop reuses the runCancels registry with reason "stopped".
+func TestCancelStopsRunningRun(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(":memory:")
 	if err != nil {
@@ -194,11 +193,11 @@ func TestApprovalCutTerminatesRunningRun(t *testing.T) {
 		st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc,
 		runCancels:       make(map[string]context.CancelFunc),
 		runCancelReasons: make(map[string]string),
-		ctx:              context.Background(), // handlers use d.ctx, not the event ctx
+		ctx:              context.Background(),
 	}
 	handled := make(chan struct{})
-	bus.Subscribe("goal:reviewing", func(ctx context.Context, e events.Event) {
-		d.onGoalReviewing(ctx, e)
+	bus.Subscribe("goal:finished", func(ctx context.Context, e events.Event) {
+		d.onGoalFinished(ctx, e)
 		close(handled)
 	})
 
@@ -228,13 +227,30 @@ func TestApprovalCutTerminatesRunningRun(t *testing.T) {
 	d.runCancels["run-a"] = func() { fired = true }
 	d.mu.Unlock()
 
-	// RequestApproval parks the goal in review and publishes goal:reviewing —
-	// the daemon cuts the agent's own still-running run.
-	if _, err := goalSvc.RequestApproval(ctx, goal.ID, "please check"); err != nil {
-		t.Fatalf("request approval: %v", err)
+	if _, err := goalSvc.Cancel(ctx, goal.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
 	}
 	<-handled
 	if !fired {
-		t.Fatalf("running run must be cut when the goal enters review")
+		t.Fatalf("running run must be stopped when the goal is cancelled")
+	}
+}
+
+// TestStopRunRejectsForeignRun: StopRun refuses a run that does not belong
+// to the given goal.
+func TestStopRunRejectsForeignRun(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	d := &Daemon{
+		st:         st,
+		runCancels: make(map[string]context.CancelFunc),
+		ctx:        context.Background(),
+	}
+	// No run rows at all: any stop attempt must fail, not silently no-op.
+	if err := d.StopRun("goal-x", "run-y"); err == nil {
+		t.Fatal("StopRun for a nonexistent run: want error")
 	}
 }

@@ -2,6 +2,8 @@
 
 import { useState, useMemo } from "react";
 import { useGoalRuns, useGoalRunMessages, useAgents } from "@/lib/queries";
+import { useQueryClient } from "@tanstack/react-query";
+import { stopRun } from "@/lib/api";
 import { useWSEvent } from "@/lib/ws";
 import { Badge, Empty } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
@@ -97,17 +99,20 @@ function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentNa
 
   return (
     <div className="bg-white rounded-2xl border border-zinc-200/80 shadow-sm overflow-hidden">
-      <button
-        onClick={() => setOpen(!open)}
-        className="w-full text-left p-3.5 flex items-center gap-3 hover:bg-zinc-50/60 transition-colors"
-      >
-        <span className="h-2 w-2 rounded-full bg-indigo-400 shrink-0" />
-        <span className="font-medium text-sm text-zinc-900">{run.agent_id ? agentName(run.agent_id) : "-"}</span>
-        <Badge status={run.status} />
-        <span className="text-xs text-zinc-400 shrink-0">#{run.attempt}</span>
-        <span className="text-xs text-zinc-400 ml-auto hidden sm:block">{timeRange}</span>
-        <span className="text-zinc-400 text-xs shrink-0">{open ? "▾" : "▸"}</span>
-      </button>
+      <div className="flex items-center p-3.5">
+        <button
+          onClick={() => setOpen(!open)}
+          className="flex-1 flex items-center gap-3 text-left hover:bg-zinc-50/60 transition-colors rounded-lg py-0.5"
+        >
+          <span className="h-2 w-2 rounded-full bg-indigo-400 shrink-0" />
+          <span className="font-medium text-sm text-zinc-900">{run.agent_id ? agentName(run.agent_id) : "-"}</span>
+          <Badge status={run.status} />
+          <span className="text-xs text-zinc-400 shrink-0">#{run.attempt}</span>
+          <span className="text-xs text-zinc-400 ml-auto hidden sm:block">{timeRange}</span>
+          <span className="text-zinc-400 text-xs shrink-0">{open ? "▾" : "▸"}</span>
+        </button>
+        {run.status === "running" && <StoppingRun goalId={goalId} runId={run.id} />}
+      </div>
 
       {!open && run.result_summary && (
         <div className="px-4 pb-3.5">
@@ -184,6 +189,42 @@ function RunMessages({ messages }: { messages: ChatMessage[] }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// StoppingRun terminates a running run on human command (决策 4-12): the run
+// cancels (no attempt consumed, no auto-retry), goal state untouched — the
+// worktree keeps its state and recovery is the human's call.
+function StoppingRun({ goalId, runId }: { goalId: string; runId: string }) {
+  const qc = useQueryClient();
+  const [stopping, setStopping] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  return (
+    <div className="flex items-center gap-2">
+      {err && <span className="text-[11px] text-red-500">{err}</span>}
+      <button
+        onClick={async () => {
+          setStopping(true);
+          setErr(null);
+          try {
+            await stopRun(goalId, runId);
+            // The stop request is accepted; the run's terminal state lands
+            // async (cancel → backend returns). Reset the button so it can be
+            // re-pressed while the run is still winding down; the card
+            // disappears once the run leaves 'running'.
+            setStopping(false);
+            qc.invalidateQueries({ queryKey: ["goal-runs", goalId] });
+          } catch (e) {
+            setErr(String(e));
+            setStopping(false);
+          }
+        }}
+        disabled={stopping}
+        className="text-[11px] text-red-500 hover:text-red-700 hover:underline disabled:opacity-50"
+      >
+        {stopping ? "停止中…" : "停止"}
+      </button>
     </div>
   );
 }

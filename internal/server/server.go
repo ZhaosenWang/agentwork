@@ -91,6 +91,16 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	}
 	mux.HandleFunc("POST /mcp/{runID}", serveMCP)
 	mux.HandleFunc("GET /mcp/{runID}", serveMCP)
+	// Human-initiated run stop (决策 4-12): terminates the running run (no
+	// attempt consumed, no auto-retry), goal state untouched — recovery is
+	// the human's call.
+	mux.HandleFunc("POST /goals/{goalID}/runs/{runID}/stop", func(w http.ResponseWriter, r *http.Request) {
+		if err := s.d.StopRun(r.PathValue("goalID"), r.PathValue("runID")); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	h.Mount(mux)
 
 	go s.hub.Run(ctx)

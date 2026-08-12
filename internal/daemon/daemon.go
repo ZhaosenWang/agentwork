@@ -183,6 +183,10 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	// the squad's role=reviewer members (the squad's own rule, enforced by
 	// the platform — not by the leader's discretion).
 	bus.Subscribe("goal:reviewing", d.onGoalReviewing)
+	// Cancel now terminates the goal's running run too (决策 4-12): a
+	// cancelled goal must not keep an agent burning compute on work that is
+	// already decided dead. Same stop mechanism as StopRun.
+	bus.Subscribe("goal:finished", d.onGoalFinished)
 	// M4-B: a delivered issue-sourced goal closes its GitHub issue (the
 	// work is merged — the issue is done). The fix commits (structured, from
 	// the deliver) travel into the close comment so the issue records WHAT
@@ -487,6 +491,23 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 			log.Printf("daemon: handoff stamped run %s terminal (claim→register window)", runID)
 		}
 	}
+}
+
+// StopRun terminates a running run on human command (决策 4-12): the run
+// cancels (no attempt consumed, no auto-retry — the convergence rule only
+// counts idle-watchdog stalls), the goal state is untouched, and the
+// worktree keeps its state — recovery is the human's call (re-trigger /
+// hand off / re-review), same as a timeout per 决策 2-6.
+func (d *Daemon) StopRun(goalID, runID string) error {
+	var g string
+	if err := d.st.DB().QueryRowContext(d.ctx, `SELECT goal_id FROM run WHERE id=?`, runID).Scan(&g); err != nil {
+		return fmt.Errorf("stop run: %v", err)
+	}
+	if g != goalID {
+		return fmt.Errorf("run %s does not belong to goal %s", runID, goalID)
+	}
+	d.cancelRun(runID, "stopped")
+	return nil
 }
 
 // cancelRun terminates a running run (if its cancel is registered), recording
@@ -1143,7 +1164,19 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// issue comments fetched at run start (M4-B: the issue is the
 	// human-agent dialogue channel — the agent starts with the latest
 	// conversation, nothing stored).
+	// A REVIEW run (triggered by the platform's system review-request
+	// comment) must NOT receive the goal's task description — it would
+	// execute the task instead of reviewing it (a live failure: the opencode
+	// reviewer re-created the file the leader had just written). Its prompt
+	// is the review instruction only; the worktree, the comment feed
+	// (injected below) and the workspace guidance give it everything else.
 	prompt := buildPrompt(title, desc, handoff)
+	if reviewRun {
+		prompt = "你是审查者（reviewer）。请审查本次改动（squad 规矩：成员写完代码后由 reviewer 审查）。\n\n" +
+			"只提意见，不要修改任何文件，不要执行任务本身。\n" +
+			"审查工作区中的改动（diff、测试、质量），然后把你的意见用 `agentwork-cli goal comment` 发到评论区（供审批人参考）。\n" +
+			"意见要具体：问题、风险、改进建议。如果改动没问题，明确说明。"
+	}
 
 	// Workspace guidance (DESIGN.md 决策 4-8), injected for EVERY run — one
 	// execution model for stdio and remote alike. The worktree lives on the
@@ -1248,7 +1281,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.mu.Unlock()
 		promptCancel()
 	}
-	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID, env.tm.activeCount)
+	go d.runIdleWatchdog(promptCtx, &lastActivity, &inFlightTools, promptCancel, q.RunID, env.tm.activeCount)
 
 	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{
 		Conn:          conn,
@@ -1398,7 +1431,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		display := map[string]string{
 			"idle_watchdog": "idle watchdog",
 			"handoff":       "handoff",
-			"approval":      "approval",
+			"stopped":       "stopped", // human-initiated (StopRun / Cancel)
 			"timeout":       "timeout",
 		}[code]
 		summary := display + ": " + result.Output
@@ -1589,7 +1622,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	var inFlightTools atomic.Int32
 	procCtx, procCancel := context.WithTimeout(ctx, time.Duration(maxRunDuration)*time.Second)
 	defer procCancel()
-	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, procCancel, q.RunID, env.tm.activeCount)
+	go d.runIdleWatchdog(procCtx, &lastActivity, &inFlightTools, procCancel, q.RunID, env.tm.activeCount)
 
 	run, err := backend.Execute(procCtx, proto.ExecuteSpec{
 		Conn:          conn,
@@ -2014,12 +2047,6 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("  the full comment feed (including their handoff note and your own\n")
 	b.WriteString("  previous report) is injected, and the worktree already contains their\n")
 	b.WriteString("  committed work. Pick up from there.\n\n")
-
-	b.WriteString("### Request human approval\n")
-	b.WriteString("- When the work is done and it needs a human checkpoint (behavior gate):\n")
-	b.WriteString("  agentwork-cli goal request-approval --reason \"<why it needs the human>\"\n")
-	b.WriteString("  Parks the goal in review with your reason; the human approves (the platform\n")
-	b.WriteString("  merges) or rejects (you continue from the decision note).\n\n")
 
 	b.WriteString("### Inspect\n")
 	b.WriteString("- agentwork-cli goal list [--limit N] [--json]   # goals (JSON; --json explicit), capped to N most recent (default all)\n")

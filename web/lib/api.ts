@@ -134,6 +134,9 @@ export const updateDomain = (id: string, body: {
 }) => api<Domain>(`/domains/${id}`, { method: "PUT", body: JSON.stringify(body) });
 export const deleteDomain = (id: string) =>
   api<void>(`/domains/${id}`, { method: "DELETE" });
+export const stopRun = (goalId: string, runId: string) =>
+  api<void>(`/goals/${goalId}/runs/${runId}/stop`, { method: "POST" });
+
 export const compileDomainPolicy = (
   id: string,
   body: { policy_text: string; processor_agent_id: string }
