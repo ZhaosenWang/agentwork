@@ -1,10 +1,12 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   useDomains, useDomain, useAgents, useSquads, useCreateDomain, useUpdateDomain, useCompileDomainPolicy,
-  useFreezeDomainChecks, useGoalEvents, useGateStats,
+  useFreezeDomainChecks, useGoalEvents, useGateStats, qk,
 } from "@/lib/queries";
+import { useWSEvent } from "@/lib/ws";
 import { Button, Dialog, Field, inputCls, PageHeader, Empty, Badge } from "@/components/ui";
 import type { Domain, Checks } from "@/lib/types";
 
@@ -57,8 +59,10 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const { data: agents } = useAgents();
   const [showEdit, setShowEdit] = useState(false);
   const [policyText, setPolicyText] = useState(d.policy_text);
-  const [processorAgent, setProcessorAgent] = useState("");
   const [compiling, setCompiling] = useState(false);
+  const [compileError, setCompileError] = useState<string | null>(null);
+  // 回显域已配置的处理器 agent（域创建时选的 / 已配过的），不必每次重选
+  const [processorAgent, setProcessorAgent] = useState(d.processor_agent_id);
   const [strength, setStrength] = useState(d.verification_strength);
   // Editable copies of the compiled command lists (the confirmation card is
   // the human's last word: 产物可见、可改、可审 — DESIGN.md §5.3).
@@ -94,11 +98,35 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const startCompile = () => {
     if (!policyText.trim() || !processorAgent) return;
     setCompiling(true);
+    // Compilation is an ASYNC processor run (explores the repo, installs
+    // deps, measures the baseline — minutes, not the API round-trip).
+    // onSuccess must NOT clear compiling: the API returning only means the
+    // run was enqueued. The state clears when the platform's
+    // domain:compiled / domain:compile_failed event arrives below.
     compile.mutate(
       { id: d.id, policy_text: policyText, processor_agent_id: processorAgent },
-      { onSuccess: () => setCompiling(false), onError: () => setCompiling(false) }
+      { onError: () => setCompiling(false) }
     );
   };
+  // The compile outcome arrives asynchronously as a WS event (the run's
+  // terminal state); only then does the "编译中…" state clear and the domain
+  // refresh (checks landed / compile failed). Events are global — filter by
+  // this domain's id.
+  const qc = useQueryClient();
+  useWSEvent("domain:compiled", (p) => {
+    if ((p as { domain_id?: string })?.domain_id === d.id) {
+      setCompiling(false);
+      setCompileError(null);
+      qc.invalidateQueries({ queryKey: qk.domain(d.id) });
+    }
+  });
+  useWSEvent("domain:compile_failed", (p) => {
+    const pld = p as { domain_id?: string; error?: string };
+    if (pld?.domain_id === d.id) {
+      setCompiling(false);
+      setCompileError(pld.error ?? "编译失败（未知原因）");
+    }
+  });
 
   return (
     <div className="rounded-lg border border-gray-200 p-4 space-y-3">
@@ -242,7 +270,14 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                   {compiling ? "编译中…" : "编译验收策略"}
                 </Button>
               </div>
+              {compiling && (
+                <div className="flex items-center gap-2 text-xs text-amber-700">
+                  <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                  正在编译验收策略——处理器 agent 正在探索仓库、安装依赖、统计基线，通常需要几分钟
+                </div>
+              )}
               {compile.isError && <p className="text-sm text-red-500">{String(compile.error)}</p>}
+              {compileError && <p className="text-sm text-red-500">编译失败：{compileError}</p>}
             </div>
           )}
         </div>

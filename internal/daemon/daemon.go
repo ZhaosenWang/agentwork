@@ -1114,7 +1114,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// local by design) still get read_file/write_file/run_command bound to
 	// THIS run's worktree + environment. Registered for the run's
 	// lifetime; the /mcp/{runID} route resolves it.
-	mcpExec := mcp.NewExecutor(runRowWorkdir, env.runEnv(nil))
+	mcpExec := mcp.NewExecutor(runRowWorkdir, env.runEnv(nil), env.tm)
 	d.mu.Lock()
 	d.mcpExecs[q.RunID] = mcpExec
 	d.mu.Unlock()
@@ -1556,7 +1556,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	env := newRunEnvironment(q.RunID, "", q.AgentID, runRowWorkdir, serverURL, binDir)
 	defer env.tm.cleanup()
 	d.mu.Lock()
-	d.mcpExecs[q.RunID] = mcp.NewExecutor(runRowWorkdir, env.runEnv(nil))
+	d.mcpExecs[q.RunID] = mcp.NewExecutor(runRowWorkdir, env.runEnv(nil), env.tm)
 	d.mu.Unlock()
 	defer func() {
 		d.mu.Lock()
@@ -1570,7 +1570,28 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failProcessorRun(ctx, q, "provider "+provider+": "+err.Error())
 		return
 	}
-	run, err := backend.Execute(ctx, proto.ExecuteSpec{
+	// Time bounds, same as worker runs (a compile agent stuck on a slow pip
+	// index was running UNBOUNDED — no maxRunDuration, no idle watchdog, so
+	// the run sat "running" forever and the page showed 编译中… indefinitely;
+	// a live 15+ minute hang on pypi.org). The domain's max_run_duration is
+	// the budget (default 2h); the idle watchdog cuts silent stalls, and the
+	// terminal manager's activeCount widens its window like a worker run.
+	maxRunDuration := 7200
+	if domainID != "" {
+		var d2 int
+		_ = d.st.DB().QueryRowContext(ctx, `SELECT max_run_duration FROM domain WHERE id=?`, domainID).Scan(&d2)
+		if d2 > 0 {
+			maxRunDuration = d2
+		}
+	}
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	var inFlightTools atomic.Int32
+	procCtx, procCancel := context.WithTimeout(ctx, time.Duration(maxRunDuration)*time.Second)
+	defer procCancel()
+	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, procCancel, q.RunID, env.tm.activeCount)
+
+	run, err := backend.Execute(procCtx, proto.ExecuteSpec{
 		Conn:          conn,
 		Cwd:           runRowWorkdir,
 		Prompt:        prompt,
@@ -1584,7 +1605,9 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 	for ev := range run.Events {
+		lastActivity.Store(time.Now().UnixNano())
 		d.persistEvent(ctx, q.RunID, ev)
+		d.trackToolInflight(&inFlightTools, ev)
 		d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
 			"run_id": q.RunID, "event": ev,
 		}})
@@ -1698,10 +1721,10 @@ Your workspace lives on the PLATFORM machine — it is not your environment:
 - Workspace root: %s
 - It contains the repository code and AGENTWORK.md, the coordination guide — read it first
 - ACCESS THE WORKSPACE ONLY THROUGH THE PLATFORM'S CHANNELS:
-  * MCP server "agentwork" (advertised at session start) — its tools operate on the workspace: agentwork_read_file (read a file), agentwork_write_file (write a file), agentwork_run_command (execute a command with the workspace as its working directory)
+  * MCP server "agentwork" (advertised at session start) — its tools operate on the workspace: agentwork_read_file (read a file), agentwork_write_file (write a file), and the command trio agentwork_terminal_create → agentwork_terminal_output → agentwork_terminal_release (commands are ASYNC: create returns a terminal id immediately, poll output until exited=true passing the returned cursor back, then release to clean up)
   * Client capabilities over ACP — fs/read_text_file, fs/write_text_file, terminal/*
   Your own local file/shell tools operate on YOUR environment — NOT the workspace. On a remote runtime your local tools cannot reach the workspace at all; locally they only happen to work when the working directory points at it
-- Commands that touch the workspace run through the platform's execution channel (agentwork_run_command or terminal/*), on the platform machine, with the workspace as their working directory
+- Commands that touch the workspace run through the platform's execution channel (agentwork_terminal_create or terminal/*), on the platform machine, with the workspace as their working directory
 - Verification, review and delivery read only what you wrote through these channels
 `, workdir)
 }

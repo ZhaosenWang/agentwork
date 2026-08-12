@@ -57,7 +57,7 @@ func TestClientRPCWiring(t *testing.T) {
 	if _, err := env.tm.wait(tid); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	resp, err := env.tm.output(tid)
+	resp, _, _, err := env.tm.output(tid, nil)
 	if err != nil {
 		t.Fatalf("output: %v", err)
 	}

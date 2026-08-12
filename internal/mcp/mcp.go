@@ -11,21 +11,40 @@
 // The server is STATELESS (StreamableHTTPOptions.Stateless): each request
 // maps to an Executor bound to one run's worktree + environment. See
 // DESIGN.md 决策 4-8.
+//
+// Command execution is ASYNC and terminal-shaped (the same model as the ACP
+// terminal RPCs): terminal_create starts a command and returns its id
+// immediately, terminal_output polls incremental output + exit status,
+// terminal_release kills and forgets. A synchronous run_command was retired:
+// it hung the HTTP request for the command's whole lifetime, had no
+// command-level timeout, and duplicated the terminal engine with a second
+// implementation. The terminal tools share the daemon's per-run
+// terminalManager — one engine, two channels, the run's cleanup kills both.
 package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
+	"time"
 
 	gmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/eushing/agentwork/internal/acp"
 )
 
-// errEmptyCommand guards the run_command tool against a missing executable.
-var errEmptyCommand = errors.New("run_command: command is required")
+// TerminalHost is the command-execution surface the MCP terminal tools use.
+// The daemon's terminalManager implements it (the same per-run pool the ACP
+// terminal RPCs use — one engine, two channels; the run's cleanup kills
+// both). Defined here so mcp stays importable by the daemon (no cycle).
+type TerminalHost interface {
+	Create(command string, args []string, env []string, cwd string, byteLimit int) (acp.TerminalId, error)
+	Output(id acp.TerminalId, cursor *int64) (*acp.TerminalOutputResponse, *int64, int64, error)
+	Release(id acp.TerminalId) error
+}
 
 // Executor binds the workspace tools to ONE run: the worktree as the
 // filesystem basis and the run environment for commands. The daemon builds
@@ -36,14 +55,16 @@ type Executor struct {
 	// Env is the command environment (platform base + run context, PATH
 	// prepended with the agentwork-cli dir).
 	Env []string
+	// host executes terminal commands — the daemon's per-run terminalManager.
+	host TerminalHost
 }
 
-// NewExecutor binds an Executor to one run's workspace.
-func NewExecutor(workdir string, env []string) *Executor {
-	return &Executor{Workdir: workdir, Env: env}
+// NewExecutor binds an Executor to one run's workspace + terminal pool.
+func NewExecutor(workdir string, env []string, host TerminalHost) *Executor {
+	return &Executor{Workdir: workdir, Env: env, host: host}
 }
 
-// NewServer builds the MCP server with the three workspace tools registered.
+// NewServer builds the MCP server with the workspace tools registered.
 func NewServer(exec *Executor) *gmcp.Server {
 	srv := gmcp.NewServer(&gmcp.Implementation{Name: "agentwork", Version: "0.1"}, nil)
 
@@ -80,54 +101,155 @@ func NewServer(exec *Executor) *gmcp.Server {
 		return &gmcp.CallToolResult{Content: []gmcp.Content{&gmcp.TextContent{Text: "written " + args.Path}}}, nil, nil
 	})
 
-	type runArgs struct {
-		Command string   `json:"command" jsonschema:"executable to run"`
+	// defaultCreateWait is how long terminal_create waits (synchronously) for
+	// a short command before handing the terminal id back: most tool calls are
+	// short (ls, git status, one test), and a synchronous result saves the
+	// agent the create→poll→release dance. Commands past the budget switch to
+	// the async path automatically. The agent controls the command's real
+	// lifetime — release (kill) an overlong command; the platform only bounds
+	// the turn (run maxRunDuration / idle watchdog) and the concurrent count.
+	const defaultCreateWait = 10 * time.Second
+
+	type createArgs struct {
+		Command string   `json:"command" jsonschema:"the FINAL executable to run — no shell syntax; pass sh -c \"...\" for shell semantics"`
 		Args    *[]string `json:"args,omitempty" jsonschema:"command arguments"`
 		Cwd     *string   `json:"cwd,omitempty" jsonschema:"working directory override (defaults to the workspace root)"`
+		Timeout *int64    `json:"timeout,omitempty" jsonschema:"sync-wait budget in seconds (default 10): if the command finishes within it the result is returned directly; otherwise a terminal_id comes back and you poll terminal_output. 0 = return the id immediately (pure async)"`
 	}
 	gmcp.AddTool(srv, &gmcp.Tool{
-		Name:        "run_command",
-		Description: "Run a command on the platform machine with the workspace as the working directory. Use for builds, tests, git and verification.",
-	}, func(ctx context.Context, req *gmcp.CallToolRequest, args runArgs) (*gmcp.CallToolResult, any, error) {
+		Name: "terminal_create",
+		Description: "Start a command on the platform machine with the workspace as the working directory. " +
+			"Waits up to the timeout budget (default 10s) for a quick result; commands that finish in time return their " +
+			"output and exit status directly (exited=true). Longer commands return a terminal_id with exited=false — " +
+			"poll terminal_output (pass the returned cursor back) until exited=true, then terminal_release. " +
+			"Commands have no platform time limit of their own: release an overlong one.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args createArgs) (*gmcp.CallToolResult, any, error) {
+		if args.Command == "" {
+			return nil, nil, errEmptyCommand
+		}
 		var argv []string
 		if args.Args != nil {
 			argv = *args.Args
 		}
-		var cwd string
-		if args.Cwd != nil {
+		cwd := exec.Workdir
+		if args.Cwd != nil && *args.Cwd != "" {
 			cwd = *args.Cwd
 		}
-		res, err := exec.runCommand(ctx, args.Command, argv, cwd)
-		return res, nil, err
+		budget := defaultCreateWait
+		if args.Timeout != nil {
+			if *args.Timeout <= 0 {
+				budget = 0 // explicit 0: pure async, return the id immediately
+			} else {
+				budget = time.Duration(*args.Timeout) * time.Second
+			}
+		}
+		id, err := exec.host.Create(args.Command, argv, exec.Env, cwd, 0)
+		if err != nil {
+			return nil, nil, err
+		}
+		var cursor *int64
+		var out strings.Builder
+		var elapsed int64
+		deadline := time.Now().Add(budget)
+		for budget > 0 {
+			resp, next, el, err := exec.host.Output(id, cursor)
+			if err != nil {
+				return nil, nil, err
+			}
+			cursor = next
+			elapsed = el
+			out.WriteString(resp.Output)
+			if resp.ExitStatus != nil {
+				return toolResult(map[string]any{
+					"terminal_id": string(id), "output": out.String(), "cursor": *next,
+					"exited": true, "exit_code": derefInt(resp.ExitStatus.ExitCode),
+					"signal": derefStr(resp.ExitStatus.Signal), "elapsed": elapsed,
+				}), nil, nil
+			}
+			if time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		// Budget exhausted — the command is still running: hand back the id +
+		// everything seen so far; the agent continues via terminal_output.
+		return toolResult(map[string]any{
+			"terminal_id": string(id), "output": out.String(), "cursor": *cursor,
+			"exited": false, "elapsed": elapsed,
+		}), nil, nil
+	})
+
+	type outputArgs struct {
+		TerminalID string `json:"terminal_id" jsonschema:"the terminal id from terminal_create"`
+		Cursor     *int64 `json:"cursor,omitempty" jsonschema:"opaque cursor from the previous terminal_output call; omit on the first poll"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name: "terminal_output",
+		Description: "Poll a command's output: returns the bytes since the given cursor (omit on the first call), " +
+			"the next cursor to pass back, and the exit status once finished. Repeat until exited=true, then terminal_release. " +
+			"The cursor makes retries safe — re-polling with an old cursor never skips or duplicates bytes.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args outputArgs) (*gmcp.CallToolResult, any, error) {
+		resp, next, elapsed, err := exec.host.Output(acp.TerminalId(args.TerminalID), args.Cursor)
+		if err != nil {
+			return nil, nil, err
+		}
+		return toolResult(map[string]any{
+			"output": resp.Output, "cursor": *next, "truncated": resp.Truncated,
+			"exited": resp.ExitStatus != nil,
+			"exit_code": derefInt(exitCode(resp)), "signal": derefStr(exitSignal(resp)),
+			"elapsed": elapsed,
+		}), nil, nil
+	})
+
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "terminal_release",
+		Description: "Kill the command (if still running) and forget it. Always call after terminal_output reports exited.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args outputArgs) (*gmcp.CallToolResult, any, error) {
+		if err := exec.host.Release(acp.TerminalId(args.TerminalID)); err != nil {
+			return nil, nil, err
+		}
+		return &gmcp.CallToolResult{Content: []gmcp.Content{&gmcp.TextContent{Text: "released " + args.TerminalID}}}, nil, nil
 	})
 
 	return srv
 }
 
-// runCommand executes synchronously in the workspace with the run
-// environment. A non-zero exit is a tool-level error (isError) carrying the
-// exit code + combined output; spawn failures return the Go error.
-func (e *Executor) runCommand(ctx context.Context, command string, argv []string, cwd string) (*gmcp.CallToolResult, error) {
-	if command == "" {
-		return nil, errEmptyCommand
+// errEmptyCommand guards the terminal_create tool against a missing executable.
+var errEmptyCommand = errors.New("terminal_create: command is required")
+
+// toolResult marshals the tool's JSON response (the SDK delivers text
+// content; a structured string keeps the schema simple).
+func toolResult(v map[string]any) *gmcp.CallToolResult {
+	raw, _ := json.Marshal(v)
+	return &gmcp.CallToolResult{Content: []gmcp.Content{&gmcp.TextContent{Text: string(raw)}}}
+}
+
+func derefInt(v *int) int {
+	if v == nil {
+		return 0
 	}
-	if cwd == "" {
-		cwd = e.Workdir
+	return *v
+}
+
+func derefStr(v *string) string {
+	if v == nil {
+		return ""
 	}
-	cmd := exec.CommandContext(ctx, command, argv...)
-	cmd.Dir = cwd
-	cmd.Env = e.Env
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return &gmcp.CallToolResult{
-				Content: []gmcp.Content{&gmcp.TextContent{Text: "exit " + itoa(ee.ExitCode()) + "\n" + string(out)}},
-				IsError: true,
-			}, nil
-		}
-		return nil, err
+	return *v
+}
+
+func exitCode(r *acp.TerminalOutputResponse) *int {
+	if r.ExitStatus == nil {
+		return nil
 	}
-	return &gmcp.CallToolResult{Content: []gmcp.Content{&gmcp.TextContent{Text: string(out)}}}, nil
+	return r.ExitStatus.ExitCode
+}
+
+func exitSignal(r *acp.TerminalOutputResponse) *string {
+	if r.ExitStatus == nil {
+		return nil
+	}
+	return r.ExitStatus.Signal
 }
 
 // HTTPHandler wraps the run's workspace server as a streamable-HTTP handler
@@ -144,26 +266,4 @@ func dirOf(path string) string {
 		return ""
 	}
 	return path[:i]
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var b [20]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		b[i] = '-'
-	}
-	return string(b[i:])
 }

@@ -28,9 +28,11 @@ import (
 	"io"
 	"log"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/eushing/agentwork/internal/acp"
@@ -41,7 +43,9 @@ import (
 type outputBuffer struct {
 	mu        sync.Mutex
 	data      []byte
-	consumed  int
+	consumed  int64 // internal cursor (ACP protocol: stateless incremental polls)
+	total     int64 // bytes written since creation (the opaque cursor space)
+	dropped   int64 // bytes slid off the window (truncation)
 	truncated bool
 	limit     int // 0 = unlimited
 }
@@ -75,25 +79,44 @@ func (b *outputBuffer) Write(p []byte) (int, error) {
 				drop++
 			}
 			b.data = b.data[drop:]
-			if b.consumed > drop {
-				b.consumed -= drop
-			} else {
-				b.consumed = 0
-			}
+			b.dropped += int64(drop)
 		}
 	}
 	b.data = append(b.data, p...)
+	b.total += int64(len(p))
 	return len(p), nil
 }
 
-// read returns the bytes written since the last read and advances the
-// cursor. Callers should NOT hold any other buffer lock.
-func (b *outputBuffer) read() ([]byte, bool) {
+// readFrom returns the bytes since the given cursor (an opaque counter in
+// the total-byte space; 0 or negative starts from the beginning) plus the
+// next cursor to pass back. Safe under retry/re-poll: passing a cursor that
+// has slid off the window returns the newest available bytes and sets
+// truncated (the protocol's signal that part of the output was dropped).
+// A nil cursor uses the buffer's INTERNAL cursor (the ACP protocol's
+// stateless incremental semantics — each call returns what's new since the
+// last call and advances it); the MCP channel passes the client-owned
+// cursor instead, so HTTP retries can never skip or duplicate bytes.
+// Callers should NOT hold any other buffer lock.
+func (b *outputBuffer) readFrom(cursor *int64) ([]byte, int64, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	out := b.data[b.consumed:]
-	b.consumed = len(b.data)
-	return out, b.truncated
+	start := b.consumed
+	if cursor != nil {
+		start = *cursor
+	}
+	if start < b.dropped {
+		start = b.dropped
+	}
+	from := start - b.dropped
+	if from < 0 {
+		from = 0
+	}
+	if from > int64(len(b.data)) {
+		from = int64(len(b.data))
+	}
+	out := b.data[from:]
+	b.consumed = b.total
+	return out, b.total, b.truncated
 }
 
 // termState is one running (or finished) command instance.
@@ -106,7 +129,19 @@ type termState struct {
 	exited bool
 	code   int
 	signal string
+	// startedAt/exitAt track how long the command has run — terminal_output
+	// reports the elapsed time so the AGENT can decide whether to keep
+	// polling or release (kill) an overlong command. Commands have no
+	// platform time limit of their own; the run's maxRunDuration/watchdog
+	// bound the turn, release is the agent's kill.
+	startedAt time.Time
+	exitAt    time.Time
 }
+
+// maxActiveTerms caps how many commands may run concurrently per run — the
+// async terminal model makes it easy for an agent to batch-create processes,
+// and the cap keeps per-run resources bounded (create rejects beyond it).
+const maxActiveTerms = 8
 
 // terminalManager owns the run's terminals. Per-run instance: created at
 // run start, cleaned up unconditionally at session close.
@@ -119,6 +154,35 @@ type terminalManager struct {
 
 func newTerminalManager() *terminalManager {
 	return &terminalManager{terms: make(map[string]*termState)}
+}
+
+// TerminalHost surface for the MCP workspace server (internal/mcp): the MCP
+// terminal tools share this manager with the ACP terminal RPCs — one engine,
+// two channels, one cleanup.
+func (m *terminalManager) Create(command string, args []string, env []string, cwd string, byteLimit int) (acp.TerminalId, error) {
+	return m.create(command, args, env, cwd, byteLimit)
+}
+func (m *terminalManager) Output(id acp.TerminalId, cursor *int64) (*acp.TerminalOutputResponse, *int64, int64, error) {
+	return m.output(id, cursor)
+}
+func (m *terminalManager) Release(id acp.TerminalId) error {
+	return m.release(id)
+}
+
+// activeIDs lists the ids of terminals still running (for the cap-rejection
+// error: the agent must see what it holds before releasing).
+func (m *terminalManager) activeIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var ids []string
+	for id, t := range m.terms {
+		t.exitMu.Lock()
+		if !t.exited {
+			ids = append(ids, id)
+		}
+		t.exitMu.Unlock()
+	}
+	return ids
 }
 
 // activeCount reports how many terminals are still running (used by the
@@ -152,6 +216,13 @@ func (m *terminalManager) create(command string, args []string, env []string, cw
 	if command == "" {
 		return "", errors.New("terminal: empty command")
 	}
+	if m.activeCount() >= maxActiveTerms {
+		// The error names the ACTIVE terminals so the agent can decide which
+		// to release (kill) before retrying — a bare "limit reached" would
+		// leave it blind.
+		return "", fmt.Errorf("terminal: %d active commands already (max %d): %s",
+			maxActiveTerms, maxActiveTerms, strings.Join(m.activeIDs(), ", "))
+	}
 	cmd := exec.Command(command, args...)
 	cmd.Env = env
 	if cwd != "" {
@@ -175,7 +246,7 @@ func (m *terminalManager) create(command string, args []string, env []string, cw
 	}
 	id := acp.TerminalId(fmt.Sprintf("t%d", m.nextID.Add(1)))
 
-	t := &termState{id: string(id), cmd: cmd, buf: buf, done: make(chan struct{})}
+	t := &termState{id: string(id), cmd: cmd, buf: buf, done: make(chan struct{}), startedAt: time.Now()}
 	m.mu.Lock()
 	m.terms[string(id)] = t
 	m.mu.Unlock()
@@ -202,27 +273,35 @@ func (m *terminalManager) create(command string, args []string, env []string, cw
 		t.exited = true
 		t.code = code
 		t.signal = signal
+		t.exitAt = time.Now()
 		t.exitMu.Unlock()
 		close(t.done)
 	}()
 	return id, nil
 }
 
-// output returns the incremental output since the last poll plus the exit
-// status if the command has finished.
-func (m *terminalManager) output(id acp.TerminalId) (*acp.TerminalOutputResponse, error) {
+// output returns the incremental output since the given cursor (nil = from
+// the start) plus the next cursor to pass back, and the exit status if the
+// command has finished. The cursor is opaque (a byte counter) and makes
+// re-polls safe: a retried request with an old cursor returns no duplicates
+// and never loses bytes to the client's own state.
+func (m *terminalManager) output(id acp.TerminalId, cursor *int64) (*acp.TerminalOutputResponse, *int64, int64, error) {
 	t := m.get(id)
 	if t == nil {
-		return nil, fmt.Errorf("terminal %q: unknown", id)
+		return nil, nil, 0, fmt.Errorf("terminal %q: unknown", id)
 	}
-	out, truncated := t.buf.read()
+	out, next, truncated := t.buf.readFrom(cursor)
 	resp := &acp.TerminalOutputResponse{Output: string(out), Truncated: truncated}
+	var elapsed int64
 	t.exitMu.Lock()
 	if t.exited {
 		resp.ExitStatus = &acp.TerminalExitStatus{ExitCode: &t.code, Signal: &t.signal}
+		elapsed = int64(t.exitAt.Sub(t.startedAt).Seconds())
+	} else {
+		elapsed = int64(time.Since(t.startedAt).Seconds())
 	}
 	t.exitMu.Unlock()
-	return resp, nil
+	return resp, &next, elapsed, nil
 }
 
 // wait blocks until the command exits and returns its exit status.

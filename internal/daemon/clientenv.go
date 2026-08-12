@@ -138,7 +138,13 @@ func (e *runEnvironment) HandleCreateTerminal(ctx context.Context, req acp.Creat
 }
 
 func (e *runEnvironment) HandleTerminalOutput(ctx context.Context, req acp.TerminalOutputRequest) (*acp.TerminalOutputResponse, error) {
-	return e.tm.output(req.TerminalID)
+	// ACP v1 carries no cursor — the buffer's internal cursor gives the
+	// stateless incremental semantics (each call returns what's new).
+	resp, _, _, err := e.tm.output(req.TerminalID, nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 func (e *runEnvironment) HandleWaitForTerminalExit(ctx context.Context, req acp.WaitForTerminalExitRequest) (*acp.WaitForTerminalExitResponse, error) {

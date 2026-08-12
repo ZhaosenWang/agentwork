@@ -29,7 +29,7 @@ func TestTerminalLifecycle(t *testing.T) {
 	var first *acp.TerminalOutputResponse
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		first, err = tm.output(id)
+		first, _, _, err = tm.output(id, nil)
 		if err != nil {
 			t.Fatalf("first poll: %v", err)
 		}
@@ -56,7 +56,7 @@ func TestTerminalLifecycle(t *testing.T) {
 		t.Fatalf("wait: want exit 0, got %+v", wait)
 	}
 	// After exit, a poll returns the tail (the last poll's output).
-	tail, err := tm.output(id)
+	tail, _, _, err := tm.output(id, nil)
 	if err != nil {
 		t.Fatalf("tail poll: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestTerminalLifecycle(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 	// Released terminals are unknown.
-	if _, err := tm.output(id); err == nil {
+	if _, _, _, err := tm.output(id, nil); err == nil {
 		t.Fatal("output after release: want unknown-terminal error")
 	}
 }
@@ -144,7 +144,7 @@ func TestTerminalOutputByteLimit(t *testing.T) {
 	if wait.ExitCode == nil || *wait.ExitCode != 0 {
 		t.Fatalf("wait: want 0, got %+v", wait)
 	}
-	out, err := tm.output(id)
+	out, _, _, err := tm.output(id, nil)
 	if err != nil {
 		t.Fatalf("output: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestTerminalShellSemantics(t *testing.T) {
 	if _, err := tm.wait(id); err != nil {
 		t.Fatalf("wait: %v", err)
 	}
-	out, err := tm.output(id)
+	out, _, _, err := tm.output(id, nil)
 	if err != nil {
 		t.Fatalf("output: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestTerminalShellSemantics(t *testing.T) {
 	if _, err := tm.wait(id2); err != nil {
 		t.Fatalf("wait 2: %v", err)
 	}
-	out2, err := tm.output(id2)
+	out2, _, _, err := tm.output(id2, nil)
 	if err != nil {
 		t.Fatalf("output 2: %v", err)
 	}
@@ -286,4 +286,24 @@ func TestFSHandlers(t *testing.T) {
 	if _, err := env.HandleCreateTerminal(t.Context(), acp.CreateTerminalRequest{Command: "/nonexistent-binary"}); err == nil {
 		t.Fatal("create with missing command: want error")
 	}
+}
+
+
+// TestTerminalActiveCap: the per-run concurrent command cap rejects beyond
+// maxActiveTerms.
+func TestTerminalActiveCap(t *testing.T) {
+	tm := newTerminalManager()
+	for i := 0; i < maxActiveTerms; i++ {
+		if _, err := tm.create("sleep", []string{"30"}, nil, "", 0); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+	if _, err := tm.create("sleep", []string{"1"}, nil, "", 0); err == nil {
+		t.Fatal("create beyond maxActiveTerms: want error")
+	} else if !strings.Contains(err.Error(), "t") {
+		// The rejection must name the active terminals so the agent can
+		// decide which to release before retrying.
+		t.Fatalf("cap error should list active terminal ids, got %q", err)
+	}
+	tm.cleanup()
 }
