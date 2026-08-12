@@ -43,8 +43,38 @@ func (d *Daemon) onGoalReviewing(ctx context.Context, e events.Event) {
 	if goalID == "" {
 		return
 	}
+	// A goal entering review must not carry a live agent run. The behavior-gate
+	// path (agent `goal request-approval`) leaves the agent's own run running:
+	// it would keep working — mutating the worktree the approval will judge
+	// (决策 2-3's evidence-pollution hole) — and it would block the review run
+	// behind per-goal serialization (the review run claims only after this one
+	// ends). Cut any running run; the review run enqueued below claims within
+	// a dispatch tick. Gate-hits and parks have no running run — no-op.
+	d.cancelReviewingRuns(ctx, goalID)
 	if err := d.maybeTriggerSquadReview(ctx, goalID); err != nil {
 		log.Printf("daemon: squad review trigger for %s: %v", goalID, err)
+	}
+}
+
+// cancelReviewingRuns terminates every running run of a goal entering review
+// (reason "approval" — an agent-requested checkpoint, not a stall).
+func (d *Daemon) cancelReviewingRuns(ctx context.Context, goalID string) {
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND status='running'`, goalID)
+	if err != nil {
+		log.Printf("daemon: review cancel scan %s: %v", goalID, err)
+		return
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range ids {
+		d.cancelRun(id, "approval")
 	}
 }
 

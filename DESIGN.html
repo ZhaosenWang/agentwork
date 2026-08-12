@@ -302,6 +302,7 @@ Leader Agent
 
 <p>Delegation 的本质是创建/更新 Goal，而不是在 AgentWork 内部偷偷执行一个不可见 Workflow。</p>
 <div class="warn callout"><strong>与冻结决策冲突（决策 3-6）：</strong>本节的 child-goal 委派模型是<strong>愿景</strong>——子 goal 机制已休眠（leader 实测 wait 死锁：无子 goal 时永久 blocked，仅可 Cancel；实际协作是顺序流，mention 全覆盖）。现状协作走 <strong>mention</strong>（同 goal 协作 run），squad 以 leader run + role=reviewer 审查 checkpoint（决策 4-4）落地。恢复 child-goal 委派需重新满足"真实并行拆活需求 + 冲突自修复"前提。</div>
+<p class="small"><strong>交接语义（决策 4-9）：</strong>goal 易主时平台终止旧 owner 的 running run（per-run cancel 注册表）——旧 agent 已交接却不结束 run，会把新 owner 的 run 永远堵在 per-goal 串行队列后（死锁）；AGENTWORK.md 同步引导"交接后立即结束你的 turn"。</p>
 
 <h2 id="runtime">8. Runtime / Agent / Session</h2>
 <h3>8.1 三层模型</h3>

@@ -96,26 +96,40 @@ const maxAttempts = 3
 
 // Daemon owns per-agent workers and the run dispatch loop.
 type Daemon struct {
-	st        *store.Store
-	bus       *events.Bus
-	addr      string
-	protoReg  *proto.Registry
-	goalSvc   *service.GoalService
-	runSvc    *service.RunService
-	squadSvc  *service.SquadService
-	schedSvc  *service.ScheduleService
-	im        *notify.Connector // M3: daily digest + intake replies (the notifier
+	st       *store.Store
+	bus      *events.Bus
+	addr     string
+	protoReg *proto.Registry
+	goalSvc  *service.GoalService
+	runSvc   *service.RunService
+	squadSvc *service.SquadService
+	schedSvc *service.ScheduleService
+	im       *notify.Connector // M3: daily digest + intake replies (the notifier
 	// is born when the long connection connects; fetch it live)
-	qs        notify.QueryStore // M3: digest aggregation (may be nil)
-	issuePoll *issue.Poller     // M4-B: open issues → goals
-	issueCloser *issue.Closer   // M4-B: delivered goal → close its issue
-	intakeSvc   *notify.IntakeService // M4-B: multi-domain clarification draft store
-	lastIssuePoll time.Time     // last poll time (the interval is configurable)
+	qs            notify.QueryStore     // M3: digest aggregation (may be nil)
+	issuePoll     *issue.Poller         // M4-B: open issues → goals
+	issueCloser   *issue.Closer         // M4-B: delivered goal → close its issue
+	intakeSvc     *notify.IntakeService // M4-B: multi-domain clarification draft store
+	lastIssuePoll time.Time             // last poll time (the interval is configurable)
 
 	mu          sync.Mutex
 	workers     map[string]*agentWorker // agentID → per-agent scheduler
 	domainLocks map[string]*domainLock  // per-domain git lock (fetch + deliver)
 	msgBuffers  map[string]*msgBuffer   // runID → aggregated text row (persistEvent)
+	// runCancels maps runID → the run's prompt cancel (registered by runTask,
+	// used to terminate a running run when its goal changes hands — a handed
+	// off agent that keeps running deadlocks the new owner's queued run behind
+	// per-goal serialization; the platform cuts the old run instead of waiting
+	// on the agent's good behavior). Guarded by mu.
+	runCancels map[string]context.CancelFunc
+	// runCancelReasons maps runID → why the run was cancelled ("idle
+	// watchdog" / "handoff" / "approval"). The cancelled branch reads it ONCE
+	// to stamp the real reason into result_summary — without it every cancel
+	// (maxRunDuration deadline, handoff, approval) would be mislabeled "idle
+	// watchdog", which both lies in the feed and poisons the convergence
+	// counter (a handoff cancel must not count as a watchdog stall). Guarded
+	// by mu.
+	runCancelReasons map[string]string
 	// mcpExecs maps runID → the run's workspace MCP executor (DESIGN.md
 	// 决策 4-8: agents that don't delegate tools to client RPCs get the
 	// workspace through an MCP server advertised at session/new). Guarded
@@ -127,14 +141,14 @@ type Daemon struct {
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.
 type agentWorker struct {
-	agentID    string
-	sem        chan struct{}    // capacity = max_concurrent
-	queue      chan *service.ClaimedRow
-	ctx        context.Context
-	cancel     context.CancelFunc
-	daemonCtx  context.Context
-	run        func(context.Context, *service.ClaimedRow)
-	maxConc    int
+	agentID   string
+	sem       chan struct{} // capacity = max_concurrent
+	queue     chan *service.ClaimedRow
+	ctx       context.Context
+	cancel    context.CancelFunc
+	daemonCtx context.Context
+	run       func(context.Context, *service.ClaimedRow)
+	maxConc   int
 }
 
 // New wires the daemon. im + qs are the M3 IM surfaces: the connector is the
@@ -145,18 +159,26 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		st: st, bus: bus, addr: addr,
 		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
-		im:          im,
-		qs:          qs,
-		intakeSvc:   intakeSvc,
-		issuePoll:   issue.NewPoller(st, goalSvc, runSvc),
-		issueCloser: issue.NewCloser(st),
-		workers:     make(map[string]*agentWorker),
-		msgBuffers:  make(map[string]*msgBuffer),
-		mcpExecs:    make(map[string]*mcp.Executor),
+		im:               im,
+		qs:               qs,
+		intakeSvc:        intakeSvc,
+		issuePoll:        issue.NewPoller(st, goalSvc, runSvc),
+		issueCloser:      issue.NewCloser(st),
+		workers:          make(map[string]*agentWorker),
+		msgBuffers:       make(map[string]*msgBuffer),
+		mcpExecs:         make(map[string]*mcp.Executor),
+		runCancels:       make(map[string]context.CancelFunc),
+		runCancelReasons: make(map[string]string),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
 	bus.Subscribe("goal:approved", d.onGoalApproved)
+	// Handoff (human reassign or `goal assign`): the goal's new owner takes
+	// over — the previous owner's running run must NOT keep going (it would
+	// deadlock the new run behind per-goal serialization: an agent that
+	// handed off believes its turn is over, so nothing stops its run, and the
+	// new owner's run waits queued forever). The platform cuts the old run.
+	bus.Subscribe("goal:assigned", d.onGoalAssigned)
 	// Squad review checkpoint: a squad-owned goal parking in review triggers
 	// the squad's role=reviewer members (the squad's own rule, enforced by
 	// the platform — not by the leader's discretion).
@@ -400,6 +422,96 @@ func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
 	log.Printf("daemon: worker removed for agent %s", id)
 }
 
+// onGoalAssigned reacts to a goal changing hands (human reassign or an
+// agent's `goal assign`): the goal's OLD owner's running run must be cut.
+// Without this a handed-off agent keeps running — it believes its turn is
+// over (the handoff was the point of its turn), so nothing stops it, and the
+// new owner's run waits queued forever behind per-goal serialization: a
+// deadlock. The cancel flows through the normal terminal path (promptCtx
+// cancel → backend reports cancelled → reconcile discards the orphaned run;
+// no attempt consumed, no auto-retry — the convergence rule only counts
+// idle-watchdog cancellations). The old run's worktree leftovers stay
+// attributable (a prior cancelled run), so the new owner's dirty check
+// passes.
+func (d *Daemon) onGoalAssigned(ctx context.Context, e events.Event) {
+	g, ok := e.Payload.(*service.Goal)
+	if !ok {
+		return
+	}
+	// The goal's new owner as an agent id (the only runs allowed to keep
+	// running on the goal). Human owner → no agent may keep running.
+	ownerAgent := ""
+	if g.AssigneeType == "agent" {
+		ownerAgent = g.AssigneeID
+	} else if g.AssigneeType == "squad" {
+		_ = d.st.DB().QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, g.AssigneeID).Scan(&ownerAgent)
+	}
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT id, agent_id FROM run WHERE goal_id=? AND status='running'`, g.ID)
+	if err != nil {
+		log.Printf("daemon: handoff cancel scan for %s: %v", g.ID, err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var runID, agentID string
+		if err := rows.Scan(&runID, &agentID); err != nil {
+			continue
+		}
+		if agentID == ownerAgent {
+			continue // the new owner's own run (re-assign to self) keeps going
+		}
+		d.mu.Lock()
+		cancel, ok := d.runCancels[runID]
+		if ok {
+			d.runCancelReasons[runID] = "handoff"
+		}
+		d.mu.Unlock()
+		if ok {
+			log.Printf("daemon: handoff cut run %s (agent %s no longer owns goal %s)", runID, agentID, g.ID)
+			cancel()
+			continue
+		}
+		// The claim→register window: the run was claimed (status='running')
+		// but runTask hasn't registered its cancel yet — the in-memory cut
+		// missed it. Stamp the run terminal in the DB; runTask's post-register
+		// self-check sees status != 'running' and self-cancels. The stamp is
+		// the only writer besides runTask itself, so no race with finishRun.
+		if _, err := d.st.DB().ExecContext(ctx,
+			`UPDATE run SET status='cancelled', finished_at=? WHERE id=? AND status='running'`, nowStr(), runID); err != nil {
+			log.Printf("daemon: handoff terminal stamp %s: %v", runID, err)
+		} else {
+			log.Printf("daemon: handoff stamped run %s terminal (claim→register window)", runID)
+		}
+	}
+}
+
+// cancelRun terminates a running run (if its cancel is registered), recording
+// why. Idempotent.
+func (d *Daemon) cancelRun(runID, reason string) {
+	d.mu.Lock()
+	cancel, ok := d.runCancels[runID]
+	if ok {
+		d.runCancelReasons[runID] = reason
+	}
+	d.mu.Unlock()
+	if ok {
+		log.Printf("daemon: cut run %s (%s)", runID, reason)
+		cancel()
+	}
+}
+
+// takeCancelReason reads and clears the run's cancellation reason — the
+// cancelled branch stamps it into result_summary once, so a handoff cut is
+// recorded as a handoff, not as an idle-watchdog stall.
+func (d *Daemon) takeCancelReason(runID string) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	r := d.runCancelReasons[runID]
+	delete(d.runCancelReasons, runID)
+	return r
+}
+
 func (d *Daemon) ensureWorker(agentID string, maxConcurrent int) *agentWorker {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
@@ -466,7 +578,10 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 	}
 	// ready = agents with at least one free slot right now.
 	var ready []string
-	type wc struct{ id string; free, queued int }
+	type wc struct {
+		id           string
+		free, queued int
+	}
 	var dump []wc
 	for id, w := range d.workers {
 		free := cap(w.sem) - len(w.sem)
@@ -800,7 +915,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
 		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
 		        g.source_ref, d.git_credentials,
-		        r2.trigger_comment_id, c.author_type
+		        r2.trigger_comment_id, COALESCE(c.author_type, '')
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
 		 LEFT JOIN domain d ON d.id = g.domain_id
@@ -948,8 +1063,8 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	serverURL := "http://" + net.JoinHostPort("127.0.0.1", port)
 	taskEnv = append(taskEnv,
 		"AGENTWORK_SERVER_URL="+serverURL,
-		"AGENTWORK_GOAL_ID="+q.GoalID,   // product-plane id (CLI comments/handoff)
-		"AGENTWORK_RUN_ID="+q.RunID,     // execution-plane id
+		"AGENTWORK_GOAL_ID="+q.GoalID, // product-plane id (CLI comments/handoff)
+		"AGENTWORK_RUN_ID="+q.RunID,   // execution-plane id
 		"AGENTWORK_AGENT_ID="+q.AgentID,
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
@@ -1037,12 +1152,16 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	prompt += fmt.Sprintf(`
 ## Workspace
 
-Your workspace is provided by the platform:
+Your workspace lives on the PLATFORM machine — it is not your environment:
 
 - Workspace root: %s
-- It contains the repository code and AGENTWORK.md, the coordination guide — read it first via the client's file access
-- The client advertises filesystem access (fs/read_text_file, fs/write_text_file) and command execution (terminal/*) over the ACP protocol. If your toolset calls these client capabilities, it operates on the workspace; commands run on the client machine with the workspace as their working directory
-- Work on the workspace through client capabilities: verification, review and delivery all read the workspace
+- It contains the repository code and AGENTWORK.md, the coordination guide — read it first
+- ACCESS THE WORKSPACE ONLY THROUGH THE PLATFORM'S CHANNELS:
+  * MCP server "agentwork" (advertised at session start) — its tools operate on the workspace: agentwork_read_file (read a file), agentwork_write_file (write a file), agentwork_run_command (execute a command with the workspace as its working directory)
+  * Client capabilities over ACP — fs/read_text_file, fs/write_text_file, terminal/*
+  Your own local file/shell tools operate on YOUR environment — NOT the workspace. On a remote runtime your local tools cannot reach the workspace at all; locally they only happen to work when the working directory points at it
+- Commands that touch the workspace run through the platform's execution channel (agentwork_run_command or terminal/*), on the platform machine, with the workspace as their working directory
+- Verification, review and delivery read only what you wrote through these channels
 `, runRowWorkdir)
 
 	// The domain's acceptance policy in NL (the "what counts as done" the
@@ -1111,6 +1230,34 @@ Your workspace is provided by the platform:
 	var inFlightTools atomic.Int32
 	promptCtx, promptCancel := context.WithTimeout(ctx, time.Duration(maxRunDuration)*time.Second)
 	defer promptCancel()
+	// Register the run's cancel so a handoff can cut it (goal:assigned →
+	// onGoalAssigned); unregister when the run finishes. The same cancel the
+	// idle watchdog fires.
+	d.mu.Lock()
+	d.runCancels[q.RunID] = promptCancel
+	delete(d.runCancelReasons, q.RunID) // fresh run — no stale reason
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.runCancels, q.RunID)
+		delete(d.runCancelReasons, q.RunID)
+		d.mu.Unlock()
+	}()
+	// Post-register self-check: a handoff that landed in the claim→register
+	// window stamped this run terminal in the DB (onGoalAssigned found no
+	// registered cancel to cut). Honor the stamp — self-cancel so the new
+	// owner's run claims immediately instead of waiting out this one. The
+	// stamp is the only concurrent writer of status besides finishRun, and
+	// finishRun runs after this check, so there is no race.
+	var registeredStatus string
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT status FROM run WHERE id=?`, q.RunID).Scan(&registeredStatus)
+	if registeredStatus != "running" {
+		log.Printf("daemon: run %s terminal-stamped before registration — self-cancelling", q.RunID)
+		d.mu.Lock()
+		d.runCancelReasons[q.RunID] = "handoff"
+		d.mu.Unlock()
+		promptCancel()
+	}
 	go d.runIdleWatchdog(ctx, &lastActivity, &inFlightTools, promptCancel, q.RunID, env.tm.activeCount)
 
 	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{
@@ -1247,14 +1394,32 @@ Your workspace is provided by the platform:
 		// The convergence rule is separate: only the FIRST cancellation gets an
 		// automatic retry; a second consecutive stall is systemic (the agent
 		// keeps hanging) and surfaces to the owner instead of looping.
-		// Only TIMEOUT cancellations count toward the convergence rule — the
-		// worktree-dirty park and human cancels also mark runs cancelled
-		// (without the watchdog summary) and must not consume the single
-		// automatic retry.
+		// Only IDLE-WATCHDOG cancellations count toward the convergence rule —
+		// the worktree-dirty park, handoff cuts, approval cuts, and human
+		// cancels also mark runs cancelled (without the watchdog summary) and
+		// must not consume the single automatic retry.
+		// Structured cancellation reason (no string-matching semantics): the
+		// code is stamped on the run row + carried in the event; the summary
+		// text is display only.
+		code := d.takeCancelReason(q.RunID)
+		if code == "" {
+			code = "timeout" // maxRunDuration deadline — no retry (决策 2-6)
+		}
+		display := map[string]string{
+			"idle_watchdog": "idle watchdog",
+			"handoff":       "handoff",
+			"approval":      "approval",
+			"timeout":       "timeout",
+		}[code]
+		summary := display + ": " + result.Output
+		if _, err := d.st.DB().ExecContext(ctx,
+			`UPDATE run SET cancel_reason=? WHERE id=?`, code, q.RunID); err != nil {
+			log.Printf("daemon: stamp cancel_reason %s: %v", q.RunID, err)
+		}
 		var priorCancelled int
 		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='cancelled' AND result_summary LIKE 'idle watchdog:%'`, q.GoalID).Scan(&priorCancelled)
-		if priorCancelled == 0 {
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='cancelled' AND cancel_reason='idle_watchdog'`, q.GoalID).Scan(&priorCancelled)
+		if priorCancelled == 0 && code == "idle_watchdog" {
 			var isLeader int
 			var squadID string
 			_ = d.st.DB().QueryRowContext(ctx, `SELECT is_leader_run, squad_id FROM run WHERE id=?`, q.RunID).Scan(&isLeader, &squadID)
@@ -1262,12 +1427,12 @@ Your workspace is provided by the platform:
 				log.Printf("daemon: requeue cancelled run %s: %v", q.RunID, err)
 			}
 		}
-		d.finishRun(ctx, q, "cancelled", "idle watchdog: "+result.Output)
+		d.finishRun(ctx, q, "cancelled", summary)
 		// Surface the stall so the notify layer can tell the owner a task
 		// stalled (cancelled runs leave the goal active with no pending run —
 		// the human decides, per decision 2-6).
 		d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
-			"run_id": q.RunID, "goal_id": q.GoalID, "reason": "idle watchdog: " + result.Output,
+			"run_id": q.RunID, "goal_id": q.GoalID, "reason": summary, "reason_code": code,
 		}})
 	case proto.StatusFailed, proto.StatusAborted:
 		d.finishRun(ctx, q, "failed", result.Output)
@@ -1278,7 +1443,7 @@ Your workspace is provided by the platform:
 // agent's transport, sends the run's fixed prompt, drains events, and then
 // collects the FILE-based result — the compiled checks.json + strength.txt —
 // from the run workdir and stores it on the associated domain in an UNFROZEN
-// state (checks_compiled_at stays ''), publishing domain:compiled so the
+// state (checks_compiled_at stays ”), publishing domain:compiled so the
 // frontend can show the owner confirmation card. Structured output is read
 // from files, never parsed from agent stdout (DESIGN.md §5.3, §9).
 func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
@@ -1757,9 +1922,11 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 
 	b.WriteString("### Hand off the current goal\n")
 	b.WriteString("- agentwork-cli goal assign <to-agent-id> [--note \"scoping instruction\"]\n")
-	b.WriteString("  Hands the goal's ownership to that agent. Your current run keeps running to")
-	b.WriteString(" completion, but its result no longer affects the goal — the new owner's run\n")
-	b.WriteString("  drives it forward. Include a --note that scopes the work for the new owner.\n\n")
+	b.WriteString("  Hands the goal's ownership to that agent. END YOUR TURN immediately after —\n")
+	b.WriteString("  the platform terminates your run (its result no longer affects the goal, and\n")
+	b.WriteString("  a live run would block the new owner's: the goal executes serially). Do not\n")
+	b.WriteString("  keep working and do not wait for the new owner. Include a --note that scopes\n")
+	b.WriteString("  the work for the new owner.\n\n")
 
 	b.WriteString("### Pull in another agent via @mention\n")
 	b.WriteString("- Post a comment on the current goal mentioning an agent to trigger a run on it:\n")
@@ -1769,6 +1936,23 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString(" `agentwork-cli agent list` (JSON output). mention://agent/<uuid> triggers a")
 	b.WriteString(" new run on that agent for THIS goal; mention://squad/<uuid> routes to the")
 	b.WriteString(" squad's leader. @all (mention://all/all) suppresses auto-trigger.\n\n")
+	b.WriteString("### Collaboration is RELAY, not waiting\n")
+	b.WriteString("- Runs on this goal execute SERIALLY: the goal has one worktree and one\n")
+	b.WriteString("  running run at a time. Your run staying alive BLOCKS the agent you\n")
+	b.WriteString("  mentioned — their run only starts when yours ends. Never wait inside\n")
+	b.WriteString("  your run for another agent's result; it can never arrive.\n")
+	b.WriteString("- If you depend on another agent's result: finish everything you can NOW,\n")
+	b.WriteString("  mention them with exactly what you need, then END your turn. When they\n")
+	b.WriteString("  finish, they mention you back — your next run starts fresh (attempt 1),\n")
+	b.WriteString("  the full comment feed (including their handoff note and your own\n")
+	b.WriteString("  previous report) is injected, and the worktree already contains their\n")
+	b.WriteString("  committed work. Pick up from there.\n\n")
+
+	b.WriteString("### Request human approval\n")
+	b.WriteString("- When the work is done and it needs a human checkpoint (behavior gate):\n")
+	b.WriteString("  agentwork-cli goal request-approval --reason \"<why it needs the human>\"\n")
+	b.WriteString("  Parks the goal in review with your reason; the human approves (the platform\n")
+	b.WriteString("  merges) or rejects (you continue from the decision note).\n\n")
 
 	b.WriteString("### Inspect\n")
 	b.WriteString("- agentwork-cli goal list [--limit N] [--json]   # goals (JSON; --json explicit), capped to N most recent (default all)\n")
@@ -1846,6 +2030,9 @@ func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.In
 				continue
 			}
 			log.Printf("daemon: idle watchdog firing for run %s (silent %s), force-stopping", runID, time.Since(last).Round(time.Second))
+			d.mu.Lock()
+			d.runCancelReasons[runID] = "idle_watchdog"
+			d.mu.Unlock()
 			cancel()
 			return
 		}

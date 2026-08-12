@@ -55,6 +55,13 @@ func Open(path string) (*Store, error) {
 	// Single writer + many readers is fine for SQLite WAL; one connection
 	// for writes keeps the model simple. Pool a few for concurrent reads.
 	db.SetMaxOpenConns(8)
+	if path == ":memory:" {
+		// An in-memory database is PER-CONNECTION in SQLite — a pool would
+		// fragment the schema across connections ("no such table" on queries
+		// that land on a different connection than the one that ran the
+		// schema). Tests only: pin a single connection.
+		db.SetMaxOpenConns(1)
+	}
 
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()

@@ -166,6 +166,14 @@ func (n *Notifier) onRunCancelled(ctx context.Context, e events.Event) {
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	reason, _ := m["reason"].(string)
+	// Platform-initiated cuts are NOT stalls: a handoff cut (the goal changed
+	// hands — the old owner's run is terminated by design) and an approval cut
+	// (the agent requested a checkpoint and the platform stops its run) are
+	// normal control flow, not "the task stalled". Only timeouts reach the
+	// human as 任务中断. Structured reason_code — no string matching.
+	if code, _ := m["reason_code"].(string); code == "handoff" || code == "approval" {
+		return
+	}
 	title := n.goalTitle(ctx, goalID)
 	if title == "" {
 		title = short(goalID)

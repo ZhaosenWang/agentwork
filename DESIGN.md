@@ -144,6 +144,10 @@ agent 干完（run 到终态）
 - **review 期间新 run 不生效（决策 2-3）**：goal 在 review 时，mention/handoff 只落 comment、**不触发 run**（审批针对的分支状态冻结，证据包不被污染）。审批通过后由人决定是否执行（后置增强：审批时提示"review 期间有 N 条未执行 mention"）。
 - **worktree 干净性**：run 开始前 git status 检查——存在无法归因的改动（如人为修改）→ 该 run 不启动，goal 进 review 等人工处理；改动可归因于历史 run（超时/取消遗留）→ 视为预期，继续。
 - **cancel/delete 语义**：Cancel 覆盖 review 态；delete 时级联清理 worktree（并入 worktree 生命周期）。
+- **handoff 终止旧 run（决策 4-9，协作防死锁）**：goal 易主（人改派 / agent `goal assign`）时，平台终止旧 owner 的 running run——否则旧 agent 认为"已交接"而不结束 run（继续干是白干、空等被 watchdog 打死、活跃轮询则 watchdogs 都拦不住），新 owner 的 run 被 per-goal 串行化永远堵在 queued：死锁。机制：daemon 维护 runID→prompt cancel 注册表（+ 取消原因码），`goal:assigned` 事件驱动取消非新 owner 的 running run；claim→注册窗口内的 run 由 DB 兜底标记（status→cancelled），runTask 注册后自查 self-cancel（窗口归零）；取消走正常终态（cancelled，不耗 attempt，不触发自动重试）；旧 run 的 worktree 残留归因于 cancelled run，新 run 脏检查豁免。重新指派给同一 agent 不终止（它仍是 owner）；assign 给 human 终止所有 running run。AGENTWORK.md 同步引导"交接后立即结束你的 turn"。
+- **review 入场终止 run（决策 4-9 延伸）**：goal 进 review（`goal:reviewing`）时平台终止该 goal 的 running run——agent `request-approval` 后自己的 run 若不终止：继续改代码会污染审批窗口的 evidence（决策 2-3 要防的），且审查 run 被 per-goal 串行挡住（审批缺审查意见）。gate 命中/脏 worktree park 场景无 running run（no-op）。
+- **取消原因结构化（决策 4-9 延伸）**：run 行 `cancel_reason` 列 + 事件 `reason_code`（`idle_watchdog|handoff|approval|timeout`）——语义判断用结构化码，不用字符串匹配（result_summary 的 "idle watchdog: " 前缀仅为展示）。效果：maxRunDuration 超时不再被误判为 watchdog 自动重试（决策 2-6：超时不重试，人决定）；notify 对 handoff/approval 取消不推"任务中断"卡。
+- **协作是接力不是等待（决策 4-9 延伸）**：同 goal 的 run 严格串行（worktree 一份），"在 run 内等对方结果"物理不可能。依赖对方时：完成能做的部分 → mention 对方（说明需求）→ 结束 run；对方完成后再 mention 回来（新 run attempt=1，完整评论 feed 注入 + worktree 文件态恢复——A5 中断恢复模型）。AGENTWORK.md 完整引导。
 - **评论即重开（决策 4-1）**：终态（done/failed/cancelled）+ **human 作者** + 评论含 **action mention**（agent/squad）→ 自动 Reopen 再触发；纯评论仅落库不重开——终态不接受静默新活。agent/system 评论不触发重开。
 - **mention pingpong 上限（决策 4-2）**：计数口径 = `trigger_comment_id` 指向 **agent 作者**评论的 run 数。>4 → 下一 run 注入"停止互相转移任务"警告；≥8 → 强制 failed（协作循环判死，系统评论留痕）。human/system 触发不计。
 - **guest run 失败留痕（决策 4-3）**：协作 run（非 assignee 触发）失败且带 `trigger_comment_id` → 写系统评论（"协作 run 失败：…"），不重试、不动 goal 状态——feed 可见即协作闭环。
@@ -414,7 +418,9 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策4-5 | **策略缺陷客观检测**：verify 命令 exit 127（POSIX command not found）→ 自动标注"疑似验收策略问题"系统评论——owner 修策略而非 agent 白烧重试（替代字符串匹配） |
 | 决策4-6 | **评论区语义**：评论区 = 协作交流区，只承载人的话与协作动作（创建/改派/审批理由/重开/对话/mention）；系统内部状态不入评论（状态史归活动日志 + 执行流）。评论 = 团队上下文的对话层——每个 run 注入完整评论 feed（不限作者、不限条数） |
 | 决策4-7 | **评论注入压缩（规划未实现）**：全量注入随评论增长由平台负责压缩——预算制分层：决策记录/触发评论永不进摘要（保真层）、最近 ~4K 估算 token 原文（保留层）、更早的进平台累积摘要（背景层）。摘要 = 平台调度的 processor run（run_type=summary），触发 = 未摘要窗口达 ~8K 估算 token，每次压最老的到回落保留预算；估算 token = 启发式（CJK×1.2 + 非CJK×0.28，±30% 只影响触发时机）。失败：事件驱动重试（新评论才再试，连续 3 次降级常驻），摘要失败不影响 goal 状态，降级 = 机械压缩（保留层原文 + 更早「作者: 首句」） |
-| 决策4-8 | **client 执行环境代理（已实现）**：双通道——ACP fs/terminal RPC（7 handler，request_permission 自动放行=工具许可非审批）+ MCP 工作区 server（官方 go-sdk，streamable HTTP，/mcp/{runID} 挂 GET+POST，session/new McpServers 注入；给工具不走 client RPC 的 agent 如 opencode，实测 agentwork_* 工具落回 worktree）。统一模型：stdio/ws/tcp 同机制（注册 handler、声明能力、注入 Workspace 指引）。terminal per-command，session 关闭统一清理。无路径限制（信任边界 = daemon 用户）；fs 敏感文件拦截、MCP capability token 列后置 |
+| 决策4-8 | **client 执行环境代理（已实现）**：双通道——ACP fs/terminal RPC（8 handler，含 request_permission 自动放行=工具许可非审批）+ MCP 工作区 server（官方 go-sdk，streamable HTTP，/mcp/{runID} 挂 GET+POST，session/new McpServers 注入；给工具不走 client RPC 的 agent 如 opencode，实测 agentwork_* 工具落回 worktree）。统一模型：stdio/ws/tcp 同机制（注册 handler、声明能力、注入 Workspace 指引）。terminal per-command，session 关闭统一清理。无路径限制（信任边界 = daemon 用户）；fs 敏感文件拦截、MCP capability token 列后置 |
+| 决策4-9 | **平台终止过期 run（已实现）**：goal 易主（handoff）与进 review（request-approval）时平台终止旧 owner/在飞 agent 的 running run——runID→cancel 注册表 + goal:assigned / goal:reviewing 事件驱动；claim→注册窗口 DB 兜底标记 + 注册后自查归零。取消原因结构化（run.cancel_reason + reason_code，不用字符串匹配）。协作语义：接力不是等待（同 goal 串行，依赖对方=完成部分→mention→结束→被拉回，A5 恢复模型）。AGENTWORK.md 引导 |
+| 决策4-10 | **pingpong 阈值保持 4/8**：接力链每跳都计入 agent 触发（防甩锅口径），4 注入收敛警告 / 8 判死（可 Reopen 恢复、计数清零）；误伤"需求拆解差的长链"的代价 < 放过真甩锅链 |
 
 ---
 
@@ -442,3 +448,4 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 - 自举部署闭环：合入 → 重新构建 → 重启 daemon（决策 2-12）
 - 处理器 agent 的扩展用途：transcript 摘要、汇报生成、卡点健康度分析（决策 2-4 推论）
 - git 凭据分权：agent 推分支与 deliver 推 main 分离（决策 2-13）
+- squad leader 变更不触发旧 leader running run 的终止（squad 无 leader 变更事件；目前后果是旧 leader run 跑完丢弃 + 协作中断，需人手动——接决策 4-9 机制时补 squad:leader_changed 事件）
