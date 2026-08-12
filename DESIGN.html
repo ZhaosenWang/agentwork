@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentWork 架构与设计文档</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --card:#fff; --text:#17202a; --muted:#667085;
+    --border:#e5e7eb; --accent:#2563eb; --code:#111827; --soft:#eef4ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;line-height:1.7}
+  .layout{display:grid;grid-template-columns:280px minmax(0,1fr);min-height:100vh}
+  nav{position:sticky;top:0;height:100vh;overflow:auto;background:#111827;color:#d1d5db;padding:28px 20px}
+  nav h1{font-size:20px;color:#fff;margin:0 0 6px}
+  nav .version{font-size:12px;color:#9ca3af;margin-bottom:22px}
+  nav a{display:block;color:#cbd5e1;text-decoration:none;font-size:13px;padding:5px 8px;border-radius:6px}
+  nav a:hover{background:#1f2937;color:#fff}
+  nav .group{margin-top:16px;color:#fff;font-weight:700;font-size:12px;text-transform:uppercase}
+  main{max-width:1120px;width:100%;margin:0 auto;padding:54px 60px 100px}
+  h1{font-size:38px;line-height:1.2;margin:0 0 12px}
+  h2{font-size:28px;margin:54px 0 16px;padding-top:10px;border-top:1px solid var(--border)}
+  h3{font-size:20px;margin:32px 0 10px}
+  h4{font-size:16px;margin:22px 0 8px}
+  p{margin:10px 0}
+  .lead{font-size:18px;color:#475467}
+  .meta{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0 28px}
+  .tag{padding:4px 10px;background:#e9eef5;border-radius:999px;font-size:12px;color:#344054}
+  .callout{background:var(--soft);border-left:4px solid var(--accent);padding:16px 18px;border-radius:8px;margin:18px 0}
+  .warn{background:#fff7ed;border-left-color:#f97316}
+  pre{background:var(--code);color:#e5e7eb;padding:18px;border-radius:10px;overflow:auto;line-height:1.5;font-size:13px}
+  code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace}
+  :not(pre)>code{background:#f1f3f5;padding:2px 5px;border-radius:4px}
+  table{width:100%;border-collapse:collapse;background:var(--card);margin:16px 0 24px}
+  th,td{border:1px solid var(--border);padding:10px 12px;text-align:left;vertical-align:top}
+  th{background:#f8fafc;font-weight:700}
+  ul,ol{padding-left:24px}
+  .diagram{background:#fff;border:1px solid var(--border);border-radius:10px;padding:18px;margin:18px 0}
+  .diagram pre{margin:0}
+  .small{font-size:13px;color:var(--muted)}
+  .decision{border:1px solid #bfdbfe;background:#eff6ff;padding:14px 16px;border-radius:8px;margin:14px 0}
+  .footer{margin-top:80px;padding-top:20px;border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
+  @media(max-width:900px){.layout{display:block}nav{position:relative;height:auto}main{padding:32px 20px}h1{font-size:30px}}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav>
+  <h1>AgentWork</h1>
+  <div class="version">Architecture & Design · v1.0 · 2026-08</div>
+  <div class="group">Overview</div>
+  <a href="#principles">1. 设计目标与原则</a>
+  <a href="#positioning">2. 产品与系统定位</a>
+  <div class="group">Domain</div>
+  <a href="#domain">3. 核心领域模型</a>
+  <a href="#goal">4. Goal</a>
+  <a href="#run">5. Run</a>
+  <a href="#state">6. 状态机</a>
+  <a href="#squad">7. Squad & Delegation</a>
+  <div class="group">Execution</div>
+  <a href="#runtime">8. Runtime / Agent / Session</a>
+  <a href="#scheduler">9. Scheduler & Admission</a>
+  <a href="#workspace">10. Workspace</a>
+  <a href="#rpc">11. Client RPC</a>
+  <div class="group">Quality</div>
+  <a href="#policy">12. Policy / Verification</a>
+  <a href="#review">13. Review / Gate</a>
+  <a href="#delivery">14. Delivery</a>
+  <a href="#evidence">15. Evidence</a>
+  <div class="group">Platform</div>
+  <a href="#event">16. Event & Event Bus</a>
+  <a href="#storage">17. Storage</a>
+  <a href="#recovery">18. Recovery & Idempotency</a>
+  <a href="#security">19. Security</a>
+  <a href="#integrations">20. Trigger / Integration</a>
+  <a href="#ui">21. Web UI</a>
+  <div class="group">Engineering</div>
+  <a href="#structure">22. Repository Structure</a>
+  <a href="#openagent">23. AgentWork × OpenAgent-go</a>
+  <a href="#decisions">24. Architecture Decisions</a>
+  <a href="#roadmap">25. Roadmap</a>
+</nav>
+
+<main>
+<h1>AgentWork 架构与设计文档</h1>
+<p class="lead">一个面向多种 Agent Runtime 的任务管理、调度、协作、验收与交付控制平面。</p>
+<div class="meta">
+  <span class="tag">Status: Vision / 规划愿景（非现状）</span>
+  <span class="tag">Version: 1.0</span>
+  <span class="tag">Date: 2026-08</span>
+  <span class="tag">Runtime: Go</span>
+  <span class="tag">Storage: SQLite</span>
+</div>
+
+<div class="callout">
+<strong>核心定义：</strong>AgentWork 不是“多 Agent Kanban”，而是一个让 Agent 能够持续、可靠、可验证、可恢复地完成工作的 <strong>Agent Execution Control Plane</strong>。Kanban、Cron、Issue、IM 都是外围入口；Goal、Run、Scheduler、Agent Session、Verification、Review、Delivery 才是核心闭环。
+</div>
+
+<div class="warn callout">
+<strong>阅读说明：</strong>本文档是 <strong>架构愿景</strong>（目标态设计），<strong>不是现状基线</strong>。现状的权威是 <a href="DESIGN.md">DESIGN.md</a>（决策 2-x / 3-x / 4-x 编号，代码注释引用它）；数据库结构以 <code>internal/store/schema.sql</code> 为准。本文描述的能力（AgentSession 统一抽象、Run Admission、worker lease、持久化 Event Log、Capability Token、Repository 层等）多数为<strong>规划未实现</strong>；与 DESIGN.md 冻结决策冲突处（§6 状态机、§7 Delegation、Roadmap）已就地标注。愿景与现状冲突时，<strong>以 DESIGN.md 与代码为准</strong>。
+</div>
+
+<h2 id="principles">1. 设计目标与原则</h2>
+<h3>1.1 目标</h3>
+<ul>
+<li>统一管理 Coding、IaC、Research、Ops 等不同类型 Agent。</li>
+<li>将“任务事实”和“一次执行”分离，支持 retry、review、handoff、recovery。</li>
+<li>让人定义验收标准，Agent 执行，平台验证，人只在必要的 Gate 出现。</li>
+<li>支持本地 Agent、远程 Agent、不同 Runtime 与不同协议。</li>
+<li>支持 crash recovery、幂等交付、执行审计与实时 UI。</li>
+<li>通过统一 Goal 模型承接 Web、Cron、Issue、IM、Agent 等不同触发来源。</li>
+</ul>
+
+<h3>1.2 核心原则</h3>
+<table>
+<tr><th>原则</th><th>含义</th></tr>
+<tr><td>Goal 是事实</td><td>业务任务的状态权威属于 Goal，而不是某个 Run。</td></tr>
+<tr><td>Run 无状态权威</td><td>Run 只描述一次执行；执行结果必须经过 Goal 层 reconcile。</td></tr>
+<tr><td>定义、执行、判定分离</td><td>Human/Domain 定义验收策略，Agent 执行，Platform/Processor 验证。</td></tr>
+<tr><td>DB 是 Truth</td><td>Event Bus/WebSocket 只负责通知，不能成为事实来源。</td></tr>
+<tr><td>Runtime 与业务解耦</td><td>业务层只依赖 AgentSession，不直接依赖 ACP/JSONL/JSON-RPC。</td></tr>
+<tr><td>Agent 不负责 Delivery</td><td>Agent 产生工作结果，平台负责 Review、Merge、Deploy 等交付动作。</td></tr>
+<tr><td>外围能力 Adapter 化</td><td>Cron、GitHub Issue、IM、PR/MR 等均通过 Trigger/Delivery Adapter 接入。</td></tr>
+<tr><td>先简单、后分布式</td><td>当前单机单用户优先 SQLite + 单 daemon，不提前引入 PostgreSQL/Temporal。</td></tr>
+</table>
+
+<h2 id="positioning">2. 产品与系统定位</h2>
+<div class="diagram"><pre>
+                         Human
+                           │
+                    Define / Approve
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │  AgentWork   │
+                    │ Control Plane│
+                    └──────┬───────┘
+                           │
+       ┌───────────────────┼───────────────────┐
+       ▼                   ▼                   ▼
+    Coding               IaC                Research
+    Agent                Agent              Agent
+       │                   │                   │
+       ▼                   ▼                   ▼
+ OpenAgent/Claude       MCP/Tools          Custom Runtime
+</pre></div>
+
+<p>AgentWork 解决的是“如何可靠地让 Agent 把工作完成”，而不是“如何让模型更聪明”。Agent Runtime 负责执行智能；AgentWork 负责工作生命周期、资源、状态、验收、审批、恢复和交付。</p>
+
+<h2 id="domain">3. 核心领域模型</h2>
+<div class="diagram"><pre>
+Domain
+ ├── Goals
+ │    ├── Goal A
+ │    │    ├── Run #1
+ │    │    ├── Run #2
+ │    │    └── Review / Evidence / Delivery
+ │    └── Goal B
+ │
+ ├── Agents
+ │    ├── Agent A
+ │    └── Agent B
+ │
+ ├── Squads
+ ├── Schedules
+ ├── Policies
+ └── Workspaces
+</pre></div>
+
+<table>
+<tr><th>实体</th><th>职责</th></tr>
+<tr><td>Domain</td><td>任务运行的业务边界，可关联仓库、Agent、Squad、Policy。</td></tr>
+<tr><td>Goal</td><td>用户真正要完成的工作，是核心 Aggregate Root。</td></tr>
+<tr><td>Run</td><td>Goal 的一次执行尝试，可 retry、失败、取消、恢复。</td></tr>
+<tr><td>Agent</td><td>可被调度的执行身份，由 Runtime + Persona/能力组成。</td></tr>
+<tr><td>Runtime</td><td>描述 Agent 如何被连接/启动/通信。</td></tr>
+<tr><td>AgentSession</td><td>业务层看到的统一 Agent 执行会话抽象。</td></tr>
+<tr><td>Workspace</td><td>Goal 对应的工作空间；GitWorktree 是当前主要实现。</td></tr>
+<tr><td>Review</td><td>人或策略对执行结果的审批。</td></tr>
+<tr><td>Evidence</td><td>验证和交付所需的结构化证据。</td></tr>
+<tr><td>Delivery</td><td>平台执行的 Merge、PR/MR、Deploy、Artifact 等动作。</td></tr>
+<tr><td>Event</td><td>系统事实变化的持久化记录。</td></tr>
+</table>
+
+<h2 id="goal">4. Goal</h2>
+<p>Goal 是系统最重要的业务实体，也是 UI、Scheduler、Agent、Review、Delivery 的共同连接点。</p>
+<p class="small">字段为愿景模型，与实际 schema 存在差异（现状含 handoff_note / human_iterations / source_ref / current_agent_id，无 priority / workspace_id / acceptance_policy_id）——以 <code>schema.sql</code> 为准。</p>
+<pre><code>Goal {
+  id
+  domain_id
+  parent_id
+  title
+  description
+  status
+  priority
+  assignee_agent_id
+  workspace_id
+  acceptance_policy_id
+  created_at
+  updated_at
+}</code></pre>
+
+<h3>4.1 Goal Aggregate</h3>
+<p>所有 Goal 状态变化必须经过 Goal 层统一 reconcile，禁止 Run、Agent、Delivery 直接修改 Goal 的终态。</p>
+<pre><code>RunCompleted
+      │
+      ▼
+RunResult
+      │
+      ▼
+Goal.Reconcile(result)
+      │
+      ├── completed
+      ├── failed
+      ├── review
+      ├── blocked
+      └── active</code></pre>
+
+<h3>4.2 Parent / Child</h3>
+<p>父子 Goal 用于表达任务分解和 Agent delegation。当前阶段不引入独立 Workflow Engine；复杂流程优先用 parent_id + dependency + Goal State Machine 表达。</p>
+
+<h2 id="run">5. Run</h2>
+<p>Run 是一次具体执行。一个 Goal 可以有多个 Run。</p>
+<p class="small">字段为愿景模型（worker_id / claimed_at / lease_until 未实现——现状为 daemon restart 时全量 recover running→queued）；实际字段含 attempt / evidence / result_summary / trigger_comment_id，以 <code>schema.sql</code> 为准。</p>
+<pre><code>Goal
+ ├── Run #1 → failed
+ ├── Run #2 → review
+ ├── Run #3 → failed
+ └── Run #4 → completed</code></pre>
+
+<pre><code>Run {
+  id
+  goal_id
+  agent_id
+  attempt
+  status
+  session_id
+  trigger
+  worker_id
+  claimed_at
+  lease_until
+  started_at
+  completed_at
+  error
+}</code></pre>
+
+<div class="callout"><strong>重要：</strong>Run 的完成、失败、取消只表示一次执行的结果。Goal 是否进入 done/review/failed 必须由 Goal Aggregate 根据 RunResult、Policy、Child Goals、Review 和 Delivery 状态统一决定。</div>
+
+<h2 id="state">6. Goal 状态机</h2>
+<div class="diagram"><pre>
+                    ┌───────────┐
+                    │  backlog  │
+                    └─────┬─────┘
+                          │ dispatch
+                          ▼
+                    ┌───────────┐
+              ┌────►│   active  │◄──────┐
+              │     └─────┬─────┘       │
+              │           │              │
+       retry/rework       │ candidate    │ reject
+              │           ▼              │
+              │     ┌───────────┐        │
+              └─────│  review   │────────┘
+                    └─────┬─────┘
+                          │ approve
+                          ▼
+                    ┌───────────┐
+                    │ delivery  │
+                    └─────┬─────┘
+                          │ success
+                          ▼
+                    ┌───────────┐
+                    │   done    │
+                    └───────────┘
+
+active ──► blocked
+active ──► failed
+active ──► cancelled
+</pre></div>
+
+<p><strong>blocked</strong> 表示系统无法继续；<strong>review</strong> 表示机器可以继续，但根据策略需要人或指定审批者决定。两者必须保持语义分离。</p>
+<p class="small"><strong>与现状差异：</strong>现状无独立 <code>delivery</code> 状态——approve 后平台执行 deliver（merge+re-verify+push），goal 保持 <code>review</code> 直至 MarkDelivered 才到 done；<code>blocked</code> 为子 goal 机制的残留状态（决策 3-6 子 goal 已休眠），现状协作走 mention 同 goal run，不创建 child goal。</p>
+
+<h2 id="squad">7. Squad & Delegation</h2>
+<p>Squad 不是执行池，而是 Agent 协作与路由组。Leader Agent 是实际的协作入口。</p>
+<pre><code>Squad
+  │
+  └── Leader
+       ├── Agent A
+       ├── Agent B
+       └── Agent C
+
+Parent Goal
+     │
+     ▼
+Leader Agent
+     │
+     ├── create child Goal → Agent A
+     ├── create child Goal → Agent B
+     └── create child Goal → Agent C</code></pre>
+
+<p>Delegation 的本质是创建/更新 Goal，而不是在 AgentWork 内部偷偷执行一个不可见 Workflow。</p>
+<div class="warn callout"><strong>与冻结决策冲突（决策 3-6）：</strong>本节的 child-goal 委派模型是<strong>愿景</strong>——子 goal 机制已休眠（leader 实测 wait 死锁：无子 goal 时永久 blocked，仅可 Cancel；实际协作是顺序流，mention 全覆盖）。现状协作走 <strong>mention</strong>（同 goal 协作 run），squad 以 leader run + role=reviewer 审查 checkpoint（决策 4-4）落地。恢复 child-goal 委派需重新满足"真实并行拆活需求 + 冲突自修复"前提。</div>
+
+<h2 id="runtime">8. Runtime / Agent / Session</h2>
+<h3>8.1 三层模型</h3>
+<pre><code>Runtime
+  ↓  How
+Agent
+  ↓  Who
+Run / AgentSession
+  ↓  What now</code></pre>
+
+<table>
+<tr><th>层</th><th>定义</th></tr>
+<tr><td>Runtime</td><td>stdio/WebSocket/TCP、ACP/JSONL/JSON-RPC、command/endpoint、环境等。</td></tr>
+<tr><td>Agent</td><td>Runtime + Persona + Model + Capabilities + Concurrency。</td></tr>
+<tr><td>Run</td><td>绑定 Goal、Prompt、Context、Attempt、Session 的一次执行。</td></tr>
+<tr><td>AgentSession</td><td>对上层屏蔽协议差异，提供 initialize/prompt/cancel/close/events/client requests 等能力。</td></tr>
+</table>
+
+<h3>8.2 Protocol Adapter</h3>
+<pre><code>                    AgentSession
+                         │
+        ┌────────────────┼────────────────┐
+        ▼                ▼                ▼
+    ACP Adapter      JSONL Adapter    JSONRPC Adapter
+        │                │                │
+        ▼                ▼                ▼
+      stdio            stdio           ws/tcp/stdio</code></pre>
+
+<p>业务层禁止出现针对 ACP/JSONL/JSON-RPC 的条件分支。协议差异必须收敛在 Runtime/Session Adapter。</p>
+
+<h2 id="scheduler">9. Scheduler & Admission</h2>
+<h3>9.1 调度闭环</h3>
+<pre><code>Trigger
+  ↓
+Create/Update Goal
+  ↓
+Create Run
+  ↓
+Admission
+  ↓
+Queue
+  ↓
+Atomic Claim
+  ↓
+Dispatch
+  ↓
+AgentSession
+  ↓
+Run Result
+  ↓
+Goal Reconcile</code></pre>
+
+<h3>9.2 Run Admission</h3>
+<p>所有 Run 触发入口必须统一经过 <code>CanRun()</code> / Admission。</p>
+<ul>
+<li>Goal 是否允许执行。</li>
+<li>依赖 Goal 是否完成。</li>
+<li>Agent 是否可用。</li>
+<li>Agent concurrency 是否达到上限。</li>
+<li>是否存在同一 Goal 的 running Run。</li>
+<li>是否需要 Approval。</li>
+<li>Workspace 是否可用。</li>
+<li>Policy 是否满足。</li>
+<li>Quota / Resource 是否满足。</li>
+</ul>
+
+<h3>9.3 Claim</h3>
+<p>Claim 必须是原子的。推荐通过数据库事务/条件 UPDATE 避免“先 SELECT 再 UPDATE”产生 race condition。</p>
+
+<pre><code>UPDATE runs
+SET status = 'running',
+    worker_id = ?,
+    claimed_at = ?,
+    lease_until = ?
+WHERE id = ?
+  AND status = 'queued'
+  AND NOT EXISTS (
+      SELECT 1 FROM runs
+      WHERE goal_id = ?
+        AND status = 'running'
+  );</code></pre>
+
+<h2 id="workspace">10. Workspace</h2>
+<p>Workspace 是 Agent 工作的物理执行边界。当前以 Git Worktree 为主要实现。</p>
+<pre><code>Domain Repository
+ ├── workspace/goal-A
+ ├── workspace/goal-B
+ └── workspace/goal-C</code></pre>
+
+<p>同一 Goal 的多个 Run 通常复用同一个 Workspace，以支持 retry/rework。不同 Goal 默认隔离。</p>
+
+<div class="decision"><strong>架构决策：</strong>业务层依赖 Workspace，不直接依赖 GitWorktree。GitWorktree 是 Workspace 的一个实现，为未来文档、知识库、IaC 状态等非 Git 资产留出空间。</div>
+
+<h2 id="rpc">11. Client RPC</h2>
+<p>远程 Agent 的关键不是“远程启动”，而是 Agent 访问其工作环境所需的 Client RPC。</p>
+<pre><code>Remote Agent
+     │
+     │ fs.read / fs.write / terminal / approval...
+     ▼
+AgentWork Client RPC
+     │
+     ▼
+Goal Workspace / Runtime Context</code></pre>
+
+<p>Client RPC 应成为 AgentWork 的通用执行边界。ACP、其他协议均可以映射到统一的能力模型。</p>
+
+<h2 id="policy">12. Policy / Verification</h2>
+<h3>12.1 定义、执行、判定分离</h3>
+<pre><code>Human / Domain
+     │
+     │ acceptance policy
+     ▼
+Policy
+     │
+     ▼
+Agent executes
+     │
+     ▼
+Processor / Verification
+     │
+     ▼
+Evidence
+     │
+     ▼
+Review / Gate</code></pre>
+
+<p>Agent 不拥有“我已经完成”的最终权威。Agent 的结果只是 Evidence 的输入。</p>
+
+<h3>12.2 Processor</h3>
+<p>Processor 是一种带明确输入/输出 Contract 的 Agent 角色，例如：</p>
+<ul>
+<li>acceptance.compile：自然语言验收条件 → checks.json</li>
+<li>summary：Run transcript → structured summary</li>
+<li>report：Run + Evidence → review report</li>
+<li>analysis：Goal history → health analysis</li>
+</ul>
+<p class="small">现状已实现：acceptance.compile、intake；summary 为决策 4-7 的规划（评论注入压缩）；report / analysis 为愿景。</p>
+
+<pre><code>Processor {
+  agent_id
+  capability
+  input_contract
+  output_contract
+}</code></pre>
+
+<h2 id="review">13. Review / Gate</h2>
+<p>Review 是 Human-in-the-loop 的显式状态，不应被简单等同于 blocked。</p>
+<pre><code>Verification
+    │
+    ├── pass ──► auto delivery
+    │
+    └── requires human
+              │
+              ▼
+            Review
+          ┌───┴───┐
+          ▼       ▼
+       approve   reject
+          │       │
+          ▼       ▼
+       delivery  active</code></pre>
+
+<p>Gate Decision 必须持久化，包含决策者、时间、决策、理由以及关联 Evidence。</p>
+
+<h2 id="delivery">14. Delivery</h2>
+<p>Delivery 是平台动作，不是 Agent 动作。</p>
+<pre><code>Agent
+  ↓
+implementation
+  ↓
+Verification
+  ↓
+Review
+  ↓
+AgentWork Delivery
+  ├── local merge
+  ├── GitHub PR
+  ├── GitLab MR
+  ├── deploy
+  └── artifact publish</code></pre>
+
+<p>Delivery 应通过 Adapter 扩展。必须具备幂等性，例如重复执行 merge/push/deploy 时能够识别已经完成的动作。</p>
+
+<h2 id="evidence">15. Evidence</h2>
+<p>Evidence 是“为什么可以认为这个 Goal 已经完成”的机器可读证据集合。</p>
+<table>
+<tr><th>类型</th><th>示例</th></tr>
+<tr><td>Diff</td><td>文件变更、统计、关键 diff。</td></tr>
+<tr><td>Test</td><td>测试命令、退出码、输出、覆盖率。</td></tr>
+<tr><td>Quality</td><td>Lint、Format、Static Analysis。</td></tr>
+<tr><td>Security</td><td>安全扫描、依赖扫描。</td></tr>
+<tr><td>Agent Report</td><td>结构化执行总结。</td></tr>
+<tr><td>Screenshot/Artifact</td><td>UI、构建产物等。</td></tr>
+<tr><td>Delivery Result</td><td>Merge/PR/Deploy 结果。</td></tr>
+</table>
+
+<p>Review 的对象应是 Evidence，而不是 Agent 的一句“done”。</p>
+
+<h2 id="event">16. Event & Event Bus</h2>
+<p>系统事实应通过 Event 持久化；Event Bus 负责异步通知。</p>
+<pre><code>Event {
+  id
+  type
+  aggregate_type
+  aggregate_id
+  payload
+  created_at
+}</code></pre>
+
+<p>典型事件：</p>
+<pre><code>goal.created
+goal.assigned
+run.created
+run.started
+run.completed
+run.failed
+review.requested
+gate.approved
+gate.rejected
+delivery.started
+delivery.completed</code></pre>
+
+<div class="callout"><strong>原则：</strong> DB = Truth；Event Bus = Notification；WebSocket = UI Transport。任何情况下不能把内存事件当作持久化事实。</div>
+<p class="small">现状：DB 行 + activity_log 是事实，事件总线为内存通知（commit 后 publish，invariant 13 已成立）；<strong>持久化 Event Log 表未实现</strong>。</p>
+
+<h2 id="storage">17. Storage</h2>
+<h3>17.1 当前选择</h3>
+<p>单机、单用户场景优先 SQLite。当前不需要为了“企业级”提前切 PostgreSQL。</p>
+
+<h3>17.2 Repository 边界</h3>
+<pre><code>Service
+  ↓
+GoalRepository / RunRepository / AgentRepository / ...
+  ↓
+Store
+  ↓
+SQLite</code></pre>
+
+<p>业务层禁止在任意位置散落 SQL。Repository 负责领域查询与持久化语义，Store 负责底层数据库实现。</p>
+
+<h3>17.3 Memory</h3>
+<p>AgentWork 的 SQLite 保存权威状态；OpenViking 等语义记忆系统只作为长期上下文和检索层。</p>
+<pre><code>AgentWork
+ ├── SQLite
+ │    └── Goal / Run / Event / Review / Gate
+ │
+ └── Memory
+      └── OpenViking / future memory backend</code></pre>
+
+<h2 id="recovery">18. Recovery & Idempotency</h2>
+<h3>18.1 Worker Lease</h3>
+<p>Run 建议具备 <code>worker_id</code>、<code>claimed_at</code>、<code>lease_until</code>。Worker 崩溃后通过 lease expiration 识别 stale run。</p>
+<p class="small"><strong>规划未实现</strong>——现状：单 daemon，restart 时 RecoverStuckRunning 全量恢复 running→queued 重新 claim，已覆盖单机 crash 场景；lease 为多 daemon / 远程 worker 时才需要。</p>
+
+<h3>18.2 Daemon Restart</h3>
+<pre><code>Daemon restart
+    │
+    ├── load Goals
+    ├── recover stale Runs
+    ├── requeue eligible Runs
+    ├── restore pending Delivery
+    └── resume Scheduler</code></pre>
+
+<h3>18.3 Idempotency</h3>
+<ul>
+<li>Run claim 必须幂等。</li>
+<li>Delivery 必须幂等。</li>
+<li>Event 写入应具备去重/唯一约束能力。</li>
+<li>Retry 必须创建新的 Run attempt，而不是覆盖历史。</li>
+</ul>
+
+<h3>18.4 Watchdog</h3>
+<p>不要只通过 stdout 无输出判断 Agent 是否死亡。应综合 protocol activity、tool activity、process heartbeat、session heartbeat。</p>
+
+<h2 id="security">19. Security</h2>
+<p>当前单机单用户可以保持轻量模型，但一旦支持远程 Runtime，必须引入 Run-scoped Capability。</p>
+<pre><code>AgentWork
+   │
+   └── Run Capability Token
+          ├── goal.read
+          ├── comment.create
+          ├── child_goal.create
+          ├── goal.assign
+          ├── approval.request
+          └── agent.list</code></pre>
+
+<p><code>GOAL_ID/RUN_ID/AGENT_ID</code> 只能作为上下文标识，不能作为授权凭证。</p>
+<p class="small"><strong>规划未实现（P1）</strong>——现状单机单用户无鉴权，GOAL_ID/RUN_ID 即访问凭证（CLI 直接凭它调 API）；接入远程 runtime（ws/tcp 对外暴露）前必须落地 Run-scoped capability token。</p>
+
+<h2 id="integrations">20. Trigger / Integration</h2>
+<p>所有外部入口都应 Adapter 化，并统一产生 Goal/Run/Comment 等领域对象。</p>
+<pre><code>                    Trigger
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+      Web             Cron          GitHub Issue
+        │              │              │
+        └──────────────┼──────────────┘
+                       ▼
+                   Create Goal
+                       │
+                       ▼
+                    Scheduler</code></pre>
+
+<p>未来可以增加 Feishu、Slack、GitLab、Webhook、Agent Trigger 等，而无需改变核心 Goal 模型。</p>
+
+<h2 id="ui">21. Web UI</h2>
+<p>UI 的第一公民应是 Goal，而不是 Agent。</p>
+<h3>21.1 Board</h3>
+<pre><code>Backlog | Active | Review | Blocked | Failed | Done</code></pre>
+
+<h3>21.2 Goal Detail</h3>
+<ul>
+<li>Goal 描述与当前状态</li>
+<li>当前 Agent / Run</li>
+<li>Timeline</li>
+<li>Comments / Conversation</li>
+<li>Evidence</li>
+<li>Verification Checks</li>
+<li>Review / Gate</li>
+<li>Delivery</li>
+</ul>
+
+<h3>21.3 Timeline</h3>
+<pre><code>08:01 Goal created
+08:02 Agent A started
+08:08 Agent A completed
+08:08 tests passed
+08:09 review requested
+08:12 human approved
+08:12 merge started
+08:13 merged</code></pre>
+
+<p>Timeline 的价值高于单纯的 Kanban，因为它能够呈现 Agent 工作的完整因果链。</p>
+
+<h2 id="structure">22. Repository Structure</h2>
+<pre><code>agentwork/
+├── cmd/
+│   ├── agentwork-daemon/
+│   └── agentwork-cli/
+├── internal/
+│   ├── acp/
+│   ├── daemon/
+│   ├── events/
+│   ├── issue/
+│   ├── notify/
+│   ├── proto/
+│   ├── runtime/
+│   ├── server/
+│   ├── service/
+│   └── store/
+├── web/
+│   ├── app/
+│   ├── components/
+│   ├── lib/
+│   └── public/
+└── DESIGN.md</code></pre>
+
+<h3>22.1 推荐的业务边界</h3>
+<pre><code>service/
+├── goal/
+├── run/
+├── agent/
+├── squad/
+├── domain/
+├── review/
+├── delivery/
+└── schedule/</code></pre>
+
+<p>不要求立即机械拆目录，但逻辑上应保持这些边界，避免形成无限膨胀的 service 包。</p>
+
+<h2 id="openagent">23. AgentWork × OpenAgent-go</h2>
+<p>两个项目必须保持清晰的上下层关系。</p>
+<div class="diagram"><pre>
+                    AgentWork
+              Orchestration / Control Plane
+                         │
+       ┌─────────────────┼─────────────────┐
+       │                 │                 │
+      Goal              Run              Policy
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         │
+                    AgentSession
+                         │
+                         ▼
+                  OpenAgent-go
+                   Agent Runtime
+                         │
+             ┌───────────┼───────────┐
+             ▼           ▼           ▼
+            LLM         Tool       Memory
+             │           │           │
+          Skills      Approval     Session
+</pre></div>
+
+<table>
+<tr><th>OpenAgent-go</th><th>AgentWork</th></tr>
+<tr><td>Agent Loop</td><td>Goal lifecycle</td></tr>
+<tr><td>LLM Adapter</td><td>Scheduling</td></tr>
+<tr><td>Tool Calling</td><td>Run lifecycle</td></tr>
+<tr><td>Session</td><td>Agent assignment</td></tr>
+<tr><td>Memory</td><td>Verification / Review</td></tr>
+<tr><td>Approval/Guard</td><td>Delivery</td></tr>
+<tr><td>Skills</td><td>Workspace / Collaboration</td></tr>
+</table>
+
+<p><strong>原则：</strong>AgentWork 不重新实现 Agent Runtime；OpenAgent-go 也不承担 Goal/Run/Scheduler 等业务编排职责。</p>
+
+<h2 id="decisions">24. Architecture Decisions</h2>
+<table>
+<tr><th>Decision</th><th>选择</th><th>原因</th></tr>
+<tr><td>D-001</td><td>Goal 是 Aggregate Root</td><td>统一多次 Run、Review、Delivery 的状态权威。</td></tr>
+<tr><td>D-002</td><td>Run 无 Goal 状态权威</td><td>避免 retry/multi-agent/race 导致状态冲突。</td></tr>
+<tr><td>D-003</td><td>Agent = Runtime + Persona/Capabilities</td><td>分离“如何连接”和“谁来执行”。</td></tr>
+<tr><td>D-004</td><td>AgentSession 屏蔽协议</td><td>避免业务层耦合 ACP/JSONL/JSON-RPC。</td></tr>
+<tr><td>D-005</td><td>Workspace 高于 GitWorktree</td><td>为非 Git 资产预留扩展能力。</td></tr>
+<tr><td>D-006</td><td>Delivery 平台执行</td><td>Agent 不应决定自己的交付结果。</td></tr>
+<tr><td>D-007</td><td>SQLite 优先</td><td>当前单机单用户没有 PostgreSQL 的必要性。</td></tr>
+<tr><td>D-008</td><td>不引入 Workflow Engine</td><td>先用 Goal + dependency + state machine 解决真实需求。</td></tr>
+<tr><td>D-009</td><td>Event Bus 非事实来源</td><td>保证 daemon crash 后仍可恢复。</td></tr>
+<tr><td>D-010</td><td>Memory 非权威数据库</td><td>语义记忆用于上下文，不承担业务状态。</td></tr>
+</table>
+
+<h2 id="roadmap">25. Roadmap</h2>
+<h3>P0 — 稳定核心闭环</h3>
+<ol>
+<li>固化 Goal Aggregate + Reconcile。</li>
+<li>统一 Run Admission。</li>
+<li>完成 AgentSession 抽象。</li>
+<li>打通 Client RPC，尤其 FS / Terminal。</li>
+<li>完善 Run Claim / Lease / Recovery。</li>
+</ol>
+
+<h3>P1 — 完善可靠执行</h3>
+<ol>
+<li>Workspace 抽象。</li>
+<li>Delivery Adapter。</li>
+<li>Evidence 模型标准化。</li>
+<li>Review / Gate 持久化与幂等。</li>
+<li>Event Log / Timeline。</li>
+<li>Run-scoped Capability。</li>
+</ol>
+
+<h3>P2 — 扩展入口与协作</h3>
+<ol>
+<li>Cron Trigger —— ✓ <span class="small">已实现（daemon dispatchSchedules + schedule 表）</span></li>
+<li>GitHub/GitLab Issue Trigger —— ✓ <span class="small">已实现（M4-B：issue poller + webhook，source_ref 链路）</span></li>
+<li>IM Trigger —— ✓ <span class="small">已实现（M3：notify 入站 + intake processor）</span></li>
+<li>Squad —— ✓ <span class="small">已实现（leader run + review checkpoint）；child-goal Delegation —— 冻结中（决策 3-6）</span></li>
+<li>Processor Capability —— <span class="small">部分：compile/intake 已实现；summary/report/analysis 为规划（决策 4-7）</span></li>
+</ol>
+
+<h3>P3 — Memory / Intelligence</h3>
+<ol>
+<li>Comment Context Compression。</li>
+<li>OpenViking 等长期记忆。</li>
+<li>Gate Decision Dataset。</li>
+<li>Policy Recommendation。</li>
+<li>Agent/Goal Health Analysis。</li>
+</ol>
+
+<h3>暂不做</h3>
+<ul>
+<li>Temporal/Airflow/LangGraph 式独立 Workflow Engine。</li>
+<li>过早迁移 PostgreSQL。</li>
+<li>复杂分布式 Scheduler。</li>
+<li>让 Agent 自己决定 Delivery。</li>
+<li>让 Event Bus 成为状态事实来源。</li>
+</ul>
+
+<h2>26. 端到端示例</h2>
+<h3>26.1 Coding Goal</h3>
+<pre><code>用户：
+“实现登录页面，并确保测试通过”
+
+        ↓
+
+Create Goal
+        ↓
+Acceptance Policy
+  - unit tests pass
+  - lint pass
+  - no config changes
+        ↓
+Scheduler Admission
+        ↓
+Create Run
+        ↓
+AgentSession
+        ↓
+Coding Agent
+        ↓
+Workspace
+        ↓
+Agent 完成
+        ↓
+Processor / Verification
+        ↓
+Evidence
+  - diff
+  - test output
+  - lint
+        ↓
+Review
+        ↓
+Human approve
+        ↓
+Delivery
+        ↓
+Merge
+        ↓
+Goal.done</code></pre>
+
+<h3>26.2 Retry</h3>
+<pre><code>Run #1
+  ↓
+test failed
+  ↓
+Goal remains active
+  ↓
+Create Run #2
+  ↓
+same Goal / Workspace
+  ↓
+Agent receives relevant context
+  ↓
+verification pass
+  ↓
+review / delivery</code></pre>
+
+<h3>26.3 Agent Delegation</h3>
+<pre><code>Parent Goal
+  ↓
+Leader Agent
+  ├── Child Goal: Backend
+  ├── Child Goal: Frontend
+  └── Child Goal: Tests
+          ↓
+      Scheduler
+          ↓
+     Agent Workers
+          ↓
+      Child Results
+          ↓
+     Parent Reconcile</code></pre>
+
+<h2>27. 最终架构原则</h2>
+<div class="callout">
+<p><strong>AgentWork 的核心不是让更多 Agent 一起工作，而是建立一套可靠的 Agent 工作生命周期。</strong></p>
+<pre><code>Trigger
+  ↓
+Goal
+  ↓
+Run
+  ↓
+Admission
+  ↓
+AgentSession
+  ↓
+Workspace
+  ↓
+Execution
+  ↓
+Verification
+  ↓
+Evidence
+  ↓
+Review / Gate
+  ↓
+Delivery
+  ↓
+Outcome
+  ↓
+Event / History
+  ↓
+Future Context</code></pre>
+<p>这条链路构成 AgentWork 的核心闭环。任何新功能都应该回答一个问题：它是在增强 Goal、Execution、Verification、Review、Delivery 这条主链，还是只是外围 Adapter？如果是后者，应尽可能保持与核心领域解耦。</p>
+</div>
+
+<div class="footer">
+AgentWork Architecture & Design（愿景） · 2026-08 · 本文档为<strong>目标态愿景</strong>，现状基线见 <a href="DESIGN.md">DESIGN.md</a>（决策 2-x/3-x/4-x）。愿景与现状冲突时以 DESIGN.md 与代码为准；实现偏离愿景处应在 DESIGN.md 记录决策，而非静默修改任一方。
+</div>
+</main>
+</div>
+</body>
+</html>
