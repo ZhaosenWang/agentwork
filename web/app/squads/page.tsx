@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { useSquads, useAgents, useCreateSquad, useDeleteSquad, useGoalEvents } from "@/lib/queries";
+import { useSquads, useAgents, useCreateSquad, useAddSquadMember, useDeleteSquad, useGoalEvents } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import type { Squad } from "@/lib/types";
 
@@ -88,16 +88,48 @@ function NewSquadForm({
   onClose: () => void;
 }) {
   const createSquad = useCreateSquad();
+  const addMember = useAddSquadMember();
   const [name, setName] = useState("");
+  // 成员是第一概念：先勾选团队成员，再从中指定 leader / reviewer 角色。
+  const [members, setMembers] = useState<string[]>([]);
   const [leaderId, setLeaderId] = useState("");
+  const [reviewerId, setReviewerId] = useState("");
   const [description, setDescription] = useState("");
   const [instructions, setInstructions] = useState("");
+
+  const memberAgents = (agents ?? []).filter((a) => members.includes(a.id));
+  const toggleMember = (id: string) => {
+    const next = members.includes(id) ? members.filter((m) => m !== id) : [...members, id];
+    setMembers(next);
+    if (!next.includes(leaderId)) setLeaderId("");
+    if (!next.includes(reviewerId)) setReviewerId("");
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     createSquad.mutate(
       { name, leader_id: leaderId, description, instructions },
-      { onSuccess: onClose }
+      {
+        onSuccess: (sq) => {
+          // Add every member; the picked reviewer gets role=reviewer
+          // (决策 4-4: the squad owns the who-reviews rule; the platform
+          // pulls role=reviewer members into review runs).
+          const rest = members.filter((m) => m !== leaderId);
+          const enqueue = (i: number) => {
+            if (i >= rest.length) {
+              onClose();
+              return;
+            }
+            const m = rest[i];
+            addMember.mutate(
+              { squadId: sq.id, member_type: "agent", member_id: m, role: m === reviewerId ? "reviewer" : "member" },
+              { onSuccess: () => enqueue(i + 1), onError: () => enqueue(i + 1) }
+            );
+          };
+          enqueue(0);
+        },
+        onError: () => onClose(),
+      }
     );
   };
 
@@ -118,10 +150,28 @@ function NewSquadForm({
         <Field label="名称" hint="必填">
           <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required placeholder="Squad 名称…" />
         </Field>
-        <Field label="Leader" hint="必填，leader 必须是 agent">
+        <Field label="成员" hint="三角色分工：leader = 协调者（拆解任务并分派给成员，不自己实现全部）；执行者 = 被 leader 分派干活的成员；reviewer = 审查者（进审批时被平台自动拉去审查）。先选成员（至少 leader），再从成员中指定 leader 和 reviewer">
+          <div className="border border-zinc-200 rounded-lg divide-y divide-zinc-100 max-h-48 overflow-y-auto">
+            {(agents ?? []).map((a) => (
+              <label key={a.id} className="flex items-center gap-2 px-3 py-2 text-sm cursor-pointer hover:bg-zinc-50">
+                <input type="checkbox" checked={members.includes(a.id)} onChange={() => toggleMember(a.id)} />
+                {a.name}
+              </label>
+            ))}
+          </div>
+        </Field>
+        <Field label="Leader" hint="必填，从成员中选">
           <select value={leaderId} onChange={(e) => setLeaderId(e.target.value)} className={inputCls} required>
             <option value="">选择…</option>
-            {agents?.map((a) => (
+            {memberAgents.map((a) => (
+              <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+          </select>
+        </Field>
+        <Field label="审核者（reviewer）" hint="可选——squad 任务进审批时，平台会自动拉审核者审查（决策 4-4）">
+          <select value={reviewerId} onChange={(e) => setReviewerId(e.target.value)} className={inputCls}>
+            <option value="">无（不需要 agent 审查）</option>
+            {memberAgents.filter((a) => a.id !== leaderId).map((a) => (
               <option key={a.id} value={a.id}>{a.name}</option>
             ))}
           </select>

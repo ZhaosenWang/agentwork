@@ -935,13 +935,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
-	var triggerAuthor, triggerCommentID string
+	var triggerAuthor, triggerCommentID, triggerCommentContent string
 	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
 		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
 		        g.source_ref, d.git_credentials,
-		        r2.trigger_comment_id, COALESCE(c.author_type, '')
+		        r2.trigger_comment_id, COALESCE(c.author_type, ''), COALESCE(c.content, '')
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
 		 LEFT JOIN domain d ON d.id = g.domain_id
@@ -949,11 +949,14 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 JOIN runtime r ON r.id = a.runtime_id
 		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent)
 	// Review run (DESIGN.md 决策 4-4): triggered by a SYSTEM comment — the
 	// platform's review request ("请审查本次改动…只提意见"). Its product is
 	// the opinion, not code: no commit of its worktree changes.
 	reviewRun := triggerAuthor == "system"
+	// collaborationRun: the run was pulled in by a teammate's comment (agent
+	// author) — the trigger comment is this turn's instruction.
+	collaborationRun := triggerAuthor == "agent"
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -1167,7 +1170,18 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// is the review instruction only; the worktree, the comment feed
 	// (injected below) and the workspace guidance give it everything else.
 	prompt := buildPrompt(title, desc, handoff)
-	if reviewRun {
+	// A COLLABORATION run (pulled in by a teammate's agent-authored comment —
+	// a review request, a help request, a relay hand-back): the trigger
+	// comment IS this turn's instruction. Without it the collaborator gets
+	// the goal's original task description and executes THAT instead of the
+	// request (a live failure: the leader-mentioned reviewer implemented the
+	// Gomoku game instead of reviewing it). The original task is not
+	// injected — it lives in the comment feed (the creation comment), which
+	// is injected below as team context (决策 4-6): the collaborator reads
+	// the background from the feed, and acts on the trigger comment.
+	if collaborationRun {
+		prompt = buildPrompt("协作请求", "> "+triggerCommentContent, handoff)
+	} else if reviewRun {
 		prompt = "你是审查者（reviewer）。请审查本次改动（squad 规矩：成员写完代码后由 reviewer 审查）。\n\n" +
 			"只提意见，不要修改任何文件，不要执行任务本身。\n" +
 			"审查工作区中的改动（diff、测试、质量），然后把你的意见用 agentwork_goal_comment 工具发到评论区（供审批人参考）。\n" +

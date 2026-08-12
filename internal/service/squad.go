@@ -97,6 +97,43 @@ func (s *SquadService) Get(ctx context.Context, id string) (*Squad, error) {
 	return &sq, nil
 }
 
+// Update edits a squad's identity (name / description / leader / instructions).
+// A leader change takes effect dynamically: goal ownership is judged against
+// the CURRENT leader at reconcile time, so an old leader's in-flight run
+// becomes orphaned (its result discarded) — no cancel is sent (leader-change
+// termination is a documented follow-up).
+func (s *SquadService) Update(ctx context.Context, id string, sq Squad) (*Squad, error) {
+	if sq.Name == "" {
+		return nil, NewValidationError("name is required")
+	}
+	if sq.LeaderID == "" {
+		return nil, NewValidationError("leader_id is required")
+	}
+	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, id, "squad"); err != nil {
+		return nil, err
+	}
+	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, sq.LeaderID, "leader agent"); err != nil {
+		return nil, err
+	}
+	if _, err := s.st.DB().ExecContext(ctx,
+		`UPDATE squad SET name=?, description=?, leader_id=?, instructions=? WHERE id=?`,
+		sq.Name, sq.Description, sq.LeaderID, sq.Instructions, id); err != nil {
+		return nil, fmt.Errorf("update squad: %w", err)
+	}
+	return s.Get(ctx, id)
+}
+
+// RemoveMember detaches a member from the squad (the leader is stored in
+// squad.leader_id, not squad_member — removal only touches ordinary members).
+func (s *SquadService) RemoveMember(ctx context.Context, squadID, memberID string) error {
+	if _, err := s.st.DB().ExecContext(ctx,
+		`DELETE FROM squad_member WHERE squad_id=? AND member_id=?`, squadID, memberID); err != nil {
+		return fmt.Errorf("remove squad member: %w", err)
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "squad:member_removed", Payload: map[string]string{"squad_id": squadID, "member_id": memberID}})
+	return nil
+}
+
 // AddMember attaches a member (agent or human) to a squad.
 func (s *SquadService) AddMember(ctx context.Context, squadID, memberType, memberID, role string) (*SquadMember, error) {
 	if memberType != "agent" && memberType != "human" {
@@ -288,11 +325,14 @@ func (s *SquadService) agentName(ctx context.Context, agentID string) string {
 // (briefing injection vs. status authority — DESIGN.md + multica
 // squad_briefing.go). Wording is plain so it's easy to tune.
 
-const squadOperatingProtocolHeader = `You are the LEADER of a squad. Work flows through you: dispatch to teammates by
-mentioning them in this goal's comments (the agentwork_goal_comment tool with a
-mention URI — see AGENTWORK.md) so they pick the work up as runs on this
-goal, do not do it all yourself. Members are NOT auto-dispatched; you
-delegate explicitly.
+const squadOperatingProtocolHeader = `You are the LEADER (coordinator) of a squad. Your job is to BREAK DOWN the
+goal into parts and DISPATCH them: mention teammates via agentwork_goal_comment
+(with a mention URI — see AGENTWORK.md) so they pick up parts as runs on this
+goal. You are the coordinator — the executor members do the work, you do NOT
+implement the whole task yourself. Members are NOT auto-dispatched; you
+delegate explicitly. After dispatching, END your turn so the executors' runs
+can start (the goal executes serially); when they finish and mention you
+back, summarize and close the loop.
 `
 
 const squadParentStatusOwned = `You drive this goal's execution. When you finish your part, END your turn —

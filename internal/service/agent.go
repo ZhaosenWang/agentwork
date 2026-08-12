@@ -72,6 +72,28 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 	return &a, nil
 }
 
+// Update edits an agent's identity/persona (name, description, system_prompt,
+// max_concurrent, env). A changed system_prompt takes effect on the agent's
+// NEXT run — in-flight runs keep their snapshot.
+func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, error) {
+	if a.Name == "" {
+		return nil, NewValidationError("name is required")
+	}
+	if a.MaxConcurrent < 1 {
+		a.MaxConcurrent = 1
+	}
+	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, id, "agent"); err != nil {
+		return nil, err
+	}
+	envJSON, _ := json.Marshal(a.Env)
+	if _, err := s.st.DB().ExecContext(ctx,
+		`UPDATE agent SET name=?, description=?, system_prompt=?, max_concurrent=?, env=? WHERE id=?`,
+		a.Name, a.Description, a.SystemPrompt, a.MaxConcurrent, string(envJSON), id); err != nil {
+		return nil, fmt.Errorf("update agent: %w", err)
+	}
+	return s.Get(ctx, id)
+}
+
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
 		`SELECT id,name,description,runtime_id,system_prompt,model,env,max_concurrent,created_at

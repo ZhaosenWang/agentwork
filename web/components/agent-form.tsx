@@ -1,46 +1,50 @@
 "use client";
 
 import { useState } from "react";
-import { useCreateAgent, useRuntimes } from "@/lib/queries";
+import { useCreateAgent, useUpdateAgent, useRuntimes } from "@/lib/queries";
+import type { Agent } from "@/lib/types";
 import { Button, Dialog, Field, inputCls } from "@/components/ui";
 
-export function AgentForm({ onClose }: { onClose: () => void }) {
+export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => void }) {
   const create = useCreateAgent();
+  const update = useUpdateAgent();
   const { data: runtimes } = useRuntimes();
-  const [name, setName] = useState("");
-  const [runtimeId, setRuntimeId] = useState("");
-  const [systemPrompt, setSystemPrompt] = useState("");
-  const [model, setModel] = useState("");
-  const [env, setEnv] = useState("{}");
-  const [maxConcurrent, setMaxConcurrent] = useState("1");
+  const [name, setName] = useState(agent?.name ?? "");
+  const [runtimeId, setRuntimeId] = useState(agent?.runtime_id ?? "");
+  const [systemPrompt, setSystemPrompt] = useState(agent?.system_prompt ?? "");
+  const [model, setModel] = useState(agent?.model ?? "");
+  const [env, setEnv] = useState(agent?.env ? JSON.stringify(agent.env, null, 2) : "{}");
+  const [maxConcurrent, setMaxConcurrent] = useState(String(agent?.max_concurrent ?? 1));
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     let parsedEnv: Record<string, string> = {};
     try { parsedEnv = JSON.parse(env || "{}"); } catch { /* keep default */ }
-    create.mutate(
-      {
-        name,
-        description: "",
-        runtime_id: runtimeId,
-        system_prompt: systemPrompt,
-        model,
-        env: parsedEnv,
-        max_concurrent: parseInt(maxConcurrent) || 1,
-      },
-      { onSuccess: onClose }
-    );
+    const body = {
+      name,
+      description: agent?.description ?? "",
+      runtime_id: runtimeId,
+      system_prompt: systemPrompt,
+      model,
+      env: parsedEnv,
+      max_concurrent: parseInt(maxConcurrent) || 1,
+    };
+    if (agent) {
+      update.mutate({ id: agent.id, ...body }, { onSuccess: onClose });
+    } else {
+      create.mutate(body, { onSuccess: onClose });
+    }
   };
 
   return (
     <Dialog
-      title="新建 Agent"
+      title={agent ? `编辑 Agent：${agent.name}` : "新建 Agent"}
       onClose={onClose}
       footer={
         <>
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button type="submit" form="agent-form" disabled={create.isPending}>
-            {create.isPending ? "创建中…" : "创建"}
+          <Button type="submit" form="agent-form" disabled={create.isPending || update.isPending}>
+            {(create.isPending || update.isPending) ? "保存中…" : agent ? "保存" : "创建"}
           </Button>
         </>
       }

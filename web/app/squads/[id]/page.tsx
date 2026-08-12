@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { useSquads, useAgents, useSquadMembers, useAddSquadMember, useGoalEvents } from "@/lib/queries";
+import { useSquads, useAgents, useSquadMembers, useAddSquadMember, useUpdateSquad, useRemoveSquadMember, useGoalEvents } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
 import type { SquadMember } from "@/lib/types";
 
@@ -15,7 +15,14 @@ export default function SquadDetailPage() {
   const { data: agents } = useAgents();
   const { data: members, isLoading } = useSquadMembers(id);
   const addMember = useAddSquadMember();
+  const updateSquad = useUpdateSquad();
+  const removeMember = useRemoveSquadMember();
   const [showAdd, setShowAdd] = useState(false);
+  const [showEdit, setShowEdit] = useState(false);
+  const [editName, setEditName] = useState("");
+  const [editLeader, setEditLeader] = useState("");
+  const [editDesc, setEditDesc] = useState("");
+  const [editInstr, setEditInstr] = useState("");
 
   const squad = squads?.find((s) => s.id === id);
   const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
@@ -36,15 +43,20 @@ export default function SquadDetailPage() {
 
       {/* Squad info */}
       <div className="bg-white rounded-xl border border-zinc-200 p-5 space-y-3">
-        <div className="grid grid-cols-2 gap-3 text-sm">
-          <div>
-            <span className="text-zinc-400">Leader：</span>
-            <span className="text-zinc-700">{agentName(squad.leader_id)}</span>
+        <div className="flex items-center justify-between">
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <div>
+              <span className="text-zinc-400">Leader：</span>
+              <span className="text-zinc-700">{agentName(squad.leader_id)}</span>
+            </div>
+            <div>
+              <span className="text-zinc-400">创建时间：</span>
+              <span className="text-zinc-700">{new Date(squad.created_at).toLocaleString()}</span>
+            </div>
           </div>
-          <div>
-            <span className="text-zinc-400">创建时间：</span>
-            <span className="text-zinc-700">{new Date(squad.created_at).toLocaleString()}</span>
-          </div>
+          <Button variant="outline" onClick={() => { setEditName(squad.name); setEditLeader(squad.leader_id); setEditDesc(squad.description || ""); setEditInstr(squad.instructions || ""); setShowEdit(true); }}>
+            编辑
+          </Button>
         </div>
         {squad.description && (
           <div>
@@ -81,6 +93,7 @@ export default function SquadDetailPage() {
                   <th className="px-3 py-2">名称</th>
                   <th className="px-3 py-2">角色</th>
                   <th className="px-3 py-2">添加时间</th>
+                  <th className="px-3 py-2"></th>
                 </tr>
               </thead>
               <tbody>
@@ -96,6 +109,13 @@ export default function SquadDetailPage() {
                     </td>
                     <td className="px-3 py-2 text-zinc-500">{m.role || "-"}</td>
                     <td className="px-3 py-2 text-zinc-400 text-xs">{new Date(m.created_at).toLocaleString()}</td>
+                    <td className="px-3 py-2">
+                      <button
+                        onClick={() => removeMember.mutate({ squadId: id, memberId: m.member_id })}
+                        className="text-red-500 hover:text-red-700 text-xs"
+                        title="移除该成员"
+                      >✕</button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -111,6 +131,92 @@ export default function SquadDetailPage() {
           agents={agents}
           onClose={() => setShowAdd(false)}
         />
+      )}
+
+      {showEdit && (
+        <Dialog
+          title={`编辑 Squad：${squad.name}`}
+          onClose={() => setShowEdit(false)}
+          footer={
+            <>
+              <Button variant="outline" onClick={() => setShowEdit(false)}>取消</Button>
+              <Button
+                onClick={() =>
+                  updateSquad.mutate(
+                    { id, name: editName, description: editDesc, leader_id: editLeader, instructions: editInstr },
+                    { onSuccess: () => setShowEdit(false) }
+                  )
+                }
+                disabled={updateSquad.isPending || !editName.trim() || !editLeader}
+              >
+                {updateSquad.isPending ? "保存中…" : "保存"}
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-4">
+            <Field label="名称" hint="必填">
+              <input value={editName} onChange={(e) => setEditName(e.target.value)} className={inputCls} placeholder="Squad 名称…" />
+            </Field>
+            <Field label="Leader" hint="必填，leader 必须是 agent（角色动态生效：旧 leader 的 in-flight run 会孤儿化）">
+              <select value={editLeader} onChange={(e) => setEditLeader(e.target.value)} className={inputCls}>
+                <option value="">选择…</option>
+                {agents?.map((a) => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
+              </select>
+            </Field>
+            <Field label="描述">
+              <textarea value={editDesc} onChange={(e) => setEditDesc(e.target.value)} className={inputCls} rows={2} />
+            </Field>
+            <Field label="Instructions" hint="leader 运行时会注入这些 instructions">
+              <textarea value={editInstr} onChange={(e) => setEditInstr(e.target.value)} className={inputCls} rows={3} placeholder="Squad 工作说明…" />
+            </Field>
+          </div>
+        </Dialog>
+      )}
+
+      {showEdit && (
+        <Dialog
+          title={`编辑 Squad：${squad.name}`}
+          onClose={() => setShowEdit(false)}
+          footer={
+            <>
+              <Button variant="outline" onClick={() => setShowEdit(false)}>取消</Button>
+              <Button
+                onClick={() =>
+                  updateSquad.mutate(
+                    { id, name: editName, description: editDesc, leader_id: editLeader, instructions: editInstr },
+                    { onSuccess: () => setShowEdit(false) }
+                  )
+                }
+                disabled={updateSquad.isPending || !editName.trim() || !editLeader}
+              >
+                {updateSquad.isPending ? "保存中…" : "保存"}
+              </Button>
+            </>
+          }
+        >
+          <div className="space-y-4">
+            <Field label="名称" hint="必填">
+              <input value={editName} onChange={(e) => setEditName(e.target.value)} className={inputCls} placeholder="Squad 名称…" />
+            </Field>
+            <Field label="Leader" hint="必填，leader 必须是 agent（角色动态生效：旧 leader 的 in-flight run 会孤儿化）">
+              <select value={editLeader} onChange={(e) => setEditLeader(e.target.value)} className={inputCls}>
+                <option value="">选择…</option>
+                {agents?.map((a) => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
+              </select>
+            </Field>
+            <Field label="描述">
+              <textarea value={editDesc} onChange={(e) => setEditDesc(e.target.value)} className={inputCls} rows={2} />
+            </Field>
+            <Field label="Instructions" hint="leader 运行时会注入这些 instructions">
+              <textarea value={editInstr} onChange={(e) => setEditInstr(e.target.value)} className={inputCls} rows={3} placeholder="Squad 工作说明…" />
+            </Field>
+          </div>
+        </Dialog>
       )}
     </div>
   );
@@ -128,7 +234,7 @@ function AddMemberDialog({
   const addMember = useAddSquadMember();
   const [memberType, setMemberType] = useState("agent");
   const [memberId, setMemberId] = useState("");
-  const [role, setRole] = useState("");
+  const [role, setRole] = useState("member");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -174,7 +280,10 @@ function AddMemberDialog({
           </Field>
         )}
         <Field label="角色">
-          <input value={role} onChange={(e) => setRole(e.target.value)} className={inputCls} placeholder="member, reviewer 等" />
+          <select value={role} onChange={(e) => setRole(e.target.value)} className={inputCls}>
+            <option value="member">执行者（被 leader 分派干活）</option>
+            <option value="reviewer">审核者（进审批时被平台自动拉去审查）</option>
+          </select>
         </Field>
         {addMember.isError && (
           <p className="text-sm text-red-500">{String(addMember.error)}</p>

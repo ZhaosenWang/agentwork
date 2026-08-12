@@ -7,6 +7,7 @@ import {
   deleteRuntime,
   listAgents,
   createAgent,
+  updateAgent,
   deleteAgent,
   listGoals,
   getGoal,
@@ -27,6 +28,8 @@ import {
   deleteSquad,
   addSquadMember,
   listSquadMembers,
+  updateSquad,
+  removeSquadMember,
   listSchedules,
   createSchedule,
   deleteSchedule,
@@ -109,6 +112,15 @@ export function useCreateAgent() {
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.agents }),
   });
 }
+export function useUpdateAgent() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string; name: string; description: string; runtime_id: string; system_prompt: string; model: string; env: Record<string, string>; max_concurrent: number }) =>
+      updateAgent(id, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.agents }),
+  });
+}
+
 export function useDeleteAgent() {
   const qc = useQueryClient();
   return useMutation({
@@ -251,6 +263,28 @@ export function useAddSquadMember() {
   return useMutation({
     mutationFn: ({ squadId, ...body }: { squadId: string; member_type: string; member_id: string; role?: string }) =>
       addSquadMember(squadId, body),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.squadMembers(vars.squadId) });
+    },
+  });
+}
+
+export function useUpdateSquad() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: { id: string; name: string; description: string; leader_id: string; instructions: string }) =>
+      updateSquad(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.squads });
+    },
+  });
+}
+
+export function useRemoveSquadMember() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ squadId, memberId }: { squadId: string; memberId: string }) =>
+      removeSquadMember(squadId, memberId),
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: qk.squadMembers(vars.squadId) });
     },

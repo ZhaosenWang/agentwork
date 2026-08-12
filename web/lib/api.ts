@@ -28,6 +28,9 @@ export const listAgents = () => api<Agent[]>("/agents");
 export const getAgent = (id: string) => api<Agent>(`/agents/${id}`);
 export const createAgent = (body: Omit<Agent, "id" | "created_at">) =>
   api<Agent>("/agents", { method: "POST", body: JSON.stringify(body) });
+export const updateAgent = (id: string, body: Record<string, unknown>) =>
+  api<Agent>(`/agents/${id}`, { method: "PUT", body: JSON.stringify(body) });
+
 export const deleteAgent = (id: string) =>
   api<void>(`/agents/${id}`, { method: "DELETE" });
 
@@ -96,6 +99,14 @@ export const createSquad = (body: {
 }) => api<Squad>("/squads", { method: "POST", body: JSON.stringify(body) });
 export const deleteSquad = (id: string) =>
   api<void>(`/squads/${id}`, { method: "DELETE" });
+export const updateSquad = (
+  id: string,
+  body: { name: string; description: string; leader_id: string; instructions: string }
+) => api<Squad>(`/squads/${id}`, { method: "PUT", body: JSON.stringify(body) });
+
+export const removeSquadMember = (squadId: string, memberId: string) =>
+  api<void>(`/squads/${squadId}/members/${memberId}`, { method: "DELETE" });
+
 export const addSquadMember = (
   squadId: string,
   body: { member_type: string; member_id: string; role?: string }

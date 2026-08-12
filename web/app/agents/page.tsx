@@ -12,6 +12,7 @@ export default function AgentsPage() {
   const { data: runtimes } = useRuntimes();
   const del = useDeleteAgent();
   const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<Agent | null>(null);
 
   const runtimeName = (id: string) => runtimes?.find((r) => r.id === id)?.name ?? id;
 
@@ -23,6 +24,7 @@ export default function AgentsPage() {
       />
 
       {showForm && <AgentForm onClose={() => setShowForm(false)} />}
+      {editing && <AgentForm agent={editing} onClose={() => setEditing(null)} />}
 
       {isLoading && <p className="text-sm text-zinc-400">加载中…</p>}
 
@@ -42,7 +44,11 @@ export default function AgentsPage() {
             <tbody>
               {agents.map((a: Agent) => (
                 <tr key={a.id} className="border-b border-zinc-50 last:border-0 hover:bg-zinc-50/60">
-                  <td className="px-4 py-3 font-medium text-zinc-900">{a.name}</td>
+                  <td className="px-4 py-3">
+                    <button onClick={() => setEditing(a)} className="font-medium text-zinc-900 hover:text-indigo-600 hover:underline" title="点击编辑 agent">
+                      {a.name}
+                    </button>
+                  </td>
                   <td className="px-4 py-3 text-zinc-600">{runtimeName(a.runtime_id)}</td>
                   <td className="px-4 py-3 text-zinc-600">{a.model || "-"}</td>
                   <td className="px-4 py-3 text-zinc-600">{a.max_concurrent}</td>

@@ -44,6 +44,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /agents", h.listAgents)
 	mux.HandleFunc("POST /agents", h.createAgent)
 	mux.HandleFunc("GET /agents/{id}", h.getAgent)
+	mux.HandleFunc("PUT /agents/{id}", h.updateAgent)
 	mux.HandleFunc("DELETE /agents/{id}", h.deleteAgent)
 
 	mux.HandleFunc("GET /goals", h.listGoals)
@@ -64,9 +65,11 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /squads", h.listSquads)
 	mux.HandleFunc("POST /squads", h.createSquad)
 	mux.HandleFunc("GET /squads/{id}", h.getSquad)
+	mux.HandleFunc("PUT /squads/{id}", h.updateSquad)
 	mux.HandleFunc("DELETE /squads/{id}", h.deleteSquad)
 	mux.HandleFunc("POST /squads/{id}/members", h.addSquadMember)
 	mux.HandleFunc("GET /squads/{id}/members", h.listSquadMembers)
+	mux.HandleFunc("DELETE /squads/{id}/members/{memberId}", h.removeSquadMember)
 
 	mux.HandleFunc("GET /schedules", h.listSchedules)
 	mux.HandleFunc("POST /schedules", h.createSchedule)
@@ -138,6 +141,15 @@ func (h *Handlers) listAgents(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handlers) getAgent(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Agent.Get(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+func (h *Handlers) updateAgent(w http.ResponseWriter, r *http.Request) {
+	var a service.Agent
+	if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Agent.Update(r.Context(), r.PathValue("id"), a)
 	writeJSON(w, out, err)
 }
 func (h *Handlers) deleteAgent(w http.ResponseWriter, r *http.Request) {
@@ -314,8 +326,24 @@ func (h *Handlers) getSquad(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Squad.Get(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
 }
+func (h *Handlers) updateSquad(w http.ResponseWriter, r *http.Request) {
+	var sq service.Squad
+	if err := json.NewDecoder(r.Body).Decode(&sq); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Squad.Update(r.Context(), r.PathValue("id"), sq)
+	writeJSON(w, out, err)
+}
 func (h *Handlers) deleteSquad(w http.ResponseWriter, r *http.Request) {
 	if err := h.Squad.Delete(r.Context(), r.PathValue("id")); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+func (h *Handlers) removeSquadMember(w http.ResponseWriter, r *http.Request) {
+	if err := h.Squad.RemoveMember(r.Context(), r.PathValue("id"), r.PathValue("memberId")); err != nil {
 		writeJSON(w, nil, err)
 		return
 	}
