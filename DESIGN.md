@@ -319,7 +319,7 @@ goal list | assign | create | comment | wait
 agent list · squad list · issue list
 ```
 
-agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任务创建），平台绝不解析 agent 输出流（不变量 3）。
+agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任务创建），平台绝不解析 agent 输出流（不变量 3）。**2026-08 修正（决策 4-13）**：agent 协作已改为 MCP 工具（goal_comment/goal_assign/goal_list/agent_list/squad_list），CLI 保留给 human 调试——agent 不再学命令语法。
 
 ---
 
@@ -423,6 +423,7 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策4-9 | **平台终止过期 run（已实现，2026-08 修正）**：goal 易主（handoff）时平台终止旧 owner 的 running run——runID→cancel 注册表 + goal:assigned 事件驱动；claim→注册窗口 DB 兜底标记 + 注册后自查归零。取消原因结构化（run.cancel_reason + reason_code，不用字符串匹配）。协作语义：接力不是等待（同 goal 串行，依赖对方=完成部分→mention→结束→被拉回，A5 恢复模型）。AGENTWORK.md 引导。修正：原"进 review 时终止 run"（approval cut）已移除——agent 不再请求审批（决策 4-11），gate 命中时触发 run 已自然完成，无需杀 |
 | 决策4-11 | **agent 无权请求审批（已实现）**：移除 `goal request-approval`（CLI/API/引导）——审批触发 = 机器 gate + 人；执行者不得请求判定（三角分离）。"什么时候要人审"由卡点规则表达；squad 审查 run 是 review 窗口的平台机制（意见供参考，非审批对象） |
 | 决策4-12 | **人工停止 run（已实现）**：`POST /goals/{id}/runs/{runId}/stop` 终止 running run（执行层操作，goal 状态不动，恢复由人决定）；Cancel goal 同时终止 running run；stdio Close 进程组杀 + 关读端（停止即刻生效） |
+| 决策4-13 | **MCP 协作工具替代 CLI（已实现）**：协作动作（评论/交接/查看）直接做成 MCP 工具（agentwork_goal_comment / goal_assign / goal_list / agent_list / squad_list）——结构化参数、schema 自带、零学习成本；agent 不再学 CLI 语法（曾实测 agent 为搞清 CLI 用法去读平台源码）。agentwork-cli 保留二进制（human 调试），agent 引导全部指向 MCP 工具 |
 | 决策4-10 | **pingpong 阈值保持 4/8**：接力链每跳都计入 agent 触发（防甩锅口径），4 注入收敛警告 / 8 判死（可 Reopen 恢复、计数清零）；误伤"需求拆解差的长链"的代价 < 放过真甩锅链 |
 
 ---

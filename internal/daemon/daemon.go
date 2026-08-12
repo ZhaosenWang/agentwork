@@ -100,9 +100,11 @@ type Daemon struct {
 	bus      *events.Bus
 	addr     string
 	protoReg *proto.Registry
-	goalSvc  *service.GoalService
-	runSvc   *service.RunService
-	squadSvc *service.SquadService
+	goalSvc    *service.GoalService
+	runSvc     *service.RunService
+	commentSvc *service.CommentService
+	agentSvc   *service.AgentService
+	squadSvc   *service.SquadService
 	schedSvc *service.ScheduleService
 	im       *notify.Connector // M3: daily digest + intake replies (the notifier
 	// is born when the long connection connects; fetch it live)
@@ -154,10 +156,10 @@ type agentWorker struct {
 // New wires the daemon. im + qs are the M3 IM surfaces: the connector is the
 // owner of the notifier (born when the long connection connects), qs feeds
 // the daily digest and intake queries. Both may be nil (notify not wired).
-func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, im *notify.Connector, qs notify.QueryStore, intakeSvc *notify.IntakeService) *Daemon {
+func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, agentSvc *service.AgentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, im *notify.Connector, qs notify.QueryStore, intakeSvc *notify.IntakeService) *Daemon {
 	d := &Daemon{
 		st: st, bus: bus, addr: addr,
-		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc,
+		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, agentSvc: agentSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
 		im:               im,
 		qs:               qs,
@@ -1069,12 +1071,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	for k, v := range agentEnv {
 		taskEnv = append(taskEnv, k+"="+v)
 	}
-	selfBin, _ := os.Executable()
-	binDir := filepath.Dir(selfBin)
-	cliPath := filepath.Join(binDir, "agentwork-cli")
-	if _, err := os.Stat(cliPath); err != nil {
-		log.Printf("daemon: agentwork-cli not found at %s; agent tool calls will fail", cliPath)
-	}
 	addr := d.addr
 	if addr == "" {
 		addr = defaultListenAddr
@@ -1090,7 +1086,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		"AGENTWORK_GOAL_ID="+q.GoalID, // product-plane id (CLI comments/handoff)
 		"AGENTWORK_RUN_ID="+q.RunID,   // execution-plane id
 		"AGENTWORK_AGENT_ID="+q.AgentID,
-		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 	)
 	// M4-B: issue-sourced goals carry the issue identity so the agent can
 	// reply via `agentwork-cli issue comment` (the platform owns the token);
@@ -1126,7 +1121,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// local tools operate on its cwd — the worktree — is unaffected: same
 	// directory, same result.) Leftover terminals are killed
 	// unconditionally at session close (defer).
-	env := newRunEnvironment(q.RunID, q.GoalID, q.AgentID, runRowWorkdir, serverURL, binDir)
+	env := newRunEnvironment(q.RunID, q.GoalID, q.AgentID, runRowWorkdir, serverURL)
 	defer env.tm.cleanup()
 
 	// Workspace MCP server (DESIGN.md 决策 4-8): every run advertises its
@@ -1136,6 +1131,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// THIS run's worktree + environment. Registered for the run's
 	// lifetime; the /mcp/{runID} route resolves it.
 	mcpExec := mcp.NewExecutor(runRowWorkdir, env.runEnv(nil), env.tm)
+	mcpExec.SetCollaboration(q.GoalID, q.AgentID, q.RunID, d.commentSvc, d.goalSvc, d.runSvc, d.agentSvc, d.squadSvc)
 	d.mu.Lock()
 	d.mcpExecs[q.RunID] = mcpExec
 	d.mu.Unlock()
@@ -1174,7 +1170,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	if reviewRun {
 		prompt = "你是审查者（reviewer）。请审查本次改动（squad 规矩：成员写完代码后由 reviewer 审查）。\n\n" +
 			"只提意见，不要修改任何文件，不要执行任务本身。\n" +
-			"审查工作区中的改动（diff、测试、质量），然后把你的意见用 `agentwork-cli goal comment` 发到评论区（供审批人参考）。\n" +
+			"审查工作区中的改动（diff、测试、质量），然后把你的意见用 agentwork_goal_comment 工具发到评论区（供审批人参考）。\n" +
 			"意见要具体：问题、风险、改进建议。如果改动没问题，明确说明。"
 	}
 
@@ -1584,12 +1580,12 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	// declares no fs/terminal capabilities and the processor agent's
 	// write/shell tools are rejected ("agent→client RPC not configured") —
 	// the compile run cannot land its checks.json artifact (a live failure).
-	selfBin, _ := os.Executable()
-	binDir := filepath.Dir(selfBin)
-	env := newRunEnvironment(q.RunID, "", q.AgentID, runRowWorkdir, serverURL, binDir)
+	env := newRunEnvironment(q.RunID, "", q.AgentID, runRowWorkdir, serverURL)
 	defer env.tm.cleanup()
 	d.mu.Lock()
-	d.mcpExecs[q.RunID] = mcp.NewExecutor(runRowWorkdir, env.runEnv(nil), env.tm)
+	mcpExec := mcp.NewExecutor(runRowWorkdir, env.runEnv(nil), env.tm)
+	mcpExec.SetCollaboration(q.GoalID, q.AgentID, q.RunID, d.commentSvc, d.goalSvc, d.runSvc, d.agentSvc, d.squadSvc)
+	d.mcpExecs[q.RunID] = mcpExec
 	d.mu.Unlock()
 	defer func() {
 		d.mu.Lock()
@@ -1753,6 +1749,7 @@ Your workspace lives on the PLATFORM machine — it is not your environment:
 
 - Workspace root: %s
 - It contains the repository code and AGENTWORK.md, the coordination guide — read it first
+- COLLABORATE through the platform's MCP collaboration tools (agentwork_goal_comment / agentwork_goal_assign / agentwork_goal_list / agentwork_agent_list / agentwork_squad_list) — the coordination contract lives in AGENTWORK.md
 - ACCESS THE WORKSPACE ONLY THROUGH THE PLATFORM'S CHANNELS:
   * MCP server "agentwork" (advertised at session start) — its tools operate on the workspace: agentwork_read_file (read a file), agentwork_write_file (write a file), and the command trio agentwork_terminal_create → agentwork_terminal_output → agentwork_terminal_release (commands are ASYNC: create returns a terminal id immediately, poll output until exited=true passing the returned cursor back, then release to clean up)
   * Client capabilities over ACP — fs/read_text_file, fs/write_text_file, terminal/*
@@ -1980,7 +1977,7 @@ func buildPrompt(title, desc, handoff string) string {
 		// explicit, completable instruction so the run reaches a terminal state.
 		body = "Complete this sub-task. Do the work it implies, then finish your turn."
 	}
-	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, agentwork-cli reference, how to delegate via mention / hand off / request approval)."
+	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, how to collaborate via the agentwork_goal_* tools: comment with mentions, hand off, inspect)."
 	if handoff != "" {
 		// A handoff/wakeup note scopes THIS turn. It is placed AHEAD of the
 		// original description, which is now *context* (not a fresh to-do
@@ -2013,29 +2010,27 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	defer rows.Close()
 	var b strings.Builder
 	b.WriteString("## Team & Coordination\n\n")
-	b.WriteString("You coordinate with other agents by calling `agentwork-cli`, which is on")
-	b.WriteString(" your PATH. The server URL, goal id, run id, and your agent id are in your")
-	b.WriteString(" environment (AGENTWORK_SERVER_URL / AGENTWORK_GOAL_ID / AGENTWORK_RUN_ID")
-	b.WriteString(" / AGENTWORK_AGENT_ID). The CLI calls back over the server; do NOT edit files")
-	b.WriteString(" to communicate intent — structured side effects via the CLI are the only way.\n\n")
-	b.WriteString("This goal's id is the value of AGENTWORK_GOAL_ID.\n\n")
+	b.WriteString("You coordinate through the MCP tools of the \"agentwork\" server (advertised at\n")
+	b.WriteString(" session start) — structured side effects, no shell, no CLI:\n")
+	b.WriteString("- agentwork_goal_comment: post on THIS goal (embed a mention to trigger a run)\n")
+	b.WriteString("- agentwork_goal_assign: hand this goal to another agent/squad\n")
+	b.WriteString("- agentwork_goal_list / agentwork_agent_list / agentwork_squad_list: inspect\n")
+	b.WriteString("Do NOT edit files to communicate intent — structured side effects are the only way.\n\n")
 
 	b.WriteString("### Hand off the current goal\n")
-	b.WriteString("- agentwork-cli goal assign <to-agent-id> [--note \"scoping instruction\"]\n")
-	b.WriteString("  Hands the goal's ownership to that agent. END YOUR TURN immediately after —\n")
-	b.WriteString("  the platform terminates your run (its result no longer affects the goal, and\n")
-	b.WriteString("  a live run would block the new owner's: the goal executes serially). Do not\n")
-	b.WriteString("  keep working and do not wait for the new owner. Include a --note that scopes\n")
-	b.WriteString("  the work for the new owner.\n\n")
+	b.WriteString("- Call agentwork_goal_assign (assignee_type=agent|squad, note = scoping instruction).\n")
+	b.WriteString("  END YOUR TURN immediately after — the platform terminates your run (its result\n")
+	b.WriteString("  no longer affects the goal, and a live run would block the new owner's: the\n")
+	b.WriteString("  goal executes serially). Do not keep working and do not wait for the new owner.\n\n")
 
 	b.WriteString("### Pull in another agent via @mention\n")
-	b.WriteString("- Post a comment on the current goal mentioning an agent to trigger a run on it:\n")
-	b.WriteString("  agentwork-cli goal comment --text \"[@Name](mention://agent/<AGENT-UUID>) <what you want>\"\n")
+	b.WriteString("- Call agentwork_goal_comment with a structured mention:\n")
+	b.WriteString("  [@Name](mention://agent/<AGENT-UUID>) <what you want>\n")
 	b.WriteString("- The mention MUST be a structured Markdown link with a mention:// URI; bare")
 	b.WriteString(" `@handle` prose does NOT trigger anything. Resolve the UUID first with")
-	b.WriteString(" `agentwork-cli agent list` (JSON output). mention://agent/<uuid> triggers a")
-	b.WriteString(" new run on that agent for THIS goal; mention://squad/<uuid> routes to the")
-	b.WriteString(" squad's leader. @all (mention://all/all) suppresses auto-trigger.\n\n")
+	b.WriteString(" agentwork_agent_list. mention://agent/<uuid> triggers a new run on that agent")
+	b.WriteString(" for THIS goal; mention://squad/<uuid> routes to the squad's leader.\n")
+	b.WriteString(" @all (mention://all/all) suppresses auto-trigger.\n\n")
 	b.WriteString("### Collaboration is RELAY, not waiting\n")
 	b.WriteString("- Runs on this goal execute SERIALLY: the goal has one worktree and one\n")
 	b.WriteString("  running run at a time. Your run staying alive BLOCKS the agent you\n")
@@ -2049,9 +2044,8 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("  committed work. Pick up from there.\n\n")
 
 	b.WriteString("### Inspect\n")
-	b.WriteString("- agentwork-cli goal list [--limit N] [--json]   # goals (JSON; --json explicit), capped to N most recent (default all)\n")
-	b.WriteString("- agentwork-cli agent list    # all agents — use this to get the UUIDs for assign/mention\n")
-	b.WriteString("- agentwork-cli squad list    # all squads\n\n")
+	b.WriteString("- agentwork_goal_list / agentwork_agent_list / agentwork_squad_list — use\n")
+	b.WriteString("  agent_list to get UUIDs for mentions and handoffs.\n\n")
 
 	b.WriteString("### Team roster\n")
 	b.WriteString("If a task falls outside your role, delegate it — mention the teammate whose")

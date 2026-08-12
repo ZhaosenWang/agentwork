@@ -8,10 +8,11 @@
 // subprocess. No path whitelists/blacklists (same risk surface as stdio —
 // sensitive-file filtering is a deferred item in DESIGN.md).
 //
-// Run context is injected at terminal/create (env + PATH): agentwork-cli
-// is on the local PATH and its default SERVER_URL reaches this daemon, so
-// collaboration works with zero CLI changes and no server-address
-// knowledge in the agent.
+// Run context is injected at terminal/create (env): the run identity
+// (AGENTWORK_GOAL_ID/RUN_ID/AGENT_ID) and the platform's server URL. The
+// agent collaborates through the MCP collaboration tools, not a CLI
+// (决策 4-13) — the CLI binary is deliberately absent from the agent
+// environment.
 package daemon
 
 import (
@@ -32,19 +33,17 @@ type runEnvironment struct {
 	runID, goalID, agentID string
 	workdir                string // the goal's worktree (default terminal cwd)
 	serverURL              string // AGENTWORK_SERVER_URL for the CLI
-	cliPath                string // directory holding agentwork-cli (PATH)
 	tm                     *terminalManager
 }
 
 // newRunEnvironment builds the per-run handler.
-func newRunEnvironment(runID, goalID, agentID, workdir, serverURL, binDir string) *runEnvironment {
+func newRunEnvironment(runID, goalID, agentID, workdir, serverURL string) *runEnvironment {
 	return &runEnvironment{
 		runID:     runID,
 		goalID:    goalID,
 		agentID:   agentID,
 		workdir:   workdir,
 		serverURL: serverURL,
-		cliPath:   binDir,
 		tm:        newTerminalManager(),
 	}
 }
@@ -63,9 +62,6 @@ func (e *runEnvironment) runEnv(agentEnv []acp.EnvVariable) []string {
 		"AGENTWORK_AGENT_ID="+e.agentID,
 		"AGENTWORK_SERVER_URL="+e.serverURL,
 	)
-	if e.cliPath != "" {
-		env = append(env, "PATH="+e.cliPath+string(os.PathListSeparator)+os.Getenv("PATH"))
-	}
 	return env
 }
 

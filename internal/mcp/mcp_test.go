@@ -16,6 +16,9 @@ import (
 	gmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/eushing/agentwork/internal/acp"
+	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/service"
+	"github.com/eushing/agentwork/internal/store"
 )
 
 // fakeHost is a test TerminalHost that actually runs commands (the daemon's
@@ -234,5 +237,75 @@ func TestMCPFullClientRoundTrip(t *testing.T) {
 		Name: "terminal_release", Arguments: map[string]any{"terminal_id": tid},
 	}); err != nil {
 		t.Fatalf("terminal_release: %v", err)
+	}
+}
+
+// TestCollaborationTools: the collaboration tools act on the run's goal via
+// the injected services (no CLI, no HTTP hop) — goal_comment lands a comment
+// (mention parsing included), goal_list sees the goal.
+func TestCollaborationTools(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	bus := events.NewBus()
+	goalSvc := service.NewGoalService(st, bus)
+	runSvc := service.NewRunService(st, bus)
+	commentSvc := service.NewCommentService(st, bus)
+	commentSvc.SetRunService(runSvc)
+	commentSvc.SetGoalService(goalSvc)
+	goalSvc.SetRunService(runSvc)
+	runSvc.SetGoalService(goalSvc)
+
+	rt, _ := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	agentSvc := service.NewAgentService(st, bus)
+	agentA, _ := agentSvc.Create(ctx, service.Agent{Name: "a", RuntimeID: rt.ID})
+	agentB, _ := agentSvc.Create(ctx, service.Agent{Name: "b", RuntimeID: rt.ID})
+	dom, _ := service.NewDomainService(st, bus).Create(ctx, service.Domain{Name: "dom", GitURL: "https://e.com/d.git"})
+	goal, _ := goalSvc.Create(ctx, service.Goal{Title: "g", DomainID: dom.ID, AssigneeType: "agent", AssigneeID: agentA.ID, Status: "active"})
+
+	exec := NewExecutor(t.TempDir(), nil, newFakeHost())
+	exec.SetCollaboration(goal.ID, agentA.ID, "run-1", commentSvc, goalSvc, runSvc, agentSvc, service.NewSquadService(st, bus))
+	session := connect(t, HTTPHandler(exec))
+	ctx2 := context.Background()
+
+	// goal_comment with a mention → comment lands + a run is enqueued for B.
+	if _, err := session.CallTool(ctx2, &gmcp.CallToolParams{
+		Name: "goal_comment",
+		Arguments: map[string]any{
+			"content": "[@b](mention://agent/" + agentB.ID + ") please help",
+		},
+	}); err != nil {
+		t.Fatalf("goal_comment: %v", err)
+	}
+	var n int
+	if err := st.DB().QueryRowContext(ctx2, `SELECT COUNT(*) FROM comment WHERE goal_id=?`, goal.ID).Scan(&n); err != nil || n < 1 {
+		t.Fatalf("comment not landed (n=%d err=%v)", n, err)
+	}
+	var pending int
+	if err := st.DB().QueryRowContext(ctx2, `SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND status='queued'`, goal.ID, agentB.ID).Scan(&pending); err != nil || pending < 1 {
+		t.Fatalf("mention run not enqueued (n=%d err=%v)", pending, err)
+	}
+
+	// goal_list sees the goal.
+	res, err := session.CallTool(ctx2, &gmcp.CallToolParams{Name: "goal_list", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("goal_list: %v", err)
+	}
+	text := res.Content[0].(*gmcp.TextContent).Text
+	if !strings.Contains(text, goal.ID) {
+		t.Fatalf("goal_list missing our goal: %q", text)
+	}
+
+	// agent_list sees both agents.
+	res, err = session.CallTool(ctx2, &gmcp.CallToolParams{Name: "agent_list", Arguments: map[string]any{}})
+	if err != nil {
+		t.Fatalf("agent_list: %v", err)
+	}
+	text = res.Content[0].(*gmcp.TextContent).Text
+	if !strings.Contains(text, agentA.ID) || !strings.Contains(text, agentB.ID) {
+		t.Fatalf("agent_list missing agents: %q", text)
 	}
 }

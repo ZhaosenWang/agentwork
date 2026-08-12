@@ -289,7 +289,7 @@ func (s *SquadService) agentName(ctx context.Context, agentID string) string {
 // squad_briefing.go). Wording is plain so it's easy to tune.
 
 const squadOperatingProtocolHeader = `You are the LEADER of a squad. Work flows through you: dispatch to teammates by
-mentioning them in this goal's comments (agentwork-cli goal comment with a
+mentioning them in this goal's comments (the agentwork_goal_comment tool with a
 mention URI — see AGENTWORK.md) so they pick the work up as runs on this
 goal, do not do it all yourself. Members are NOT auto-dispatched; you
 delegate explicitly.

@@ -239,7 +239,7 @@ func TestTerminalShellSemantics(t *testing.T) {
 // TestTerminalEnvInjection: the run context lands in the command's
 // environment, overriding anything the agent passes.
 func TestTerminalEnvInjection(t *testing.T) {
-	env := newRunEnvironment("run-1", "goal-1", "agent-1", t.TempDir(), "http://127.0.0.1:7373", "/opt/bin")
+	env := newRunEnvironment("run-1", "goal-1", "agent-1", t.TempDir(), "http://127.0.0.1:7373")
 	got := env.runEnv([]acp.EnvVariable{{Name: "AGENTWORK_GOAL_ID", Value: "spoofed"}, {Name: "MY_VAR", Value: "kept"}})
 	joined := strings.Join(got, "\n")
 	for _, want := range []string{
@@ -253,8 +253,13 @@ func TestTerminalEnvInjection(t *testing.T) {
 			t.Fatalf("env missing %q in:\n%s", want, joined)
 		}
 	}
-	if !strings.Contains(joined, "PATH=/opt/bin:") {
-		t.Fatalf("PATH not prepended with cli dir:\n%s", joined)
+	// The CLI is deliberately absent from the agent environment (决策 4-13):
+	// the inherited system PATH must pass through untouched.
+	if strings.Contains(joined, "/opt/bin") {
+		t.Fatalf("agent env must not contain the CLI dir (决策 4-13):\n%s", joined)
+	}
+	if !strings.Contains(joined, "PATH=") {
+		t.Fatalf("inherited PATH must be preserved:\n%s", joined)
 	}
 }
 
@@ -262,7 +267,7 @@ func TestTerminalEnvInjection(t *testing.T) {
 // creation, and error paths.
 func TestFSHandlers(t *testing.T) {
 	dir := t.TempDir()
-	env := newRunEnvironment("run-1", "goal-1", "agent-1", dir, "http://127.0.0.1:7373", "")
+	env := newRunEnvironment("run-1", "goal-1", "agent-1", dir, "http://127.0.0.1:7373")
 
 	path := dir + "/nested/deep/file.txt"
 	if _, err := env.HandleWriteTextFile(t.Context(), acp.WriteTextFileRequest{Path: path, Content: "a\nb\nc\nd\ne\n"}); err != nil {

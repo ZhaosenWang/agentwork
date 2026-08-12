@@ -34,6 +34,7 @@ import (
 	gmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/eushing/agentwork/internal/acp"
+	"github.com/eushing/agentwork/internal/service"
 )
 
 // TerminalHost is the command-execution surface the MCP terminal tools use.
@@ -55,6 +56,20 @@ type Executor struct {
 	// Env is the command environment (platform base + run context, PATH
 	// prepended with the agentwork-cli dir).
 	Env []string
+	// Run context: collaboration tools act on THIS goal as THIS agent.
+	GoalID string
+	AgentID string
+	RunID  string
+	// Services for the collaboration tools (comment / assign / list). The
+	// daemon injects them — the tools act in-process, no CLI, no HTTP hop.
+	// The CLI was the old collaboration channel; an agent had to learn its
+	// command syntax (and sometimes read the platform's source to figure it
+	// out). MCP tools carry their own schema — zero learning cost.
+	commentSvc *service.CommentService
+	goalSvc    *service.GoalService
+	runSvc     *service.RunService
+	agentSvc   *service.AgentService
+	squadSvc   *service.SquadService
 	// host executes terminal commands — the daemon's per-run terminalManager.
 	host TerminalHost
 }
@@ -62,6 +77,12 @@ type Executor struct {
 // NewExecutor binds an Executor to one run's workspace + terminal pool.
 func NewExecutor(workdir string, env []string, host TerminalHost) *Executor {
 	return &Executor{Workdir: workdir, Env: env, host: host}
+}
+
+// SetCollaboration wires the services the collaboration tools need.
+func (e *Executor) SetCollaboration(goalID, agentID, runID string, commentSvc *service.CommentService, goalSvc *service.GoalService, runSvc *service.RunService, agentSvc *service.AgentService, squadSvc *service.SquadService) {
+	e.GoalID, e.AgentID, e.RunID = goalID, agentID, runID
+	e.commentSvc, e.goalSvc, e.runSvc, e.agentSvc, e.squadSvc = commentSvc, goalSvc, runSvc, agentSvc, squadSvc
 }
 
 // NewServer builds the MCP server with the workspace tools registered.
@@ -209,6 +230,117 @@ func NewServer(exec *Executor) *gmcp.Server {
 			return nil, nil, err
 		}
 		return &gmcp.CallToolResult{Content: []gmcp.Content{&gmcp.TextContent{Text: "released " + args.TerminalID}}}, nil, nil
+	})
+
+	// ── Collaboration tools (决策 4-13): the agent coordinates through MCP
+	// tools, not a CLI — structured args, schema-described, no command
+	// syntax to learn. The CLI channel is retired from agent guidance.
+	type commentArgs struct {
+		Content string `json:"content" jsonschema:"the comment text; embed a structured mention like [@Name](mention://agent/<id>) to trigger a run on that agent"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "goal_comment",
+		Description: "Post a comment on THIS goal as your agent — the collaboration surface. Embed a mention ([@Name](mention://agent/<uuid>) or mention://squad/<uuid>) to trigger a run on that agent; resolve uuids with agent_list / squad_list. Bare @handle does NOT trigger anything.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args commentArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.commentSvc == nil || exec.GoalID == "" {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		if _, err := exec.commentSvc.Create(ctx, service.Comment{
+			GoalID: exec.GoalID, AuthorType: "agent", AuthorID: exec.AgentID, Content: args.Content, RunID: exec.RunID,
+		}); err != nil {
+			return nil, nil, err
+		}
+		return toolResult(map[string]any{"ok": true}), nil, nil
+	})
+
+	type assignArgs struct {
+		AssigneeType string `json:"assignee_type" jsonschema:"agent | squad | human"`
+		AssigneeID   string `json:"assignee_id" jsonschema:"the agent/squad id to hand the goal to ('' with human)"`
+		Note         string `json:"note,omitempty" jsonschema:"scoping instruction for the new owner — becomes their next run's scope"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "goal_assign",
+		Description: "Hand THIS goal to another agent/squad (or back to the human). END YOUR TURN right after — the platform terminates your run, the new owner's run drives the goal. Include a note that scopes the work for the new owner.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args assignArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil || exec.GoalID == "" {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		g, err := exec.goalSvc.Assign(ctx, exec.GoalID, args.AssigneeType, args.AssigneeID, args.Note)
+		if err != nil {
+			return nil, nil, err
+		}
+		// Enqueue the new owner's run (same as the Web handler): Assign moves
+		// ownership; the run drives the goal forward. Coalesces if pending.
+		if args.AssigneeType == "agent" || args.AssigneeType == "squad" {
+			if _, err := exec.runSvc.EnqueueForGoal(ctx, *g); err != nil {
+				return nil, nil, err
+			}
+		}
+		return toolResult(map[string]any{"ok": true}), nil, nil
+	})
+
+	type listArgs struct {
+		Status *string `json:"status,omitempty" jsonschema:"filter by status (backlog|active|review|done|failed|cancelled)"`
+		Limit  *int    `json:"limit,omitempty" jsonschema:"max results (default all)"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "goal_list",
+		Description: "List goals (optionally filtered) — see what is waiting, what is active, what needs attention.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args listArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		goals, err := exec.goalSvc.List(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		var out []map[string]any
+		for _, g := range goals {
+			if args.Status != nil && g.Status != *args.Status {
+				continue
+			}
+			out = append(out, map[string]any{"id": g.ID, "title": g.Title, "status": g.Status, "assignee": g.AssigneeType + "/" + g.AssigneeID})
+			if args.Limit != nil && len(out) >= *args.Limit {
+				break
+			}
+		}
+		return toolResult(map[string]any{"goals": out}), nil, nil
+	})
+
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "agent_list",
+		Description: "List all agents — resolve agent uuids for mentions (goal_comment) and handoffs (goal_assign).",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args struct{}) (*gmcp.CallToolResult, any, error) {
+		if exec.agentSvc == nil {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		agents, err := exec.agentSvc.List(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		var out []map[string]any
+		for _, a := range agents {
+			out = append(out, map[string]any{"id": a.ID, "name": a.Name, "description": a.Description})
+		}
+		return toolResult(map[string]any{"agents": out}), nil, nil
+	})
+
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "squad_list",
+		Description: "List all squads — resolve squad uuids for mentions and handoffs.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args struct{}) (*gmcp.CallToolResult, any, error) {
+		if exec.squadSvc == nil {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		squads, err := exec.squadSvc.List(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		var out []map[string]any
+		for _, sq := range squads {
+			out = append(out, map[string]any{"id": sq.ID, "name": sq.Name, "leader_id": sq.LeaderID})
+		}
+		return toolResult(map[string]any{"squads": out}), nil, nil
 	})
 
 	return srv

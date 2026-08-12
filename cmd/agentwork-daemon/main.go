@@ -62,6 +62,7 @@ func main() {
 	goalSvc := service.NewGoalService(st, bus)
 	runSvc := service.NewRunService(st, bus)
 	commentSvc := service.NewCommentService(st, bus)
+	agentSvc := service.NewAgentService(st, bus)
 	goalSvc.SetRunService(runSvc)
 	runSvc.SetGoalService(goalSvc)
 	commentSvc.SetRunService(runSvc)
@@ -85,7 +86,7 @@ func main() {
 	protoReg.Register("jsonl", jsonlbackend.New())
 	protoReg.Register("jsonrpc", jsonrpcbackend.New())
 
-	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, squadSvc, schedSvc, imConn, qs, intakeSvc)
+	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, commentSvc, agentSvc, squadSvc, schedSvc, imConn, qs, intakeSvc)
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("daemon: %v", err)
