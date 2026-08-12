@@ -22,10 +22,11 @@ type Comment struct {
 	ParentID   string `json:"parent_id"`
 	Content    string `json:"content"`
 	CreatedAt  string `json:"created_at"`
-	// RunID is a CREATE-ONLY request field: an agent's comment carries the
-	// run it was made in (AGENTWORK_RUN_ID), and the platform threads it as
-	// a REPLY to that run's trigger comment (the mention that started it) —
-	// collaboration conversations chain automatically, no agent cooperation.
+	// RunID is the run whose product this comment is (AGENTWORK_RUN_ID for
+	// agent comments; insertRunResultComment stamps the run). Persisted —
+	// the approval panel distinguishes worker reports from review opinions
+	// by run ownership (DESIGN.md 决策 4-4). Also used to thread an agent
+	// comment as a REPLY to its run's trigger comment.
 	RunID string `json:"run_id,omitempty"`
 }
 
@@ -141,8 +142,8 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 		parentID = c.ParentID
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,?,?,?)`,
-		c.ID, c.GoalID, c.AuthorType, c.AuthorID, parentID, c.Content, c.CreatedAt); err != nil {
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,?,?,?,?)`,
+		c.ID, c.GoalID, c.AuthorType, c.AuthorID, parentID, c.Content, c.CreatedAt, c.RunID); err != nil {
 		return nil, fmt.Errorf("insert comment: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -300,7 +301,7 @@ func (s *CommentService) enqueueLeaderRunForMention(ctx context.Context, squadID
 
 func (s *CommentService) List(ctx context.Context, goalID string) ([]Comment, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at FROM comment WHERE goal_id=? ORDER BY created_at`, goalID)
+		`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id FROM comment WHERE goal_id=? ORDER BY created_at`, goalID)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +310,7 @@ func (s *CommentService) List(ctx context.Context, goalID string) ([]Comment, er
 	for rows.Next() {
 		var c Comment
 		var parentID sql.NullString
-		if err := rows.Scan(&c.ID, &c.GoalID, &c.AuthorType, &c.AuthorID, &parentID, &c.Content, &c.CreatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.GoalID, &c.AuthorType, &c.AuthorID, &parentID, &c.Content, &c.CreatedAt, &c.RunID); err != nil {
 			return nil, err
 		}
 		c.ParentID = parentID.String

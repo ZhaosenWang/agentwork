@@ -134,6 +134,7 @@ export interface Comment {
   parent_id: string;
   content: string;
   created_at: string;
+  run_id?: string; // the run whose product this comment is ('' = trigger/context)
 }
 
 export interface Squad {

@@ -84,14 +84,31 @@ function ReviewPanel({ goal }: { goal: Goal }) {
   const resolveOutcome =
     justResolved ?? (goal.review_request?.startsWith("deliver:") ? "deliver_failed" : null);
 
-  // Latest run's evidence (diff stats + verify output + agent summary).
-  const lastRun = runs?.filter((r) => r.status === "completed" || r.status === "failed").at(-1);
+  // 被审批对象 = 触发卡点的 run（DESIGN.md 决策 4-4）：agent 目标 = assignee
+  // 的 run，squad 目标 = leader run（is_leader_run）。不能用"最新 completed"
+  // ——审查 run 在触发 run 之后入队，时间近似会把审批对象错位成审查 run
+  // （审查意见/失败被当成被审批的证据）。
+  const ownerRun = (r: { agent_id: string; is_leader_run: boolean }) =>
+    goal.assignee_type === "squad" ? r.is_leader_run : r.agent_id === goal.assignee_id;
+  const lastRun = (runs ?? [])
+    .filter((r) => (r.status === "completed" || r.status === "failed") && ownerRun(r))
+    .at(-1);
   let evidence: Record<string, unknown> | null = null;
   if (lastRun?.evidence) {
     try { evidence = JSON.parse(lastRun.evidence); } catch { /* not JSON */ }
   }
 
-  const agentComments = recentComments.filter((c) => c.author_type === "agent");
+  // 本轮审查 run = 完成于触发 run 之后的非 owner run（review 窗口内唯一允许
+  // 的 run——决策 2-3 冻结 mention）。审查意见区只显示它们的产出；worker
+  // 汇报（证据区已展示）与历史轮次的意见不占本轮审批视线。
+  const reviewRuns = new Set(
+    (runs ?? [])
+      .filter((r) => r.finished_at && !ownerRun(r) && (lastRun?.finished_at ?? "") < r.finished_at)
+      .map((r) => r.id)
+  );
+  const agentComments = recentComments.filter(
+    (c) => c.author_type === "agent" && c.run_id && reviewRuns.has(c.run_id)
+  );
   const otherComments = recentComments.filter((c) => c.author_type !== "agent");
 
   return (

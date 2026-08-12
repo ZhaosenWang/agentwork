@@ -504,6 +504,7 @@ AgentWork Delivery
 </table>
 
 <p>Review 的对象应是 Evidence，而不是 Agent 的一句“done”。</p>
+<p class="small"><strong>审批对象语义（决策 4-4）：</strong>被审批的是<strong>触发卡点的 owner run</strong> 的证据（agent 目标 = assignee 的 run，squad 目标 = leader run）——不能用“最新 completed”近似（审查 run 晚于触发 run 入队，会把审批对象错位成审查者）；reviewer 的审查意见是评论区的<strong>参考观点</strong>，不是被审批对象。审查 run 只读：不提交其 worktree 改动（残留走下一 run 脏检查安全失败）。</p>
 
 <h2 id="event">16. Event & Event Bus</h2>
 <p>系统事实应通过 Event 持久化；Event Bus 负责异步通知。</p>

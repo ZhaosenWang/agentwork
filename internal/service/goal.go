@@ -599,8 +599,8 @@ func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) 
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
-		newID(), rc.GoalID, "agent", rc.AgentID, strings.TrimSpace(rc.Summary), now()); err != nil {
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,NULL,?,?,?)`,
+		newID(), rc.GoalID, "agent", rc.AgentID, strings.TrimSpace(rc.Summary), now(), rc.RunID); err != nil {
 		return fmt.Errorf("insert run-result comment: %w", err)
 	}
 	return nil
@@ -652,8 +652,8 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 			}
 			content := "协作 run 失败：" + summary
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
-				newID(), rc.GoalID, content, now()); err != nil {
+				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,'system','',NULL,?,?,?)`,
+				newID(), rc.GoalID, content, now(), rc.RunID); err != nil {
 				return fmt.Errorf("insert guest-failure comment: %w", err)
 			}
 		}

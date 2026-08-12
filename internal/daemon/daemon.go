@@ -794,18 +794,25 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
+	var triggerAuthor, triggerCommentID string
 	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
 		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
-		        g.source_ref, d.git_credentials
+		        g.source_ref, d.git_credentials,
+		        r2.trigger_comment_id, c.author_type
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
 		 LEFT JOIN domain d ON d.id = g.domain_id
 		 JOIN agent a ON a.id = r2.agent_id
 		 JOIN runtime r ON r.id = a.runtime_id
+		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor)
+	// Review run (DESIGN.md 决策 4-4): triggered by a SYSTEM comment — the
+	// platform's review request ("请审查本次改动…只提意见"). Its product is
+	// the opinion, not code: no commit of its worktree changes.
+	reviewRun := triggerAuthor == "system"
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -1172,9 +1179,15 @@ Your workspace is provided by the platform:
 			// branch, and uncommitted work would deliver nothing). The
 			// domain's declared excludes (checks.excludes, compiled + owner-
 			// confirmed) keep dependency dirs out of the branch.
-			if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID), checks.Excludes); err != nil {
-				d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
-				return
+			// A REVIEW run is exempt (DESIGN.md 决策 4-4): its product is the
+			// opinion, not code — review artifacts must not merge into the
+			// goal branch. Leftovers (if the reviewer edited anyway) fail the
+			// next run's dirty check into a human park — a safe fallback.
+			if !reviewRun {
+				if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID), checks.Excludes); err != nil {
+					d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
+					return
+				}
 			}
 			// Machine verification (DESIGN.md §4/§5 (§9 invariant 14)): the
 			// domain's verify commands run BEFORE the run is finished. A red

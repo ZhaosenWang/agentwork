@@ -217,8 +217,11 @@ CREATE TABLE IF NOT EXISTS comment (
     author_id   TEXT NOT NULL DEFAULT '',   -- zero id for system rows
     parent_id   TEXT REFERENCES comment(id), -- one level of threading
     content     TEXT NOT NULL,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    run_id      TEXT NOT NULL DEFAULT ''   -- the run whose product this comment is ('' = trigger/context rows)
 );
+
+CREATE INDEX IF NOT EXISTS idx_comment_goal ON comment(goal_id, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_comment_goal ON comment(goal_id, created_at);
 
