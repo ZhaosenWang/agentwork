@@ -433,20 +433,23 @@ func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
 // idle-watchdog cancellations). The old run's worktree leftovers stay
 // attributable (a prior cancelled run), so the new owner's dirty check
 // passes.
-func (d *Daemon) onGoalAssigned(ctx context.Context, e events.Event) {
+func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 	g, ok := e.Payload.(*service.Goal)
 	if !ok {
 		return
 	}
 	// The goal's new owner as an agent id (the only runs allowed to keep
 	// running on the goal). Human owner → no agent may keep running.
+	// DB work uses d.ctx, NOT the published event's ctx — the publisher is
+	// often an HTTP handler whose ctx is cancelled the moment it returns
+	// (see onGoalReviewing).
 	ownerAgent := ""
 	if g.AssigneeType == "agent" {
 		ownerAgent = g.AssigneeID
 	} else if g.AssigneeType == "squad" {
-		_ = d.st.DB().QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, g.AssigneeID).Scan(&ownerAgent)
+		_ = d.st.DB().QueryRowContext(d.ctx, `SELECT leader_id FROM squad WHERE id=?`, g.AssigneeID).Scan(&ownerAgent)
 	}
-	rows, err := d.st.DB().QueryContext(ctx,
+	rows, err := d.st.DB().QueryContext(d.ctx,
 		`SELECT id, agent_id FROM run WHERE goal_id=? AND status='running'`, g.ID)
 	if err != nil {
 		log.Printf("daemon: handoff cancel scan for %s: %v", g.ID, err)
@@ -477,7 +480,7 @@ func (d *Daemon) onGoalAssigned(ctx context.Context, e events.Event) {
 		// missed it. Stamp the run terminal in the DB; runTask's post-register
 		// self-check sees status != 'running' and self-cancels. The stamp is
 		// the only writer besides runTask itself, so no race with finishRun.
-		if _, err := d.st.DB().ExecContext(ctx,
+		if _, err := d.st.DB().ExecContext(d.ctx,
 			`UPDATE run SET status='cancelled', finished_at=? WHERE id=? AND status='running'`, nowStr(), runID); err != nil {
 			log.Printf("daemon: handoff terminal stamp %s: %v", runID, err)
 		} else {

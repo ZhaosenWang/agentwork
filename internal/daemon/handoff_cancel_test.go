@@ -33,6 +33,7 @@ func TestHandoffCancelsOldOwnerRun(t *testing.T) {
 		st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc,
 		runCancels:       make(map[string]context.CancelFunc),
 		runCancelReasons: make(map[string]string),
+		ctx:              context.Background(), // handlers use d.ctx, not the event ctx
 	}
 	// The bus runs handlers on its own goroutines with no acknowledgement —
 	// wrap the handler with a done channel so the test waits for it (the
@@ -129,6 +130,7 @@ func TestHandoffToHumanCancelsAllRuns(t *testing.T) {
 		st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc,
 		runCancels:       make(map[string]context.CancelFunc),
 		runCancelReasons: make(map[string]string),
+		ctx:              context.Background(), // handlers use d.ctx, not the event ctx
 	}
 	handled := make(chan struct{})
 	bus.Subscribe("goal:assigned", func(ctx context.Context, e events.Event) {
@@ -192,6 +194,7 @@ func TestApprovalCutTerminatesRunningRun(t *testing.T) {
 		st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc,
 		runCancels:       make(map[string]context.CancelFunc),
 		runCancelReasons: make(map[string]string),
+		ctx:              context.Background(), // handlers use d.ctx, not the event ctx
 	}
 	handled := make(chan struct{})
 	bus.Subscribe("goal:reviewing", func(ctx context.Context, e events.Event) {

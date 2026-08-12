@@ -34,7 +34,7 @@ import (
 
 // onGoalReviewing reacts to a goal parking in review: if the goal belongs to
 // a squad with reviewer members, trigger the squad's review checkpoint.
-func (d *Daemon) onGoalReviewing(ctx context.Context, e events.Event) {
+func (d *Daemon) onGoalReviewing(_ context.Context, e events.Event) {
 	m, ok := e.Payload.(map[string]any)
 	if !ok {
 		return
@@ -43,6 +43,12 @@ func (d *Daemon) onGoalReviewing(ctx context.Context, e events.Event) {
 	if goalID == "" {
 		return
 	}
+	// NOTE: event handlers must NOT use the published event's ctx — it is the
+	// PUBLISHER's ctx (an HTTP request ctx for RequestApproval), cancelled the
+	// moment the publisher returns; every DB query here would fail with
+	// "context canceled" and the cut would silently not happen (a live run
+	// kept running while its goal sat in review waiting for the human). Use
+	// the daemon-lifetime ctx.
 	// A goal entering review must not carry a live agent run. The behavior-gate
 	// path (agent `goal request-approval`) leaves the agent's own run running:
 	// it would keep working — mutating the worktree the approval will judge
@@ -50,8 +56,8 @@ func (d *Daemon) onGoalReviewing(ctx context.Context, e events.Event) {
 	// behind per-goal serialization (the review run claims only after this one
 	// ends). Cut any running run; the review run enqueued below claims within
 	// a dispatch tick. Gate-hits and parks have no running run — no-op.
-	d.cancelReviewingRuns(ctx, goalID)
-	if err := d.maybeTriggerSquadReview(ctx, goalID); err != nil {
+	d.cancelReviewingRuns(d.ctx, goalID)
+	if err := d.maybeTriggerSquadReview(d.ctx, goalID); err != nil {
 		log.Printf("daemon: squad review trigger for %s: %v", goalID, err)
 	}
 }
