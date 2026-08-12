@@ -1152,20 +1152,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// ACP protocol capabilities (deterministic); the agent maps them to its
 	// own tools — its toolset is its own business, agentwork states the
 	// environment facts and the collaboration contract.
-	prompt += fmt.Sprintf(`
-## Workspace
-
-Your workspace lives on the PLATFORM machine — it is not your environment:
-
-- Workspace root: %s
-- It contains the repository code and AGENTWORK.md, the coordination guide — read it first
-- ACCESS THE WORKSPACE ONLY THROUGH THE PLATFORM'S CHANNELS:
-  * MCP server "agentwork" (advertised at session start) — its tools operate on the workspace: agentwork_read_file (read a file), agentwork_write_file (write a file), agentwork_run_command (execute a command with the workspace as its working directory)
-  * Client capabilities over ACP — fs/read_text_file, fs/write_text_file, terminal/*
-  Your own local file/shell tools operate on YOUR environment — NOT the workspace. On a remote runtime your local tools cannot reach the workspace at all; locally they only happen to work when the working directory points at it
-- Commands that touch the workspace run through the platform's execution channel (agentwork_run_command or terminal/*), on the platform machine, with the workspace as their working directory
-- Verification, review and delivery read only what you wrote through these channels
-`, runRowWorkdir)
+	prompt += workspaceGuidance(runRowWorkdir)
 
 	// The domain's acceptance policy in NL (the "what counts as done" the
 	// OWNER defined) — the agent works toward it instead of finding out at
@@ -1545,7 +1532,8 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failProcessorRun(ctx, q, "parse listen addr: "+err.Error())
 		return
 	}
-	taskEnv = append(taskEnv, "AGENTWORK_SERVER_URL=http://"+net.JoinHostPort("127.0.0.1", port))
+	serverURL := "http://" + net.JoinHostPort("127.0.0.1", port)
+	taskEnv = append(taskEnv, "AGENTWORK_SERVER_URL="+serverURL)
 
 	conn, err := runtime.Open(ctx, runtime.Spec{
 		Transport: transport, Executable: execPath, Args: args, Endpoint: endpoint, Env: rtEnv,
@@ -1557,12 +1545,40 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	}
 	defer conn.Close()
 
+	// Unified execution model (DESIGN.md 决策 4-8): a processor run gets the
+	// same client execution environment + MCP workspace server + Workspace
+	// contract as a worker run. Without the client handler the ACP handshake
+	// declares no fs/terminal capabilities and the processor agent's
+	// write/shell tools are rejected ("agent→client RPC not configured") —
+	// the compile run cannot land its checks.json artifact (a live failure).
+	selfBin, _ := os.Executable()
+	binDir := filepath.Dir(selfBin)
+	env := newRunEnvironment(q.RunID, "", q.AgentID, runRowWorkdir, serverURL, binDir)
+	defer env.tm.cleanup()
+	d.mu.Lock()
+	d.mcpExecs[q.RunID] = mcp.NewExecutor(runRowWorkdir, env.runEnv(nil))
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.mcpExecs, q.RunID)
+		d.mu.Unlock()
+	}()
+	prompt += workspaceGuidance(runRowWorkdir)
+
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {
 		d.failProcessorRun(ctx, q, "provider "+provider+": "+err.Error())
 		return
 	}
-	run, err := backend.Execute(ctx, proto.ExecuteSpec{Conn: conn, Cwd: runRowWorkdir, Prompt: prompt})
+	run, err := backend.Execute(ctx, proto.ExecuteSpec{
+		Conn:          conn,
+		Cwd:           runRowWorkdir,
+		Prompt:        prompt,
+		ClientHandler: env,
+		McpServers: []acp.McpServer{{
+			Type: "http", Name: "agentwork", URL: serverURL + "/mcp/" + q.RunID,
+		}},
+	})
 	if err != nil {
 		d.failProcessorRun(ctx, q, "execute: "+err.Error())
 		return
@@ -1663,6 +1679,31 @@ func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, su
 	d.bus.Publish(ctx, events.Event{Topic: "domain:compile_failed", Payload: map[string]any{
 		"run_id": q.RunID, "error": summary,
 	}})
+}
+
+// workspaceGuidance is the Workspace contract (DESIGN.md 决策 4-8) injected
+// into EVERY run's prompt — worker AND processor alike (the unified model:
+// every run registers the client handler, declares capabilities, and gets
+// this section; a processor run without it cannot write its file artifact —
+// a live failure: the compile agent's write/shell tools were rejected with
+// "agent→client RPC not configured" and checks.json never landed). It names
+// the platform's own tools (deterministic); the agent's own toolset is its
+// business — the contract is the boundary.
+func workspaceGuidance(workdir string) string {
+	return fmt.Sprintf(`
+## Workspace
+
+Your workspace lives on the PLATFORM machine — it is not your environment:
+
+- Workspace root: %s
+- It contains the repository code and AGENTWORK.md, the coordination guide — read it first
+- ACCESS THE WORKSPACE ONLY THROUGH THE PLATFORM'S CHANNELS:
+  * MCP server "agentwork" (advertised at session start) — its tools operate on the workspace: agentwork_read_file (read a file), agentwork_write_file (write a file), agentwork_run_command (execute a command with the workspace as its working directory)
+  * Client capabilities over ACP — fs/read_text_file, fs/write_text_file, terminal/*
+  Your own local file/shell tools operate on YOUR environment — NOT the workspace. On a remote runtime your local tools cannot reach the workspace at all; locally they only happen to work when the working directory points at it
+- Commands that touch the workspace run through the platform's execution channel (agentwork_run_command or terminal/*), on the platform machine, with the workspace as their working directory
+- Verification, review and delivery read only what you wrote through these channels
+`, workdir)
 }
 
 // nowStr is the daemon-side UTC timestamp helper (service.now is private).
