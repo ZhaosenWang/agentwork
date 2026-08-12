@@ -77,7 +77,12 @@ func (n *Notifier) Subscribe(bus *events.Bus) {
 	bus.Subscribe("run:cancelled", n.onRunCancelled)
 }
 
-func (n *Notifier) onGoalReviewing(ctx context.Context, e events.Event) {
+// NOTE: the published event carries the PUBLISHER's ctx (often an HTTP
+// request, cancelled the moment the handler returns) — DB work here would
+// fail with "context canceled". Notify is background push; it uses its own
+// ctx, not the event's.
+func (n *Notifier) onGoalReviewing(_ context.Context, e events.Event) {
+	ctx := context.Background()
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	reason, _ := m["reason"].(string)
@@ -102,7 +107,12 @@ func (n *Notifier) onGoalReviewing(ctx context.Context, e events.Event) {
 	n.asyncSend(fmt.Sprintf("🔔 待审批：goal %s 等你决定\n%s\n（批准后平台自动合入）", short(goalID), reason))
 }
 
-func (n *Notifier) onGoalDelivered(ctx context.Context, e events.Event) {
+// NOTE: the published event carries the PUBLISHER's ctx (often an HTTP
+// request, cancelled the moment the handler returns) — DB work here would
+// fail with "context canceled". Notify is background push; it uses its own
+// ctx, not the event's.
+func (n *Notifier) onGoalDelivered(_ context.Context, e events.Event) {
+	ctx := context.Background()
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	note, _ := m["note"].(string)
@@ -127,7 +137,12 @@ func (n *Notifier) onGoalDelivered(ctx context.Context, e events.Event) {
 	n.sendMilestoneCard("✅", "blue", "已自动合入", body)
 }
 
-func (n *Notifier) onGoalDeliverFailed(ctx context.Context, e events.Event) {
+// NOTE: the published event carries the PUBLISHER's ctx (often an HTTP
+// request, cancelled the moment the handler returns) — DB work here would
+// fail with "context canceled". Notify is background push; it uses its own
+// ctx, not the event's.
+func (n *Notifier) onGoalDeliverFailed(_ context.Context, e events.Event) {
+	ctx := context.Background()
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	note, _ := m["note"].(string)
@@ -138,7 +153,12 @@ func (n *Notifier) onGoalDeliverFailed(ctx context.Context, e events.Event) {
 	n.sendMilestoneCard("⚠️", "red", "合入失败", fmt.Sprintf("**%s**  \n`goal %s`  \n%s", title, short(goalID), truncate(note, 300)))
 }
 
-func (n *Notifier) onGoalFinished(ctx context.Context, e events.Event) {
+// NOTE: the published event carries the PUBLISHER's ctx (often an HTTP
+// request, cancelled the moment the handler returns) — DB work here would
+// fail with "context canceled". Notify is background push; it uses its own
+// ctx, not the event's.
+func (n *Notifier) onGoalFinished(_ context.Context, e events.Event) {
+	ctx := context.Background()
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	status, _ := m["status"].(string)
@@ -162,7 +182,12 @@ func (n *Notifier) onGoalFinished(ctx context.Context, e events.Event) {
 	}
 }
 
-func (n *Notifier) onRunCancelled(ctx context.Context, e events.Event) {
+// NOTE: the published event carries the PUBLISHER's ctx (often an HTTP
+// request, cancelled the moment the handler returns) — DB work here would
+// fail with "context canceled". Notify is background push; it uses its own
+// ctx, not the event's.
+func (n *Notifier) onRunCancelled(_ context.Context, e events.Event) {
+	ctx := context.Background()
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	reason, _ := m["reason"].(string)
