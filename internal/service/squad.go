@@ -295,12 +295,15 @@ goal, do not do it all yourself. Members are NOT auto-dispatched; you
 delegate explicitly.
 `
 
-const squadParentStatusOwned = `You own this goal's status. When the overall objective is achieved, move it to
-done. Dispatching members toward sub-work is not completion — only push the
-parent to done once the whole objective is met.
+const squadParentStatusOwned = `You drive this goal's execution. When you finish your part, END your turn —
+completion is JUDGED, not declared: the platform's machine verification +
+the domain's gate rules + the human's approval decide whether the goal is
+done. You never set the goal's status yourself, and you do not wait for a
+"final confirmation" to close it — your run ending is your part done, the
+rest is the platform's and the human's.
 `
 
 const squadParentStatusNotOwned = `You were @mentioned to help on a goal someone else owns. Do NOT change this
-goal's status — advise or delegate by mentioning teammates in comments, but
-leave status changes to the owner.
+goal's status — advise or delegate by mentioning teammates in comments. No
+agent sets goal status; completion is judged by the platform + human.
 `
