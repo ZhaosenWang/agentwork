@@ -10,11 +10,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/runtime"
 	"github.com/eushing/agentwork/internal/service"
+	"net"
 )
 
 // runIntakeTask executes an inbound-message parse run (M3-4): the parser
@@ -73,12 +76,49 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 	}
 	defer conn.Close()
 
+	// Unified execution model (DESIGN.md 决策 4-8), same as worker and
+	// compile runs: WITHOUT the client handler the ACP handshake declares no
+	// fs/terminal capabilities and the parser's local write tools are
+	// rejected ("agent→client RPC not configured") — the intake.json artifact
+	// never lands (a live failure, same as compile before its fix). The
+	// intake branch was missed when the shared processor path was fixed;
+	// give it the environment + MCP workspace + Workspace contract too.
+	addr := d.addr
+	if addr == "" {
+		addr = defaultListenAddr
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		d.failIntakeRun(ctx, q, "parse listen addr: "+err.Error())
+		return
+	}
+	serverURL := "http://" + net.JoinHostPort("127.0.0.1", port)
+	env := newRunEnvironment(q.RunID, "", q.AgentID, workdir, serverURL)
+	defer env.tm.cleanup()
+	d.mu.Lock()
+	d.mcpExecs[q.RunID] = mcp.NewExecutor(workdir, env.runEnv(nil), env.tm)
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.mcpExecs, q.RunID)
+		d.mu.Unlock()
+	}()
+	prompt += workspaceGuidance(workdir)
+
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {
 		d.failIntakeRun(ctx, q, "provider "+provider+": "+err.Error())
 		return
 	}
-	run, err := backend.Execute(ctx, proto.ExecuteSpec{Conn: conn, Cwd: workdir, Prompt: prompt})
+	run, err := backend.Execute(ctx, proto.ExecuteSpec{
+		Conn:          conn,
+		Cwd:           workdir,
+		Prompt:        prompt,
+		ClientHandler: env,
+		McpServers: []acp.McpServer{{
+			Type: "http", Name: "agentwork", URL: serverURL + "/mcp/" + q.RunID,
+		}},
+	})
 	if err != nil {
 		d.failIntakeRun(ctx, q, "execute: "+err.Error())
 		return
@@ -208,12 +248,12 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 		return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
 	}
 	goal, err := d.goalSvc.Create(ctx, service.Goal{
-		Title:        g.Title,
-		Description:  g.Description,
-		DomainID:     g.DomainID,
-		AssigneeType: "agent",
-		AssigneeID:   g.AssigneeID,
-		Status:       "active",
+		Title:         g.Title,
+		Description:   g.Description,
+		DomainID:      g.DomainID,
+		AssigneeType:  "agent",
+		AssigneeID:    g.AssigneeID,
+		Status:        "active",
 		CreatedByType: "human",
 	})
 	if err != nil {
@@ -324,15 +364,15 @@ func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) 
 		timezone = "UTC"
 	}
 	s, err := d.schedSvc.Create(ctx, service.Schedule{
-		Name:          sch.Name,
-		TitleTemplate: sch.Title,
-		Description:   sch.Description,
-		AssigneeType:  "agent",
-		AssigneeID:    sch.AssigneeID,
-		DomainID:      sch.DomainID,
+		Name:           sch.Name,
+		TitleTemplate:  sch.Title,
+		Description:    sch.Description,
+		AssigneeType:   "agent",
+		AssigneeID:     sch.AssigneeID,
+		DomainID:       sch.DomainID,
 		CronExpression: sch.Cron,
-		Timezone:      timezone,
-		Enabled:       true,
+		Timezone:       timezone,
+		Enabled:        true,
 	})
 	if err != nil {
 		return "创建定时任务失败：" + err.Error()
