@@ -30,7 +30,7 @@ func buildReviewCard(g ReviewGoal) (string, error) {
 	if len(g.Comments) > 0 {
 		b.WriteString("\n\n**审查意见**")
 		for _, c := range g.Comments {
-			b.WriteString("\n> " + truncate(c, 400))
+			b.WriteString("\n> " + c)
 		}
 	}
 	card := map[string]any{
@@ -138,7 +138,7 @@ func evidenceSummary(raw string) string {
 			parts = append(parts, "verify: "+strings.Join(cmds, " | "))
 		}
 		if tail != "" {
-			parts = append(parts, "结果："+truncate(tail, 120))
+			parts = append(parts, "结果："+tail)
 		}
 	}
 	if a := strings.TrimSpace(ev.Agent); a != "" {

@@ -34,6 +34,13 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		d.failIntakeRun(ctx, q, "mkdir workdir: "+err.Error())
 		return
 	}
+	// The artifact's ABSOLUTE path: the scratch dir is opaque to the agent —
+	// told to "write intake.json in the current directory" it guessed (a
+	// write_file call missing its required path arg, then a raw shell heredoc
+	// terminal_create cannot run — command must be an executable). State the
+	// full path so the write_file path argument is unambiguous.
+	prompt += fmt.Sprintf("\n\n产物文件绝对路径：%s\n（用 agentwork_write_file 的 path 参数写入此绝对路径；不要猜测工作目录，不要用 shell 重定向）\n",
+		filepath.Join(workdir, "intake.json"))
 	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
 	var maxConcurrent int
 	err := d.st.DB().QueryRowContext(ctx,
@@ -108,10 +115,12 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 
 // failIntakeRun marks the parse run failed AND tells the owner — the inbound
 // flow already acknowledged the message ("⏳ 收到"), so a silent failure
-// would leave the user waiting for a result that never comes.
+// would leave the user waiting for a result that never comes. The failure
+// detail is sent IN FULL (no truncation): the user debugging a parse failure
+// needs the whole reason, including the path that failed.
 func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summary string) {
 	if n := d.imNotifier(); n != nil {
-		if err := n.Send("⚠️ 消息解析失败：" + truncateIn(summary, 200)); err != nil {
+		if err := n.Send("⚠️ 消息解析失败：" + summary); err != nil {
 			log.Printf("daemon: intake failure reply: %v", err)
 		}
 	}

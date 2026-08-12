@@ -109,7 +109,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 	}
 	gmcp.AddTool(srv, &gmcp.Tool{
 		Name:        "write_file",
-		Description: "Write a file in the workspace (absolute path; parent directories are created).",
+		Description: "Write a file. path is REQUIRED — the absolute path of the file (<absolute-path>); parent directories are created. Do NOT use shell redirection for file writes.",
 	}, func(ctx context.Context, req *gmcp.CallToolRequest, args writeArgs) (*gmcp.CallToolResult, any, error) {
 		if dir := dirOf(args.Path); dir != "" {
 			if err := os.MkdirAll(dir, 0o755); err != nil {

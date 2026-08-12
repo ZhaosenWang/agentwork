@@ -1593,6 +1593,14 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		d.mu.Unlock()
 	}()
 	prompt += workspaceGuidance(runRowWorkdir)
+	// The artifact's ABSOLUTE path: a processor's scratch dir is opaque to the
+	// agent — told to "write intake.json in the current directory", it guessed
+	// (a write_file call missing its path argument, then a raw shell heredoc
+	// that terminal_create cannot execute — the command must be an
+	// executable). State the file's full path so write_file's required path
+	// argument is unambiguous.
+	prompt += fmt.Sprintf("\n\n产物文件绝对路径：%s\n（用 agentwork_write_file 的 path 参数写入此绝对路径；不要猜测工作目录，不要用 shell 重定向）\n",
+		filepath.Join(runRowWorkdir, "intake.json"))
 
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {
