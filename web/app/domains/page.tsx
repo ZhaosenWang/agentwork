@@ -8,7 +8,7 @@ import {
 } from "@/lib/queries";
 import { useWSEvent } from "@/lib/ws";
 import { Button, Dialog, Field, inputCls, PageHeader, Empty, Badge } from "@/components/ui";
-import type { Domain, Checks } from "@/lib/types";
+import type { Domain, Checks, Guard, GateRule } from "@/lib/types";
 
 export default function DomainsPage() {
   useGoalEvents();
@@ -63,6 +63,42 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const [compileError, setCompileError] = useState<string | null>(null);
   // 回显域已配置的处理器 agent（域创建时选的 / 已配过的），不必每次重选
   const [processorAgent, setProcessorAgent] = useState(d.processor_agent_id);
+  // 手动编辑验收策略（决策 2-8 降级路径：不依赖模型编译；冻结后也可再编辑）
+  const [editChecksOpen, setEditChecksOpen] = useState(false);
+  const [dlgSetup, setDlgSetup] = useState<string[]>([]);
+  const [dlgExcludes, setDlgExcludes] = useState<string[]>([]);
+  const [dlgVerify, setDlgVerify] = useState<string[]>([]);
+  const [dlgGuards, setDlgGuards] = useState<Guard[]>([]);
+  const [dlgGates, setDlgGates] = useState<GateRule[]>([]);
+  const [dlgStrength, setDlgStrength] = useState(d.verification_strength);
+  const [dlgError, setDlgError] = useState<string | null>(null);
+  const openChecksEditor = () => {
+    setDlgSetup([...(d.checks.setup ?? [])]);
+    setDlgExcludes([...(d.checks.excludes ?? [])]);
+    setDlgVerify([...(d.checks.verify ?? [])]);
+    setDlgGuards((d.checks.guards ?? []).map((g) => ({ ...g })));
+    setDlgGates((d.checks.gates ?? []).map((g) => ({ ...g })));
+    setDlgStrength(d.verification_strength);
+    setDlgError(null);
+    setEditChecksOpen(true);
+  };
+  const saveChecks = () => {
+    const checks: Checks = {
+      ...d.checks,
+      setup: dlgSetup,
+      excludes: dlgExcludes,
+      verify: dlgVerify,
+      guards: dlgGuards,
+      gates: dlgGates,
+    };
+    freeze.mutate(
+      { id: d.id, checks, verification_strength: dlgStrength },
+      {
+        onSuccess: () => setEditChecksOpen(false),
+        onError: (e) => setDlgError(String(e)),
+      }
+    );
+  };
   const [strength, setStrength] = useState(d.verification_strength);
   // Editable copies of the compiled command lists (the confirmation card is
   // the human's last word: 产物可见、可改、可审 — DESIGN.md §5.3).
@@ -269,15 +305,10 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                 <Button onClick={startCompile} disabled={compiling || !policyText.trim() || !processorAgent}>
                   {compiling ? "编译中…" : "编译验收策略"}
                 </Button>
+                <Button variant="outline" onClick={openChecksEditor}>
+                  手动编辑
+                </Button>
               </div>
-              {compiling && (
-                <div className="flex items-center gap-2 text-xs text-amber-700">
-                  <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-                  正在编译验收策略——处理器 agent 正在探索仓库、安装依赖、统计基线，通常需要几分钟
-                </div>
-              )}
-              {compile.isError && <p className="text-sm text-red-500">{String(compile.error)}</p>}
-              {compileError && <p className="text-sm text-red-500">编译失败：{compileError}</p>}
             </div>
           )}
         </div>
@@ -285,8 +316,192 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
 
       {compiled && (
         <div className="flex gap-2 border-t border-gray-100 pt-3">
-          <Button variant="outline" onClick={() => startCompile()}>重新编译</Button>
+          <Button variant="outline" onClick={() => startCompile()} disabled={compiling}>
+            {compiling ? "编译中…" : "重新编译"}
+          </Button>
+          <Button variant="outline" onClick={openChecksEditor}>
+            编辑策略
+          </Button>
         </div>
+      )}
+
+      {/* 编译进行中反馈——两种状态（首次编译 / 重新编译）共享：编译是异步
+          processor run，compiling 保持到 domain:compiled / compile_failed
+          事件到达（API 返回只是 run 入队，编译本身要几分钟）。 */}
+      {compiling && (
+        <div className="flex items-center gap-2 text-xs text-amber-700">
+          <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+          正在编译验收策略——处理器 agent 正在探索仓库、安装依赖、统计基线，通常需要几分钟
+        </div>
+      )}
+      {compile.isError && <p className="text-sm text-red-500">{String(compile.error)}</p>}
+      {compileError && <p className="text-sm text-red-500">编译失败：{compileError}</p>}
+
+      {/* 手动编辑验收策略（决策 2-8）：不依赖模型编译，直接写 checks 后冻结；
+          冻结后也可再编辑（重新冻结更新 checks_compiled_at）。 */}
+      {editChecksOpen && (
+        <Dialog
+          title="编辑验收策略"
+          onClose={() => setEditChecksOpen(false)}
+          footer={
+            <div className="flex gap-2 justify-end">
+              <Button variant="ghost" onClick={() => setEditChecksOpen(false)}>取消</Button>
+              <Button onClick={saveChecks} disabled={freeze.isPending}>
+                {freeze.isPending ? "保存中…" : "保存并冻结"}
+              </Button>
+            </div>
+          }
+        >
+          <div className="space-y-3">
+            <Field label="环境准备 setup（幂等命令）">
+              <div className="space-y-2">
+                {dlgSetup.map((v, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <input
+                      value={v}
+                      onChange={(e) => setDlgSetup(dlgSetup.map((x, j) => j === i ? e.target.value : x))}
+                      className={inputCls}
+                      placeholder="cd web && npm install"
+                    />
+                    <button onClick={() => setDlgSetup(dlgSetup.filter((_, j) => j !== i))} className="text-red-500 shrink-0 px-1" title="删除这条">✕</button>
+                  </div>
+                ))}
+                <button onClick={() => setDlgSetup([...dlgSetup, ""])} className="text-xs text-indigo-600 hover:underline">+ 添加命令</button>
+              </div>
+            </Field>
+            <Field label="提交排除 excludes（glob）">
+              <div className="space-y-2">
+                {dlgExcludes.map((v, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <input
+                      value={v}
+                      onChange={(e) => setDlgExcludes(dlgExcludes.map((x, j) => j === i ? e.target.value : x))}
+                      className={inputCls}
+                      placeholder="**/node_modules/**"
+                    />
+                    <button onClick={() => setDlgExcludes(dlgExcludes.filter((_, j) => j !== i))} className="text-red-500 shrink-0 px-1" title="删除这条">✕</button>
+                  </div>
+                ))}
+                <button onClick={() => setDlgExcludes([...dlgExcludes, ""])} className="text-xs text-indigo-600 hover:underline">+ 添加排除</button>
+              </div>
+            </Field>
+            <Field label="机器验证 verify（exit 0 为过）">
+              <div className="space-y-2">
+                {dlgVerify.map((v, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <input
+                      value={v}
+                      onChange={(e) => setDlgVerify(dlgVerify.map((x, j) => j === i ? e.target.value : x))}
+                      className={inputCls}
+                      placeholder="go test ./..."
+                    />
+                    <button onClick={() => setDlgVerify(dlgVerify.filter((_, j) => j !== i))} className="text-red-500 shrink-0 px-1" title="删除这条">✕</button>
+                  </div>
+                ))}
+                <button onClick={() => setDlgVerify([...dlgVerify, ""])} className="text-xs text-indigo-600 hover:underline">+ 添加命令</button>
+              </div>
+            </Field>
+            <Field label="结构化约束 guards（机器检查的硬约束）">
+              <div className="space-y-2">
+                {dlgGuards.map((g, i) => (
+                  <div key={i} className="flex items-start gap-2">
+                    <div className="flex-1 space-y-1.5 rounded-lg border border-gray-200 p-2">
+                      <select
+                        value={g.type}
+                        onChange={(e) => setDlgGuards(dlgGuards.map((x, j) => j === i ? { ...x, type: e.target.value } : x))}
+                        className={inputCls}
+                      >
+                        <option value="diff_contains">diff_contains（改动必含）</option>
+                        <option value="diff_excludes">diff_excludes（改动禁触）</option>
+                        <option value="coverage_delta">coverage_delta（覆盖率提升）</option>
+                      </select>
+                    {g.type !== "coverage_delta" && (
+                      <input
+                        value={g.pattern}
+                        onChange={(e) => setDlgGuards(dlgGuards.map((x, j) => j === i ? { ...x, pattern: e.target.value } : x))}
+                        className={inputCls}
+                        placeholder={g.type === "diff_contains" ? "改动必须包含的 glob，如 **/*_test.go" : "禁止触碰的 glob，如 config/*"}
+                      />
+                    )}
+                    {g.type === "coverage_delta" && (
+                      <input
+                        type="number"
+                        value={g.min_delta}
+                        onChange={(e) => setDlgGuards(dlgGuards.map((x, j) => j === i ? { ...x, min_delta: Number(e.target.value) } : x))}
+                        className={inputCls}
+                        placeholder="覆盖率提升百分点"
+                      />
+                    )}
+                    </div>
+                    <button
+                      onClick={() => setDlgGuards(dlgGuards.filter((_, j) => j !== i))}
+                      className="text-red-500 shrink-0 mt-2 px-1"
+                      title="删除这条约束"
+                    >✕</button>
+                  </div>
+                ))}
+                <button
+                  onClick={() => setDlgGuards([...dlgGuards, { type: "diff_contains", pattern: "", min_delta: 0 }])}
+                  className="text-xs text-indigo-600 hover:underline"
+                >
+                  + 添加约束
+                </button>
+              </div>
+            </Field>
+            <Field label="卡点规则 gates（何时必须停给人审批）">
+              <div className="space-y-2">
+                {dlgGates.map((g, i) => (
+                  <div key={i} className="flex items-start gap-2">
+                    <div className="flex-1 space-y-1.5 rounded-lg border border-gray-200 p-2">
+                      <select
+                        value={g.name}
+                        onChange={(e) => setDlgGates(dlgGates.map((x, j) => j === i ? { ...x, name: e.target.value } : x))}
+                        className={inputCls}
+                      >
+                        <option value="merge">merge（每次完成必审）</option>
+                        <option value="diff_contains">diff_contains（改动命中必审）</option>
+                        <option value="diff_excludes">diff_excludes（触碰禁路必审）</option>
+                      </select>
+                    <input
+                      value={g.when}
+                      onChange={(e) => setDlgGates(dlgGates.map((x, j) => j === i ? { ...x, when: e.target.value } : x))}
+                      className={inputCls}
+                      placeholder="审批时给人看的触发说明（如：测试通过且覆盖率不低于基线，人工确认测试充分性）"
+                    />
+                    {g.name !== "merge" && (
+                      <input
+                        value={g.pattern}
+                        onChange={(e) => setDlgGates(dlgGates.map((x, j) => j === i ? { ...x, pattern: e.target.value } : x))}
+                        className={inputCls}
+                        placeholder="机器判定的 glob（如 config/*）"
+                      />
+                    )}
+                    </div>
+                    <button
+                      onClick={() => setDlgGates(dlgGates.filter((_, j) => j !== i))}
+                      className="text-red-500 shrink-0 mt-2 px-1"
+                      title="删除这条卡点"
+                    >✕</button>
+                  </div>
+                ))}
+                <button
+                  onClick={() => setDlgGates([...dlgGates, { name: "merge", when: "", pattern: "" }])}
+                  className="text-xs text-indigo-600 hover:underline"
+                >
+                  + 添加卡点
+                </button>
+              </div>
+            </Field>
+            <Field label="验证强度">
+              <select value={dlgStrength} onChange={(e) => setDlgStrength(e.target.value)} className={inputCls}>
+                <option value="strong">strong（强验证，默认少卡点）</option>
+                <option value="medium">medium</option>
+                <option value="weak">weak（弱验证，强制人工段）</option>
+              </select>
+            </Field>
+            {dlgError && <p className="text-sm text-red-500">{dlgError}</p>}
+          </div>
+        </Dialog>
       )}
     </div>
   );
