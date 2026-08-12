@@ -712,9 +712,14 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 				// trigger into firing on a non-review goal.
 				break
 			}
+			// The activity trail must record the REAL reason that parked the
+			// goal — a hardcoded {"gate":"merge"} mislabels diff_contains hits,
+			// the unfrozen-policy gate, and the weak-strength default. Same
+			// {"reason": ...} shape as requested_review / parked_review.
+			detail, _ := json.Marshal(map[string]string{"reason": reason})
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'entered_review',?,?)`,
-				newID(), rc.GoalID, "system", "", `{"gate":"merge"}`, now()); err != nil {
+				newID(), rc.GoalID, "system", "", string(detail), now()); err != nil {
 				return fmt.Errorf("insert review activity: %w", err)
 			}
 			pendingEvents = append(pendingEvents, events.Event{Topic: "goal:reviewing", Payload: map[string]any{

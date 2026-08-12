@@ -33,9 +33,9 @@ function buildStats(goals: Goal[]): StatItem[] {
     {
       key: "pending",
       label: "待审批",
-      hint: "backlog",
+      hint: "review",
       dot: "bg-amber-500",
-      count: count("backlog"),
+      count: count("review"),
     },
     {
       key: "done",
