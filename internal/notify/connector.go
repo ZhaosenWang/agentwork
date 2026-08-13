@@ -154,8 +154,8 @@ func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, erro
 		defer cancel()
 		result, err := registration.RegisterApp(regCtx, &registration.Options{
 			AppPreset: &registration.AppPreset{
-				Name: "agentwork",
-				Desc: "agentwork AI 工作流（自动化闭环）",
+				Name: "agentwork-bot",
+				Desc: "agentwork butler: your AI workflow steward — work goes to me, checkpoints come to you",
 			},
 			Addons: &registration.AppAddons{
 				Scopes: registration.AppAddonsScopes{
