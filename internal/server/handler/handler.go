@@ -56,6 +56,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/cancel", h.cancelGoal)
 	mux.HandleFunc("POST /goals/{id}/review", h.resolveGoalReview)
 	mux.HandleFunc("POST /goals/{id}/reopen", h.reopenGoal)
+	mux.HandleFunc("POST /goals/{id}/activate", h.activateGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/runs/{runId}/messages", h.listRunMessages)
 	mux.HandleFunc("GET /goals/{id}/timeline", h.goalTimeline)
@@ -277,6 +278,14 @@ func (h *Handlers) reopenGoal(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	out, err := h.Goal.Reopen(r.Context(), r.PathValue("id"), body.Reason)
+	writeJSON(w, out, err)
+}
+
+// activateGoal moves a backlog goal into execution (决策 6-14: the missing
+// backlog → active edge — a goal created without an assignee had no path
+// back into the pipeline).
+func (h *Handlers) activateGoal(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Goal.Activate(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
 }
 

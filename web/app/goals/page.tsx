@@ -174,6 +174,7 @@ function NewGoalForm({
   const [domainErr, setDomainErr] = useState("");
   const [assigneeType, setAssigneeType] = useState("");
   const [assigneeId, setAssigneeId] = useState("");
+  const [assigneeErr, setAssigneeErr] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -183,6 +184,13 @@ function NewGoalForm({
       body.assignee_type = assigneeType;
       body.assignee_id = assigneeId;
       body.status = "active";
+    }
+    // A chosen assignee TYPE without a chosen agent/squad would silently
+    // drop the assignee and the backend rejects it as "agent goal without
+    // assignee_id" — fail loudly here instead.
+    if (assigneeType && !assigneeId) {
+      setAssigneeErr(assigneeType === "agent" ? "请选择一个 Agent——或先到「Agent」页创建 runtime 和 agent" : "请选择一个 Squad——或先到「Squad」页创建小队");
+      return;
     }
     // v2: agent/squad-executed goals must belong to a domain (DESIGN.md §2).
     if (assigneeType === "agent" || assigneeType === "squad") {
@@ -250,8 +258,8 @@ function NewGoalForm({
             </select>
           </Field>
         )}
-        {(createGoal.isError || domainErr) && (
-          <p className="text-sm text-red-500">{domainErr || String(createGoal.error)}</p>
+        {(createGoal.isError || domainErr || assigneeErr) && (
+          <p className="text-sm text-red-500">{domainErr || assigneeErr || String(createGoal.error)}</p>
         )}
       </form>
     </Dialog>

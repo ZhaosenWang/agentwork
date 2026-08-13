@@ -122,7 +122,16 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 		return nil, NewValidationError("title is required")
 	}
 	if g.AssigneeType == "" {
-		g.AssigneeType = "agent"
+		if g.AssigneeID == "" {
+			// No assignee at all — an unassigned backlog item (the web
+			// form's "无（进入 backlog）" option). Type "human" carries the
+			// placeholder semantics: no run can ever enqueue until a real
+			// assignee is chosen (Assign validates the domain then).
+			g.AssigneeType = "human"
+		} else {
+			// An id without a type — convenience default.
+			g.AssigneeType = "agent"
+		}
 	}
 	if g.Status == "" {
 		g.Status = "backlog"
@@ -1283,6 +1292,37 @@ func (s *GoalService) IssueSource(ctx context.Context, goalID string) (ref, toke
 	return ref, token, ref != "", nil
 }
 
+// Activate moves a BACKLOG goal to active (决策 6-14): the missing
+// backlog → active edge — a goal created without an assignee, or un-assigned
+// and parked, had no path back into execution (Create and Reopen were the
+// only entries to active). Conditional transition (backlog only); the
+// assignee's run goes through the unified owner-run spawn (P0.5), so
+// human-assigned goals activate without a run (manual placeholder), exactly
+// like creation.
+func (s *GoalService) Activate(ctx context.Context, goalID string) (*Goal, error) {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='active' WHERE id=? AND status='backlog'`, goalID)
+	if err != nil {
+		return nil, fmt.Errorf("activate goal: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		g, gerr := s.Get(ctx, goalID)
+		if gerr != nil {
+			return nil, gerr
+		}
+		return nil, NewValidationError(fmt.Sprintf("cannot activate: the goal is %s (only backlog goals can be activated)", g.Status))
+	}
+	if _, err := s.st.DB().ExecContext(ctx,
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'activated','{}',?)`,
+		newID(), goalID, "human", "", now()); err != nil {
+		return nil, fmt.Errorf("insert activity: %w", err)
+	}
+	if _, err := s.EnqueueOwnerRun(ctx, goalID); err != nil {
+		return nil, fmt.Errorf("enqueue after activate: %w", err)
+	}
+	return s.Get(ctx, goalID)
+}
+
 // Reopen restarts a terminal goal — failed/cancelled (the failed-goal human
 // take-over path, DESIGN.md §13) AND done (the comment-triggered reopen:
 // a mention on a done goal is "this task is not over" — an追加需求, GitHub's
@@ -1343,12 +1383,16 @@ func (s *GoalService) EnqueueOwnerRun(ctx context.Context, goalID string) (*Run,
 	if g.Status != "active" {
 		return nil, nil // review/terminal goals take no fresh owner run
 	}
+	// Human-assigned goals are manual placeholders — no run to spawn. The
+	// check lives here (not in resolveLeader, which REJECTS non-agent/squad
+	// assignees) because this entry's contract is "no-op for human" — the
+	// same shape Reopen/Activate rely on.
+	if g.AssigneeType == "human" {
+		return nil, nil
+	}
 	agentID, isLeader, squadID, err := s.runSvc.resolveLeader(ctx, g.AssigneeType, g.AssigneeID)
 	if err != nil {
 		return nil, err
-	}
-	if agentID == "" {
-		return nil, nil // human-assigned — no run to spawn
 	}
 	return s.runSvc.enqueue(ctx, goalID, agentID, 1, isLeader, squadID, "")
 }

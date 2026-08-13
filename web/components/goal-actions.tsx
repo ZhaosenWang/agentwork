@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useAgents, useSquads, useAssignGoal, useCancelGoal,
-  useReopenGoal, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments } from "@/lib/queries";
+  useReopenGoal, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments, useActivateGoal } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Goal } from "@/lib/types";
@@ -12,6 +12,7 @@ export function GoalActions({ goal }: { goal: Goal }) {
   const cancel = useCancelGoal();
   const deleteGoal = useDeleteGoal();
   const reopen = useReopenGoal();
+  const activate = useActivateGoal();
   const [showAssign, setShowAssign] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
 
@@ -21,6 +22,12 @@ export function GoalActions({ goal }: { goal: Goal }) {
   return (
     <div className="flex gap-2 flex-wrap items-center">
       <Button onClick={() => setShowAssign(true)}>分配</Button>
+
+      {goal.status === "backlog" && (
+        <Button onClick={() => activate.mutate(goal.id)} disabled={activate.isPending}>
+          {activate.isPending ? "激活中…" : "激活"}
+        </Button>
+      )}
 
       {!isTerminal && (
         <Button variant="danger" onClick={() => cancel.mutate(goal.id)} disabled={cancel.isPending}>

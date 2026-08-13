@@ -314,3 +314,94 @@ func TestReconcileAllActiveReArmsAttention(t *testing.T) {
 		t.Fatalf("no active goals left — sweep must be empty, got n=%d err=%v", n, err)
 	}
 }
+
+// TestActivateBacklogGoal (决策 6-14): backlog → active is the missing
+// entry back into execution — conditional on backlog only, and the spawn
+// goes through the unified owner-run entry (P0.5), so a human-assigned
+// goal activates without a run, exactly like creation.
+func TestActivateBacklogGoal(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "worker")
+	domID := seedDomain(t, st)
+
+	// A backlog goal with an agent assignee: no run at creation.
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "backlog", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	if runs, _ := rs.List(ctx, g.ID); len(runs) != 0 {
+		t.Fatalf("backlog goal must not enqueue at creation, got %d runs", len(runs))
+	}
+	after, err := gs.Activate(ctx, g.ID)
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+	if after.Status != "active" {
+		t.Fatalf("activate must move backlog → active, got %q", after.Status)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) != 1 || runs[0].Role != "owner" {
+		t.Fatalf("activate must spawn the owner run, got %+v", runs)
+	}
+
+	// Conditional: a second activate on a non-backlog goal is refused.
+	if _, err := gs.Activate(ctx, g.ID); !errors.Is(err, ErrValidation) {
+		t.Fatalf("activating an active goal must be rejected, got %v", err)
+	}
+	// Terminal goals too.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='done' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.Activate(ctx, g.ID); !errors.Is(err, ErrValidation) {
+		t.Fatalf("activating a done goal must be rejected, got %v", err)
+	}
+
+	// Human-assigned backlog: activates without a run (manual placeholder).
+	g2, err := gs.Create(ctx, Goal{Title: "human work", AssigneeType: "human", Status: "backlog"})
+	if err != nil {
+		t.Fatalf("create human goal: %v", err)
+	}
+	after2, err := gs.Activate(ctx, g2.ID)
+	if err != nil {
+		t.Fatalf("activate human goal: %v", err)
+	}
+	if after2.Status != "active" {
+		t.Fatalf("human goal must activate, got %q", after2.Status)
+	}
+	if runs, _ := rs.List(ctx, g2.ID); len(runs) != 0 {
+		t.Fatalf("human-assigned activation must not enqueue, got %d runs", len(runs))
+	}
+}
+
+// TestCreateUnassignedBacklogGoal: a title-only goal (the web form's
+// "无（进入 backlog）" option) is a valid unassigned work item — the
+// backend must NOT default it to an agent goal with an empty id (the 400
+// "assignee_id is required for an agent goal" a bare title used to hit).
+// It lands as a human placeholder, backlog, no run.
+func TestCreateUnassignedBacklogGoal(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	g, err := gs.Create(ctx, Goal{Title: "自我介绍一下啊"})
+	if err != nil {
+		t.Fatalf("title-only goal must be creatable: %v", err)
+	}
+	if g.AssigneeType != "human" || g.AssigneeID != "" {
+		t.Fatalf("unassigned goal must be a human placeholder, got %s/%s", g.AssigneeType, g.AssigneeID)
+	}
+	if g.Status != "backlog" {
+		t.Fatalf("unassigned goal must stay backlog, got %q", g.Status)
+	}
+	if runs, _ := rs.List(ctx, g.ID); len(runs) != 0 {
+		t.Fatalf("unassigned goal must not enqueue, got %d runs", len(runs))
+	}
+	// A bare id without a type still defaults to agent (API convenience).
+	a := seedAgent(t, st, "a")
+	g2, err := gs.Create(ctx, Goal{Title: "bare id", AssigneeID: a, Status: "backlog", DomainID: seedDomain(t, st)})
+	if err != nil {
+		t.Fatalf("bare id must default to agent: %v", err)
+	}
+	if g2.AssigneeType != "agent" || g2.AssigneeID != a {
+		t.Fatalf("bare id must default to agent, got %s/%s", g2.AssigneeType, g2.AssigneeID)
+	}
+}

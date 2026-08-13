@@ -18,6 +18,7 @@ import {
   cancelGoal,
   resolveGoalReview,
   reopenGoal,
+  activateGoal,
   listGoalRuns,
   listGoalRunMessages,
   listGoalComments,
@@ -185,6 +186,16 @@ export function useReopenGoal() {
     mutationFn: (id: string) => reopenGoal(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.goals });
+    },
+  });
+}
+export function useActivateGoal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: activateGoal,
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: qk.goals });
+      qc.invalidateQueries({ queryKey: qk.goal(id) });
     },
   });
 }

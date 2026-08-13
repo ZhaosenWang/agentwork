@@ -469,6 +469,7 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策6-11 | **Run terminal 与 Reconcile 的原子边界（P0-1）**：`run.reconciled_at` 在 reconcile 事务内盖章——terminal 状态与 reconcile 同生共死；'' = terminal-but-unreconciled（崩溃窗口），daemon 启动 `ReconcilePendingTerminal` 重放（幂等：条件转移 + 汇报评论与盖章同事务，重放不重复；从未开跑的 cancelled run 无 reconcile 语义，跳过）。不变量 I2：**任何 terminal Run 最终必被 Reconcile，且 Reconcile 幂等**——**已实现** |
 | 决策6-12 | **边界钉死批次（P0-2/P1-1/P1-2/P1-3）**：① CreateSubGoal 与初始 run 同事务（幽灵 sub-goal 不可能）；② 仅 active goal 可拆活（review = execution freeze 点，terminal/backlog 拒绝——状态机不自环）；③ verifier verdict 强校验（role=verify + sub_goal_id + agent_id==verifier_id + sg.verifying + run.running）；④ conflict 不武装 owner attention（rework 是 assignee 的责任，新 revision 回 ready 才唤醒 owner；终局守卫仍把 conflict 算 pending，goal 不会带冲突进卡点）——**已实现** |
 | 决策6-13 | **Successor Run 与状态转移同事务 + 启动全量 reconcile（P0-3）**：所有 afterCommit enqueue（sub-goal 重试/verifier/reject rework/conflict rework、owner 重试、consult 恢复）搬进各自 reconcile 事务——状态转移与其后继 run 同生共死，崩溃窗口不再丢后继 run（事件只负责 publish，DB 写全在事务内）；daemon 启动 `ReconcileAllActive` 遍历 active goal 重跑幂等 ReconcileGoal——latch 事件在提交后丢失也能从 DB 真相重推导 attention 并补 spawn。Event≠Truth 的完整恢复面——**已实现** |
+| 决策6-14 | **backlog 激活路径（`POST /goals/{id}/activate`）**：backlog → active 的第三入口（此前只有创建与 Reopen）——未指派而创建的 goal 有了回到流水线的路。条件转移（仅 backlog），spawn 走 P0.5 统一入口；顺带修正 `EnqueueOwnerRun` 的 human 契约（文档声称 no-op、实现报错——Reopen 人工 goal 的潜在雷同处修复）——**已实现** |
 
 ---
 

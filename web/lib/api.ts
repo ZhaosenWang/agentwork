@@ -65,6 +65,8 @@ export const resolveGoalReview = (
   id: string,
   body: { decision: "approve" | "reject" | "redirect"; reason?: string }
 ) => api<Goal>(`/goals/${id}/review`, { method: "POST", body: JSON.stringify(body) });
+export const activateGoal = (id: string) =>
+  api<Goal>(`/goals/${id}/activate`, { method: "POST" });
 
 // ── Sub-goal ──
 export const listSubGoals = (goalId: string) => api<import("./types").SubGoal[]>(`/goals/${goalId}/sub-goals`);
