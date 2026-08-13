@@ -11,7 +11,7 @@ const NAV_ITEMS = [
   { href: "/runtimes", label: "Runtime", icon: Terminal },
   { href: "/squads", label: "Squad", icon: Users },
   { href: "/schedules", label: "Schedule", icon: Clock },
-  { href: "/domains", label: "Domain", icon: Boxes },
+  { href: "/domains", label: "项目", icon: Boxes },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

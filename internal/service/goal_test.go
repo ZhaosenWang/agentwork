@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
@@ -207,9 +206,6 @@ func TestCancelNotClobbered(t *testing.T) {
 	}
 }
 
-// TestSubGoalCoordination: parent waits on children; when all children finish,
-// the parent is woken (re-queued) with a wakeup note. Proves the dynamic
-
 // TestCoalescePending: enqueuing a second run for the same (goal,agent) while
 // one is pending coalesces — exactly one queued/running run per pair.
 func TestCoalescePending(t *testing.T) {
@@ -237,14 +233,6 @@ func TestCoalescePending(t *testing.T) {
 		t.Fatalf("expected exactly 1 pending run after coalesce, got %d (r1=%s)", pending, r1.Status)
 	}
 }
-
-// TestWakeRunawayGuarded: the P0-1 fix. When a parent has been woken
-// maxWakeCycles times already, another child-done does NOT wake it again —
-// instead the goal is force-failed, so a runaway re-fan-out loop is bounded
-// and surfaced rather than burning runs forever. (Guard is a state-machine
-
-// Ensure the test binary doesn't time out on the background bus goroutines.
-var _ = time.Second
 
 // TestReopenFailedGoal: the human take-over path — failed/cancelled → active
 // with a fresh run (attempt resets), exactly like a reject iteration.
@@ -277,9 +265,6 @@ func TestReopenFailedGoal(t *testing.T) {
 		t.Fatal("active goal must not be reopenable")
 	}
 }
-
-// TestParkForManualReview: the worktree-dirty path — a worktree with unattributed changes
-// parks the active goal in review (the human resolves, then the normal review
 
 // TestClaimPerGoalSerialization: a queued run of a goal is NOT claimed while
 // another run of the same goal is running (the worktree is exclusive); it

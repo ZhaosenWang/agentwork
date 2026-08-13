@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useGoals, useAgents, useSquads, useDomains, useCreateGoal, useGoalEvents } from "@/lib/queries";
-import { Badge, Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
+import { Badge, AttentionChip, Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
 import { GoalStats } from "@/components/goal-stats";
 import type { Goal, GoalStatus } from "@/lib/types";
 
@@ -12,7 +12,6 @@ const STATUS_TABS: { label: string; value: GoalStatus | "all" }[] = [
   { label: "待审批", value: "review" },
   { label: "backlog", value: "backlog" },
   { label: "active", value: "active" },
-  { label: "blocked", value: "blocked" },
   { label: "done", value: "done" },
   { label: "failed", value: "failed" },
   { label: "cancelled", value: "cancelled" },
@@ -22,7 +21,6 @@ const STATUS_TABS: { label: string; value: GoalStatus | "all" }[] = [
 const STATUS_BAR: Record<string, string> = {
   backlog: "from-zinc-300 to-zinc-400",
   active: "from-blue-500 to-indigo-500",
-  blocked: "from-amber-400 to-amber-500",
   review: "from-purple-500 to-fuchsia-500",
   done: "from-emerald-500 to-teal-500",
   failed: "from-red-500 to-rose-500",
@@ -109,7 +107,10 @@ export default function GoalsPage() {
                   <h3 className="font-medium text-zinc-900 group-hover:text-indigo-700 transition-colors">
                     {g.title}
                   </h3>
-                  <Badge status={g.status} className="shrink-0" />
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <AttentionChip attention={g.attention} />
+                    <Badge status={g.status} className="shrink-0" />
+                  </div>
                 </div>
                 {g.status === "review" && g.review_request && (
                   <p className="mt-1.5 text-xs text-purple-700 line-clamp-1">{g.review_request}</p>

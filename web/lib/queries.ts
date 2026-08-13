@@ -36,6 +36,8 @@ import {
   listDomains,
   listSubGoals,
   createSubGoal,
+  listSubGoalVerifications,
+  listGoalChanges,
   getDomain,
   createDomain,
   updateDomain,
@@ -50,6 +52,7 @@ import {
   getGateStats,
 } from "./api";
 import { useWSEvent } from "./ws";
+import type { WSEvent } from "./types";
 
 // ── Query keys ──
 export const qk = {
@@ -61,6 +64,9 @@ export const qk = {
   goalComments: (goalId: string) => ["goals", goalId, "comments"] as const,
   goalTimeline: (goalId: string) => ["goals", goalId, "timeline"] as const,
   goalSubGoals: (goalId: string) => ["goals", goalId, "sub-goals"] as const,
+  goalChanges: (goalId: string) => ["goals", goalId, "changes"] as const,
+  subGoalVerifications: (goalId: string, subGoalId: string) =>
+    ["goals", goalId, "sub-goals", subGoalId, "verifications"] as const,
   squads: ["squads"] as const,
   squad: (id: string) => ["squads", id] as const,
   squadMembers: (squadId: string) => ["squads", squadId, "members"] as const,
@@ -219,7 +225,25 @@ export function useCreateSubGoal() {
       createSubGoal(goalId, body),
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: qk.goalSubGoals(vars.goalId) });
+      qc.invalidateQueries({ queryKey: qk.goalChanges(vars.goalId) });
     },
+  });
+}
+
+// A sub-goal's verification rounds — fetched lazily when its row expands.
+export function useSubGoalVerifications(goalId: string, subGoalId: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.subGoalVerifications(goalId, subGoalId),
+    queryFn: () => listSubGoalVerifications(goalId, subGoalId),
+    enabled: enabled && !!subGoalId,
+  });
+}
+
+// ── Change hooks (v2) ──
+export function useGoalChanges(goalId: string) {
+  return useQuery({
+    queryKey: qk.goalChanges(goalId),
+    queryFn: () => listGoalChanges(goalId),
   });
 }
 
@@ -412,19 +436,44 @@ export function useSetScheduleEnabled() {
 // ── WebSocket event → cache invalidation ──
 export function useGoalEvents() {
   const qc = useQueryClient();
-  // Goal lifecycle events
-  useWSEvent("goal:created", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:assigned", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:finished", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:retrying", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:retry_failed", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:waiting", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:deleted", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:reviewing", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:approved", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:review_resolved", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:delivered", () => qc.invalidateQueries({ queryKey: qk.goals }));
-  useWSEvent("goal:deliver_failed", () => qc.invalidateQueries({ queryKey: qk.goals }));
+  // Goal-scoped events: invalidate the list AND the specific goal's detail —
+  // the detail page (attention badge, handoff note, review state) must not
+  // go stale until a page reload. Payloads carry goal_id (goal:created and
+  // goal:assigned carry the Goal struct under `id` instead).
+  const invalidateGoal = (p: WSEvent["payload"]) => {
+    qc.invalidateQueries({ queryKey: qk.goals });
+    const m = p as Record<string, unknown> | undefined;
+    const id = m?.goal_id ?? m?.id;
+    if (typeof id === "string" && id) {
+      qc.invalidateQueries({ queryKey: qk.goal(id) });
+      qc.invalidateQueries({ queryKey: qk.goalChanges(id) });
+    }
+  };
+  useWSEvent("goal:created", invalidateGoal);
+  useWSEvent("goal:assigned", invalidateGoal);
+  useWSEvent("goal:finished", invalidateGoal);
+  useWSEvent("goal:retrying", invalidateGoal);
+  useWSEvent("goal:retry_failed", invalidateGoal);
+  useWSEvent("goal:deleted", invalidateGoal);
+  useWSEvent("goal:reviewing", invalidateGoal);
+  useWSEvent("goal:approved", invalidateGoal);
+  useWSEvent("goal:review_resolved", invalidateGoal);
+  useWSEvent("goal:delivered", invalidateGoal);
+  useWSEvent("goal:deliver_failed", invalidateGoal);
+  // run.terminal re-derives the goal's attention (the Coordinator persists
+  // it) — the detail badge follows without a reload.
+  useWSEvent("run:terminal", (p) => {
+    const m = p as Record<string, unknown> | undefined;
+    const id = m?.goal_id;
+    if (typeof id === "string" && id) {
+      qc.invalidateQueries({ queryKey: qk.goal(id) });
+      qc.invalidateQueries({ queryKey: qk.goalChanges(id) });
+    }
+  });
+  // change.* events re-derive attention too, and refresh the change panel.
+  useWSEvent("change.ready", invalidateGoal);
+  useWSEvent("change.integrated", invalidateGoal);
+  useWSEvent("change.conflict", invalidateGoal);
   // Agent lifecycle events
   useWSEvent("agent:created", () => qc.invalidateQueries({ queryKey: qk.agents }));
   useWSEvent("agent:deleted", () => qc.invalidateQueries({ queryKey: qk.agents }));

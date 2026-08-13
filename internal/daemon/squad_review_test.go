@@ -186,32 +186,6 @@ func TestSquadReviewDedupWithExistingMention(t *testing.T) {
 	}
 }
 
-// TestSquadReviewSkipsWorktreePark: worktree-dirty park is a platform problem
-// (the run never started) — there is no finished work to review, so no
-// review request may fire.
-func TestSquadReviewSkipsWorktreePark(t *testing.T) {
-	d, st, gs, _, squadSvc := newSquadReviewDaemon(t)
-	ctx := context.Background()
-	goalID, _ := squadWithReviewer(t, d, st, gs, squadSvc, "reviewer")
-
-	if _, err := st.DB().ExecContext(ctx,
-		`UPDATE goal SET review_request=? WHERE id=?`,
-		"worktree 有未归因的改动（可能是手动编辑）：\n M secret.txt\n请检查 worktree 后批准继续或驳回。", goalID); err != nil {
-		t.Fatalf("park goal: %v", err)
-	}
-	if err := d.maybeTriggerSquadReview(ctx, goalID); err != nil {
-		t.Fatalf("trigger squad review: %v", err)
-	}
-	var n int
-	if err := st.DB().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system'`, goalID).Scan(&n); err != nil {
-		t.Fatalf("count comments: %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("worktree-dirty park → no review request, got %d", n)
-	}
-}
-
 // TestSquadReviewSkipsLeaderSelfReview: a reviewer who IS the leader would
 // review its own work — the platform excludes it.
 func TestSquadReviewSkipsLeaderSelfReview(t *testing.T) {

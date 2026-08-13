@@ -19,7 +19,7 @@ import (
 // frontend.
 var topics = []string{
 	"goal:created", "goal:assigned", "goal:finished", "goal:retrying", "goal:retry_failed",
-	"goal:waiting", "goal:deleted", "goal:reviewing", "goal:approved", "goal:review_resolved",
+	"goal:deleted", "goal:reviewing", "goal:approved", "goal:review_resolved",
 	"goal:delivered", "goal:deliver_failed",
 	"run:enqueued", "run:coalesced", "run:claimed", "run:discarded", "run:event", "run:cancelled", "run:terminal", "sub_goal.created", "sub_goal.verified", "sub_goal.rejected", "sub_goal.failed", "sub_goal.cancelled", "change.ready", "change.integrated", "change.conflict",
 	"comment:created",

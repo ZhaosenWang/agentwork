@@ -61,6 +61,8 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /goals/{id}/timeline", h.goalTimeline)
 	mux.HandleFunc("GET /goals/{id}/sub-goals", h.listSubGoals)
 	mux.HandleFunc("POST /goals/{id}/sub-goals", h.createSubGoal)
+	mux.HandleFunc("GET /goals/{id}/sub-goals/{subGoalId}/verifications", h.listSubGoalVerifications)
+	mux.HandleFunc("GET /goals/{id}/changes", h.listGoalChanges)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
 
@@ -689,6 +691,31 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 
 func (h *Handlers) listSubGoals(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Goal.ListSubGoals(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+
+// listGoalChanges returns the goal's changes with their revision history —
+// the Web change panel (the owner's integration view, v2 决策 6-3).
+func (h *Handlers) listGoalChanges(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Goal.ListChangeDetails(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+
+// listSubGoalVerifications returns a sub-goal's verification rounds — the
+// Web sub-goal panel's audit trail (v2 决策 6-5).
+func (h *Handlers) listSubGoalVerifications(w http.ResponseWriter, r *http.Request) {
+	goalID := r.PathValue("id")
+	subGoalID := r.PathValue("subGoalId")
+	sg, err := h.Goal.GetSubGoal(r.Context(), subGoalID)
+	if err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	if sg.GoalID != goalID {
+		writeJSON(w, nil, service.ErrNotFound)
+		return
+	}
+	out, err := h.Goal.ListVerificationResults(r.Context(), subGoalID)
 	writeJSON(w, out, err)
 }
 

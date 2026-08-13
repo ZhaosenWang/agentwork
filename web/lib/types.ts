@@ -27,7 +27,6 @@ export interface Agent {
 export type GoalStatus =
   | "backlog"
   | "active"
-  | "blocked"
   | "review"
   | "done"
   | "failed"
@@ -160,6 +159,46 @@ export interface SubGoal {
   created_at: string;
 }
 
+// Change is a sub-goal's logical deliverable (v2 决策 6-3): the owner
+// integrates it into the goal branch. HeadRef = the LATEST revision's head.
+export interface Change {
+  id: string;
+  goal_id: string;
+  sub_goal_id: string;
+  status: string; // ready | integrating | integrated | conflict
+  head_ref: string;
+  created_at: string;
+}
+
+// ChangeRevision binds a change to the integration base it was built
+// against — conflict rework appends seq N+1 on the SAME change.
+export interface ChangeRevision {
+  id: string;
+  change_id: string;
+  seq: number;
+  base_ref: string;
+  head_ref: string;
+  created_at: string;
+}
+
+// ChangeDetail is a change with its revision history (GET /goals/{id}/changes).
+export interface ChangeDetail extends Change {
+  revisions: ChangeRevision[];
+}
+
+// VerificationResult is one verification round of a sub-goal (v2 决策 6-5):
+// machine checks or an agent verifier's structured verdict.
+export interface VerificationResult {
+  id: string;
+  goal_id: string;
+  sub_goal_id: string;
+  verifier_run_id: string; // '' = machine verification
+  status: string; // passed | rejected
+  summary: string;
+  evidence: string;
+  created_at: string;
+}
+
 export interface SquadMember {
   id: string;
   squad_id: string;
@@ -188,7 +227,7 @@ export interface Schedule {
 // WS event shape from the hub: {"topic":"goal:created","payload":{...}}
 export type WSTopic =
   | "goal:created" | "goal:assigned" | "goal:finished"
-  | "goal:retrying" | "goal:retry_failed" | "goal:waiting" | "goal:deleted"
+  | "goal:retrying" | "goal:retry_failed" | "goal:deleted"
   | "goal:reviewing" | "goal:approved" | "goal:review_resolved"
   | "goal:delivered" | "goal:deliver_failed"
   | "run:enqueued" | "run:coalesced" | "run:claimed" | "run:discarded" | "run:event" | "run:cancelled" | "run:terminal"

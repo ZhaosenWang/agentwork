@@ -99,16 +99,15 @@ func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID
 
 // enqueueTx is the atomic enqueue core: inserts a run row under the caller's
 // transaction. It performs the per-(goal,agent) pending coalesce check INSIDE
-// the same tx so it sees the caller's un-committed state (this is what keeps
-// a parent-wake flipping blocked→active + enqueue one atomic operation, and
-// what stops two parallel child-dones from double-enqueuing the parent).
+// the same tx so it sees the caller's un-committed state — the Coordinator's
+// conditional spawn (决策 6-4) relies on this: two racing reconciles see each
+// other's pending run and coalesce into one.
 //
 // The run event (enqueued/coalesced) is RETURNED, not published: publishing
 // inside the tx would violate the "bus.Publish after commit" invariant (a
 // rolled-back tx must not emit). The caller publishes after its commit.
-// Note: EnqueueExistingTx (the parent-wake path inside a goal tx) does not
-// publish — the goal layer's commitAndEmit covers goal events; the run event
-// for that path is a known M2 refinement.
+// Note: EnqueueExistingTx (the Coordinator's path inside a goal tx) does not
+// publish — the goal layer's commitAndEmit covers goal events.
 func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, *events.Event, error) {
 	if pending, err := s.hasPending(ctx, tx, goalID, agentID); err != nil {
 		return nil, nil, err

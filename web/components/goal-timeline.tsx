@@ -88,15 +88,13 @@ type FlowColor = (typeof FLOW_COLORS)[number];
 // Actions that ARE processing steps (flow nodes). Comments and system
 // chatter are not — they live in the comment feed.
 const FLOW_ACTIONS = new Set([
-  "created", "handoff", "entered_review", "requested_review", "parked_review",
+  "created", "handoff", "entered_review",
   "reopened", "cancelled", "mention_cycle_failed",
 ]);
 const ACTION_LABEL: Record<string, string> = {
   created: "📝 创建",
   handoff: "🔀 改派",
   entered_review: "🔔 等待审批",
-  requested_review: "🙋 请求审批",
-  parked_review: "🛑 停靠审批（脏工作区）",
   reopened: "↩️ 重开",
   cancelled: "🚫 取消",
   mention_cycle_failed: "⚠️ 协作循环判死",
@@ -556,7 +554,7 @@ export function GoalStatusBar({ goalId, goalStatus }: { goalId: string; goalStat
     cancelled: { icon: "🚫", text: "已取消", cls: "text-zinc-500" },
     active: { icon: "⏸️", text: "等待中", cls: "text-zinc-500" },
     backlog: { icon: "📥", text: "未开始", cls: "text-zinc-400" },
-    blocked: { icon: "⏳", text: "等待子任务", cls: "text-zinc-500" },
+    review: { icon: "🔔", text: "等待审批", cls: "text-purple-700" },
   };
   const m = meta[goalStatus] ?? { icon: "•", text: goalStatus, cls: "text-zinc-500" };
   return (

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"log"
-	"strings"
 
 	"github.com/google/uuid"
 	"github.com/eushing/agentwork/internal/events"
@@ -14,23 +13,24 @@ import (
 //
 // The reviewer is a member of the squad — the squad OWNS the "who reviews"
 // rule (member role="reviewer", set when the squad is built), and the
-// PLATFORM enforces it: when a squad-owned goal parks in review (the gate
-// fired, or the agent requested approval), the daemon automatically posts a
+// PLATFORM enforces it: when a squad-owned goal parks in review (a gate
+// fired on the completed owner run), the daemon automatically posts a
 // system mention asking each reviewer to review the change. No prompt text
 // has to tell the leader to "hand off to the reviewer" — the squad's
 // structure IS the instruction, and it fires every round (reject → new
 // leader run → review again → reviewers re-triggered).
 //
 // The review run is an ordinary mention run (EnqueueForMention): it runs in
-// the same worktree while the goal sits in review (the human's approval
-// window — that is exactly when the review opinions must be visible), and
-// its result is discarded by reconcile like any guest run — the opinions
-// live in the comments, which the approval card and the human read.
+// its own read-only worktree while the goal sits in review (the human's
+// approval window — that is exactly when the review opinions must be
+// visible), and its result is discarded by reconcile like any guest run —
+// the opinions live in the comments, which the approval card and the human
+// read.
 //
-// Note: this fires on EVERY goal:reviewing, including the
-// worktree-dirty park and behavior-gate requests — a review request is
-// harmless there (the reviewer sees whatever is in the worktree and says
-// so). The coalesce on (goal, reviewer) keeps re-parks from stacking runs.
+// Note: goal:reviewing is published only by the gate park in
+// ReconcileOnRunEnd (a handoff-loop park, 决策 5-7, emits no event — the
+// squad has no code change to review there). The coalesce on (goal,
+// reviewer) keeps re-parks from stacking runs.
 
 // onGoalReviewing reacts to a goal parking in review: if the goal belongs to
 // a squad with reviewer members, trigger the squad's review checkpoint.
@@ -67,10 +67,10 @@ func (d *Daemon) onGoalReviewing(_ context.Context, e events.Event) {
 // approval's evidence). Coalescing on (goal, reviewer) keeps repeated parks
 // from stacking runs.
 func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) error {
-	var assigneeType, assigneeID, reviewRequest string
+	var assigneeType, assigneeID string
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT assignee_type, assignee_id, review_request FROM goal WHERE id=?`, goalID).
-		Scan(&assigneeType, &assigneeID, &reviewRequest)
+		`SELECT assignee_type, assignee_id FROM goal WHERE id=?`, goalID).
+		Scan(&assigneeType, &assigneeID)
 	if err == sql.ErrNoRows {
 		return nil // goal vanished
 	}
@@ -79,15 +79,6 @@ func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) err
 	}
 	if assigneeType != "squad" || assigneeID == "" {
 		return nil // not squad-owned — no squad rule applies
-	}
-	// The review-request guard: only reviews of FINISHED work trigger the
-	// squad review. The worktree-dirty park is a platform problem, not
-	// finished work — the run never started, so a review run would audit a
-	// stale worktree (possibly a human's manual edits) and review nothing.
-	// (A deliver failure re-parks via goal:deliver_failed, not goal:reviewing
-	// — it never reaches here.)
-	if strings.HasPrefix(reviewRequest, "worktree") {
-		return nil
 	}
 
 	// The squad's leader (a reviewer who IS the leader would review its own

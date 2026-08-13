@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS run (
     session_id         TEXT NOT NULL DEFAULT '',  -- protocol-returned; for history/future resume
     workdir            TEXT NOT NULL DEFAULT '',
     status             TEXT NOT NULL DEFAULT 'queued', -- queued|running|completed|failed|cancelled
-    cancel_reason      TEXT NOT NULL DEFAULT '',  -- structured: idle_watchdog|handoff|approval|timeout|'' (decisions don't string-match summaries)
+    cancel_reason      TEXT NOT NULL DEFAULT '',  -- structured: idle_watchdog|handed_off|stopped|timeout|'' (decisions don't string-match summaries)
     attempt            INTEGER NOT NULL DEFAULT 1,
     result_summary     TEXT NOT NULL DEFAULT '',
     evidence           TEXT NOT NULL DEFAULT '',   -- JSON: diff stats + verify output + agent summary
@@ -328,8 +328,6 @@ CREATE TABLE IF NOT EXISTS comment (
     created_at  TEXT NOT NULL,
     run_id      TEXT NOT NULL DEFAULT ''   -- the run whose product this comment is ('' = trigger/context rows)
 );
-
-CREATE INDEX IF NOT EXISTS idx_comment_goal ON comment(goal_id, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_comment_goal ON comment(goal_id, created_at);
 

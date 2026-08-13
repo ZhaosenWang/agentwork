@@ -243,7 +243,7 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 			if e := s.enqueueLeaderRunForMention(ctx, m.ID, c.GoalID, c.ID); e != nil {
 				continue
 			}
-		case "human", "all", "issue":
+		case "human", "all":
 			// No run; just a rendered link.
 		}
 	}

@@ -355,10 +355,3 @@ func TestDoneCancelsQueuedRuns(t *testing.T) {
 	}
 }
 
-// TestWaitChildrenRefusesWithoutSubGoals: a wait with zero non-terminal
-// sub-goals would deadlock the goal forever (nothing can ever wake it) —
-// TestBlockedRunCompletionDoesNotFakeReview: a completed run on a blocked
-// goal must not leave an entered_review trace (the park UPDATE hit 0 rows) —
-// a fake park would mislead the review trigger into firing on a non-review
-
-// TestWaitChildrenCancelsQueuedRuns: waiting on sub-goals drops queued runs —

@@ -70,6 +70,14 @@ export const createSubGoal = (
   goalId: string,
   body: { title: string; description?: string; assignee_id: string; verifier_id?: string }
 ) => api<import("./types").SubGoal>(`/goals/${goalId}/sub-goals`, { method: "POST", body: JSON.stringify(body) });
+// A sub-goal's verification rounds (v2: the audit trail behind verified/rejected).
+export const listSubGoalVerifications = (goalId: string, subGoalId: string) =>
+  api<import("./types").VerificationResult[]>(`/goals/${goalId}/sub-goals/${subGoalId}/verifications`);
+
+// ── Change (v2) ──
+// A goal's changes with revision history — the owner's integration view.
+export const listGoalChanges = (goalId: string) =>
+  api<import("./types").ChangeDetail[]>(`/goals/${goalId}/changes`);
 
 // ── Run ──
 export const listGoalRuns = (goalId: string) =>

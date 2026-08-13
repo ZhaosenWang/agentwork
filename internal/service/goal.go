@@ -27,7 +27,7 @@ type Goal struct {
 	DomainID        string `json:"domain_id"`     // owning domain (required for agent/squad goals — v2)
 	AssigneeType    string `json:"assignee_type"` // agent | squad | human
 	AssigneeID      string `json:"assignee_id"`
-	Status          string `json:"status"` // backlog|active|done|failed|blocked|review|cancelled
+	Status          string `json:"status"` // backlog|active|done|failed|review|cancelled
 	HandoffNote     string `json:"handoff_note"`
 	ReviewRequest   string `json:"review_request"`   // gate trigger reason / deliver-failure note
 	HumanIterations int    `json:"human_iterations"` // reject iterations (separate from run.attempt)
@@ -128,9 +128,10 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	if g.CreatedByType == "" {
 		g.CreatedByType = "human"
 	}
-	// Note: blocked/review are transitive statuses (WaitChildren / the
-	// checkpoint gate); reject them at creation so callers can't plant a goal
-	// in a waiting state.
+	// Note: review is a transitive status (the checkpoint gate) — reject it at
+	// creation so callers can't plant a goal in a waiting state. (blocked was
+	// retired with the wait-children model, 决策 6-10; the check stays as a
+	// belt-and-braces guard against stale clients.)
 	if g.Status == "blocked" || g.Status == "review" {
 		return nil, NewValidationError("cannot create a goal in blocked/review status")
 	}
@@ -694,18 +695,22 @@ func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 
 // ReconcileOnRunEnd is the ONLY place that advances a goal's status based on a
 // run's terminal outcome. It is called by the daemon after a run reaches a
-// terminal status (completed/failed). Everything else — handoff, cancel,
-// wait-children — only changes goal.status directly; they never use a run's
-// result. See DESIGN.md
+// terminal status (completed/failed/cancelled). Everything else — handoff,
+// cancel — changes goal.status without consulting a run's result. See DESIGN.md
 //
 // Rules:
 //
+//	sub-goal runs report to the sub-goal layer (ReconcileSubGoalRun);
+//	verify runs just land their report (ReconcileVerifyRun) — neither
+//	  touches goal.status
 //	run.agent != current assignee  → discard (handoff/reassign orphaned run)
 //	goal.status == cancelled       → discard
-//	run completed, no inflight sub-goals → goal → done, wake parent
-//	run completed, sub-goals inflight → leave; child-done flow owns the wake
+//	run completed, no pending sub-goals/changes → gate judgment → done | review
+//	run completed, work still pending → stay active (the Coordinator's
+//	  attention loop owns the next wake, 决策 6-4/6-8)
 //	run failed, attempts left → enqueue a retry run (attempt+1)
 //	run failed, attempts exhausted → goal → failed
+//	run cancelled → the goal stays where it is (timeout/handoff — 决策 2-6/6-6)
 //
 // insertRunResultComment lands a completed run's report in the feed as the
 // agent's comment — the delivery summary is what the human rejects/approves
@@ -889,14 +894,14 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 			// Park in review. The handoff/wakeup note is NOT cleared — if the
 			// human rejects, the next run resumes from it.
 			res, err := tx.ExecContext(ctx,
-				`UPDATE goal SET status='review', review_request=? WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked','review')`,
+				`UPDATE goal SET status='review', review_request=? WHERE id=? AND status NOT IN ('done','failed','cancelled','review')`,
 				reason, rc.GoalID)
 			if err != nil {
 				return fmt.Errorf("park goal in review: %w", err)
 			}
 			if n, _ := res.RowsAffected(); n == 0 {
-				// The goal is not parkable (blocked / already review /
-				// terminal): the gate cannot fire here. NO activity, NO
+				// The goal is not parkable (already review / terminal):
+				// the gate cannot fire here. NO activity, NO
 				// reviewing event — a fake park must not mislead the review
 				// trigger into firing on a non-review goal.
 				break
@@ -922,11 +927,11 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 		// DESIGN: the daemon no longer clears handoff_note itself; only the
 		// goal layer, after confirming the run owns the goal, does.)
 		if res, err := tx.ExecContext(ctx,
-			`UPDATE goal SET status='done', handoff_note='' WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked','review')`,
+			`UPDATE goal SET status='done', handoff_note='' WHERE id=? AND status NOT IN ('done','failed','cancelled','review')`,
 			rc.GoalID); err != nil {
 			return fmt.Errorf("promote goal done: %w", err)
 		} else if n, _ := res.RowsAffected(); n == 0 {
-			break // goal is blocked (waiting children) — leave for the wake
+			break // the goal moved elsewhere (review/terminal raced) — no promote
 		}
 		// The goal reached a terminal state — queued runs (a mention that
 		// raced ahead) must not be claimed onto a finished goal.
@@ -960,7 +965,7 @@ func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) 
 			})
 		} else {
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE goal SET status='failed' WHERE id=? AND status NOT IN ('done','failed','cancelled','blocked','review')`,
+				`UPDATE goal SET status='failed' WHERE id=? AND status NOT IN ('done','failed','cancelled','review')`,
 				rc.GoalID); err != nil {
 				return fmt.Errorf("fail goal: %w", err)
 			}
@@ -1506,7 +1511,7 @@ func (s *GoalService) GateStats(ctx context.Context) ([]GateStat, error) {
 // MarkDelivered closes the deliver step (DESIGN.md §7), called by the
 // daemon after its deterministic merge + re-verify + push:
 //
-//	success → review → done (handoff_note cleared, parent woken)
+//	success → review → done (handoff_note cleared)
 //	failure → stays in review with the reason annotated (review_request),
 //	          so the human can retry deliver or reject the change back.
 //
@@ -1532,9 +1537,10 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 
 	event := "goal:deliver_failed"
 	if success {
-		// M0 simplification: a delivered goal is done regardless of children
-		// (the deliver already merged this goal's branch). Parent coordination
-		// semantics are refined in M1/M2.
+		// A delivered goal is done: the deliver already merged this goal's
+		// branch. Pending sub-goals cannot exist here — the finalization guard
+		// (决策 6-8) keeps the goal out of the gate judgment while work is
+		// pending.
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE goal SET status='done', handoff_note='', review_request='' WHERE id=? AND status='review'`, goalID); err != nil {
 			return nil, fmt.Errorf("mark delivered: %w", err)
@@ -1576,22 +1582,6 @@ func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []event
 	}
 	return nil
 }
-
-// wakeParentIfReadyInTx is the child→parent notification. When a sub-goal
-// reaches a terminal status, if the parent is blocked (waiting on children)
-// and all its non-terminal sub-goals are now terminal, re-queue a run on the
-// parent's current assignee with a wakeup note summarising the children.
-// Guarded by `WHERE status='blocked'` so a concurrent wake bails (double-wake
-// prevention). Per DESIGN.md (dynamic wait set).
-// wakeParentIfReadyInTx wakes a blocked parent once all its children are
-// terminal. evs collects the run events produced by the wake's enqueue —
-
-// NotifyChildDone is the child→parent trigger: after a sub-goal reaches a
-// terminal status, see whether the parent is blocked (waiting on children)
-// and all its sub-goals are now terminal, and if so re-queue the parent's
-// current assignee with a wakeup note. Idempotent via the `WHERE status='blocked'`
-
-// WakeupParentIfReady is a public alias preserved for callers that name it the
 
 // assigneeLabel resolves an assignee's display name for the creation comment
 // (agent name / squad name).

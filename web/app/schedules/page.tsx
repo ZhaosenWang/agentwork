@@ -181,7 +181,7 @@ function NewScheduleForm({
             </select>
           </Field>
         )}
-        <Field label="所属项目" hint="必填，每次触发时在此域的仓库上执行（验收策略 + worktree 来自该域）">
+        <Field label="所属项目" hint="必填，每次触发时在此项目的仓库上执行（验收策略 + worktree 来自该项目）">
           <select value={domainId} onChange={(e) => setDomainId(e.target.value)} className={inputCls} required>
             <option value="">选择…</option>
             {domains?.map((d) => (

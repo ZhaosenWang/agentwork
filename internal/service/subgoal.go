@@ -221,6 +221,14 @@ func (s *GoalService) ReconcileSubGoalRun(ctx context.Context, rc goalRunContext
 		evs = append(evs, events.Event{Topic: "sub_goal.verified", Payload: map[string]any{
 			"goal_id": sg.GoalID, "sub_goal_id": sg.ID, "change_id": changeID,
 		}})
+		// The change is now READY for integration (v2 §11: change.ready — the
+		// frontend change panel and the attention badge react to it). A
+		// no-code sub-goal (materialize returned '') has no change to report.
+		if changeID != "" {
+			evs = append(evs, events.Event{Topic: "change.ready", Payload: map[string]any{
+				"goal_id": sg.GoalID, "change_id": changeID, "sub_goal_id": sg.ID,
+			}})
+		}
 	case "failed", "cancelled":
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE sub_goal SET execution_attempt=execution_attempt+1 WHERE id=? AND status IN ('running','done')`,
@@ -391,6 +399,11 @@ func (s *GoalService) VerifySubGoal(ctx context.Context, runID, verdict, summary
 		evs = append(evs, events.Event{Topic: "sub_goal.verified", Payload: map[string]any{
 			"goal_id": sg.GoalID, "sub_goal_id": sg.ID, "change_id": changeID,
 		}})
+		if changeID != "" {
+			evs = append(evs, events.Event{Topic: "change.ready", Payload: map[string]any{
+				"goal_id": sg.GoalID, "change_id": changeID, "sub_goal_id": sg.ID,
+			}})
+		}
 	} else {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE sub_goal SET status='running', quality_iteration=quality_iteration+1 WHERE id=? AND status='verifying'`,
@@ -441,7 +454,13 @@ func (s *GoalService) MarkChangeIntegrated(ctx context.Context, changeID string,
 			changeID); err != nil {
 			return fmt.Errorf("mark integrated: %w", err)
 		}
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		s.bus.Publish(ctx, events.Event{Topic: "change.integrated", Payload: map[string]any{
+			"goal_id": goalID, "change_id": changeID, "sub_goal_id": sgID,
+		}})
+		return nil
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE change SET status='conflict' WHERE id=? AND status IN ('ready','integrating')`,
@@ -535,6 +554,61 @@ func (s *GoalService) ListChanges(ctx context.Context, goalID string) ([]Change,
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// ChangeRevision is one revision of a Change (决策 6-3): every revision binds
+// the change to the integration base it was built against (base_ref) and the
+// commit that delivers it (head_ref). Conflict rework appends seq N+1 on the
+// SAME change — the revision history is the audit of which base each round
+// targeted.
+type ChangeRevision struct {
+	ID        string `json:"id"`
+	ChangeID  string `json:"change_id"`
+	Seq       int    `json:"seq"`
+	BaseRef   string `json:"base_ref"`
+	HeadRef   string `json:"head_ref"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ChangeDetail is a Change with its revision history — the Web change
+// panel's row (the owner's integration view).
+type ChangeDetail struct {
+	Change
+	Revisions []ChangeRevision `json:"revisions"`
+}
+
+// ListChangeDetails lists a goal's changes with their revisions. A
+// per-change revision query is fine at single-user scale (at most
+// maxActiveSubGoals changes per goal).
+func (s *GoalService) ListChangeDetails(ctx context.Context, goalID string) ([]ChangeDetail, error) {
+	changes, err := s.ListChanges(ctx, goalID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ChangeDetail, 0, len(changes))
+	for _, c := range changes {
+		rows, err := s.st.DB().QueryContext(ctx,
+			`SELECT id, change_id, seq, base_ref, head_ref, created_at
+			 FROM change_revision WHERE change_id=? ORDER BY seq`, c.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list revisions: %w", err)
+		}
+		var revs []ChangeRevision
+		for rows.Next() {
+			var r ChangeRevision
+			if err := rows.Scan(&r.ID, &r.ChangeID, &r.Seq, &r.BaseRef, &r.HeadRef, &r.CreatedAt); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan revision: %w", err)
+			}
+			revs = append(revs, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		out = append(out, ChangeDetail{Change: c, Revisions: revs})
+	}
+	return out, nil
 }
 
 // MarkChangeIntegrating stamps Ready → Integrating (the integrate_change tool

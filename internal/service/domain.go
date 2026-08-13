@@ -90,12 +90,11 @@ type Guard struct {
 //	diff_contains  — the run's diff must contain a path matching Pattern
 //	diff_excludes  — the run's diff must not contain a path matching Pattern
 //
-// (The `request` kind is gone — agents cannot request approval, 决策 4-11.)
 // diff_* conditions are evaluated by the daemon (it owns the git diff) and
 // recorded on the run row (run.gates_hit); the goal layer only reads the
 // result — the daemon computes, the goal layer judges.
 type GateRule struct {
-	Name    string `json:"name"`    // merge | diff_contains | diff_excludes | request
+	Name    string `json:"name"`    // merge | diff_contains | diff_excludes
 	When    string `json:"when"`    // human-readable condition description
 	Pattern string `json:"pattern"` // diff_* gates: glob over changed paths
 }

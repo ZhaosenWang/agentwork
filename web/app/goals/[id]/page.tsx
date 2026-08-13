@@ -7,8 +7,9 @@ import { GoalActions } from "@/components/goal-actions";
 import { GoalComments } from "@/components/goal-comments";
 import { GoalRuns } from "@/components/goal-runs";
 import { GoalSubGoals } from "@/components/goal-subgoals";
+import { GoalChanges } from "@/components/goal-changes";
 import { GoalStatusBar, GoalTimeline } from "@/components/goal-timeline";
-import { Badge } from "@/components/ui";
+import { Badge, AttentionChip } from "@/components/ui";
 import type { Goal } from "@/lib/types";
 
 export default function GoalDetailPage() {
@@ -40,6 +41,7 @@ export default function GoalDetailPage() {
         <div className="flex items-center gap-3 mt-3">
           <h1 className="text-lg font-semibold text-zinc-900">{goal.title}</h1>
           <Badge status={goal.status} />
+          <AttentionChip attention={goal.attention} />
           <GoalStatusBar goalId={id} goalStatus={goal.status} />
         </div>
         <p className="text-sm text-zinc-500 mt-1">
@@ -72,6 +74,9 @@ export default function GoalDetailPage() {
 
       {/* Sub-goals（v2：goal 内部拆出的工作项，不是 child goal） */}
       <GoalSubGoals goalId={id} />
+
+      {/* Changes（v2：子任务的逻辑交付物 + 修订史——owner 的集成视图） */}
+      <GoalChanges goalId={id} />
 
       {/* Runs */}
       <GoalRuns goalId={id} />
