@@ -1395,9 +1395,17 @@ func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) erro
 		return fmt.Errorf("load goal for reconcile: %w", err)
 	}
 
-	attention, err := s.deriveOwnerAttentionTx(ctx, tx, goalID)
-	if err != nil {
-		return err
+	// Attention is armed only for ACTIVE goals: terminal goals have no owner
+	// to wake (a done goal with a leftover ready change — the pre-guard era's
+	// stale artifact — showed "待集成变更" forever), and review goals are
+	// frozen (the owner cannot run while the human judges; the review_request
+	// is the signal there).
+	attention := ""
+	if status == "active" {
+		attention, err = s.deriveOwnerAttentionTx(ctx, tx, goalID)
+		if err != nil {
+			return err
+		}
 	}
 	// The derived attention is persisted (决策 6-8): the UI badge and the IM
 	// notification dedup read it; human owners get NO run — attention + notify.

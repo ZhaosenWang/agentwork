@@ -190,3 +190,54 @@ func TestConflictDoesNotArmAttention(t *testing.T) {
 		t.Fatalf("reworked ready change must re-arm attention, got %q", g3.Attention)
 	}
 }
+
+// TestAttentionNotArmedForNonActiveGoals: a ready change on a terminal goal
+// must not arm owner attention — there is no owner to wake. (The pre-guard
+// era left exactly such rows: a done goal with a ready change showed
+// "待集成变更" forever.)
+func TestAttentionNotArmedForNonActiveGoals(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "owner")
+	b := seedAgent(t, st, "worker")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var sgRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&sgRun); err != nil {
+		t.Fatalf("sub-goal run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, sgRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Finish(ctx, sgRun, "completed", "implemented"); err != nil {
+		t.Fatalf("finish sub-goal run: %v", err)
+	}
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	g1, _ := gs.Get(ctx, g.ID)
+	if g1.Attention != "integration" {
+		t.Fatalf("active goal with a ready change must arm attention, got %q", g1.Attention)
+	}
+
+	// The goal reaches done (deliver path) while the change is still ready.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='done' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile after done: %v", err)
+	}
+	g2, _ := gs.Get(ctx, g.ID)
+	if g2.Attention != "" {
+		t.Fatalf("terminal goals must not carry attention, got %q", g2.Attention)
+	}
+}
