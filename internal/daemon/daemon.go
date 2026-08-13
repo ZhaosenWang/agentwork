@@ -248,6 +248,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if n > 0 {
 		log.Printf("daemon: recovered %d stuck running run(s)", n)
 	}
+	// P0-1 (决策 6-11): terminal runs whose reconcile never happened (a crash
+	// between the terminal UPDATE and the reconcile transaction) replay their
+	// reconcile here — every transition is conditional, so the replay is
+	// idempotent. This closes the durable-execution window.
+	if n, err := d.runSvc.ReconcilePendingTerminal(ctx); err != nil {
+		log.Printf("daemon: reconcile pending terminal runs: %v", err)
+	} else if n > 0 {
+		log.Printf("daemon: replayed reconcile for %d unreconciled terminal run(s)", n)
+	}
 	// Decision 2-9, trigger side: an approve followed by a crash leaves the
 	// goal in review with the approve recorded and no deliver — re-run the
 	// deliver (its merge/push idempotency makes the replay safe).

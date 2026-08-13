@@ -881,14 +881,14 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		pendingEvents = append(pendingEvents, events.Event{Topic: "run:discarded", Payload: map[string]any{
 			"run_id": rc.RunID, "goal_id": rc.GoalID, "reason": "orphaned",
 		}})
-		return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit)
+		return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit, rc.RunID)
 	}
 	if g.Status == "cancelled" {
 		// Goal was cancelled while this run was in flight. Discard.
 		pendingEvents = append(pendingEvents, events.Event{Topic: "run:discarded", Payload: map[string]any{
 			"run_id": rc.RunID, "goal_id": rc.GoalID, "reason": "cancelled",
 		}})
-		return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit)
+		return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit, rc.RunID)
 	}
 
 	switch rc.Status {
@@ -1029,7 +1029,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		// the daemon already published run:cancelled with the structured reason.
 	}
 
-	return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit)
+	return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit, rc.RunID)
 }
 
 // gatesForGoal decides whether a completed run parks the goal in review
@@ -1431,7 +1431,7 @@ func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) erro
 		if err := tx.QueryRowContext(ctx, `
 			SELECT MAX(x.ts) FROM (
 			  SELECT COALESCE((SELECT MAX(r2.created_at) FROM change_revision r2 WHERE r2.change_id = c.id), c.created_at) AS ts
-			  FROM change c WHERE c.goal_id=? AND c.status IN ('ready','conflict')
+			  FROM change c WHERE c.goal_id=? AND c.status='ready'
 			  UNION ALL
 			  SELECT MAX(COALESCE((SELECT MAX(r3.finished_at) FROM run r3 WHERE r3.sub_goal_id = sg.id AND r3.role='subgoal'), sg.created_at))
 			  FROM sub_goal sg WHERE sg.goal_id=? AND sg.status='failed'
@@ -1475,10 +1475,13 @@ func (s *GoalService) deriveOwnerAttentionTx(ctx context.Context, tx *sql.Tx, go
 	if failed > 0 {
 		bits = append(bits, "recovery")
 	}
-	// need_integration: changes ready for the owner to merge.
+	// need_integration: changes READY for the owner to merge. A conflicted
+	// change is the ASSIGNEE's rework, not the owner's work (P1-3) — the
+	// owner has nothing actionable during the conflict window and is woken
+	// only when the new revision returns the change to ready.
 	var ready int
 	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM change WHERE goal_id=? AND status IN ('ready','conflict')`, goalID).Scan(&ready); err != nil {
+		`SELECT COUNT(*) FROM change WHERE goal_id=? AND status='ready'`, goalID).Scan(&ready); err != nil {
 		return "", fmt.Errorf("attention: changes ready: %w", err)
 	}
 	if ready > 0 {
@@ -1620,7 +1623,19 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 // collected events and runs the after-commit callbacks. This keeps the
 // "bus.Publish after commit" invariant: a rolled-back transaction (commit
 // error) emits nothing.
-func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []events.Event, after []func()) error {
+//
+// runID (non-empty) stamps the run's reconciled_at INSIDE the same
+// transaction (P0-1, 决策 6-11): the run's terminal outcome and its
+// reconcile become one atomic unit — a crash before this commit leaves
+// reconciled_at='' and the startup replay re-runs the reconcile; the report
+// comment and the stamp live or die together, so a replay never duplicates
+// them.
+func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []events.Event, after []func(), runID string) error {
+	if runID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE run SET reconciled_at=? WHERE id=?`, now(), runID); err != nil {
+			return fmt.Errorf("stamp reconciled_at: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}

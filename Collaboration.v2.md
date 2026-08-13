@@ -91,10 +91,11 @@ Goal Coordinator ──► DB Transaction
 
 - **OwnerAttention 是派生状态**（不为空才值得叫醒 owner）：
   ```
-  need_integration   = ∃ Change(ready|conflict) 或 ∃ 未集成且 Verified 的 sub-goal
+  need_integration   = ∃ Change(ready) 或 ∃ 未集成且 Verified 的 sub-goal
   need_recovery      = ∃ Sub-goal Failed / ∃ Change conflict 反复 / 集成异常
   need_user_action   = handoff loop 审停等
   ```
+  （2026-08 修订，决策 6-12：`conflict` 不再计入 need_integration——冲突期 owner 无可行动作，rework 是 assignee 的责任；新 revision 回 ready 才重新武装 attention。终局守卫仍将 conflict 计为 pending。）
   硬规则：**owner run 的创建只能由 Coordinator → deriveOwnerAttention → conditional enqueue 产生**（P0.5 统一 spawn 入口，禁止任何 handler/工具直接 spawn）
 - **Reconcile 幂等**：执行 100 次最终状态相同。所有关键转移 conditional transition（`WHERE status=expected` / `INSERT ... WHERE NOT EXISTS (同 goal 且 role=owner 且 queued/running)`）
 - **Latch 双触发**：`attention != empty && ownerIdle` 是状态条件不是一次性事件——**Sub-goal/Change state changed 与 run.terminal 两个方向都必须触发 Reconcile**。硬规则：*任何可能改变"Goal 是否需要 Owner attention"判定的状态变更，都必须触发 Goal Reconcile*

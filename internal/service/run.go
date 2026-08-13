@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
@@ -214,23 +215,40 @@ func (s *RunService) EnqueueForMention(ctx context.Context, goalID, agentID, tri
 // single-flight — the Claim guard enforces the rest). run.attempt mirrors the
 // sub-goal's execution_attempt+1 (informational ordinal).
 func (s *RunService) EnqueueSubGoalRun(ctx context.Context, subGoalID string) (*Run, error) {
-	var goalID, assigneeID string
-	var execAttempt int
-	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT goal_id, assignee_id, execution_attempt FROM sub_goal WHERE id=?`, subGoalID).
-		Scan(&goalID, &assigneeID, &execAttempt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("load sub-goal: %w", err)
-	}
-
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	r, ev, err := s.enqueueSubGoalRunTx(ctx, tx, subGoalID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if ev != nil {
+		s.bus.Publish(ctx, *ev)
+	}
+	return r, nil
+}
+
+// enqueueSubGoalRunTx inserts a sub-goal execution run under the caller's
+// transaction (P0-2: CreateSubGoal uses it so the sub_goal row and its first
+// run are born atomically). The run event is RETURNED — the caller publishes
+// after its commit (invariant 13).
+func (s *RunService) enqueueSubGoalRunTx(ctx context.Context, tx *sql.Tx, subGoalID string) (*Run, *events.Event, error) {
+	var goalID, assigneeID string
+	var execAttempt int
+	err := tx.QueryRowContext(ctx,
+		`SELECT goal_id, assignee_id, execution_attempt FROM sub_goal WHERE id=?`, subGoalID).
+		Scan(&goalID, &assigneeID, &execAttempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("load sub-goal: %w", err)
+	}
 
 	// Coalesce per (sub_goal, ROLE): a pending VERIFY run must not swallow the
 	// assignee's rework run (the reject path enqueues it while the verifier is
@@ -240,10 +258,10 @@ func (s *RunService) EnqueueSubGoalRun(ctx context.Context, subGoalID string) (*
 	err = tx.QueryRowContext(ctx,
 		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' AND status IN ('queued','running') LIMIT 1`, subGoalID).Scan(&existing)
 	if err == nil {
-		return &Run{ID: existing, GoalID: goalID, AgentID: assigneeID, Role: "subgoal", SubGoalID: subGoalID, Status: "queued"}, nil
+		return &Run{ID: existing, GoalID: goalID, AgentID: assigneeID, Role: "subgoal", SubGoalID: subGoalID, Status: "queued"}, nil, nil
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("check pending sub-goal run: %w", err)
+		return nil, nil, fmt.Errorf("check pending sub-goal run: %w", err)
 	}
 
 	ts := now()
@@ -262,13 +280,10 @@ func (s *RunService) EnqueueSubGoalRun(ctx context.Context, subGoalID string) (*
 		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,sub_goal_id,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.SubGoalID, r.Attempt, "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
-		return nil, fmt.Errorf("insert sub-goal run: %w", err)
+		return nil, nil, fmt.Errorf("insert sub-goal run: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	s.bus.Publish(ctx, events.Event{Topic: "run:enqueued", Payload: r})
-	return &r, nil
+	ev := &events.Event{Topic: "run:enqueued", Payload: r}
+	return &r, ev, nil
 }
 
 // EnqueueVerifyRun creates a verifier run (决策 6-5): role=verify, on the
@@ -521,22 +536,14 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 		status, summary, now(), runID); err != nil {
 		return fmt.Errorf("finish run: %w", err)
 	}
-	// Re-read the minimal context the goal layer needs to reconcile.
-	var rc goalRunContext
-	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary, trigger_comment_id, role, sub_goal_id, base_ref, head_ref
-		 FROM run WHERE id=?`, runID).
-		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary, &rc.TriggerCommentID, &rc.Role, &rc.SubGoalID, &rc.BaseRef, &rc.HeadRef)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+	if err := s.reconcileRun(ctx, runID); err != nil {
+		return err
 	}
+	rc, err := s.loadRunContext(ctx, runID)
 	if err != nil {
-		return fmt.Errorf("load run for reconcile: %w", err)
-	}
-	if s.goalSvc == nil {
-		return errors.New("runSvc.goalSvc not wired")
-	}
-	if err := s.goalSvc.ReconcileOnRunEnd(ctx, rc); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		return err
 	}
 	// run.terminal is the Coordinator's wakeup hint (决策 6-4, P2-5): the
@@ -548,6 +555,85 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 		}})
 	}
 	return nil
+}
+
+// loadRunContext re-reads the minimal context the goal layer needs to
+// reconcile (shared by Finish and the startup replay).
+func (s *RunService) loadRunContext(ctx context.Context, runID string) (goalRunContext, error) {
+	var rc goalRunContext
+	err := s.st.DB().QueryRowContext(ctx,
+		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary, trigger_comment_id, role, sub_goal_id, base_ref, head_ref
+		 FROM run WHERE id=?`, runID).
+		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary, &rc.TriggerCommentID, &rc.Role, &rc.SubGoalID, &rc.BaseRef, &rc.HeadRef)
+	if err != nil {
+		return rc, err
+	}
+	return rc, nil
+}
+
+// reconcileRun replays a run's terminal outcome through the goal layer — the
+// single entry both Finish and the startup replay use (P0-1, 决策 6-11). The
+// reconcile stamps run.reconciled_at inside its own transaction, so a crash
+// between the terminal UPDATE (Finish) and this call leaves the marker empty
+// and ReconcilePendingTerminal re-runs it.
+func (s *RunService) reconcileRun(ctx context.Context, runID string) error {
+	rc, err := s.loadRunContext(ctx, runID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // run vanished (goal deleted) — nothing to reconcile
+		}
+		return err
+	}
+	if s.goalSvc == nil {
+		return errors.New("runSvc.goalSvc not wired")
+	}
+	return s.goalSvc.ReconcileOnRunEnd(ctx, rc)
+}
+
+// ReconcilePendingTerminal replays the reconcile for runs whose terminal
+// state never got reconciled (daemon crash between the terminal UPDATE and
+// the reconcile transaction — P0-1). The replay is safe: every transition
+// is conditional, and the report comment commits atomically with
+// reconciled_at, so a crash mid-reconcile never duplicates anything.
+// Runs cancelled while still QUEUED (never started) have no reconcile
+// semantics and are skipped. Returns how many runs were replayed.
+func (s *RunService) ReconcilePendingTerminal(ctx context.Context) (int, error) {
+	rows, err := s.st.DB().QueryContext(ctx,
+		`SELECT id FROM run WHERE reconciled_at=''
+		   AND (status IN ('completed','failed') OR (status='cancelled' AND started_at != ''))`)
+	if err != nil {
+		return 0, fmt.Errorf("scan unreconciled runs: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, id := range ids {
+		if err := s.reconcileRun(ctx, id); err != nil {
+			log.Printf("service: replay reconcile %s: %v", id, err)
+			continue
+		}
+		// Republish the Coordinator's latch edge (idempotent — ReconcileGoal
+		// recomputes from DB state) so attention follows the replayed state.
+		rc, err := s.loadRunContext(ctx, id)
+		if err == nil && rc.GoalID != "" {
+			s.bus.Publish(ctx, events.Event{Topic: "run.terminal", Payload: map[string]any{
+				"run_id": rc.RunID, "goal_id": rc.GoalID, "status": rc.Status,
+			}})
+		}
+		n++
+	}
+	return n, nil
 }
 
 

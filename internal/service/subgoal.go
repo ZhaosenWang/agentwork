@@ -63,8 +63,11 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 		return nil, NewValidationError(fmt.Sprintf("too many active sub-goals (%d max) — resolve existing ones first", maxActiveSubGoals))
 	}
 
-	// The goal must exist and be one a sub-goal can hang off (active or
-	// review — the owner splits work from either).
+	// The goal must exist and be ACTIVE (P1-1): review is an execution freeze
+	// point (决策 2-3 — new work must not mutate the state under the human's
+	// judgment), terminal goals have no execution left to split, and backlog
+	// is not dispatched yet. Only active allows new work — the state machine
+	// must not self-loop.
 	var gStatus string
 	err := s.st.DB().QueryRowContext(ctx, `SELECT status FROM goal WHERE id=?`, goalID).Scan(&gStatus)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -72,6 +75,9 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load goal: %w", err)
+	}
+	if gStatus != "active" {
+		return nil, NewValidationError(fmt.Sprintf("cannot create a sub-goal: the goal is %s (only active goals can be split)", gStatus))
 	}
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, assigneeID, "assignee agent"); err != nil {
 		return nil, err
@@ -92,21 +98,37 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 		Status:      "running",
 		CreatedAt:   ts,
 	}
-	if _, err := s.st.DB().ExecContext(ctx,
+	if s.runSvc == nil {
+		return nil, errors.New("goalSvc.runSvc not wired")
+	}
+	// P0-2: the sub_goal row and its FIRST run are born in ONE transaction —
+	// a crash between the two inserts would leave a ghost sub-goal (running,
+	// no run, stuck forever). The run event is returned and published only
+	// after the commit (invariant 13).
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO sub_goal (id,goal_id,title,description,assignee_id,verifier_id,status,execution_attempt,quality_iteration,created_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
 		sg.ID, sg.GoalID, sg.Title, sg.Description, sg.AssigneeID, sg.VerifierID, sg.Status, sg.ExecutionAttempt, sg.QualityIteration, sg.CreatedAt); err != nil {
 		return nil, fmt.Errorf("insert sub_goal: %w", err)
 	}
-	if s.runSvc == nil {
-		return nil, errors.New("goalSvc.runSvc not wired")
-	}
-	if _, err := s.runSvc.EnqueueSubGoalRun(ctx, sg.ID); err != nil {
+	_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID)
+	if err != nil {
 		return nil, fmt.Errorf("enqueue sub-goal run: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	s.bus.Publish(ctx, events.Event{Topic: "sub_goal.created", Payload: map[string]any{
 		"goal_id": goalID, "sub_goal_id": sg.ID,
 	}})
+	if runEv != nil {
+		s.bus.Publish(ctx, *runEv)
+	}
 	return &sg, nil
 }
 
@@ -260,6 +282,13 @@ func (s *GoalService) reconcileSubGoalRunOnce(ctx context.Context, rc goalRunCon
 		}
 	}
 
+	// Stamp the run's reconciled_at in the SAME transaction as the sub-goal
+	// transition (P0-1, 决策 6-11): the terminal outcome and its reconcile
+	// are one atomic unit — a crash before this commit leaves
+	// reconciled_at='' and the startup replay re-runs it.
+	if _, err := tx.ExecContext(ctx, `UPDATE run SET reconciled_at=? WHERE id=?`, now(), rc.RunID); err != nil {
+		return fmt.Errorf("stamp reconciled_at: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -333,18 +362,21 @@ func (s *GoalService) materializeChangeTx(ctx context.Context, tx *sql.Tx, sg Su
 // VerifySubGoal is the verifier verdict tool's service entry (决策 6-5): the
 // CALLING run must be the sub-goal's verify run (role + sub_goal_id match —
 // the verdict authority lives in the run, not the tool caller's say-so).
-// passed → verified + Change/Revision atomic + sub_goal.verified event;
-// rejected → verification_result recorded + quality_iteration++ + back to
-// running with the assignee's successor run. Every round appends a
-// verification_result row (audit/evidence).
+// P1-2 hardens the boundary: the run's AGENT must be the sub-goal's named
+// verifier (verifier_id is authority, not metadata) and the run must still
+// be running (a cancelled verify run cannot judge). passed → verified +
+// Change/Revision atomic + sub_goal.verified event; rejected →
+// verification_result recorded + quality_iteration++ + back to running with
+// the assignee's successor run. Every round appends a verification_result
+// row (audit/evidence).
 func (s *GoalService) VerifySubGoal(ctx context.Context, runID, verdict, summary, evidence string) error {
 	if verdict != "passed" && verdict != "rejected" {
 		return NewValidationError("verdict must be passed or rejected")
 	}
-	var role, subGoalID, agentID, goalID string
+	var role, subGoalID, agentID, goalID, runStatus string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT role, sub_goal_id, agent_id, goal_id FROM run WHERE id=?`, runID).
-		Scan(&role, &subGoalID, &agentID, &goalID)
+		`SELECT role, sub_goal_id, agent_id, goal_id, status FROM run WHERE id=?`, runID).
+		Scan(&role, &subGoalID, &agentID, &goalID, &runStatus)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -353,6 +385,9 @@ func (s *GoalService) VerifySubGoal(ctx context.Context, runID, verdict, summary
 	}
 	if role != "verify" {
 		return NewValidationError("only a verify run can issue a sub-goal verdict")
+	}
+	if runStatus != "running" {
+		return NewValidationError("the verify run is no longer running — its verdict window is closed")
 	}
 
 	tx, err := s.st.DB().BeginTx(ctx, nil)
@@ -371,6 +406,11 @@ func (s *GoalService) VerifySubGoal(ctx context.Context, runID, verdict, summary
 	}
 	if err != nil {
 		return fmt.Errorf("load sub-goal: %w", err)
+	}
+	// P1-2: verifier identity is authority, not metadata — the calling run's
+	// agent must BE the sub-goal's named verifier.
+	if agentID != sg.VerifierID {
+		return NewValidationError("the verdict must come from the sub-goal's verifier agent")
 	}
 	// Conditional: only a verifying sub-goal takes a verdict (idempotency —
 	// double verdicts from a retried tool call no-op).
@@ -503,6 +543,10 @@ func (s *GoalService) ReconcileVerifyRun(ctx context.Context, rc goalRunContext)
 	defer tx.Rollback()
 	if _, err := insertRunResultComment(ctx, tx, rc); err != nil {
 		return err
+	}
+	// Same P0-1 stamp as the other reconcile paths (决策 6-11).
+	if _, err := tx.ExecContext(ctx, `UPDATE run SET reconciled_at=? WHERE id=?`, now(), rc.RunID); err != nil {
+		return fmt.Errorf("stamp reconciled_at: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return err

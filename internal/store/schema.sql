@@ -182,6 +182,13 @@ CREATE TABLE IF NOT EXISTS run (
     queued_at          TEXT NOT NULL,
     started_at         TEXT NOT NULL DEFAULT '',
     finished_at        TEXT NOT NULL DEFAULT '',
+    -- P0-1 (决策 6-11): stamped INSIDE the reconcile transaction when the
+    -- run's terminal outcome was reconciled. '' = terminal-but-unreconciled
+    -- (daemon crash between the terminal UPDATE and the reconcile tx) — the
+    -- startup replay (RunService.ReconcilePendingTerminal) re-runs the
+    -- reconcile, which is safe: every transition is conditional and the
+    -- stamp commits atomically with the run-report comment (no duplicates).
+    reconciled_at      TEXT NOT NULL DEFAULT '',
     created_at         TEXT NOT NULL
 );
 

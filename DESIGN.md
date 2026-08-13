@@ -359,6 +359,7 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 16. **统一 spawn 入口**（决策 6-4 P0.5：owner run 的创建只经 Coordinator → deriveOwnerAttention → conditional enqueue；verifier 判定/handler 不得直接 spawn）
 17. **Workspace 属 run**（决策 6-2：路径即归属；出生 = claim 时刻 branch HEAD；同 agent 不同 workspace 是常态，禁止退回 per-agent 串行）
 18. **Change 跨 workspace 交付**（决策 6-3：禁直接 copy 文件；Ready ⇔ 已持久化 Revision；Revision 绑定 Integration Base）
+19. **任何 terminal Run 最终必被 Reconcile**（决策 6-11：reconciled_at 与 reconcile 同事务盖章；'' = 崩溃窗口，启动重放；Reconcile 幂等）
 
 ---
 
@@ -465,6 +466,8 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策6-8 | **Goal 级联与 attention**：Cancel 级联停 sub-goals/runs（Change/Verification 历史保留）；Delete 物理级联（软删除后置）；Reopen 不复活旧 sub-goal；`goal.attention` 列持久化派生状态，human owner attention → `goal.attention_needed` 事件 → IM 卡（不 spawn）；当前版本所有 sub-goal 均 required；**fan-out ≤20 active**（历史不限）；无代码 sub-goal = verified 且无 Change（交付物走评论 feed）；**owner run 终局守卫**：存在非终态 sub-goal 或 ready/conflict change 时，owner run 完成不进入卡点判定（goal 保持 active，attention 循环接管下一步）——人门只在最终状态触发——**已实现** |
 | 决策6-9 | **run.attempt 降级为实例序号**：重试判定权威移到实体计数（goal.execution_attempt / sub_goal.execution_attempt + quality_iteration）；run 是一次执行实例（sub-goal 与 run 是 1:N，关系真相 = run.sub_goal_id，无 current_run_id 指针）。**实现注记**：sub_goal.execution_attempt/quality_iteration 已为权威；goal 层重试仍由 run.attempt 承担，goal.execution_attempt 列建而未用——对齐待做 |
 | 决策6-10 | **v2 数据模型与工具面**：新表 sub_goal/change/change_revision/verification_result；MCP 工具面 = comment_goal/consult_agent/handoff_goal/create_sub_goal/cancel_sub_goal/verify_sub_goal/integrate_change/get_change/get_sub_goal/get_verification/goal_list/agent_list/squad_list；**blocked/wait/parent 机制已退役**（WaitChildren/wake/wake_count/goal.parent_id 全部删除，goal 状态机回五态）——**已实现** |
+| 决策6-11 | **Run terminal 与 Reconcile 的原子边界（P0-1）**：`run.reconciled_at` 在 reconcile 事务内盖章——terminal 状态与 reconcile 同生共死；'' = terminal-but-unreconciled（崩溃窗口），daemon 启动 `ReconcilePendingTerminal` 重放（幂等：条件转移 + 汇报评论与盖章同事务，重放不重复；从未开跑的 cancelled run 无 reconcile 语义，跳过）。不变量 I2：**任何 terminal Run 最终必被 Reconcile，且 Reconcile 幂等**——**已实现** |
+| 决策6-12 | **边界钉死批次（P0-2/P1-1/P1-2/P1-3）**：① CreateSubGoal 与初始 run 同事务（幽灵 sub-goal 不可能）；② 仅 active goal 可拆活（review = execution freeze 点，terminal/backlog 拒绝——状态机不自环）；③ verifier verdict 强校验（role=verify + sub_goal_id + agent_id==verifier_id + sg.verifying + run.running）；④ conflict 不武装 owner attention（rework 是 assignee 的责任，新 revision 回 ready 才唤醒 owner；终局守卫仍把 conflict 算 pending，goal 不会带冲突进卡点）——**已实现** |
 
 ---
 

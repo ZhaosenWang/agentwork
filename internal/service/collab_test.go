@@ -597,6 +597,12 @@ func TestVerifierFlow(t *testing.T) {
 		`SELECT id FROM run WHERE sub_goal_id=? AND role='verify' LIMIT 1`, sg.ID).Scan(&verifyRunID); err != nil {
 		t.Fatalf("verify run must be enqueued: %v", err)
 	}
+	// The verdict tool is only reachable while the run is LIVE — claim it
+	// (P1-2: a non-running verify run has no verdict window).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='running' WHERE id=?`, verifyRunID); err != nil {
+		t.Fatal(err)
+	}
 
 	// Round 1: rejected.
 	if err := gs.VerifySubGoal(ctx, verifyRunID, "rejected", "error handling is wrong", "see auth.go"); err != nil {
@@ -610,6 +616,11 @@ func TestVerifierFlow(t *testing.T) {
 	if err := st.DB().QueryRowContext(ctx,
 		`SELECT status FROM verification_result WHERE sub_goal_id=? ORDER BY created_at DESC LIMIT 1`, sg.ID).Scan(&vrStatus); err != nil || vrStatus != "rejected" {
 		t.Fatalf("verification_result must record rejected: %q err=%v", vrStatus, err)
+	}
+	// The verifier ends its turn after the verdict (production shape) — the
+	// terminal run frees the coalesce for the next round's verify run.
+	if err := rs.Finish(ctx, verifyRunID, "completed", "rejected verdict given"); err != nil {
+		t.Fatalf("finish verify run: %v", err)
 	}
 	// The assignee's successor run is queued; complete it → verifying again.
 	var assigneeRun2 string
@@ -632,6 +643,10 @@ func TestVerifierFlow(t *testing.T) {
 	if err := st.DB().QueryRowContext(ctx,
 		`SELECT id FROM run WHERE sub_goal_id=? AND role='verify' AND status='queued' LIMIT 1`, sg.ID).Scan(&verifyRunID2); err != nil {
 		t.Fatalf("second verify run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='running' WHERE id=?`, verifyRunID2); err != nil {
+		t.Fatal(err)
 	}
 	// Round 2: passed → verified + Change.
 	if err := gs.VerifySubGoal(ctx, verifyRunID2, "passed", "looks good", "tests green"); err != nil {
@@ -696,6 +711,11 @@ func TestVerifySubGoalPermission(t *testing.T) {
 	if err := st.DB().QueryRowContext(ctx,
 		`SELECT id FROM run WHERE sub_goal_id=? AND role='verify' LIMIT 1`, sg.ID).Scan(&verifyRunID); err != nil {
 		t.Fatalf("verify run: %v", err)
+	}
+	// The verdict tool is only reachable while the run is LIVE (P1-2).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='running' WHERE id=?`, verifyRunID); err != nil {
+		t.Fatal(err)
 	}
 	if err := gs.VerifySubGoal(ctx, verifyRunID, "passed", "ok", ""); err != nil {
 		t.Fatalf("verdict: %v", err)
