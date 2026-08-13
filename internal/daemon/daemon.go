@@ -1656,11 +1656,14 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		Cwd:           runRowWorkdir,
 		Prompt:        prompt,
 		ClientHandler: env,
-		McpServers: []acp.McpServer{{
+		// The platform's workspace server first, then the agent's own
+		// configured MCP servers (its specialty tools) — both advertised at
+		// session/new, both live in the agent's tool registry.
+		McpServers: append([]acp.McpServer{{
 			Type: "http",
 			Name: "agentwork",
 			URL:  serverURL + "/mcp/" + q.RunID,
-		}},
+		}}, d.extraMcpServers(ctx, q.AgentID)...),
 	})
 	if err != nil {
 		conn.Close()
@@ -2045,9 +2048,9 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		Cwd:           runRowWorkdir,
 		Prompt:        prompt,
 		ClientHandler: env,
-		McpServers: []acp.McpServer{{
+		McpServers: append([]acp.McpServer{{
 			Type: "http", Name: "agentwork", URL: serverURL + "/mcp/" + q.RunID,
-		}},
+		}}, d.extraMcpServers(ctx, q.AgentID)...),
 	})
 	if err != nil {
 		d.failProcessorRun(ctx, q, "execute: "+err.Error())
@@ -2259,6 +2262,24 @@ func (d *Daemon) insertChatMessage(ctx context.Context, runID, role, content, to
 		uuid.NewString(), runID, role, content, toolCalls, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		log.Printf("daemon: persist event for run %s: %v", runID, err)
 	}
+}
+
+// extraMcpServers loads the agent's configured EXTRA MCP servers — the
+// agent's own tools (browser, database, an external ACP agent via an MCP
+// bridge, ...). The platform's workspace server is always advertised first;
+// a config typo is logged and skipped, never fatal to the run.
+func (d *Daemon) extraMcpServers(ctx context.Context, agentID string) []acp.McpServer {
+	var raw string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT mcp_servers FROM agent WHERE id=?`, agentID).Scan(&raw); err != nil {
+		return nil
+	}
+	var extra []acp.McpServer
+	if err := json.Unmarshal([]byte(raw), &extra); err != nil {
+		log.Printf("daemon: agent %s mcp_servers parse: %v", agentID, err)
+		return nil
+	}
+	return extra
 }
 
 func (d *Daemon) loadAgentEnv(ctx context.Context, agentID string) (map[string]string, error) {

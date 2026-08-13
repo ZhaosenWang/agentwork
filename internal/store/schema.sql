@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS agent (
     system_prompt   TEXT NOT NULL DEFAULT '',
     model           TEXT NOT NULL DEFAULT '',  -- optional override
     env             TEXT NOT NULL DEFAULT '{}', -- agent-level env, layered over runtime env
+    mcp_servers     TEXT NOT NULL DEFAULT '[]', -- extra MCP servers advertised at session/new (acp.McpServer JSON array); the platform's workspace server is always prepended
     max_concurrent  INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL
 );

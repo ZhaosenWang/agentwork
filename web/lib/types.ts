@@ -19,6 +19,16 @@ export interface RuntimeTestResult {
   details?: string;
 }
 
+// McpServer mirrors acp.McpServer: an extra MCP server the agent's runs
+// advertise at session/new alongside the platform's workspace server.
+export interface McpServer {
+  type?: string; // ""=stdio | http | sse
+  name: string;
+  command?: string; // stdio
+  args?: string[]; // stdio
+  url?: string; // http / sse
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -27,6 +37,7 @@ export interface Agent {
   system_prompt: string;
   model: string;
   env: Record<string, string>;
+  mcp_servers: McpServer[]; // the agent's own tools (browser/db/…), always after the workspace server
   max_concurrent: number;
   created_at: string;
 }

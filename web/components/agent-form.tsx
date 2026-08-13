@@ -14,12 +14,19 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
   const [systemPrompt, setSystemPrompt] = useState(agent?.system_prompt ?? "");
   const [model, setModel] = useState(agent?.model ?? "");
   const [env, setEnv] = useState(agent?.env ? JSON.stringify(agent.env, null, 2) : "{}");
+  const [mcpServers, setMcpServers] = useState(
+    agent?.mcp_servers && agent.mcp_servers.length > 0 ? JSON.stringify(agent.mcp_servers, null, 2) : ""
+  );
   const [maxConcurrent, setMaxConcurrent] = useState(String(agent?.max_concurrent ?? 1));
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     let parsedEnv: Record<string, string> = {};
     try { parsedEnv = JSON.parse(env || "{}"); } catch { /* keep default */ }
+    let parsedMcp: import("@/lib/types").McpServer[] = [];
+    if (mcpServers.trim()) {
+      try { parsedMcp = JSON.parse(mcpServers); } catch { /* keep default */ }
+    }
     const body = {
       name,
       description: agent?.description ?? "",
@@ -27,6 +34,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
       system_prompt: systemPrompt,
       model,
       env: parsedEnv,
+      mcp_servers: parsedMcp,
       max_concurrent: parseInt(maxConcurrent) || 1,
     };
     if (agent) {
@@ -73,6 +81,10 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
 
         <Field label="Env (JSON)">
           <input value={env} onChange={(e) => setEnv(e.target.value)} className={`${inputCls} font-mono`} placeholder="{}" />
+        </Field>
+
+        <Field label="额外 MCP 服务器（JSON 数组）" hint={`留空 = 只用平台 workspace server。示例：[{"name":"browser","type":"http","url":"http://localhost:9222/mcp"}]`}>
+          <textarea value={mcpServers} onChange={(e) => setMcpServers(e.target.value)} className={`${inputCls} font-mono`} rows={4} placeholder="[]" />
         </Field>
 
         <Field label="最大并发">
