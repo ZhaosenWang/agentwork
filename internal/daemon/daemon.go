@@ -1447,8 +1447,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// owner's state; edits made here are discarded at run end, commits are
 		// flagged. Answer the question, post the answer as a comment.
 		prompt = buildPrompt("Consultation request", "> "+triggerCommentContent, handoff) +
-			"\n\nYou are the consulted expert (a READ-ONLY consult run). Answer the question with your analysis and advice, and post the answer to the comment feed with agentwork_comment_goal.\n" +
-			"Do NOT modify any file in the worktree, do NOT git commit, do NOT execute the task itself — your edits are discarded by the platform. End your turn right after answering."
+			"\n\nYou are the consulted expert in a READ-ONLY consult run: answer the question with your analysis and advice, post it with agentwork_comment_goal, and end your turn. Do NOT modify files, do NOT commit, do NOT execute the task itself — your edits are discarded."
 	} else if reviewRun {
 		// The review prompt carries the GOAL's identity — a reviewer who does
 		// not know what the goal is about can only stare at the diff. A
@@ -2399,7 +2398,7 @@ func buildPrompt(title, desc, handoff string) string {
 		// explicit, completable instruction so the run reaches a terminal state.
 		body = "Complete this sub-task. Do the work it implies, then finish your turn."
 	}
-	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, how to collaborate via the agentwork_* tools: comment, consult, hand off, split into sub-goals, inspect)."
+	guide := "Read AGENTWORK.md in the working directory first — your identity, the team roster and the collaboration contract for this run live there."
 	if handoff != "" {
 		// A handoff/wakeup note scopes THIS turn. It is placed AHEAD of the
 		// original description, which is now *context* (not a fresh to-do
@@ -2432,65 +2431,45 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	defer rows.Close()
 	var b strings.Builder
 	b.WriteString("## Team & Coordination\n\n")
-	b.WriteString("You coordinate through the MCP tools of the \"agentwork\" server (advertised at\n")
-	b.WriteString(" session start) — structured side effects, no shell, no CLI. FOUR behaviors,\n")
-	b.WriteString(" pick by intent:\n")
-	b.WriteString("- COMMENT: agentwork_comment_goal — post on THIS goal (progress,\n")
-	b.WriteString("  findings, notes). Never triggers another run.\n")
-	b.WriteString("- CONSULT: agentwork_consult_agent(agent_id, question) — ask another\n")
-	b.WriteString("  agent for information/judgment. The platform enqueues a READ-ONLY guest\n")
-	b.WriteString("  run on them; their answer lands in the feed; the platform auto-resumes\n")
-	b.WriteString("  YOUR next run after they answer. Only the goal's owner can consult.\n")
-	b.WriteString("- HANDOFF: agentwork_handoff_goal(assignee_type, assignee_id,\n")
-	b.WriteString("  reason) — transfer THIS goal's ownership. Only the owner can.\n")
-	b.WriteString("- SUB-GOAL: agentwork_create_sub_goal(title, assignee_id, ...) —\n")
-	b.WriteString("  split a work item off THIS goal (NOT a new goal): the sub-goal runs on\n")
-	b.WriteString("  its own branch with machine verification; a verified sub-goal produces a\n")
-	b.WriteString("  Change and the platform wakes YOU to integrate it. Only the owner can split.\n")
-	b.WriteString("Do NOT edit files to communicate intent — structured side effects are the only way.\n\n")
+	b.WriteString("You coordinate ONLY through the MCP tools of the \"agentwork\" server\n")
+	b.WriteString("(advertised at session start) — structured side effects, never shell,\n")
+	b.WriteString("never file edits to communicate intent.\n\n")
 
-	b.WriteString("### Hand off the current goal\n")
-	b.WriteString("- Call agentwork_handoff_goal (assignee_type=agent|squad|human, reason =\n")
-	b.WriteString("  scoping instruction for the new owner). END YOUR TURN immediately after —\n")
-	b.WriteString("  the platform terminates your run and enqueues the new owner's\n")
-	b.WriteString("  run. Do not keep working, do not wait for the new owner.\n\n")
+	b.WriteString("### The four behaviors (pick by intent)\n")
+	b.WriteString("- COMMENT: agentwork_comment_goal(content) — say something (progress,\n")
+	b.WriteString("  findings). Never triggers another run. Anyone may.\n")
+	b.WriteString("- CONSULT: agentwork_consult_agent(agent_id, question) — ask for\n")
+	b.WriteString("  information/judgment. A READ-ONLY guest run answers; the answer lands\n")
+	b.WriteString("  in the feed and the platform auto-resumes YOUR next run. OWNER ONLY.\n")
+	b.WriteString("  Never wait inside a run — ask, end your turn.\n")
+	b.WriteString("- HANDOFF: agentwork_handoff_goal(assignee_type, assignee_id, reason) —\n")
+	b.WriteString("  transfer this goal's ownership. END YOUR TURN right after; the platform\n")
+	b.WriteString("  cuts your run and starts the new owner's. OWNER ONLY.\n")
+	b.WriteString("- SUB-GOAL: agentwork_create_sub_goal(title, assignee_id, verifier_id?) —\n")
+	b.WriteString("  split a work item off THIS goal (not a new goal). It runs on its own\n")
+	b.WriteString("  branch with machine verification; a verified sub-goal produces a Change\n")
+	b.WriteString("  and the platform wakes YOU to integrate. A sub-goal completing does NOT\n")
+	b.WriteString("  complete the goal. OWNER ONLY.\n\n")
 
-	b.WriteString("### Consult another agent\n")
-	b.WriteString("- Call agentwork_consult_agent(agent_id, question). The guest run is\n")
-	b.WriteString("  READ-ONLY — its edits are discarded by the platform. The answer comes back\n")
-	b.WriteString("  as a comment and YOUR next run starts automatically (attempt 1, full\n")
-	b.WriteString("  comment feed injected). Resolve uuids with agentwork_agent_list.\n")
-	b.WriteString("- Never wait INSIDE your run for an answer — ask, end your turn, and the\n")
-	b.WriteString("  platform resumes you (a fresh run with the answer in the feed).\n\n")
+	b.WriteString("### Work the Change pipeline (owner)\n")
+	b.WriteString("- Woken with an Owner Attention section? agentwork_get_change lists the\n")
+	b.WriteString("  changes; agentwork_integrate_change(change_id) merges each ready one\n")
+	b.WriteString("  into your worktree. A conflict wakes the assignee to rework\n")
+	b.WriteString("  automatically — wait for the new Revision.\n")
+	b.WriteString("- Inspect: agentwork_get_sub_goal / agentwork_get_verification; cancel a\n")
+	b.WriteString("  stuck item with agentwork_cancel_sub_goal(sub_goal_id).\n\n")
 
-	b.WriteString("### Split work into sub-goals\n")
-	b.WriteString("- Call agentwork_create_sub_goal(parent_goal_id defaults to THIS goal, title,\n")
-	b.WriteString("  assignee_id, verifier_id optional). The sub-goal runs on its own branch\n")
-	b.WriteString("  with machine verification (or the named agent verifier). A verified\n")
-	b.WriteString("  sub-goal becomes a Change the platform wakes YOU to integrate — a\n")
-	b.WriteString("  sub-goal completing does NOT complete the goal.\n\n")
+	b.WriteString("### Verify (verify runs only)\n")
+	b.WriteString("- Judge the work item, then issue agentwork_verify_sub_goal(verdict,\n")
+	b.WriteString("  summary, evidence) ONCE and end your turn.\n\n")
 
-	b.WriteString("### Integrate changes (owner)\n")
-	b.WriteString("- When you are woken with an Owner Attention section: list changes with\n")
-	b.WriteString("  agentwork_get_change, then integrate each ready one with\n")
-	b.WriteString("  agentwork_integrate_change(change_id) — the platform merges it into\n")
-	b.WriteString("  your worktree. A conflict wakes the assignee automatically.\n")
-	b.WriteString("- Inspect details with agentwork_get_sub_goal / agentwork_get_verification.\n")
-	b.WriteString("- Cancel a stuck work item with agentwork_cancel_sub_goal(sub_goal_id).\n\n")
-
-	b.WriteString("### Verify a sub-goal (verifier)\n")
-	b.WriteString("- If you are a verify run: judge the work item, then issue your verdict\n")
-	b.WriteString("  ONCE via agentwork_verify_sub_goal(verdict=passed|rejected, summary,\n")
-	b.WriteString("  evidence) and end your turn.\n\n")
-
-	b.WriteString("### Inspect\n")
-	b.WriteString("- agentwork_goal_list / agentwork_agent_list / agentwork_squad_list — use\n")
-	b.WriteString("  agent_list to get UUIDs for consults and handoffs.\n\n")
+	b.WriteString("### Lists\n")
+	b.WriteString("- agentwork_goal_list / agentwork_agent_list / agentwork_squad_list —\n")
+	b.WriteString("  resolve uuids with agent_list / squad_list before consults and handoffs.\n\n")
 
 	b.WriteString("### Team roster\n")
-	b.WriteString("If a task falls outside your role, delegate it with\n")
-	b.WriteString(" agentwork_create_sub_goal (owner only — the assignee runs it on their\n")
-	b.WriteString(" own worktree), or hand the goal off entirely.\n\n")
+	b.WriteString("Delegating work = agentwork_create_sub_goal or agentwork_handoff_goal —\n")
+	b.WriteString("never a mention in a comment (mentions are read-only consults).\n\n")
 	var n int
 	for rows.Next() {
 		var id, name, desc string
