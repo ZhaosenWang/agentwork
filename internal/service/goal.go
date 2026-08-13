@@ -1764,6 +1764,18 @@ func (s *GoalService) assigneeLabel(ctx context.Context, tx *sql.Tx, atype, aid 
 	return name, nil
 }
 
+// IsSQLiteUniqueViolation reports whether err is a UNIQUE-constraint
+// violation — the idempotency signal for guarded inserts (schedule_run
+// uq(schedule_id, planned_at): a concurrent tick's duplicate firing is a
+// no-op, NOT a failure to swallow).
+func IsSQLiteUniqueViolation(err error) bool {
+	var se *sqlite.Error
+	if errors.As(err, &se) {
+		return se.Code() == sqlite3.SQLITE_CONSTRAINT_UNIQUE || se.Code() == sqlite3.SQLITE_CONSTRAINT
+	}
+	return false
+}
+
 // isSQLiteBusy reports whether err is a SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT
 // failure. WAL snapshot-upgrade races fail IMMEDIATELY with SQLITE_BUSY —
 // the busy_timeout pragma does not apply to them (the tx took a read

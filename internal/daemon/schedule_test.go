@@ -88,3 +88,78 @@ func TestFireScheduleGoalInsert(t *testing.T) {
 		t.Fatalf("run agent mismatch: %q", run.AgentID)
 	}
 }
+
+// TestFireScheduleAtomicBirth: the fired goal, its schedule_run row and its
+// FIRST run are born in one transaction (P0-3) — and a duplicate firing of
+// the same planned_at is a no-op (uq idempotency): one goal, one run.
+func TestFireScheduleAtomicBirth(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	bus := events.NewBus()
+
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	if err != nil {
+		t.Fatalf("runtime: %v", err)
+	}
+	agent, err := service.NewAgentService(st, bus).Create(ctx, service.Agent{Name: "maintainer", RuntimeID: rt.ID})
+	if err != nil {
+		t.Fatalf("agent: %v", err)
+	}
+	domain, err := service.NewDomainService(st, bus).Create(ctx, service.Domain{Name: "d", GitURL: "https://example.com/d.git"})
+	if err != nil {
+		t.Fatalf("domain: %v", err)
+	}
+	sched, err := service.NewScheduleService(st, bus).Create(ctx, service.Schedule{
+		Name: "s", TitleTemplate: "t", Description: "d",
+		AssigneeType: "agent", AssigneeID: agent.ID, DomainID: domain.ID,
+		CronExpression: "*/1 * * * *", Timezone: "UTC",
+	})
+	if err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+	goalSvc := service.NewGoalService(st, bus)
+	runSvc := service.NewRunService(st, bus)
+	goalSvc.SetRunService(runSvc)
+	runSvc.SetGoalService(goalSvc)
+	d := &Daemon{st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc}
+
+	due := scheduleDueRow{
+		ScheduleID: sched.ID, TitleTemplate: "t", Description: "d",
+		AssigneeType: "agent", AssigneeID: agent.ID, DomainID: domain.ID,
+		CronExpression: "*/1 * * * *", Timezone: "UTC",
+		NextRunAt: "2026-08-13T12:00:00Z",
+	}
+	d.fireSchedule(ctx, due)
+
+	// One goal, one schedule_run, one queued owner run — all born together.
+	var goals, firings, runs int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM goal WHERE created_by_id=?`, sched.ID).Scan(&goals); err != nil || goals != 1 {
+		t.Fatalf("exactly 1 fired goal, got %d (err %v)", goals, err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schedule_run WHERE schedule_id=?`, sched.ID).Scan(&firings); err != nil || firings != 1 {
+		t.Fatalf("exactly 1 firing, got %d (err %v)", firings, err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id IN (SELECT goal_id FROM schedule_run WHERE schedule_id=?) AND status='queued'`,
+		sched.ID).Scan(&runs); err != nil || runs != 1 {
+		t.Fatalf("exactly 1 queued first run, got %d (err %v)", runs, err)
+	}
+
+	// A duplicate firing of the same planned_at (concurrent tick) is a no-op.
+	d.fireSchedule(ctx, due)
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM goal WHERE created_by_id=?`, sched.ID).Scan(&goals); err != nil || goals != 1 {
+		t.Fatalf("duplicate firing must not create a second goal, got %d (err %v)", goals, err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id IN (SELECT goal_id FROM schedule_run WHERE schedule_id=?)`,
+		sched.ID).Scan(&runs); err != nil || runs != 1 {
+		t.Fatalf("duplicate firing must not enqueue a second run, got %d (err %v)", runs, err)
+	}
+}

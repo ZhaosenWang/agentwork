@@ -2576,23 +2576,37 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO schedule_run (id,schedule_id,goal_id,planned_at,status,created_at) VALUES (?,?,?,?,'dispatched',?)`,
 		uuid.NewString(), r.ScheduleID, goalID, plannedAt, ts); err != nil {
-		// Unique index violation → a concurrent tick already fired this
-		// planned_at. Roll back the goal insert and just advance next_run_at.
-		log.Printf("daemon: schedule %s already fired at %s, skipping", r.ScheduleID, plannedAt)
-		d.advanceScheduleNextRun(ctx, r, plannedAt)
+		if service.IsSQLiteUniqueViolation(err) {
+			// A concurrent tick already fired this planned_at. Roll the tx
+			// back EXPLICITLY before the advance UPDATE below — the advance
+			// runs on a separate connection, and an open tx would contend on
+			// the write lock (and deadlock single-connection test stores).
+			_ = tx.Rollback()
+			log.Printf("daemon: schedule %s already fired at %s, skipping", r.ScheduleID, plannedAt)
+			d.advanceScheduleNextRun(ctx, r, plannedAt)
+			return
+		}
+		// A REAL insert error: do NOT advance — the next tick retries this
+		// firing instead of silently swallowing the failure and skipping it.
+		log.Printf("daemon: schedule %s insert schedule_run failed (not advanced): %v", r.ScheduleID, err)
+		return
+	}
+	// P0-3 (决策 6-13): the fired goal and its FIRST run are born in ONE
+	// transaction — a crash after the commit can no longer leave a run-less
+	// active goal.
+	_, runEv, err := d.runSvc.EnqueueForGoalTx(ctx, tx, service.Goal{
+		ID: goalID, AssigneeType: r.AssigneeType, AssigneeID: r.AssigneeID,
+	})
+	if err != nil {
+		log.Printf("daemon: schedule %s enqueue run: %v", r.ScheduleID, err)
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("daemon: schedule %s commit: %v", r.ScheduleID, err)
 		return
 	}
-	// Enqueue the first run for the new goal via the services (coalesce + leader
-	// routing for squad assignees).
-	g, err := d.goalSvc.Get(ctx, goalID)
-	if err != nil {
-		log.Printf("daemon: schedule %s load goal: %v", r.ScheduleID, err)
-	} else if _, err := d.runSvc.EnqueueForGoal(ctx, *g); err != nil {
-		log.Printf("daemon: schedule %s enqueue run: %v", r.ScheduleID, err)
+	if runEv != nil {
+		d.bus.Publish(ctx, *runEv)
 	}
 	d.advanceScheduleNextRun(ctx, r, plannedAt)
 	d.bus.Publish(ctx, events.Event{Topic: "schedule:fired", Payload: map[string]any{

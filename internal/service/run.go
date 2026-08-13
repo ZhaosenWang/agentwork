@@ -193,6 +193,24 @@ func (s *RunService) EnqueueForGoal(ctx context.Context, g Goal) (*Run, error) {
 	return s.enqueue(ctx, g.ID, agentID, 1, isLeader, squadID, "")
 }
 
+// EnqueueForGoalTx is EnqueueForGoal under the caller's transaction — the
+// schedule-firing path uses it (P0-3, 决策 6-13): the fired goal and its
+// first run are born ATOMICALLY, so a crash after the commit can no longer
+// leave a run-less active goal (the startup sweeps cannot resurrect it —
+// attention derives only from changes/failed sub-goals). resolveLeader runs
+// outside the tx (read-only, idempotent); the run event is RETURNED for the
+// caller to publish after commit (invariant 13).
+func (s *RunService) EnqueueForGoalTx(ctx context.Context, tx *sql.Tx, g Goal) (*Run, *events.Event, error) {
+	if g.AssigneeType != "agent" && g.AssigneeType != "squad" {
+		return nil, nil, nil // human-assigned: no run
+	}
+	agentID, isLeader, squadID, err := s.resolveLeader(ctx, g.AssigneeType, g.AssigneeID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return s.enqueueTx(ctx, tx, g.ID, agentID, 1, isLeader, squadID, "")
+}
+
 // EnqueueExisting enqueues a run on an explicit agent (used by retry and
 // parent-wake: the agent id is already known). Coalesces if a pending run
 // exists for this (goal,agent).
