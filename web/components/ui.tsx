@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 
 // ── Button ──
@@ -152,10 +152,22 @@ export function Dialog({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Backdrop-click-to-close requires BOTH press and release on the backdrop.
+  // A text-selection drag that starts inside the panel and releases over the
+  // backdrop fires a click on their common ancestor (the backdrop) — with a
+  // naive onClick that would close the dialog mid-selection ("selecting all
+  // closes the dialog").
+  const pressedOnBackdrop = useRef(false);
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm p-4"
-      onClick={onClose}
+      onMouseDown={(e) => {
+        pressedOnBackdrop.current = e.target === e.currentTarget;
+      }}
+      onClick={() => {
+        if (pressedOnBackdrop.current) onClose();
+      }}
     >
       <div
         className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-zinc-200 flex flex-col max-h-[90vh] page-enter"
