@@ -241,3 +241,76 @@ func TestAttentionNotArmedForNonActiveGoals(t *testing.T) {
 		t.Fatalf("terminal goals must not carry attention, got %q", g2.Attention)
 	}
 }
+
+// TestReconcileAllActiveReArmsAttention (P0-3): a crash can lose the latch
+// events AFTER their transactions committed — the DB has a ready change but
+// attention was never derived and no owner was spawned. The startup sweep
+// re-derives from DB truth (idempotent ReconcileGoal per active goal) and
+// re-spawns exactly what the state demands. Terminal goals are untouched.
+func TestReconcileAllActiveReArmsAttention(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "owner")
+	b := seedAgent(t, st, "worker")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var sgRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&sgRun); err != nil {
+		t.Fatalf("sub-goal run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, sgRun); err != nil {
+		t.Fatal(err)
+	}
+	// The sub-goal verifies + the change becomes ready — but the Coordinator
+	// never runs (simulated lost events): attention stays '' and no owner
+	// run exists beyond the initial... the goal never had an owner run here.
+	if err := rs.Finish(ctx, sgRun, "completed", "implemented"); err != nil {
+		t.Fatalf("finish sub-goal run: %v", err)
+	}
+	g1, _ := gs.Get(ctx, g.ID)
+	if g1.Attention != "" {
+		t.Fatalf("attention must be empty before any reconcile, got %q", g1.Attention)
+	}
+
+	// The startup sweep re-arms from DB truth.
+	n, err := gs.ReconcileAllActive(ctx)
+	if err != nil {
+		t.Fatalf("reconcile all: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 active goal reconciled, got %d", n)
+	}
+	g2, _ := gs.Get(ctx, g.ID)
+	if g2.Attention != "integration" {
+		t.Fatalf("sweep must re-arm attention from the ready change, got %q", g2.Attention)
+	}
+	var ownerRuns int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='owner' AND status IN ('queued','running')`, g.ID).Scan(&ownerRuns); err != nil {
+		t.Fatal(err)
+	}
+	if ownerRuns != 1 {
+		t.Fatalf("sweep must spawn the owner run, got %d pending owner runs", ownerRuns)
+	}
+
+	// Terminal goals are untouched.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='done' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET attention='' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	n, err = gs.ReconcileAllActive(ctx)
+	if err != nil || n != 0 {
+		t.Fatalf("no active goals left — sweep must be empty, got n=%d err=%v", n, err)
+	}
+}

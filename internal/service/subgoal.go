@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -205,8 +204,6 @@ func (s *GoalService) reconcileSubGoalRunOnce(ctx context.Context, rc goalRunCon
 	}
 
 	var evs []events.Event
-	enqueueVerifierAfterCommit := false
-	enqueueRetryAfterCommit := false
 	switch rc.Status {
 	case "completed":
 		// The run's report lands in the goal's feed (owner context).
@@ -229,7 +226,17 @@ func (s *GoalService) reconcileSubGoalRunOnce(ctx context.Context, rc goalRunCon
 			evs = append(evs, events.Event{Topic: "sub_goal.verifying", Payload: map[string]any{
 				"goal_id": sg.GoalID, "sub_goal_id": sg.ID,
 			}})
-			enqueueVerifierAfterCommit = true
+			// P0-3 (决策 6-13): the verifier run is born IN this transaction —
+			// a crash after the commit can no longer leave a verifying
+			// sub-goal with no verifier run. The run event is published after
+			// the commit below (invariant 13).
+			_, runEv, err := s.runSvc.enqueueVerifyRunTx(ctx, tx, sg.ID)
+			if err != nil {
+				return fmt.Errorf("enqueue verifier run: %w", err)
+			}
+			if runEv != nil {
+				evs = append(evs, *runEv)
+			}
 			break
 		}
 		// Conditional transition: done → verified. (The daemon's verification
@@ -266,11 +273,18 @@ func (s *GoalService) reconcileSubGoalRunOnce(ctx context.Context, rc goalRunCon
 		var attempt int
 		_ = tx.QueryRowContext(ctx, `SELECT execution_attempt FROM sub_goal WHERE id=?`, sg.ID).Scan(&attempt)
 		if attempt < maxExecutionAttempts {
-			// Retry the assignee (a fresh sub-goal run, same sub-goal).
+			// Retry the assignee — the retry run is born in THIS transaction
+			// (P0-3): a crash can no longer lose the successor run.
 			evs = append(evs, events.Event{Topic: "sub_goal.retrying", Payload: map[string]any{
 				"goal_id": sg.GoalID, "sub_goal_id": sg.ID, "execution_attempt": attempt,
 			}})
-			enqueueRetryAfterCommit = true
+			_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID)
+			if err != nil {
+				return fmt.Errorf("enqueue retry run: %w", err)
+			}
+			if runEv != nil {
+				evs = append(evs, *runEv)
+			}
 		} else {
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE sub_goal SET status='failed' WHERE id=? AND status IN ('running','done')`, sg.ID); err != nil {
@@ -291,18 +305,6 @@ func (s *GoalService) reconcileSubGoalRunOnce(ctx context.Context, rc goalRunCon
 	}
 	if err := tx.Commit(); err != nil {
 		return err
-	}
-	// Post-commit side effects (invariant 13) — explicit, not deferred: a
-	// failed commit must never enqueue.
-	if enqueueVerifierAfterCommit {
-		if _, err := s.runSvc.EnqueueVerifyRun(ctx, sg.ID); err != nil {
-			log.Printf("sub-goal verifier enqueue %s: %v", sg.ID, err)
-		}
-	}
-	if enqueueRetryAfterCommit {
-		if _, err := s.runSvc.EnqueueSubGoalRun(ctx, sg.ID); err != nil {
-			log.Printf("sub-goal retry enqueue %s: %v", sg.ID, err)
-		}
 	}
 	for _, e := range evs {
 		s.bus.Publish(ctx, e)
@@ -424,7 +426,6 @@ func (s *GoalService) VerifySubGoal(ctx context.Context, runID, verdict, summary
 	}
 
 	var evs []events.Event
-	enqueueRejectAfterCommit := false
 	if verdict == "passed" {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE sub_goal SET status='verified' WHERE id=? AND status='verifying'`, sg.ID); err != nil {
@@ -459,16 +460,19 @@ func (s *GoalService) VerifySubGoal(ctx context.Context, runID, verdict, summary
 		evs = append(evs, events.Event{Topic: "sub_goal.rejected", Payload: map[string]any{
 			"goal_id": sg.GoalID, "sub_goal_id": sg.ID,
 		}})
-		enqueueRejectAfterCommit = true
+		// P0-3 (决策 6-13): the assignee's rework run is born IN this
+		// transaction — a crash after the commit can no longer lose it. The
+		// run event is published after the commit below (invariant 13).
+		_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID)
+		if err != nil {
+			return fmt.Errorf("enqueue rework run: %w", err)
+		}
+		if runEv != nil {
+			evs = append(evs, *runEv)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
-	}
-	// Post-commit side effect (invariant 13) — explicit, not deferred.
-	if enqueueRejectAfterCommit {
-		if _, err := s.runSvc.EnqueueSubGoalRun(ctx, sg.ID); err != nil {
-			log.Printf("sub-goal reject enqueue %s: %v", sg.ID, err)
-		}
 	}
 	for _, e := range evs {
 		s.bus.Publish(ctx, e)
@@ -519,16 +523,24 @@ func (s *GoalService) MarkChangeIntegrated(ctx context.Context, changeID string,
 		sgID); err != nil {
 		return fmt.Errorf("rework sub-goal: %w", err)
 	}
+	// P0-3 (决策 6-13): the assignee's rework run is born IN this
+	// transaction — the conflict transition and its successor run are one
+	// atomic unit. The run event is published after the commit (invariant 13).
+	var runEv *events.Event
+	if _, ev, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sgID); err != nil {
+		return fmt.Errorf("enqueue rework run: %w", err)
+	} else {
+		runEv = ev
+	}
 	if err := tx.Commit(); err != nil {
 		return err
-	}
-	// The assignee's successor run — after commit (invariant 13).
-	if _, err := s.runSvc.EnqueueSubGoalRun(ctx, sgID); err != nil {
-		log.Printf("sub-goal conflict enqueue %s: %v", sgID, err)
 	}
 	s.bus.Publish(ctx, events.Event{Topic: "change.conflict", Payload: map[string]any{
 		"goal_id": goalID, "change_id": changeID, "sub_goal_id": sgID,
 	}})
+	if runEv != nil {
+		s.bus.Publish(ctx, *runEv)
+	}
 	return nil
 }
 

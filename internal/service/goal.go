@@ -869,12 +869,18 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 					return oerr
 				}
 				if owns && g.Status == "active" {
-					agent := requesterAgent
-					afterCommit = append(afterCommit, func() {
-						if err := s.runSvc.EnqueueExisting(ctx, rc.GoalID, agent, 1, false, ""); err != nil {
+					// P0-3 (决策 6-13): the resume run is born IN this
+					// transaction — a crash can no longer lose the requester's
+					// successor run. An enqueue failure is only logged (the
+					// consult's answer is already in the feed).
+					_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, requesterAgent, 1, false, "")
+					if err != nil {
+						afterCommit = append(afterCommit, func() {
 							log.Printf("goal: consult resume enqueue for %s: %v", rc.GoalID, err)
-						}
-					})
+						})
+					} else if runEv != nil {
+						pendingEvents = append(pendingEvents, *runEv)
+					}
 				}
 			}
 		}
@@ -991,20 +997,24 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 	case "failed":
 		if rc.Attempt < maxAttempts {
 			// Retry: enqueue a fresh run at attempt+1 on the same agent so
-			// history is preserved. Deferred to after commit — the retry needs
-			// the per-(goal,agent) coalesce, which RunService owns.
+			// history is preserved. P0-3 (决策 6-13): the retry run is born
+			// IN this transaction — a crash after the commit can no longer
+			// lose the successor run. The retry events publish after the
+			// commit (invariant 13, via commitAndEmit).
 			attempt := rc.Attempt + 1
-			afterCommit = append(afterCommit, func() {
-				if err := s.runSvc.EnqueueExisting(ctx, rc.GoalID, rc.AgentID, attempt, rc.IsLeaderRun, rc.SquadID); err != nil {
-					s.bus.Publish(ctx, events.Event{Topic: "goal:retry_failed", Payload: map[string]any{
-						"goal_id": rc.GoalID, "error": err.Error(),
-					}})
-				} else {
-					s.bus.Publish(ctx, events.Event{Topic: "goal:retrying", Payload: map[string]any{
-						"goal_id": rc.GoalID, "attempt": attempt,
-					}})
+			_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, rc.AgentID, attempt, rc.IsLeaderRun, rc.SquadID)
+			if err != nil {
+				pendingEvents = append(pendingEvents, events.Event{Topic: "goal:retry_failed", Payload: map[string]any{
+					"goal_id": rc.GoalID, "error": err.Error(),
+				}})
+			} else {
+				if runEv != nil {
+					pendingEvents = append(pendingEvents, *runEv)
 				}
-			})
+				pendingEvents = append(pendingEvents, events.Event{Topic: "goal:retrying", Payload: map[string]any{
+					"goal_id": rc.GoalID, "attempt": attempt,
+				}})
+			}
 		} else {
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE goal SET status='failed' WHERE id=? AND status NOT IN ('done','failed','cancelled','review')`,
@@ -1468,6 +1478,41 @@ func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) erro
 		}})
 	}
 	return nil
+}
+
+// ReconcileAllActive re-derives owner attention for EVERY active goal — the
+// startup recovery face of Event≠Truth (决策 6-4, P0-3 决策 6-13): a crash
+// can lose latch events (sub_goal.verified, run.terminal, ...) AFTER their
+// transactions committed, and no replay resurrects them. The DB state is the
+// truth: re-running the idempotent ReconcileGoal per goal re-arms attention
+// and re-spawns whatever the state demands. Called once at daemon startup.
+func (s *GoalService) ReconcileAllActive(ctx context.Context) (int, error) {
+	rows, err := s.st.DB().QueryContext(ctx, `SELECT id FROM goal WHERE status='active'`)
+	if err != nil {
+		return 0, fmt.Errorf("scan active goals: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, id := range ids {
+		if err := s.ReconcileGoal(ctx, id); err != nil {
+			log.Printf("service: reconcile all active (%s): %v", id, err)
+			continue
+		}
+		n++
+	}
+	return n, nil
 }
 
 // deriveOwnerAttentionTx computes the v2 OwnerAttention bits (决策 6-4/6-8)

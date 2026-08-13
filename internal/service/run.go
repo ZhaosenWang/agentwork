@@ -291,35 +291,53 @@ func (s *RunService) enqueueSubGoalRunTx(ctx context.Context, tx *sql.Tx, subGoa
 // per-sub-goal single-flight keeps it serialized with the assignee's runs —
 // the verifier judges a stable state).
 func (s *RunService) EnqueueVerifyRun(ctx context.Context, subGoalID string) (*Run, error) {
-	var goalID, verifierID string
-	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT goal_id, verifier_id FROM sub_goal WHERE id=?`, subGoalID).
-		Scan(&goalID, &verifierID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("load sub-goal: %w", err)
-	}
-	if verifierID == "" {
-		return nil, NewValidationError("the sub-goal has no agent verifier")
-	}
-
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	r, ev, err := s.enqueueVerifyRunTx(ctx, tx, subGoalID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if ev != nil {
+		s.bus.Publish(ctx, *ev)
+	}
+	return r, nil
+}
 
-	// Coalesce per (sub_goal, role) — see EnqueueSubGoalRun.
+// enqueueVerifyRunTx inserts a verifier run under the caller's transaction
+// (P0-3, 决策 6-13: the reconcile parks the sub-goal verifying and births
+// the verifier run ATOMICALLY — a crash after the commit can no longer
+// leave a verifying sub-goal with no verifier run). The run event is
+// RETURNED — the caller publishes after its commit (invariant 13).
+func (s *RunService) enqueueVerifyRunTx(ctx context.Context, tx *sql.Tx, subGoalID string) (*Run, *events.Event, error) {
+	var goalID, verifierID string
+	err := tx.QueryRowContext(ctx,
+		`SELECT goal_id, verifier_id FROM sub_goal WHERE id=?`, subGoalID).
+		Scan(&goalID, &verifierID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("load sub-goal: %w", err)
+	}
+	if verifierID == "" {
+		return nil, nil, NewValidationError("the sub-goal has no agent verifier")
+	}
+
+	// Coalesce per (sub_goal, role) — see enqueueSubGoalRunTx.
 	var existing string
 	err = tx.QueryRowContext(ctx,
 		`SELECT id FROM run WHERE sub_goal_id=? AND role='verify' AND status IN ('queued','running') LIMIT 1`, subGoalID).Scan(&existing)
 	if err == nil {
-		return &Run{ID: existing, GoalID: goalID, AgentID: verifierID, Role: "verify", SubGoalID: subGoalID, Status: "queued"}, nil
+		return &Run{ID: existing, GoalID: goalID, AgentID: verifierID, Role: "verify", SubGoalID: subGoalID, Status: "queued"}, nil, nil
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("check pending sub-goal run: %w", err)
+		return nil, nil, fmt.Errorf("check pending sub-goal run: %w", err)
 	}
 
 	ts := now()
@@ -338,13 +356,10 @@ func (s *RunService) EnqueueVerifyRun(ctx context.Context, subGoalID string) (*R
 		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,sub_goal_id,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.SubGoalID, r.Attempt, "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
-		return nil, fmt.Errorf("insert verify run: %w", err)
+		return nil, nil, fmt.Errorf("insert verify run: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	s.bus.Publish(ctx, events.Event{Topic: "run:enqueued", Payload: r})
-	return &r, nil
+	ev := &events.Event{Topic: "run:enqueued", Payload: r}
+	return &r, ev, nil
 }
 
 // EnqueueProcessorRun creates a platform-internal processor run (DESIGN.md

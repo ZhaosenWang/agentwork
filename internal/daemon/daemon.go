@@ -257,6 +257,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if n > 0 {
 		log.Printf("daemon: replayed reconcile for %d unreconciled terminal run(s)", n)
 	}
+	// P0-3 (决策 6-13): latch events lost in a crash (their transactions
+	// committed but the publish never ran) are re-armed from DB truth —
+	// ReconcileGoal is idempotent, so re-deriving every active goal's
+	// attention re-spawns exactly what the state demands.
+	if n, err := d.goalSvc.ReconcileAllActive(ctx); err != nil {
+		log.Printf("daemon: reconcile all active goals: %v", err)
+	} else if n > 0 {
+		log.Printf("daemon: reconciled %d active goal(s)", n)
+	}
 	// Decision 2-9, trigger side: an approve followed by a crash leaves the
 	// goal in review with the approve recorded and no deliver — re-run the
 	// deliver (its merge/push idempotency makes the replay safe).
