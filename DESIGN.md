@@ -71,6 +71,10 @@ cron/Web  goal→run→   (域策略      (仲裁事务内)  review    合入/me
 | **验收策略** | 完成判定的完整定义：机器验证 + 结构化约束 + 卡点规则 | 属域 |
 | **mention** | 协作原语 = **Consult（问）的唯一协议语义**（决策 5-1/5-2）——评论中的结构化 URI `[@Name](mention://agent\|squad\|human\|all/<id\|all>)` 触发 guest run（只读，决策 5-3），不改变 goal owner、不创建子 goal；平台解析已持久化的评论体，绝不解析 agent stdout | 评论属 goal |
 | **squad** | 路由组，不干活——分配给 squad / @squad 只路由到 leader；成员多态（agent\|human）+ role，`role=reviewer` 成员被平台自动拉入审查 checkpoint | 无 |
+| **sub_goal** | 拆出的工作项实体（决策 6-1）——**不是 child goal**：不可递归、依附 goal 生命周期、无独立交付；assignee（做）+ verifier（验）分离，两层失败计数 | goal |
+| **change** | 跨 workspace 的逻辑交付物（决策 6-3）：4 态（ready/integrating/integrated/conflict），Revision 绑定 Integration Base；与第一版 Revision 同事务原子创建 | goal |
+| **verification** | sub-goal 的质量判定轮次（决策 6-5）：机器（域验证命令）或 agent verifier 的结构化 verdict，verification_result 审计 | goal |
+| **attention** | OwnerAttention 派生状态（决策 6-8）：integration/recovery/user_action，Coordinator 事务内持久化到 `goal.attention`——UI 徽标与 IM 通知去重依据 | goal |
 | **processor agent** | 平台侧 LLM 执行者（NL→checks 编译、验证强度推断、IM 入站解析）；与 worker 同级配置，run_kind=processor，产物走文件（文件即副作用） | 无 |
 
 ---
@@ -90,9 +94,11 @@ cron/Web  goal→run→   (域策略      (仲裁事务内)  review    合入/me
     -- M0 仅实现 type=repo；其他资产域类型（文档/配置/知识库/backlog）后置（§13）
 + goal 表新增:
     domain_id → domain.id（agent 执行的 goal 必须有域）
-    worktree_path / branch_name（goal 的 worktree 与分支）
     review_request（卡点触发原因/证据包指针）
     human_iterations INT（人 reject 迭代计数，与 run.attempt 分开——盲点 2）
+    execution_attempt INT（决策 6-9：机器重试计数——见决策 6-9 注记：goal 层重试目前仍由 run.attempt 承担，本列建而未用）
+    attention TEXT（决策 6-8：OwnerAttention 派生状态持久化——'' | integration | recovery | user_action）
+    -- worktree_path / branch_name 已退役（决策 6-2：worktree 按 run 实例化；goal 分支名由 goalID 派生 feat-<前8位>）
 + run 表新增:
     run_kind(worker/processor——处理器 agent 的内部 run 与 worker run 同一套调度机制，决策 2-17)
     run_type(compile|intake)（processor 子任务分类，M3 扩展：摘要/健康分析）
@@ -100,6 +106,15 @@ cron/Web  goal→run→   (域策略      (仲裁事务内)  review    合入/me
     trigger_comment_id（触发源评论——mention 溯源 / guest run 失败留痕 / pingpong 计数口径）
     is_leader_run / squad_id（squad leader run 标记；权威判定按 reconcile 时刻动态查表，不信任静态标记）
     evidence TEXT(JSON)（证据包：diff 统计 + 验证输出 + agent 汇报摘要；卡点触发时生成，审批卡引用）
+    role（决策 5-4/6-9：owner|subgoal|consult|review|verify——enqueue 时派生的信息快照；归属判定仍按 reconcile 时刻动态查表）
+    sub_goal_id / base_ref / head_ref（决策 6-1/6-3/6-9：sub-goal run 的工作项指针 + Change 修订的 base/head ref——sub_goal 与 run 是 1:N，关系真相 = run.sub_goal_id，无 current_run_id 指针）
+    dirty_snapshot（已退役——决策 6-2 run 级 workspace 后仅保留列）
++ v2 协作实体表（决策 6-1/6-3/6-5/5-8/5-9）：
+    sub_goal（工作项：assignee+verifier、status 8 态、execution_attempt/quality_iteration）
+    change / change_revision（逻辑交付物 + 修订；Change 与第一版 Revision 同事务原子创建，Ready ⇔ 已持久化 Revision）
+    verification_result（每轮验证一条：verifier_run_id、passed|rejected、summary+evidence；轮次 ≠ run.attempt）
+    handoff_event（所有权转移 append-only 审计：from/to 多态 + from_run_id/to_run_id + reason + actor）
+    consult_request（consult 全链路：requester_run_id 即恢复锚点、trigger/guest/response 三评论）
 + gate_decision 表（卡点决策留痕 + 健康度学习数据源）:
     id, goal_id, run_id(证据包关联), gate_rule, decision(approve/reject/redirect),
     reason, decided_by, decided_at, review_duration
@@ -128,17 +143,17 @@ agent 干完（run 到终态）
 → 触发 ReconcileOnRunEnd（事务内）：
     读验证结果 + 卡点规则
     → 全过且无卡点命中 → done
-    → 验证挂 → run failed → attempt 重试 → 耗尽 → goal failed（报人）
+    → 验证挂 → run failed → 重试（≤3：sub-goal 层 execution_attempt 为权威；goal 层目前由 run.attempt 承担，见决策 6-9 注记）→ 耗尽 → failed（报人）
     → 卡点命中 → review（等人）
-→ 人 approve/reject → ResolveReview → approve 触发 deliver（§7）/ reject 回 active 带决策 note
-→ approve: 触发 deliver（§6）；reject: 新 run 带决策 note（同 worktree）
+    （sub-goal/verify run 路由到 ReconcileSubGoalRun / ReconcileVerifyRun，不碰 goal 状态——决策 6-1/6-5）
+→ 人 approve/reject → ResolveReview → approve 触发 deliver（§7）/ reject 回 active 带决策 note（新 run 从分支 HEAD 切新 workspace，决策 6-2）
 ```
 
 ### 规则
 
 - **per-workspace 串行化（决策 6-2）**：每个 run 有独立 worktree；owner run 单飞 + 每 sub-goal 至多一个活跃 run，consult/review/verify 只读可与 owner 并行。service 层 enqueue 检查 + daemon 调度层保证，不做 DB 约束。
 - **attempt 分开计数**：机器失败重试（`run.attempt`，上限 3）与人类 reject 迭代（`goal.human_iterations`，不设硬上限）分离，合法迭代不得被误掐断。reject 的触发源记入 `trigger_comment_id`（已有字段）。
-- **maxRunDuration（决策 2-6）**：单 run 最大时长（默认 2h，域策略可调），超时 → run 记 **cancelled（不消耗 attempt）**，goal 保持 active，汇报人"任务超时"——人决定重开或放弃（重开 = 新 run 继续同一 worktree）。与 idle watchdog（静默）互补。
+- **maxRunDuration（决策 2-6）**：单 run 最大时长（默认 2h，域策略可调），超时 → run 记 **cancelled（不消耗 attempt）**，goal 保持 active，汇报人"任务超时"——人决定重开或放弃（重开 = 新 run 从分支 HEAD 切新 workspace，决策 6-2）。与 idle watchdog（静默）互补。
 - **verify_timeout**：验证命令自身超时（默认 10min，域策略可调），超时视同验证失败（防挂死的 verify 让 run 永远 running）。
 - **review 期间新 run 不生效（决策 2-3）**：goal 在 review 时，mention/handoff 只落 comment、**不触发 run**（审批针对的分支状态冻结，证据包不被污染）。审批通过后由人决定是否执行（后置增强：审批时提示"review 期间有 N 条未执行 mention"）。
 - **worktree 干净性（决策 6-2 修订）**：run 级 worktree 使脏检查退役——runs/<runID> 路径即归属，脏的就是该 run 自己的产物（crash 恢复复用）；consult/review/verify 结束时平台 reset --hard + clean 丢弃一切改动。
@@ -147,7 +162,7 @@ agent 干完（run 到终态）
 - **handoff 终止旧 run（决策 4-9，协作防死锁）**：goal 易主（人改派 / agent handoff）时，平台终止旧 owner 的 running run——否则旧 agent 认为"已交接"而不结束 run（继续干是白干、空等被 watchdog 打死、活跃轮询则 watchdogs 都拦不住），新 owner 的 run 被 per-goal 串行化永远堵在 queued：死锁。机制：daemon 维护 runID→prompt cancel 注册表（+ 取消原因码），`goal:assigned` 事件驱动取消非新 owner 的 running run；claim→注册窗口内的 run 由 DB 兜底标记（status→handed_off，决策 5-5），runTask 注册后自查 self-cancel（窗口归零）；旧 run 终态 cancelled + cancel_reason=handed_off（不耗 attempt，不触发自动重试；决策 6-6 撤销 5-5 的独立状态）；新 owner 从 branch HEAD 切新 workspace，不代提交 WIP。重新指派给同一 agent 不终止（它仍是 owner）；assign 给 human 终止所有 running run。AGENTWORK.md 同步引导"交接后立即结束你的 turn"。
 - **取消原因结构化（决策 4-9 延伸）**：run 行 `cancel_reason` 列 + 事件 `reason_code`（`idle_watchdog|handoff|timeout`）——语义判断用结构化码，不用字符串匹配（result_summary 的 "idle watchdog: " 前缀仅为展示）。效果：maxRunDuration 超时不再被误判为 watchdog 自动重试（决策 2-6：超时不重试，人决定）；notify 对 handoff 取消不推"任务中断"卡。
 - **agent 无权请求审批（决策 4-11）**：审批触发 = 机器 gate（域策略卡点规则）+ 人——agent 的 `goal request-approval`（M2 行为卡点实现）已移除：执行者不得请求判定（三角分离不变量 9）——"什么时候要人审"由卡点规则表达（如 merge 必审），不是 agent 自觉（不变量 10）。agent 干完活 → run 自然 completed → 机器判定（gate 命中 → review；无卡点 + 验证过 → done）；squad 审查 run 在 review 窗口自动触发（平台机制），意见进评论区供审批参考——审批对象只有一个（触发 review 的 worker run），reviewer 意见不是审批对象。
-- **协作四行为模型（决策 5-1/5-2，替代 4-9 的接力文案）**：同 goal 的 run 严格串行（worktree 一份），"在 run 内等对方结果"物理不可能。协作只有四种行为：Comment（说——纯评论）、Consult（问——mention 触发 guest run，guest 只读，完成后平台自动恢复 requester，决策 5-8）、Handoff（接力——所有权转移，旧 run handed_off + 新 owner run，决策 5-6 权限）、Sub-goal（拆活——新 goal 独立生命周期，父 goal 用 goal_wait 挂起，决策 5-1）。依赖对方信息 → consult；依赖对方干活 → handoff 或 sub-goal。AGENTWORK.md 完整引导。
+- **协作四行为模型（决策 5-1/5-2，替代 4-9 的接力文案）**："在 run 内等对方结果"物理不可能——owner run 单飞 + 每 sub-goal 至多一个活跃 run（consult/review/verify 只读可与 owner 并行，决策 6-2）。协作只有四种行为：Comment（说——纯评论，mention 永不触发 run）、Consult（问——mention 触发只读 guest run，完成后平台自动恢复 requester，决策 5-8）、Handoff（接力——所有权转移，旧 owner run 终止（cancel_reason=handed_off，决策 6-6）+ 新 owner run，决策 5-6 权限）、Sub-goal（拆活——sub_goal 实体，不是新 goal，决策 6-1）。依赖对方信息 → consult；依赖对方干活 → handoff 或 sub-goal。AGENTWORK.md 完整引导。
 - **评论即重开（决策 4-1）**：终态（done/failed/cancelled）+ **human 作者** + 评论含 **action mention**（agent/squad）→ 自动 Reopen 再触发；纯评论仅落库不重开——终态不接受静默新活。agent/system 评论不触发重开。
 - **mention pingpong 上限（决策 4-2）**：计数口径 = `trigger_comment_id` 指向 **agent 作者**评论的 run 数。>4 → 下一 run 注入"停止互相转移任务"警告；≥8 → 强制 failed（协作循环判死，系统评论留痕）。human/system 触发不计。
 - **guest run 失败留痕（决策 4-3）**：协作 run（非 assignee 触发）失败且带 `trigger_comment_id` → 写系统评论（"协作 run 失败：…"），不重试、不动 goal 状态——feed 可见即协作闭环。
@@ -163,10 +178,10 @@ agent 干完（run 到终态）
 
 | 数值 | 语义 |
 |---|---|
-| attempt ≤ 3 | 机器失败自动重试上限（maxAttempts），同 agent 同 goal |
-| wake ≤ 3 | blocked→active 唤醒上限，超出 force-fail 父 goal（防逃亡再扇出） |
+| execution_attempt ≤ 3 | 机器失败重试上限：sub-goal 层为权威计数（决策 6-9）；goal 层目前由 run.attempt 承担（goal.execution_attempt 建而未用，见决策 6-9 注记） |
 | mention &gt;4 / ≥8 | agent 间协作 run 数：注入"停止互相转任务"警告 / 强制 failed（决策 4-2） |
-| deliverWaitForRuns = 5min | approve 后等待该 goal in-flight run 的上限，超时报告"请稍后再批准" |
+| handoff ≥4 / ≥8 | 所有权交接次数：系统评论警告 / goal 进 review 审停（决策 5-7，不判 failed） |
+| deliverWaitForRuns = 5min | approve 后只等该 goal 的 **owner run**（sub-goal/consult/verify 不写 goal 分支，不阻塞交付——决策 6-6），超时报告"请稍后再批准" |
 | verify_timeout = 600s | 单条验证命令超时（−1 视同失败，防挂死 verify 让 run 永远 running） |
 | max_run_duration = 7200s | 单 run 最大时长，超时 → run cancelled（不耗 attempt），goal 保持 active |
 | idle watchdog 2min / 10min | 无输出静默停摆 / tool 在飞放宽窗 |
@@ -235,43 +250,44 @@ agent 干完（run 到终态）
 ### 6.1 域持共享仓，goal 持 worktree
 
 ```
-domain（agentwork 仓）
- └── 共享仓（daemon 持有，只 clone 一次）
-      ├── worktree-<goal-A> ← 分支 feat/xxx（任务 A 的工作区）
-      ├── worktree-<goal-B> ← 分支 feat/yyy（任务 B 的工作区）
-      └── ...
+~/.agentwork/runs/
+ ├── repos/<domainID>/         共享仓（bare，只 clone 一次；origin refspec 指 refs/remotes/origin/*）
+ ├── runs/<runID>/             per-run 临时 worktree（决策 6-2：owner 检 feat-<goal> 分支；
+ │                             sub-goal 分支 feat-<goal>-sg-<sub>；verify detached 快照）
+ └── deliver-<goalID>/         交付临时 worktree（detached 于 origin/<default>，交付后移除）
 ```
 
-- "在哪个域就在哪干活"：goal 挂 domain → daemon 分配该域一个 worktree（独立目录 + 独立分支）→ run 在此工作
-- 多任务并行：每 goal 一个 worktree 互不干扰（git worktree 是业界并行 agent 标准做法）
-- 同一 goal 的 run **顺序复用同一 worktree**（per-goal 串行，§4）
-- **延迟分配（决策 2-18）**：worktree 在第一个 run 开始前才创建（goal 先记录目标 branch），backlog 挂起不占磁盘资源
-- **共享仓同步**：每次 run 开始前 daemon fetch 共享仓（分支 base 新鲜）；deliver 时 pull 主分支。**fetch 与 deliver 共用同一把 per-domain 锁（决策 2-10）**——并发 fetch 同一共享仓会 index.lock 冲突
-- worktree 生命周期：goal 终态后保留 N 天再清理（后置，daemon 定时任务）
+- "在哪个域就在哪干活"：goal 挂 domain → daemon 为该域的 bare 共享仓分配 **run 级临时 worktree**（独立目录；owner 检 goal 分支，sub-goal 从 goal 分支 HEAD 切自己的分支，verify detached 只读快照）→ run 在此工作
+- 多任务并行：每 run 一个 worktree 互不干扰（git worktree 是业界并行 agent 标准做法）
+- **worktree 是暂态（决策 6-2）**：git 一个分支只能一个 checkout——run 结束立即释放（defer git worktree remove），下一个 run 从分支 HEAD 切新 workspace；checkpoint 走提交，不走文件态
+- **延迟分配（决策 2-18）**：worktree 在 run claim 后才创建，backlog 挂起不占磁盘资源
+- **共享仓同步**：每次 run 开始前 daemon fetch 共享仓（分支 base 新鲜）；deliver 时 fetch 主分支。**fetch 与 deliver 共用同一把 per-domain 锁（决策 2-10）**——并发 fetch 同一共享仓会 index.lock 冲突
+- worktree 磁盘目录生命周期：终态 run 的目录保留 worktreeRetentionDays=7 天后由 cleanupWorktrees 清理；崩溃遗留由启动 sweepRunWorktrees（worktree prune + 清 runs/）与 sweepDeliverWorktrees 处理（未提交 WIP 丢失是接受的代价——恢复 = 提交态 + transcript）
 
 ### 6.2 上下文恢复（A5，CPU 中断模型）
 
 | CPU 中断 | agentwork 卡点 |
 |---|---|
-| 保存现场（寄存器/PC） | run 事件持久化到 `chat_message` + 改动留在 worktree |
+| 保存现场（寄存器/PC） | run 事件持久化到 `chat_message` + 改动提交进 goal 分支（run 结束 commitRunChanges，checkpoint 走分支态） |
 | 处理中断 | 人审批（review 态） |
-| 恢复现场 | 新 run 回到同一 worktree（文件态）+ 重放上轮 transcript（会话态） |
+| 恢复现场 | 新 workspace 从分支 HEAD 切出（决策 6-2 修订：分支态 checkpoint）+ 重放上轮 transcript（会话态） |
 | 继续执行 | agent 从被打断处继续 |
 
 - **M0/M1：swap 模型**——现场存在 SQLite 和磁盘，等多久都不怕（进程不保活，机器重启不丢）。
 - **长驻路径**：ACP `session/load`/`session/resume`，`session_id` 已记录；等 agent 支持服务端会话时升级为进程级恢复。
 - transcript 重放：只重放被中断那轮的 transcript；超阈值截断/摘要（摘要后置）。
-- 新 run 开始前检查 worktree 干净性（git status），脏则报人。
+- worktree 干净性不再是恢复前提：`runs/<runID>` 路径即归属（决策 6-2），脏的就是该 run 自己的产物；consult/review/verify 结束时平台 reset --hard + clean 丢弃一切改动（只读契约）。
 
 ---
 
 ## 7. 交付：自动合入
 
 ```
-卡点 approve → daemon 在 goal 的 worktree 执行 deliver（确定性脚本，无 LLM）：
-  git checkout <default_branch> → git pull → git merge --no-ff <goal分支>
+卡点 approve → daemon 在临时 deliver worktree 执行 deliver（确定性脚本，无 LLM）：
+  等 owner run 结束（deliverWaitForRuns，决策 6-6）→ runs/deliver-<goalID> detached 检出
+  origin/<default> → git fetch → git merge --no-ff <goal分支>
   → 合并后【再跑一遍域验证】（合并后的 main 必须绿）
-  → git push → goal 层 MarkDelivered → done
+  → git push → goal 层 MarkDelivered → done → 移除临时 worktree
 失败（冲突/验证红）→ 不 push，goal 回 review 标注失败原因
   → 人可：重试 deliver / reject 回去让 agent 修（reject 语义天然覆盖）
 ```
@@ -307,7 +323,8 @@ daemon 启动时按顺序恢复，状态全在 SQLite + worktree，重启不丢�
 
 1. `RecoverStuckRunning`——遗留 `running` run 全部复位 queued，重新 claim；
 2. `recoverWorkers`——重建全部 agent worker；
-3. `recoverPendingDelivers`——扫描"review 且已 approve 但未 done"的 goal，重放 deliver（merge/push 幂等保证安全，决策 2-9）。
+3. `recoverPendingDelivers`——扫描"review 且已 approve 但未 done"的 goal，重放 deliver（merge/push 幂等保证安全，决策 2-9）；
+4. `sweepRunWorktrees` + `sweepDeliverWorktrees`——崩溃遗留的 per-run 临时 worktree 与 deliver worktree（git worktree prune + 清目录，决策 6-2；恢复 = 提交态 + transcript，未提交 WIP 丢失是接受的代价）。
 
 ### agentwork-cli 命令面（跨 agent 协作通道）
 
@@ -318,7 +335,7 @@ goal list | assign | create | comment | wait
 agent list · squad list · issue list
 ```
 
-agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任务创建），平台绝不解析 agent 输出流（不变量 3）。**2026-08 修正（决策 4-13）**：agent 协作已改为 MCP 工具，CLI 保留给 human 调试——agent 不再学命令语法。**2026-08 再修正（决策 5-2，替代 4-13）**：MCP 协作工具面重构为四行为模型——comment_goal（说）/ consult_agent（问）/ handoff_goal（接力）/ create_sub_goal（拆活）/ goal_wait（挂起等子完成）+ goal_list/agent_list/squad_list（查看）；goal_comment/goal_assign 移除。
+agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任务创建），平台绝不解析 agent 输出流（不变量 3）。**2026-08 修正（决策 4-13）**：agent 协作已改为 MCP 工具，CLI 保留给 human 调试——agent 不再学命令语法。**2026-08 再修正（决策 5-2，替代 4-13）**：MCP 协作工具面重构为四行为模型——comment_goal（说）/ consult_agent（问）/ handoff_goal（接力）/ create_sub_goal（拆活）/ goal_wait（挂起等子完成）+ goal_list/agent_list/squad_list（查看）；goal_comment/goal_assign 移除。**2026-08 三修（决策 6-10）**：blocked/wait 机制退役，goal_wait 移除；工具面扩充为 cancel_sub_goal / verify_sub_goal / integrate_change / get_change / get_sub_goal / get_verification。
 
 ---
 
@@ -379,7 +396,7 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | A2 | 在哪个域就在哪干活；`agent.workdir_base` 删除；agent 执行的 goal 必须有域 |
 | A3 | 与 A2 统一为 worktree 模型（域共享仓，goal 持 worktree+分支） |
 | A4 | 交付自动：approve → 平台 merge + 复验 + push；失败回 review 标注 |
-| A5 | 上下文恢复 = 同 worktree（文件态）+ transcript 重放（会话态）；session/resume 留作长驻路径 |
+| A5 | 上下文恢复 = 同 worktree（文件态）+ transcript 重放（会话态）；session/resume 留作长驻路径。**已被决策 6-2 修订**：恢复改为分支态 checkpoint（新 workspace 从分支 HEAD 切出）+ transcript 重放 |
 | A6 | 验证失败统一 run failed（attempt 重试），验证输出进 result_summary |
 | 盲点1 | per-goal run 串行化（service+daemon 双层，不做 DB 约束） |
 | 盲点2 | 机器失败重试与人 reject 迭代分开计数（reject 不误触 maxAttempts） |
@@ -429,7 +446,7 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策4-13 | **MCP 协作工具替代 CLI（已实现）**：协作动作（评论/交接/查看）直接做成 MCP 工具（agentwork_goal_comment / goal_assign / goal_list / agent_list / squad_list）——结构化参数、schema 自带、零学习成本；agent 不再学 CLI 语法（曾实测 agent 为搞清 CLI 用法去读平台源码）。agentwork-cli 保留二进制（human 调试），agent 引导全部指向 MCP 工具 |
 | 决策4-10 | **pingpong 阈值保持 4/8**：接力链每跳都计入 agent 触发（防甩锅口径），4 注入收敛警告 / 8 判死（可 Reopen 恢复、计数清零）；误伤"需求拆解差的长链"的代价 < 放过真甩锅链 |
 | 决策5-1 | **子 goal 复活（撤销决策 3-6）**：Collaboration.md 全盘采纳——协作四行为模型（Comment 说 / Consult 问 / Handoff 接力 / Sub-goal 拆活）要求子 goal 承担"拆活"路径；`CreateSubGoal` 恢复引导（AGENTWORK.md + MCP `create_sub_goal`），机制复用既有 WaitChildren/wakeParentIfReadyInTx/wake_count，父完成不自动完成。与 3-6 的区别：拆活入口从"agent 自建 goal"收窄为显式工具 + owner 权限（决策 5-6） |
-| 决策5-2 | **MCP 协作工具面重构（替代决策 4-13）**：移除 goal_comment/goal_assign；新工具 comment_goal（说）/ consult_agent（问）/ handoff_goal（接力）/ create_sub_goal（拆活）/ goal_wait（挂起等子完成），保留 goal_list/agent_list/squad_list。语义显式化：mention 不再承担任务委派或所有权转移 |
+| 决策5-2 | **MCP 协作工具面重构（替代决策 4-13）**：移除 goal_comment/goal_assign；新工具 comment_goal（说）/ consult_agent（问）/ handoff_goal（接力）/ create_sub_goal（拆活）/ goal_wait（挂起等子完成），保留 goal_list/agent_list/squad_list。语义显式化：mention 不再承担任务委派或所有权转移。**2026-08 经 6-10 修订**：goal_wait 随 blocked/wait 退役移除，工具面扩充 cancel_sub_goal/verify_sub_goal/integrate_change/get_change/get_sub_goal/get_verification |
 | 决策5-3 | **guest run 只读平台化**：consult/review run 不 commitRunChanges；平台在 run 结束时丢弃 guest 窗口期新产生的未提交改动（entry 脏路径快照求差，entry 已脏路径保留——A5 恢复模型）；guest 直接 commit 检测到写系统评论提醒（不 revert，无法无损还原 entry 状态） |
 | 决策5-4 | **run.role 显式化**：run 表加 role（owner\|subgoal\|consult\|review\|verify，2026-08 经 6-9 扩展），enqueue 时派生（isLeader/无 trigger→owner；trigger 评论 system→review、其余→consult）；角色是信息快照，归属判定仍按 reconcile 时刻动态查表（不变量不变） |
 | 决策5-5 | **run 状态 handed_off**：handoff 终止的旧 owner run 记为 handed_off（cancel_reason=handoff 保留），不再是 cancelled——"交接"不是取消/失败；不耗 attempt、不自动重试、notify 不推中断卡（同 cancelled+handoff 规则）；脏检查逃生门扩展（cancelled/handed_off/guest/review 历史均视为可归属）——**已撤销（决策 6-6：handed_off 回滚为 cancel_reason 语义，status 保持五态）** |
@@ -446,7 +463,7 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策6-6 | **Handoff 语义扩展 + handed_off 状态撤销（撤销 5-5）**：Handoff 是 Goal Owner 的变化不是 run 生命周期新状态——run.status 回五态，`cancel_reason=handed_off` 承担语义；handoff 只终止 owner 角色 run（sub-goal/consult/verify runs 继续，onGoalAssigned 按角色过滤）；forced handoff（MVP 唯一形态）：kill 后**不代提交 WIP**（mid-git-op 不安全），WIP 留 `runs/<old-runID>/` 取证，新 owner 从 branch HEAD 切新 workspace；deliver 只等 owner run（`deliverWaitForOwnerRuns`）；handoff_event 表保留；循环 4/8 审停不变 |
 | 决策6-7 | **consult 恢复路由 + 只读口径**：恢复目标 = requester_run_id 的 successor run（按 requester run 角色路由，禁止 goal_id→owner）；consult 只读 = **domain read-only**（不改 goal/sub-goal/change 状态；workspace ephemeral 写允许；不产生 Deliverable/Change） |
 | 决策6-8 | **Goal 级联与 attention**：Cancel 级联停 sub-goals/runs（Change/Verification 历史保留）；Delete 物理级联（软删除后置）；Reopen 不复活旧 sub-goal；`goal.attention` 列持久化派生状态，human owner attention → `goal.attention_needed` 事件 → IM 卡（不 spawn）；当前版本所有 sub-goal 均 required；**fan-out ≤20 active**（历史不限）；无代码 sub-goal = verified 且无 Change（交付物走评论 feed）；**owner run 终局守卫**：存在非终态 sub-goal 或 ready/conflict change 时，owner run 完成不进入卡点判定（goal 保持 active，attention 循环接管下一步）——人门只在最终状态触发——**已实现** |
-| 决策6-9 | **run.attempt 降级为实例序号**：重试判定权威移到实体计数（goal.execution_attempt / sub_goal.execution_attempt + quality_iteration）；run 是一次执行实例（sub-goal 与 run 是 1:N，关系真相 = run.sub_goal_id，无 current_run_id 指针） |
+| 决策6-9 | **run.attempt 降级为实例序号**：重试判定权威移到实体计数（goal.execution_attempt / sub_goal.execution_attempt + quality_iteration）；run 是一次执行实例（sub-goal 与 run 是 1:N，关系真相 = run.sub_goal_id，无 current_run_id 指针）。**实现注记**：sub_goal.execution_attempt/quality_iteration 已为权威；goal 层重试仍由 run.attempt 承担，goal.execution_attempt 列建而未用——对齐待做 |
 | 决策6-10 | **v2 数据模型与工具面**：新表 sub_goal/change/change_revision/verification_result；MCP 工具面 = comment_goal/consult_agent/handoff_goal/create_sub_goal/cancel_sub_goal/verify_sub_goal/integrate_change/get_change/get_sub_goal/get_verification/goal_list/agent_list/squad_list；**blocked/wait/parent 机制已退役**（WaitChildren/wake/wake_count/goal.parent_id 全部删除，goal 状态机回五态）——**已实现** |
 
 ---
