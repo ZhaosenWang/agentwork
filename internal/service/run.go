@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
@@ -26,6 +25,18 @@ type Run struct {
 	SessionID        string `json:"session_id"`
 	Workdir          string `json:"workdir"`
 	Status           string `json:"status"`
+	// Role is the run's collaboration role stamped at enqueue (决策 5-4):
+	// owner|subgoal|consult|review|verify ('' for processor runs).
+	// Informational snapshot — goal authority is judged DYNAMICALLY at
+	// reconcile (ownRunByGoal), never from this column.
+	Role             string `json:"role"`
+	// SubGoalID is the sub-goal this run executes ('' for goal-level runs).
+	SubGoalID        string `json:"sub_goal_id"`
+	// BaseRef/HeadRef are the Change revision refs the daemon stamps at a
+	// sub-goal run's end (merge-base of goal branch and the sub-goal branch,
+	// and the branch head SHA).
+	BaseRef          string `json:"base_ref"`
+	HeadRef          string `json:"head_ref"`
 	Attempt          int    `json:"attempt"`
 	ResultSummary    string `json:"result_summary"`
 	Evidence         string `json:"evidence"` // JSON: diff stats + verify output + summary
@@ -118,10 +129,15 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 	if isLeader {
 		leaderFlag = 1
 	}
+	role, err := s.resolveRunRole(ctx, tx, isLeader, triggerCommentID)
+	if err != nil {
+		return nil, nil, err
+	}
 	r := Run{
 		ID:              newID(),
 		GoalID:          goalID,
 		AgentID:         agentID,
+		Role:            role,
 		Attempt:         attempt,
 		IsLeaderRun:     isLeader,
 		SquadID:         squadID,
@@ -131,13 +147,35 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		CreatedAt:       ts,
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Attempt, r.ResultSummary, r.TriggerCommentID, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.Attempt, r.ResultSummary, r.TriggerCommentID, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
 		return nil, nil, fmt.Errorf("insert run: %w", err)
 	}
 	ev := &events.Event{Topic: "run:enqueued", Payload: r}
 	return &r, ev, nil
+}
+
+// resolveRunRole derives the run's collaboration role at enqueue time
+// (决策 5-4/6-9): leader runs and untriggered runs are owner runs; trigger-
+// comment runs are review (system-authored — the platform's review request)
+// or consult (agent/human-authored — a consult). Informational snapshot only.
+func (s *RunService) resolveRunRole(ctx context.Context, tx *sql.Tx, isLeader bool, triggerCommentID string) (string, error) {
+	if isLeader || triggerCommentID == "" {
+		return "owner", nil
+	}
+	var authorType string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT author_type FROM comment WHERE id=?`, triggerCommentID).Scan(&authorType); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "consult", nil // trigger comment vanished — treat as consult
+		}
+		return "", fmt.Errorf("resolve trigger author: %w", err)
+	}
+	if authorType == "system" {
+		return "review", nil
+	}
+	return "consult", nil
 }
 
 // EnqueueForGoal creates the first run for a goal based on its current
@@ -169,6 +207,130 @@ func (s *RunService) EnqueueExisting(ctx context.Context, goalID, agentID string
 // current assignee) and does NOT cancel any in-flight run.
 func (s *RunService) EnqueueForMention(ctx context.Context, goalID, agentID, triggerCommentID string) (*Run, error) {
 	return s.enqueue(ctx, goalID, agentID, 1, false, "", triggerCommentID)
+}
+
+// EnqueueSubGoalRun creates a sub-goal execution run (决策 6-1/6-9): role
+// subgoal, bound to the sub_goal via run.sub_goal_id, on the sub-goal's
+// assignee. Coalesces on a pending run for the same sub-goal (per-sub-goal
+// single-flight — the Claim guard enforces the rest). run.attempt mirrors the
+// sub-goal's execution_attempt+1 (informational ordinal).
+func (s *RunService) EnqueueSubGoalRun(ctx context.Context, subGoalID string) (*Run, error) {
+	var goalID, assigneeID string
+	var execAttempt int
+	err := s.st.DB().QueryRowContext(ctx,
+		`SELECT goal_id, assignee_id, execution_attempt FROM sub_goal WHERE id=?`, subGoalID).
+		Scan(&goalID, &assigneeID, &execAttempt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load sub-goal: %w", err)
+	}
+
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Coalesce per (sub_goal, ROLE): a pending VERIFY run must not swallow the
+	// assignee's rework run (the reject path enqueues it while the verifier is
+	// still finishing). Cross-role concurrency is governed by Claim's
+	// per-sub-goal single-flight, not by the enqueue coalesce.
+	var existing string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' AND status IN ('queued','running') LIMIT 1`, subGoalID).Scan(&existing)
+	if err == nil {
+		return &Run{ID: existing, GoalID: goalID, AgentID: assigneeID, Role: "subgoal", SubGoalID: subGoalID, Status: "queued"}, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("check pending sub-goal run: %w", err)
+	}
+
+	ts := now()
+	r := Run{
+		ID:        newID(),
+		GoalID:    goalID,
+		AgentID:   assigneeID,
+		Role:      "subgoal",
+		SubGoalID: subGoalID,
+		Attempt:   execAttempt + 1,
+		Status:    "queued",
+		QueuedAt:  ts,
+		CreatedAt: ts,
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,sub_goal_id,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.SubGoalID, r.Attempt, "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
+		return nil, fmt.Errorf("insert sub-goal run: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "run:enqueued", Payload: r})
+	return &r, nil
+}
+
+// EnqueueVerifyRun creates a verifier run (决策 6-5): role=verify, on the
+// sub-goal's named verifier agent, coalesced per sub-goal (the Claim guard's
+// per-sub-goal single-flight keeps it serialized with the assignee's runs —
+// the verifier judges a stable state).
+func (s *RunService) EnqueueVerifyRun(ctx context.Context, subGoalID string) (*Run, error) {
+	var goalID, verifierID string
+	err := s.st.DB().QueryRowContext(ctx,
+		`SELECT goal_id, verifier_id FROM sub_goal WHERE id=?`, subGoalID).
+		Scan(&goalID, &verifierID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load sub-goal: %w", err)
+	}
+	if verifierID == "" {
+		return nil, NewValidationError("the sub-goal has no agent verifier")
+	}
+
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	// Coalesce per (sub_goal, role) — see EnqueueSubGoalRun.
+	var existing string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='verify' AND status IN ('queued','running') LIMIT 1`, subGoalID).Scan(&existing)
+	if err == nil {
+		return &Run{ID: existing, GoalID: goalID, AgentID: verifierID, Role: "verify", SubGoalID: subGoalID, Status: "queued"}, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("check pending sub-goal run: %w", err)
+	}
+
+	ts := now()
+	r := Run{
+		ID:        newID(),
+		GoalID:    goalID,
+		AgentID:   verifierID,
+		Role:      "verify",
+		SubGoalID: subGoalID,
+		Attempt:   1,
+		Status:    "queued",
+		QueuedAt:  ts,
+		CreatedAt: ts,
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,sub_goal_id,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.SubGoalID, r.Attempt, "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
+		return nil, fmt.Errorf("insert verify run: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "run:enqueued", Payload: r})
+	return &r, nil
 }
 
 // EnqueueProcessorRun creates a platform-internal processor run (DESIGN.md
@@ -213,9 +375,9 @@ func (s *RunService) EnqueueProcessorRun(ctx context.Context, runType, domainID,
 		CreatedAt: ts,
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,prompt,session_id,workdir,status,attempt,result_summary,evidence,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, "", r.AgentID, r.RunKind, r.RunType, r.DomainID, r.Prompt, "", "", r.Status, 1, "", "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,prompt,session_id,workdir,status,role,attempt,result_summary,evidence,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, "", r.AgentID, r.RunKind, r.RunType, r.DomainID, r.Prompt, "", "", r.Status, "", 1, "", "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
 		return nil, fmt.Errorf("insert processor run: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -267,11 +429,15 @@ type ClaimedRow struct {
 // letting the daemon pass the set of agents with free capacity and claiming
 // only within that set. Returns (nil, nil) when nothing is claimable.
 //
-// PER-GOAL SERIALIZATION: a goal's runs are strictly sequential — a queued
-// run is not claimed while ANOTHER run of the same goal is running (the
-// worktree is exclusive to one run at a time; a mention-triggered run
-// arriving mid-run must WAIT, not race the worktree — the worktree-cleanliness
-// gate used to cancel it instead, which silently dropped the review step).
+// SERIALIZATION (决策 6-2, per-workspace): every run gets its OWN worktree, so
+// the old per-goal lock is gone. The remaining guards:
+//   - an OWNER run is not claimed while another owner run of the same goal is
+//     running (owner single-flight — the goal branch has one writer);
+//   - a SUB-GOAL run is not claimed while another run of the same sub-goal is
+//     running (per-sub-goal single-flight);
+//   - consult/review/verify runs are read-only snapshots and run freely in
+//     parallel.
+//
 // Processor runs (goal_id='') are unaffected.
 func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedRow, error) {
 	if len(readyAgents) == 0 {
@@ -295,7 +461,9 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 		   WHERE r.status='queued' AND r.agent_id IN (`+placeholders+`)
 		     AND NOT EXISTS (
 		       SELECT 1 FROM run r2
-		       WHERE r2.goal_id != '' AND r2.goal_id = r.goal_id AND r2.status='running'
+		       WHERE r2.status='running'
+		         AND ((r.role = 'owner' AND r2.role = 'owner' AND r2.goal_id != '' AND r2.goal_id = r.goal_id)
+		              OR (r.sub_goal_id != '' AND r2.sub_goal_id = r.sub_goal_id))
 		     )
 		   ORDER BY r.queued_at
 		   LIMIT 1
@@ -357,9 +525,9 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 	// Re-read the minimal context the goal layer needs to reconcile.
 	var rc goalRunContext
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary, trigger_comment_id
+		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary, trigger_comment_id, role, sub_goal_id, base_ref, head_ref
 		 FROM run WHERE id=?`, runID).
-		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary, &rc.TriggerCommentID)
+		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary, &rc.TriggerCommentID, &rc.Role, &rc.SubGoalID, &rc.BaseRef, &rc.HeadRef)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -369,25 +537,24 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 	if s.goalSvc == nil {
 		return errors.New("runSvc.goalSvc not wired")
 	}
-	return s.goalSvc.ReconcileOnRunEnd(ctx, rc)
+	if err := s.goalSvc.ReconcileOnRunEnd(ctx, rc); err != nil {
+		return err
+	}
+	// run.terminal is the Coordinator's wakeup hint (决策 6-4, P2-5): the
+	// latch's second edge — "owner run terminal → Reconcile" — subscribes here.
+	// Published AFTER the reconcile committed (invariant 13).
+	if rc.GoalID != "" {
+		s.bus.Publish(ctx, events.Event{Topic: "run.terminal", Payload: map[string]any{
+			"run_id": rc.RunID, "goal_id": rc.GoalID, "status": rc.Status,
+		}})
+	}
+	return nil
 }
 
-// NotifyChildDone is called after a sub-goal reaches a terminal status. It
-// delegates to the goal layer's parent-wake logic (which checks the parent is
-// blocked and all sub-goals terminal, then re-queues the parent's assignee).
-// Kept on RunService for convenience; the real guard is in GoalService.
-func (s *RunService) NotifyChildDone(ctx context.Context, childGoalID string) {
-	if s.goalSvc == nil {
-		return
-	}
-	if err := s.goalSvc.NotifyChildDone(ctx, childGoalID); err != nil {
-		log.Printf("run: notify child-done for goal %s: %v", childGoalID, err)
-	}
-}
 
 func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
+		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
 		 FROM run WHERE goal_id=? ORDER BY queued_at`, goalID)
 	if err != nil {
 		return nil, err
@@ -397,7 +564,7 @@ func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	for rows.Next() {
 		var r Run
 		var leaderFlag int
-		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.SessionID, &r.Workdir, &r.Status, &r.Attempt, &r.ResultSummary, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.SessionID, &r.Workdir, &r.Status, &r.Role, &r.Attempt, &r.ResultSummary, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		r.IsLeaderRun = leaderFlag != 0

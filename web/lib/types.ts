@@ -37,7 +37,6 @@ export interface Goal {
   id: string;
   title: string;
   description: string;
-  parent_id: string;
   domain_id: string;
   assignee_type: string; // agent | squad | human
   assignee_id: string;
@@ -50,6 +49,7 @@ export interface Goal {
   created_at: string;
   source_ref: string; // M4-B: "github:owner/repo#123" (external issue source)
   current_agent_id: string; // latest running/queued run's agent ('' = none)
+  attention: string; // v2 OwnerAttention：'' | integration | recovery | user_action
 }
 
 export interface GateRule {
@@ -114,6 +114,7 @@ export interface Run {
   session_id: string;
   workdir: string;
   status: RunStatus;
+  role: string; // owner | subgoal | consult | review | verify（决策 5-4/6-9，enqueue 时派生）
   attempt: number;
   result_summary: string;
   evidence: string; // JSON: diff stats + verify output + agent summary
@@ -143,6 +144,19 @@ export interface Squad {
   description: string;
   leader_id: string;
   instructions: string;
+  created_at: string;
+}
+
+export interface SubGoal {
+  id: string;
+  goal_id: string;
+  title: string;
+  description: string;
+  assignee_id: string;
+  verifier_id: string; // '' = 机器验证
+  status: string; // running | verifying | verified | rejected | cancelled | failed
+  execution_attempt: number;
+  quality_iteration: number;
   created_at: string;
 }
 
@@ -177,7 +191,9 @@ export type WSTopic =
   | "goal:retrying" | "goal:retry_failed" | "goal:waiting" | "goal:deleted"
   | "goal:reviewing" | "goal:approved" | "goal:review_resolved"
   | "goal:delivered" | "goal:deliver_failed"
-  | "run:enqueued" | "run:coalesced" | "run:claimed" | "run:discarded" | "run:event" | "run:cancelled"
+  | "run:enqueued" | "run:coalesced" | "run:claimed" | "run:discarded" | "run:event" | "run:cancelled" | "run:terminal"
+  | "sub_goal.created" | "sub_goal.verified" | "sub_goal.rejected" | "sub_goal.failed" | "sub_goal.cancelled"
+  | "change.ready" | "change.integrated" | "change.conflict"
   | "comment:created"
   | "agent:created" | "agent:deleted"
   | "squad:created" | "squad:deleted" | "squad:member_added"
@@ -199,6 +215,7 @@ export interface TimelineItem {
   run_id?: string;               // run: the run row (for detail fetch)
   agent_id?: string;             // run: the executing agent
   run_status?: string;           // run: queued|running|completed|failed|cancelled
+  role?: string;                 // run: owner|subgoal|consult|review|verify
   attempt?: number;              // run: machine-retry counter
   started_at?: string;           // run: execution window
   finished_at?: string;

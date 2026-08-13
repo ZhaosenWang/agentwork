@@ -174,6 +174,18 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
+	// run.terminal → ReconcileGoal (决策 6-4): the latch's second edge — any
+	// terminal run re-evaluates whether the goal needs its owner. The event is
+	// only a wakeup hint; ReconcileGoal recomputes from DB state.
+	bus.Subscribe("run.terminal", d.onRunTerminal)
+	// sub-goal state changes → ReconcileGoal (决策 6-4): the latch's first
+	// edge — a verified sub-goal (change ready) or a failed one (recovery)
+	// re-evaluates owner attention.
+	bus.Subscribe("sub_goal.verified", d.onSubGoalStateChanged)
+	bus.Subscribe("sub_goal.failed", d.onSubGoalStateChanged)
+	// A cancelled sub-goal's running run must stop (owner management, 决策
+	// 6-1) — same stop mechanism as goal cancel.
+	bus.Subscribe("sub_goal.cancelled", d.onSubGoalCancelled)
 	bus.Subscribe("goal:approved", d.onGoalApproved)
 	// Handoff (human reassign or `goal assign`): the goal's new owner takes
 	// over — the previous owner's running run must NOT keep going (it would
@@ -215,6 +227,7 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 func (d *Daemon) Run(ctx context.Context) error {
 	d.ctx = ctx
 	d.recoverWorkers(ctx)
+	d.sweepDeliverWorktrees(ctx)
 	if n, err := d.runSvc.RecoverStuckRunning(ctx); err != nil {
 		log.Printf("daemon: recover stuck running: %v", err)
 	} else if n > 0 {
@@ -428,6 +441,71 @@ func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
 	log.Printf("daemon: worker removed for agent %s", id)
 }
 
+// onRunTerminal funnels a terminal run into the Coordinator (决策 6-4): the
+// event is a wakeup hint only — ReconcileGoal recomputes the authoritative
+// state in its own transaction. DB work uses d.ctx (never the publisher's
+// HTTP-scoped ctx).
+func (d *Daemon) onRunTerminal(_ context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]any)
+	if !ok {
+		return
+	}
+	goalID, _ := m["goal_id"].(string)
+	if goalID == "" {
+		return
+	}
+	if err := d.goalSvc.ReconcileGoal(d.ctx, goalID); err != nil {
+		log.Printf("daemon: reconcile goal %s: %v", goalID, err)
+	}
+}
+
+// onSubGoalStateChanged funnels sub-goal state changes into the Coordinator
+// (决策 6-4): same wakeup-hint semantics as onRunTerminal.
+func (d *Daemon) onSubGoalStateChanged(_ context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]any)
+	if !ok {
+		return
+	}
+	goalID, _ := m["goal_id"].(string)
+	if goalID == "" {
+		return
+	}
+	if err := d.goalSvc.ReconcileGoal(d.ctx, goalID); err != nil {
+		log.Printf("daemon: reconcile goal %s: %v", goalID, err)
+	}
+}
+
+// onSubGoalCancelled terminates a cancelled sub-goal's running run (the
+// service already dropped queued ones and stamped the state).
+func (d *Daemon) onSubGoalCancelled(_ context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]any)
+	if !ok {
+		return
+	}
+	subGoalID, _ := m["sub_goal_id"].(string)
+	if subGoalID == "" {
+		return
+	}
+	rows, err := d.st.DB().QueryContext(d.ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND status='running'`, subGoalID)
+	if err != nil {
+		log.Printf("daemon: sub-goal cancel scan %s: %v", subGoalID, err)
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		log.Printf("daemon: sub-goal cancelled — stopping run %s", id)
+		d.cancelRun(id, "stopped")
+	}
+}
+
 // onGoalAssigned reacts to a goal changing hands (human reassign or an
 // agent's `goal assign`): the goal's OLD owner's running run must be cut.
 // Without this a handed-off agent keeps running — it believes its turn is
@@ -456,41 +534,54 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 		_ = d.st.DB().QueryRowContext(d.ctx, `SELECT leader_id FROM squad WHERE id=?`, g.AssigneeID).Scan(&ownerAgent)
 	}
 	rows, err := d.st.DB().QueryContext(d.ctx,
-		`SELECT id, agent_id FROM run WHERE goal_id=? AND status='running'`, g.ID)
+		// 决策 6-6: handoff only terminates the OWNER-role run — sub-goal,
+		// consult, review and verify runs continue (they don't write the goal
+		// branch; per-run workspaces make them safe in parallel).
+		`SELECT id, agent_id FROM run WHERE goal_id=? AND status='running' AND role='owner'`, g.ID)
 	if err != nil {
 		log.Printf("daemon: handoff cancel scan for %s: %v", g.ID, err)
 		return
 	}
-	defer rows.Close()
+	// Collect rows FIRST, then act: the stamp below writes to the DB, and a
+	// single-connection store (in-memory tests) deadlocks if the write runs
+	// while this cursor still holds the only connection.
+	type runningRun struct{ id, agentID string }
+	var toCut []runningRun
 	for rows.Next() {
-		var runID, agentID string
-		if err := rows.Scan(&runID, &agentID); err != nil {
+		var rr runningRun
+		if err := rows.Scan(&rr.id, &rr.agentID); err != nil {
 			continue
 		}
-		if agentID == ownerAgent {
+		toCut = append(toCut, rr)
+	}
+	rows.Close()
+	for _, rr := range toCut {
+		if rr.agentID == ownerAgent {
 			continue // the new owner's own run (re-assign to self) keeps going
 		}
 		d.mu.Lock()
-		cancel, ok := d.runCancels[runID]
+		cancel, ok := d.runCancels[rr.id]
 		if ok {
-			d.runCancelReasons[runID] = "handoff"
+			d.runCancelReasons[rr.id] = "handoff"
 		}
 		d.mu.Unlock()
 		if ok {
-			log.Printf("daemon: handoff cut run %s (agent %s no longer owns goal %s)", runID, agentID, g.ID)
+			log.Printf("daemon: handoff cut run %s (agent %s no longer owns goal %s)", rr.id, rr.agentID, g.ID)
 			cancel()
 			continue
 		}
 		// The claim→register window: the run was claimed (status='running')
 		// but runTask hasn't registered its cancel yet — the in-memory cut
-		// missed it. Stamp the run terminal in the DB; runTask's post-register
-		// self-check sees status != 'running' and self-cancels. The stamp is
-		// the only writer besides runTask itself, so no race with finishRun.
+		// missed it. Stamp the run terminal in the DB (决策 6-6: status stays
+		// 'cancelled', the structured cancel_reason carries the semantics);
+		// runTask's post-register self-check sees status != 'running' and
+		// self-cancels. The stamp is the only writer besides runTask itself,
+		// so no race with finishRun.
 		if _, err := d.st.DB().ExecContext(d.ctx,
-			`UPDATE run SET status='cancelled', finished_at=? WHERE id=? AND status='running'`, nowStr(), runID); err != nil {
-			log.Printf("daemon: handoff terminal stamp %s: %v", runID, err)
+			`UPDATE run SET status='cancelled', cancel_reason='handed_off', finished_at=? WHERE id=? AND status='running'`, nowStr(), rr.id); err != nil {
+			log.Printf("daemon: handoff terminal stamp %s: %v", rr.id, err)
 		} else {
-			log.Printf("daemon: handoff stamped run %s terminal (claim→register window)", runID)
+			log.Printf("daemon: handoff stamped run %s terminal (claim→register window)", rr.id)
 		}
 	}
 }
@@ -677,35 +768,45 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 
 // ── worktree model (DESIGN.md §6) ──
 //
-// Layout:
+// v2 layout (决策 6-2, run-scoped workspaces):
 //
-//	{workspaceRoot}/domains/{domainID}/repo/     shared repo (cloned once)
-//	{workspaceRoot}/domains/{domainID}/wt-{goalID}/  per-goal worktree
+//	{runsRoot}/runs/<runID>/         per-run worktree (owner runs check out the
+//	                                 goal branch; consult/review/verify runs
+//	                                 detach from a ref — read-only)
+//	{runsRoot}/repos/<domainID>/     shared bare repo (cloned once)
+//	{runsRoot}/proc/<runID>/         processor scratch dirs
 //
-// The domain owns the shared repo; each goal gets its own worktree + branch,
-// so multiple goals develop the same repo in parallel without interference.
-// Worktrees are allocated lazily (decision 2-18): the first run of a goal
-// creates it; later runs of the same goal reuse it — which is what makes
-// checkpoint resume (A5) work: the file-state is physically still there.
-// git operations on the shared repo (fetch, and every deliver) are
-// serialized per domain (decision 2-10): concurrent fetches would collide on
-// index.lock.
+// The domain owns the shared bare repo; each RUN gets its own worktree —
+// the execution-isolation unit (workspace ownership: the path runs/<runID>
+// belongs to that run, clean or not). The goal branch lives in the bare repo;
+// checkpoints travel via commits (A5 revised: branch state, not file state).
+// git operations on the shared repo (fetch, worktree add/remove, and every
+// deliver) are serialized per domain (decision 2-10): concurrent fetches
+// would collide on index.lock.
 
-// workspaceRoot is where domain repos and goal worktrees live.
-func workspaceRoot() string {
+// runsRoot is where run worktrees and the domain bare repos live.
+func runsRoot() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join(os.TempDir(), "agentwork-workspaces")
+		return filepath.Join(os.TempDir(), "agentwork-runs")
 	}
-	return filepath.Join(home, ".agentwork", "workspaces")
+	return filepath.Join(home, ".agentwork", "runs")
 }
 
 func domainRepoPath(domainID string) string {
-	return filepath.Join(workspaceRoot(), "domains", domainID, "repo")
+	return filepath.Join(runsRoot(), "repos", domainID)
 }
 
-func goalWorktreePath(domainID, goalID string) string {
-	return filepath.Join(workspaceRoot(), "domains", domainID, "wt-"+goalID)
+// runWorktreePath is the run's execution worktree — the workspace (决策 6-2:
+// path is the ownership boundary; a recovered run reuses its own dirty dir).
+func runWorktreePath(runID string) string {
+	return filepath.Join(runsRoot(), "runs", runID)
+}
+
+// deliverWorktreePath is the ephemeral worktree deliver uses to merge the
+// goal branch into the default branch (removed after the deliver step).
+func deliverWorktreePath(goalID string) string {
+	return filepath.Join(runsRoot(), "deliver-"+goalID)
 }
 
 // goalBranchName is the branch a goal's worktree works on.
@@ -810,14 +911,19 @@ func gitCloneURL(gitURL, credentials string) string {
 	return "https://" + cred + "@" + strings.TrimPrefix(gitURL, "https://")
 }
 
-// ensureGoalWorktree lazily allocates (decision 2-18) and syncs the goal's
-// worktree: fetches the shared repo (under the domain lock) and, if the
-// worktree does not exist yet, creates it on a fresh branch from the domain's
-// default branch. Returns the worktree path.
-func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitURL, gitCredentials, defaultBranch string) (string, error) {
-	wt := goalWorktreePath(domainID, goalID)
+// ensureRunWorktreeFor allocates the run's worktree (决策 6-2): owner runs
+// check out the goal branch (created from the domain's default branch on the
+// first run; later runs reuse the branch — the A5 checkpoint now travels via
+// commits, not file state). Sub-goal runs (subGoalID != '') branch from the
+// goal branch's current HEAD on their own sub-goal branch — that HEAD is the
+// Change revision's integration base. Verify runs DETACH at the sub-goal
+// branch head (read-only review of a stable state). A recovered run reuses
+// its own directory as-is (workspace ownership: runs/<runID> dirt belongs to
+// that run). Returns the worktree path.
+func (d *Daemon) ensureRunWorktreeFor(ctx context.Context, runID, domainID, goalID, subGoalID, role, gitURL, gitCredentials, defaultBranch string) (string, error) {
+	wt := runWorktreePath(runID)
 	if _, err := os.Stat(filepath.Join(wt, ".git")); err == nil {
-		return wt, nil
+		return wt, nil // recovery path: the run re-claims its own workspace
 	}
 	unlock := d.lockDomain(domainID)
 	defer unlock()
@@ -829,21 +935,57 @@ func (d *Daemon) ensureGoalWorktree(ctx context.Context, domainID, goalID, gitUR
 	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("git fetch: %w: %s", err, string(out))
 	}
-	// Create the branch from the domain's configured default branch
-	// (DESIGN.md §6: the domain owns default_branch). If origin/
-	// {defaultBranch} does not exist, the error names it — the domain config
-	// is wrong and the owner fixes it. No silent fallbacks.
 	if defaultBranch == "" {
 		defaultBranch = "main"
 	}
+
+	if subGoalID != "" {
+		if role == "verify" {
+			// Verify workspace: a DETACHED snapshot of the sub-goal branch —
+			// the verifier judges a stable state, never writes the branch.
+			cmd := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "--detach", wt, "refs/heads/"+subGoalBranchName(goalID, subGoalID))
+			if out, err := cmd.CombinedOutput(); err != nil {
+				return "", fmt.Errorf("git worktree add (verify): %w: %s", err, string(out))
+			}
+			return wt, nil
+		}
+		// Sub-goal workspace: branch from the goal branch's HEAD (falling back
+		// to origin/<default> when the goal branch does not exist yet — the
+		// owner split work before its first commit).
+		base := "refs/heads/" + goalBranchName(goalID)
+		if _, err := exec.CommandContext(ctx, "git", "-C", repo, "rev-parse", "--verify", "--quiet", base).CombinedOutput(); err != nil {
+			base = "origin/" + defaultBranch
+		}
+		cmd := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "-b", subGoalBranchName(goalID, subGoalID), wt, base)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// The branch may exist from an earlier attempt (retry path).
+			if exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", wt, subGoalBranchName(goalID, subGoalID)).Run() != nil {
+				return "", fmt.Errorf("git worktree add (sub-goal): %w: %s", err, string(out))
+			}
+		}
+		return wt, nil
+	}
+
+	// Owner workspace: the goal branch, created from the domain's configured
+	// default branch (DESIGN.md §6: the domain owns default_branch). If
+	// origin/{defaultBranch} does not exist, the error names it — the domain
+	// config is wrong and the owner fixes it. No silent fallbacks.
 	cmd := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "-b", goalBranchName(goalID), wt, "origin/"+defaultBranch)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// The branch may already exist from an earlier run (resume path).
+		// The branch may already exist from an earlier run (checkpoint path).
 		if exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", wt, goalBranchName(goalID)).Run() != nil {
 			return "", fmt.Errorf("git worktree add: %w: %s", err, string(out))
 		}
 	}
 	return wt, nil
+}
+
+// subGoalBranchName names the sub-goal's branch in the bare repo.
+func subGoalBranchName(goalID, subGoalID string) string {
+	if len(subGoalID) > 8 {
+		subGoalID = subGoalID[:8]
+	}
+	return goalBranchName(goalID) + "-sg-" + subGoalID
 }
 
 // gitRun runs a git command in dir and returns its combined output.
@@ -874,26 +1016,25 @@ func insertFiredGoal(ctx context.Context, tx *sql.Tx, goalID, title, desc, domai
 	return err
 }
 
-// ── worktree lifecycle (M1) ──
+// ── worktree lifecycle (决策 6-2, run-scoped) ──
 
-// cleanupWorktrees removes worktrees of goals that reached a terminal state
-// more than worktreeRetentionDays ago. The goal's branch stays in the shared
-// repo (history is preserved); only the checkout is reclaimed.
+// cleanupWorktrees removes run worktrees whose run reached a terminal state
+// more than worktreeRetentionDays ago (runs/<runID> is the workspace — the
+// branch state lives in the bare repo; only the checkout is reclaimed).
 func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 	rows, err := d.st.DB().QueryContext(ctx,
-		`SELECT g.id, g.domain_id, MAX(r.finished_at)
-		 FROM goal g JOIN run r ON r.goal_id = g.id
-		 WHERE g.status IN ('done','failed','cancelled')
-		 GROUP BY g.id, g.domain_id`)
+		`SELECT id, finished_at FROM run
+		 WHERE status IN ('completed','failed','cancelled')
+		   AND finished_at != ''`)
 	if err != nil {
 		log.Printf("daemon: cleanup worktrees: query: %v", err)
 		return
 	}
-	type row struct{ goalID, domainID, finished string }
+	type row struct{ runID, finished string }
 	var found []row
 	for rows.Next() {
 		var r row
-		if err := rows.Scan(&r.goalID, &r.domainID, &r.finished); err != nil {
+		if err := rows.Scan(&r.runID, &r.finished); err != nil {
 			continue
 		}
 		found = append(found, r)
@@ -902,24 +1043,49 @@ func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 
 	cutoff := time.Now().Add(-worktreeRetentionDays * 24 * time.Hour)
 	for _, r := range found {
-		if r.domainID == "" {
-			continue
-		}
 		t, err := time.Parse(time.RFC3339Nano, r.finished)
 		if err != nil || t.After(cutoff) {
 			continue
 		}
-		wt := goalWorktreePath(r.domainID, r.goalID)
+		wt := runWorktreePath(r.runID)
 		if _, err := os.Stat(wt); err != nil {
 			continue
 		}
-		unlock := d.lockDomain(r.domainID)
-		if out, err := gitRun(ctx, domainRepoPath(r.domainID), "worktree", "remove", "--force", wt); err != nil {
-			log.Printf("daemon: cleanup worktree %s: %v %s", r.goalID, err, out)
+		// run worktrees were born in some domain's bare repo — find it via the
+		// run's goal; removal goes through git (worktree bookkeeping).
+		var domainID string
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT g.domain_id FROM goal g JOIN run r ON r.goal_id = g.id WHERE r.id=?`, r.runID).Scan(&domainID)
+		if domainID == "" {
+			continue
+		}
+		unlock := d.lockDomain(domainID)
+		if out, err := gitRun(ctx, domainRepoPath(domainID), "worktree", "remove", "--force", wt); err != nil {
+			log.Printf("daemon: cleanup worktree %s: %v %s", r.runID, err, out)
 		} else {
-			log.Printf("daemon: removed worktree for terminal goal %s (retention expired)", r.goalID)
+			log.Printf("daemon: removed worktree for terminal run %s (retention expired)", r.runID)
 		}
 		unlock()
+	}
+}
+
+// sweepDeliverWorktrees drops leftover ephemeral deliver worktrees (a deliver
+// crashed mid-merge leaves runs/deliver-<goalID> behind). Called at startup —
+// the worktree is recreated per deliver, so dropping is always safe.
+func (d *Daemon) sweepDeliverWorktrees(ctx context.Context) {
+	entries, err := os.ReadDir(runsRoot())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "deliver-") {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(runsRoot(), e.Name())); err != nil {
+			log.Printf("daemon: sweep deliver worktree %s: %v", e.Name(), err)
+		} else {
+			log.Printf("daemon: swept stale deliver worktree %s", e.Name())
+		}
 	}
 }
 
@@ -935,13 +1101,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
-	var triggerAuthor, triggerCommentID, triggerCommentContent string
+	var triggerAuthor, triggerCommentID, triggerCommentContent, runRole, subGoalID string
 	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
 		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
 		        g.source_ref, d.git_credentials,
-		        r2.trigger_comment_id, COALESCE(c.author_type, ''), COALESCE(c.content, '')
+		        r2.trigger_comment_id, COALESCE(c.author_type, ''), COALESCE(c.content, ''), r2.role, r2.sub_goal_id
 		 FROM run r2
 		 JOIN goal g ON g.id = r2.goal_id
 		 LEFT JOIN domain d ON d.id = g.domain_id
@@ -949,73 +1115,51 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 JOIN runtime r ON r.id = a.runtime_id
 		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent)
-	// Review run (DESIGN.md 决策 4-4): triggered by a SYSTEM comment — the
-	// platform's review request ("请审查本次改动…只提意见"). Its product is
-	// the opinion, not code: no commit of its worktree changes.
-	reviewRun := triggerAuthor == "system"
-	// collaborationRun: the run was pulled in by a teammate's comment (agent
-	// author) — the trigger comment is this turn's instruction.
-	collaborationRun := triggerAuthor == "agent"
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &runRole, &subGoalID)
+	// Run role (决策 5-4/6-x, stamped at enqueue): review runs are the
+	// platform's review requests (SYSTEM trigger comment — "请审查本次改动…
+	// 只提意见"); consult runs are pulled in by an agent/human mention comment
+	// — the trigger comment is this turn's instruction. Owner runs carry the
+	// goal's execution authority (judged dynamically at reconcile, not here).
+	// Sub-goal runs execute ONE work item on their own branch — the goal's
+	// state machine is untouched by their outcome (决策 6-1).
+	reviewRun := runRole == "review"
+	consultRun := runRole == "consult"
+	subGoalRun := runRole == "subgoal"
+	verifyRun := runRole == "verify"
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
 	}
+	// A sub-goal run's task is the WORK ITEM, not the goal (the goal's
+	// description would re-execute the whole goal).
+	if subGoalRun || verifyRun {
+		var sgTitle, sgDesc string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT title, description FROM sub_goal WHERE id=?`, subGoalID).Scan(&sgTitle, &sgDesc); err != nil {
+			d.failRun(ctx, q, fmt.Sprintf("load sub-goal: %v", err))
+			return
+		}
+		title, desc = sgTitle, sgDesc
+	}
 
 	d.ensureWorker(q.AgentID, maxConcurrent)
 
-	// Working directory (DESIGN.md §6): the run works in the goal's
-	// worktree — lazily allocated on first run, reused on later runs of the
-	// same goal (this is what makes checkpoint resume work: the file state is
-	// physically still there). Every agent-executed run belongs to a domain
-	// (Create and Assign enforce it), so there is no scratch fallback.
+	// Working directory (决策 6-2): every run gets its OWN worktree under
+	// runs/<runID> — the workspace. Owner runs check out the goal branch
+	// (checkpoints travel via commits); sub-goal runs branch from the goal
+	// branch's current HEAD (their Change's integration base); a recovered
+	// run re-claims its own directory as-is (workspace ownership: its dirt
+	// is its own). Fresh workspaces make the old unattributed-dirt park
+	// unnecessary — there is no shared worktree a manual edit could pollute.
 	if domainID == "" {
 		d.failRun(ctx, q, "run's goal has no domain — cannot allocate a worktree")
 		return
 	}
-	runRowWorkdir, err := d.ensureGoalWorktree(ctx, domainID, q.GoalID, gitURL, gitCredentials, defaultBranch)
+	runRowWorkdir, err := d.ensureRunWorktreeFor(ctx, q.RunID, domainID, q.GoalID, subGoalID, runRole, gitURL, gitCredentials, defaultBranch)
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
 		return
-	}
-	// Worktree cleanliness (DESIGN.md §4): a run must not start on a
-	// worktree carrying changes nobody can account for — the daemon would
-	// sweep a human's manual edits into the goal's commits. AGENTWORK.md
-	// (platform-injected) and the domain-declared excludes are EXPECTED; a
-	// cancelled previous run's leftovers are attributable (the checkpoint
-	// resume model relies on them). Anything else dirty at run start parks
-	// the goal in review for the human.
-	//
-	// Two escape hatches keep this from deadlocking:
-	//   - a prior cancelled run → the dirt is that run's leftovers (resume);
-	//   - the goal was just REJECTED → the dirt is what the agent must fix
-	//     this round (the human told it to, via the review decision note) —
-	//     blocking the run would trap the goal in park→reject forever.
-	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
-	if dirty := unattributedDirty(ctx, runRowWorkdir, checks.Excludes); dirty != "" {
-		var priorCancelled int
-		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='cancelled'`, q.GoalID).Scan(&priorCancelled)
-		var handoff string
-		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT handoff_note FROM goal WHERE id=?`, q.GoalID).Scan(&handoff)
-		justRejected := strings.HasPrefix(handoff, "Review decision: reject")
-		if priorCancelled == 0 && !justRejected {
-			reason := "worktree 有未归因的改动（可能是手动编辑）：\n" + dirty + "\n请检查 worktree 后批准继续或驳回。"
-			if err := d.goalSvc.ParkForManualReview(ctx, q.GoalID, reason); err != nil {
-				log.Printf("daemon: park %s for manual review: %v", q.GoalID, err)
-			}
-			// The run is parked WITHOUT the cancelled auto-retry path: the goal
-			// is already in review (park set it) and a retry would re-park and
-			// burn attempts. Stamp the run terminal directly — no Finish, no
-			// reconcile (the goal layer already moved).
-			if _, err := d.st.DB().ExecContext(ctx,
-				`UPDATE run SET status='cancelled', finished_at=? WHERE id=?`, nowStr(), q.RunID); err != nil {
-				log.Printf("daemon: park run %s terminal: %v", q.RunID, err)
-			}
-			return
-		}
-		log.Printf("daemon: worktree dirty for %s but attributable (cancelled leftovers or reject round) — continuing", q.GoalID)
 	}
 
 	// Environment readiness BEFORE the agent starts (决策 3-1, the setup half):
@@ -1026,6 +1170,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// guarantee the judging environment is fresh). A failed setup here is an
 	// environment failure — the run fails with that attribution, the retry
 	// chain applies as usual.
+	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
 	if checksFrozen && len(checks.Setup) > 0 {
 		setupReport, ok := runSetupOnly(ctx, runRowWorkdir, checks, timeout)
 		if !ok {
@@ -1179,13 +1324,31 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// injected — it lives in the comment feed (the creation comment), which
 	// is injected below as team context (决策 4-6): the collaborator reads
 	// the background from the feed, and acts on the trigger comment.
-	if collaborationRun {
-		prompt = buildPrompt("协作请求", "> "+triggerCommentContent, handoff)
+	if consultRun {
+		// A CONSULT (决策 5-1/5-2): the mention asked for information/judgment.
+		// READ-ONLY by platform contract (决策 5-3) — the worktree is the
+		// owner's state; edits made here are discarded at run end, commits are
+		// flagged. Answer the question, post the answer as a comment.
+		prompt = buildPrompt("Consultation request", "> "+triggerCommentContent, handoff) +
+			"\n\nYou are the consulted expert (a READ-ONLY consult run). Answer the question with your analysis and advice, and post the answer to the comment feed with agentwork_comment_goal.\n" +
+			"Do NOT modify any file in the worktree, do NOT git commit, do NOT execute the task itself — your edits are discarded by the platform. End your turn right after answering."
 	} else if reviewRun {
-		prompt = "你是审查者（reviewer）。请审查本次改动（squad 规矩：成员写完代码后由 reviewer 审查）。\n\n" +
-			"只提意见，不要修改任何文件，不要执行任务本身。\n" +
-			"审查工作区中的改动（diff、测试、质量），然后把你的意见用 agentwork_goal_comment 工具发到评论区（供审批人参考）。\n" +
-			"意见要具体：问题、风险、改进建议。如果改动没问题，明确说明。"
+		prompt = "You are a reviewer. Review the current changes (squad rule: after a member implements, a reviewer reviews).\n\n" +
+			"Give your opinion ONLY — do not modify any file, do not execute the task itself.\n" +
+			"Inspect the changes in the worktree (diff, tests, quality), then post your opinion to the comment feed with agentwork_comment_goal (the approver reads it).\n" +
+			"Be specific: problems, risks, improvement suggestions. If the changes look good, say so explicitly."
+	} else if verifyRun {
+		// A VERIFIER (决策 6-5): the sub-goal's quality gate — machine checks
+		// passed, now the named verifier judges. READ-ONLY workspace; the
+		// verdict goes through the STRUCTURED tool (never stdout) — the
+		// platform makes the verified/rejected transition from it.
+		prompt = "You are the verifier for this sub-goal. Judge whether the work product meets its requirements.\n\n" +
+			"Task: " + title + "\n" + desc + "\n\n" +
+			"The worktree holds the sub-goal branch (READ-ONLY). Inspect the implementation, tests and quality — you may RUN tests, but do not modify any file and do not commit.\n\n" +
+			"Then issue your verdict ONCE with agentwork_verify_sub_goal:\n" +
+			"- verdict=\"passed\": summary states what you verified, evidence carries key artifacts (test output excerpts etc.)\n" +
+			"- verdict=\"rejected\": summary must list the CONCRETE problems (the assignee fixes from them)\n\n" +
+			"Give the verdict once, then end your turn immediately."
 	}
 
 	// Workspace guidance (DESIGN.md 决策 4-8), injected for EVERY run — one
@@ -1195,7 +1358,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// ACP protocol capabilities (deterministic); the agent maps them to its
 	// own tools — its toolset is its own business, agentwork states the
 	// environment facts and the collaboration contract.
-	prompt += workspaceGuidance(runRowWorkdir)
+	prompt += worktreeGuidance(runRowWorkdir)
 
 	// The domain's acceptance policy in NL (the "what counts as done" the
 	// OWNER defined) — the agent works toward it instead of finding out at
@@ -1208,8 +1371,26 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	_ = d.st.DB().QueryRowContext(ctx,
 		`SELECT d.policy_text FROM goal g JOIN domain d ON d.id=g.domain_id WHERE g.id=?`, q.GoalID).Scan(&policyText)
 	if s := strings.TrimSpace(policyText); s != "" {
-		prompt += "\n\n## 验收策略（这个域的完成标准，由域所有者定义）\n" + s +
-			"\n\n机器会按此验收你的改动——干活时对照它，避免返工。"
+		prompt += "\n\n## Acceptance policy (this domain's definition of done, set by the domain owner)\n" + s +
+			"\n\nThe machine will judge your changes against this — work toward it to avoid rework."
+	}
+
+	// Sub-goal rework context (决策 6-5/6-3): a rejected verdict or a
+	// conflicted change is WHY this round runs — inject it so the assignee
+	// fixes, not redoes.
+	if subGoalRun && subGoalID != "" {
+		var rejectSummary string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT summary FROM verification_result WHERE sub_goal_id=? AND status='rejected' ORDER BY created_at DESC LIMIT 1`,
+			subGoalID).Scan(&rejectSummary); err == nil && strings.TrimSpace(rejectSummary) != "" {
+			prompt += "\n\n## Why your previous round was rejected (fix from this — do NOT start over)\n" + rejectSummary
+		}
+		var chStatus string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT status FROM change WHERE sub_goal_id=? ORDER BY created_at DESC LIMIT 1`,
+			subGoalID).Scan(&chStatus); err == nil && chStatus == "conflict" {
+			prompt += "\n\n## Your previous Change conflicted at integration\nResolve it against the new integration base (the goal branch's current state); your new Revision replaces the old one."
+		}
 	}
 
 	// The verification-failure feedback loop: a RETRY run (attempt > 1, the
@@ -1222,25 +1403,67 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		if err := d.st.DB().QueryRowContext(ctx,
 			`SELECT result_summary FROM run WHERE goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`,
 			q.GoalID).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
-			prompt += "\n\n## 上一轮失败原因（机器验证未通过——据此修改现有代码，不要从零重做）\n" + truncateIn(lastFail, 1500)
+			prompt += "\n\n## Why the previous round failed (machine verification did not pass — fix the existing code, do NOT start over)\n" + truncateIn(lastFail, 1500)
 		}
 	}
 
 	prompt += d.commentsInjection(ctx, q.GoalID)
 	if len(issueComments) > 0 {
 		var b strings.Builder
-		b.WriteString("\n\n## Issue 最新交流（来自 GitHub）\n")
+		b.WriteString("\n\n## Latest issue conversation (from the remote)\n")
 		for _, cm := range issueComments {
 			fmt.Fprintf(&b, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
 		}
 		prompt += b.String()
 	}
+	// Owner Resume Context (决策 6-4): a spawned owner run needs to know WHY
+	// it was woken — the attention index, not a DB dump. Changes ready for
+	// integration, failed sub-goals, the verification state. Expand details
+	// on demand via agentwork_get_change / get_sub_goal / get_verification.
+	if runRole == "owner" {
+		if attention := d.goalAttention(ctx, q.GoalID); attention != "" {
+			prompt += "\n\n## Owner Attention (why you were woken)\n"
+			changes, _ := d.goalSvc.ListChanges(ctx, q.GoalID)
+			var ready, conflicted []string
+			for _, c := range changes {
+				if c.Status == "ready" {
+					ready = append(ready, c.ID)
+				} else if c.Status == "conflict" {
+					conflicted = append(conflicted, c.ID)
+				}
+			}
+			if len(ready) > 0 {
+				prompt += fmt.Sprintf("- %d change(s) ready to integrate (inspect with agentwork_get_change, merge each with agentwork_integrate_change)\n", len(ready))
+			}
+			if len(conflicted) > 0 {
+				prompt += fmt.Sprintf("- %d change(s) in conflict (the assignee was woken to rework; wait for the new Revision)\n", len(conflicted))
+			}
+			sgs, _ := d.goalSvc.ListSubGoals(ctx, q.GoalID)
+			var failed int
+			var verified int
+			for _, sg := range sgs {
+				if sg.Status == "failed" {
+					failed++
+				} else if sg.Status == "verified" {
+					verified++
+				}
+			}
+			if failed > 0 {
+				prompt += fmt.Sprintf("- %d sub-goal(s) failed (inspect with agentwork_get_sub_goal, then cancel or re-create)\n", failed)
+			}
+			if verified > 0 {
+				prompt += fmt.Sprintf("- %d sub-goal(s) verified\n", verified)
+			}
+			prompt += "Handle these attention items, then continue the goal's own work or end your turn.\n"
+		}
+	}
+
 	// Mention-cycle hint (soft tier): the goal's agent-triggered churn is
 	// above the hint threshold — tell the agents to stop circular handoffs
 	// instead of perpetuating them. (The hard tier fails the goal at the
 	// trigger site.)
 	if n, err := d.agentTriggeredRunCount(ctx, q.GoalID); err == nil && n > service.MaxMentionHints {
-		prompt += fmt.Sprintf("\n\n⚠️ 协作警告：agent 之间已互相转移任务 %d 次。请不要再把任务转给其他 agent——自己完成剩余工作，或结束本轮等待人工处理。", n)
+		prompt += fmt.Sprintf("\n\n⚠️ Collaboration warning: agents have handed this task back and forth %d times. Do NOT hand it off again — finish the remaining work yourself, or end your turn and leave it for a human.", n)
 	}
 
 	backend, err := d.protoReg.Get(provider)
@@ -1331,6 +1554,25 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// The event stream is done — flush the aggregated text buffer so the last
 	// message of the turn is persisted (persistEvent aggregates per-role).
 	d.flushRunMessages(ctx, q.RunID)
+
+	// Consult/review read-only enforcement (决策 6-2/6-7): the run's workspace
+	// started CLEAN (fresh worktree from a ref) — whatever the outcome, reset
+	// it to HEAD and clean untracked files (domain read-only: ephemeral writes
+	// allowed, nothing survives). A guest that committed DIRECTLY is flagged
+	// in the feed (not reverted — HEAD may carry the owner's history under
+	// it... the fresh workspace makes baseSHA==claim-HEAD, so any commit is
+	// the guest's own and only flagged for human visibility).
+	if (reviewRun || consultRun || verifyRun) && domainID != "" {
+		resetGuestWorkspace(ctx, runRowWorkdir)
+		if committed := guestCommittedLog(ctx, runRowWorkdir, baseSHA); committed != "" {
+			if _, err := d.st.DB().ExecContext(ctx,
+				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,'system','',NULL,?,?,?)`,
+				uuid.NewString(), q.GoalID, "⚠️ A read-only run committed changes directly (consult/review contract violated) — they stay on the goal branch and are visible before delivery:\n```\n"+committed+"\n```", nowStr(), q.RunID); err != nil {
+				log.Printf("daemon: guest commit warning for run %s: %v", q.RunID, err)
+			}
+		}
+	}
+
 	switch result.Status {
 	case proto.StatusCompleted:
 		// The handoff/wakeup note is consumed by the goal layer (ReconcileOnRunEnd
@@ -1359,11 +1601,10 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// branch, and uncommitted work would deliver nothing). The
 			// domain's declared excludes (checks.excludes, compiled + owner-
 			// confirmed) keep dependency dirs out of the branch.
-			// A REVIEW run is exempt (DESIGN.md 决策 4-4): its product is the
-			// opinion, not code — review artifacts must not merge into the
-			// goal branch. Leftovers (if the reviewer edited anyway) fail the
-			// next run's dirty check into a human park — a safe fallback.
-			if !reviewRun {
+			// GUEST and REVIEW runs are exempt (决策 5-3): their product is
+			// opinion/information, not code — nothing of theirs merges into
+			// the goal branch; window changes were already discarded above.
+			if !reviewRun && !consultRun && !verifyRun {
 				if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID), checks.Excludes); err != nil {
 					d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
 					return
@@ -1405,12 +1646,30 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				// fire on the run's changed paths. The fired gates are recorded on
 				// the run row — the goal layer reads them in the reconcile
 				// transaction (the daemon computes, the goal layer judges).
-				gatesHit := evalGates(ctx, runRowWorkdir, baseSHA, checks)
-				if len(gatesHit) > 0 {
-					gatesJSON, _ := json.Marshal(gatesHit)
-					if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET gates_hit=? WHERE id=?`, string(gatesJSON), q.RunID); err != nil {
-						log.Printf("daemon: record gates_hit for run %s: %v", q.RunID, err)
+				// SUB-GOAL runs skip gates (决策 6-1): their work item has no
+				// human checkpoint — verification is machine (or the optional
+				// agent verifier, 决策 6-5), the human gates stay goal-level.
+				if !subGoalRun && !verifyRun {
+					gatesHit := evalGates(ctx, runRowWorkdir, baseSHA, checks)
+					if len(gatesHit) > 0 {
+						gatesJSON, _ := json.Marshal(gatesHit)
+						if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET gates_hit=? WHERE id=?`, string(gatesJSON), q.RunID); err != nil {
+							log.Printf("daemon: record gates_hit for run %s: %v", q.RunID, err)
+						}
 					}
+				}
+			}
+			// Sub-goal runs stamp the Change revision refs (决策 6-3): the
+			// revision's integration base (merge-base of the goal branch and the
+			// sub-goal branch) + the delivered head — the sub-goal layer creates
+			// Change + Revision atomically from these.
+			if subGoalRun && subGoalID != "" {
+				goalBranch := goalBranchName(q.GoalID)
+				base := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "merge-base", goalBranch, "HEAD"))
+				head := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
+				if _, err := d.st.DB().ExecContext(ctx,
+					`UPDATE run SET base_ref=?, head_ref=? WHERE id=?`, base, head, q.RunID); err != nil {
+					log.Printf("daemon: stamp change refs for run %s: %v", q.RunID, err)
 				}
 			}
 			// Evidence bundle for the approval card (decision 2-3).
@@ -1460,6 +1719,10 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				log.Printf("daemon: requeue cancelled run %s: %v", q.RunID, err)
 			}
 		}
+		// 决策 6-6: a handoff cut keeps status='cancelled' — the structured
+		// cancel_reason ('handed_off') carries the semantics (handoff is a
+		// Goal-level event, not a run lifecycle state). Same non-retry,
+		// non-notify behavior as before.
 		d.finishRun(ctx, q, "cancelled", summary)
 		// Surface the stall so the notify layer can tell the owner a task
 		// stalled (cancelled runs leave the goal active with no pending run —
@@ -1518,7 +1781,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	// empty dir produced "pip install -r requirements.txt" for a zero-
 	// dependency repo and every verification failed). Intake runs keep the
 	// scratch dir (no repo involved).
-	runRowWorkdir := filepath.Join(workspaceRoot(), "proc", q.RunID)
+	runRowWorkdir := filepath.Join(runsRoot(), "proc", q.RunID)
 	if runType == "compile" {
 		var gitURL, gitCredentials, defaultBranch string
 		_ = d.st.DB().QueryRowContext(ctx,
@@ -1606,14 +1869,14 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		delete(d.mcpExecs, q.RunID)
 		d.mu.Unlock()
 	}()
-	prompt += workspaceGuidance(runRowWorkdir)
+	prompt += worktreeGuidance(runRowWorkdir)
 	// The artifact's ABSOLUTE path: a processor's scratch dir is opaque to the
 	// agent — told to "write intake.json in the current directory", it guessed
 	// (a write_file call missing its path argument, then a raw shell heredoc
 	// that terminal_create cannot execute — the command must be an
 	// executable). State the file's full path so write_file's required path
 	// argument is unambiguous.
-	prompt += fmt.Sprintf("\n\n产物文件绝对路径：%s\n（用 agentwork_write_file 的 path 参数写入此绝对路径；不要猜测工作目录，不要用 shell 重定向）\n",
+	prompt += fmt.Sprintf("\n\nThe artifact file's ABSOLUTE path: %s\n(Write to this exact path with agentwork_write_file's path argument; do NOT guess the working directory, do NOT use shell redirection.)\n",
 		filepath.Join(runRowWorkdir, "intake.json"))
 
 	backend, err := d.protoReg.Get(provider)
@@ -1755,28 +2018,28 @@ func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, su
 	}})
 }
 
-// workspaceGuidance is the Workspace contract (DESIGN.md 决策 4-8) injected
-// into EVERY run's prompt — worker AND processor alike (the unified model:
-// every run registers the client handler, declares capabilities, and gets
-// this section; a processor run without it cannot write its file artifact —
-// a live failure: the compile agent's write/shell tools were rejected with
-// "agent→client RPC not configured" and checks.json never landed). It names
-// the platform's own tools (deterministic); the agent's own toolset is its
-// business — the contract is the boundary.
-func workspaceGuidance(workdir string) string {
+// worktreeGuidance is the execution-environment contract (DESIGN.md 决策
+// 4-8/6-2) injected into EVERY run's prompt — worker AND processor alike (the
+// unified model: every run registers the client handler, declares
+// capabilities, and gets this section; a processor run without it cannot
+// write its file artifact — a live failure: the compile agent's write/shell
+// tools were rejected with "agent→client RPC not configured" and checks.json
+// never landed). It names the platform's own tools (deterministic); the
+// agent's own toolset is its business — the contract is the boundary.
+func worktreeGuidance(workdir string) string {
 	return fmt.Sprintf(`
 ## Workspace
 
-Your workspace lives on the PLATFORM machine — it is not your environment:
+Your worktree lives on the PLATFORM machine — it is not your environment:
 
-- Workspace root: %s
+- Worktree root: %s
 - It contains the repository code and AGENTWORK.md, the coordination guide — read it first
-- COLLABORATE through the platform's MCP collaboration tools (agentwork_goal_comment / agentwork_goal_assign / agentwork_goal_list / agentwork_agent_list / agentwork_squad_list) — the coordination contract lives in AGENTWORK.md
-- ACCESS THE WORKSPACE ONLY THROUGH THE PLATFORM'S CHANNELS:
-  * MCP server "agentwork" (advertised at session start) — its tools operate on the workspace: agentwork_read_file (read a file), agentwork_write_file (write a file), and the command trio agentwork_terminal_create → agentwork_terminal_output → agentwork_terminal_release (commands are ASYNC: create returns a terminal id immediately, poll output until exited=true passing the returned cursor back, then release to clean up)
+- COLLABORATE through the platform's MCP collaboration tools (agentwork_comment_goal / agentwork_consult_agent / agentwork_handoff_goal / agentwork_create_sub_goal / agentwork_goal_list / agentwork_agent_list / agentwork_squad_list) — the coordination contract lives in AGENTWORK.md
+- ACCESS THE WORKTREE ONLY THROUGH THE PLATFORM'S CHANNELS:
+  * MCP server "agentwork" (advertised at session start) — its tools operate on the worktree: agentwork_read_file (read a file), agentwork_write_file (write a file), and the command trio agentwork_terminal_create → agentwork_terminal_output → agentwork_terminal_release (commands are ASYNC: create returns a terminal id immediately, poll output until exited=true passing the returned cursor back, then release to clean up)
   * Client capabilities over ACP — fs/read_text_file, fs/write_text_file, terminal/*
-  Your own local file/shell tools operate on YOUR environment — NOT the workspace. On a remote runtime your local tools cannot reach the workspace at all; locally they only happen to work when the working directory points at it
-- Commands that touch the workspace run through the platform's execution channel (agentwork_terminal_create or terminal/*), on the platform machine, with the workspace as their working directory
+  Your own local file/shell tools operate on YOUR environment — NOT the worktree. On a remote runtime your local tools cannot reach the worktree at all; locally they only happen to work when the working directory points at it
+- Commands that touch the worktree run through the platform's execution channel (agentwork_terminal_create or terminal/*), on the platform machine, with the worktree as their working directory
 - Verification, review and delivery read only what you wrote through these channels
 `, workdir)
 }
@@ -1894,12 +2157,6 @@ func (d *Daemon) finishRun(ctx context.Context, q *service.ClaimedRow, status, s
 	if err := d.runSvc.Finish(ctx, q.RunID, status, summary); err != nil {
 		log.Printf("daemon: finish run %s: %v", q.RunID, err)
 	}
-	// If this run was for a sub-goal, notify the goal layer to consider waking
-	// the parent. (The parent's wakeup is owned by GoalService.NotifyChildDone,
-	// guarded by status='blocked' + all-children-terminal inside its tx.)
-	if q.GoalID != "" {
-		d.runSvc.NotifyChildDone(ctx, q.GoalID)
-	}
 }
 
 // goalOwnsSquadStatus mirrors multica's ownsIssueStatus: a leader run may only
@@ -1940,11 +2197,11 @@ func (d *Daemon) leaderSquadFor(ctx context.Context, goalID, agentID string) (st
 func (d *Daemon) annotatePolicyIssue(ctx context.Context, goalID string) {
 	var n int
 	_ = d.st.DB().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system' AND content LIKE '疑似验收策略问题%'`, goalID).Scan(&n)
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system' AND content LIKE '⚠️ Likely acceptance-policy problem%'`, goalID).Scan(&n)
 	if n > 0 {
 		return
 	}
-	content := "⚠️ 疑似验收策略问题：验证命令/脚本不存在（POSIX exit 127）——请检查域的验收策略，修正后重开任务；agent 无法绕过该检查。"
+	content := "⚠️ Likely acceptance-policy problem: a verification command/script does not exist (POSIX exit 127) — check the domain's acceptance policy and fix it, then reopen the task; agents cannot bypass this check."
 	_, _ = d.st.DB().ExecContext(ctx,
 		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
 		uuid.NewString(), goalID, content, nowStr())
@@ -1958,6 +2215,13 @@ func (d *Daemon) agentTriggeredRunCount(ctx context.Context, goalID string) (int
 		`SELECT COUNT(*) FROM run r JOIN comment c ON c.id = r.trigger_comment_id
 		 WHERE r.goal_id=? AND c.author_type='agent'`, goalID).Scan(&n)
 	return n, err
+}
+
+// goalAttention reads the persisted OwnerAttention ('' when none).
+func (d *Daemon) goalAttention(ctx context.Context, goalID string) string {
+	var a string
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, goalID).Scan(&a)
+	return a
 }
 
 // commentsInjection renders the goal's FULL collaboration feed as the
@@ -1987,7 +2251,7 @@ func (d *Daemon) commentsInjection(ctx context.Context, goalID string) string {
 	if b.Len() == 0 {
 		return ""
 	}
-	return "\n\n## Goal 评论（协作交流，完整 feed）\n" + b.String()
+	return "\n\n## Goal comments (the full collaboration feed)\n" + b.String()
 }
 
 // buildPrompt assembles the opening prompt for a run turn.
@@ -1999,7 +2263,7 @@ func buildPrompt(title, desc, handoff string) string {
 		// explicit, completable instruction so the run reaches a terminal state.
 		body = "Complete this sub-task. Do the work it implies, then finish your turn."
 	}
-	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, how to collaborate via the agentwork_goal_* tools: comment with mentions, hand off, inspect)."
+	guide := "Read AGENTWORK.md in the working directory first — it is the coordination guide for this run (team roster, how to collaborate via the agentwork_* tools: comment, consult, hand off, split into sub-goals, inspect)."
 	if handoff != "" {
 		// A handoff/wakeup note scopes THIS turn. It is placed AHEAD of the
 		// original description, which is now *context* (not a fresh to-do
@@ -2033,41 +2297,59 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	var b strings.Builder
 	b.WriteString("## Team & Coordination\n\n")
 	b.WriteString("You coordinate through the MCP tools of the \"agentwork\" server (advertised at\n")
-	b.WriteString(" session start) — structured side effects, no shell, no CLI:\n")
-	b.WriteString("- agentwork_goal_comment: post on THIS goal (embed a mention to trigger a run)\n")
-	b.WriteString("- agentwork_goal_assign: hand this goal to another agent/squad\n")
-	b.WriteString("- agentwork_goal_list / agentwork_agent_list / agentwork_squad_list: inspect\n")
+	b.WriteString(" session start) — structured side effects, no shell, no CLI. FOUR behaviors,\n")
+	b.WriteString(" pick by intent:\n")
+	b.WriteString("- COMMENT: agentwork_comment_goal — post on THIS goal (progress,\n")
+	b.WriteString("  findings, notes). Never triggers another run.\n")
+	b.WriteString("- CONSULT: agentwork_consult_agent(agent_id, question) — ask another\n")
+	b.WriteString("  agent for information/judgment. The platform enqueues a READ-ONLY guest\n")
+	b.WriteString("  run on them; their answer lands in the feed; the platform auto-resumes\n")
+	b.WriteString("  YOUR next run after they answer. Only the goal's owner can consult.\n")
+	b.WriteString("- HANDOFF: agentwork_handoff_goal(assignee_type, assignee_id,\n")
+	b.WriteString("  reason) — transfer THIS goal's ownership. Only the owner can.\n")
+	b.WriteString("- SUB-GOAL: agentwork_create_sub_goal(title, assignee_id, ...) —\n")
+	b.WriteString("  split a work item off THIS goal (NOT a new goal): the sub-goal runs on\n")
+	b.WriteString("  its own branch with machine verification; a verified sub-goal produces a\n")
+	b.WriteString("  Change and the platform wakes YOU to integrate it. Only the owner can split.\n")
 	b.WriteString("Do NOT edit files to communicate intent — structured side effects are the only way.\n\n")
 
 	b.WriteString("### Hand off the current goal\n")
-	b.WriteString("- Call agentwork_goal_assign (assignee_type=agent|squad, note = scoping instruction).\n")
-	b.WriteString("  END YOUR TURN immediately after — the platform terminates your run (its result\n")
-	b.WriteString("  no longer affects the goal, and a live run would block the new owner's: the\n")
-	b.WriteString("  goal executes serially). Do not keep working and do not wait for the new owner.\n\n")
+	b.WriteString("- Call agentwork_handoff_goal (assignee_type=agent|squad|human, reason =\n")
+	b.WriteString("  scoping instruction for the new owner). END YOUR TURN immediately after —\n")
+	b.WriteString("  the platform terminates your run and enqueues the new owner's\n")
+	b.WriteString("  run. Do not keep working, do not wait for the new owner.\n\n")
 
-	b.WriteString("### Pull in another agent via @mention\n")
-	b.WriteString("- Call agentwork_goal_comment with a structured mention:\n")
-	b.WriteString("  [@Name](mention://agent/<AGENT-UUID>) <what you want>\n")
-	b.WriteString("- The mention MUST be a structured Markdown link with a mention:// URI; bare")
-	b.WriteString(" `@handle` prose does NOT trigger anything. Resolve the UUID first with")
-	b.WriteString(" agentwork_agent_list. mention://agent/<uuid> triggers a new run on that agent")
-	b.WriteString(" for THIS goal; mention://squad/<uuid> routes to the squad's leader.\n")
-	b.WriteString(" @all (mention://all/all) suppresses auto-trigger.\n\n")
-	b.WriteString("### Collaboration is RELAY, not waiting\n")
-	b.WriteString("- Runs on this goal execute SERIALLY: the goal has one worktree and one\n")
-	b.WriteString("  running run at a time. Your run staying alive BLOCKS the agent you\n")
-	b.WriteString("  mentioned — their run only starts when yours ends. Never wait inside\n")
-	b.WriteString("  your run for another agent's result; it can never arrive.\n")
-	b.WriteString("- If you depend on another agent's result: finish everything you can NOW,\n")
-	b.WriteString("  mention them with exactly what you need, then END your turn. When they\n")
-	b.WriteString("  finish, they mention you back — your next run starts fresh (attempt 1),\n")
-	b.WriteString("  the full comment feed (including their handoff note and your own\n")
-	b.WriteString("  previous report) is injected, and the worktree already contains their\n")
-	b.WriteString("  committed work. Pick up from there.\n\n")
+	b.WriteString("### Consult another agent\n")
+	b.WriteString("- Call agentwork_consult_agent(agent_id, question). The guest run is\n")
+	b.WriteString("  READ-ONLY — its edits are discarded by the platform. The answer comes back\n")
+	b.WriteString("  as a comment and YOUR next run starts automatically (attempt 1, full\n")
+	b.WriteString("  comment feed injected). Resolve uuids with agentwork_agent_list.\n")
+	b.WriteString("- Runs on this goal execute SERIALLY (one worktree): never wait INSIDE your\n")
+	b.WriteString("  run for an answer — ask, end your turn, and get resumed.\n\n")
+
+	b.WriteString("### Split work into sub-goals\n")
+	b.WriteString("- Call agentwork_create_sub_goal(parent_goal_id defaults to THIS goal, title,\n")
+	b.WriteString("  assignee_id, verifier_id optional). The sub-goal runs on its own branch\n")
+	b.WriteString("  with machine verification (or the named agent verifier). A verified\n")
+	b.WriteString("  sub-goal becomes a Change the platform wakes YOU to integrate — a\n")
+	b.WriteString("  sub-goal completing does NOT complete the goal.\n\n")
+
+	b.WriteString("### Integrate changes (owner)\n")
+	b.WriteString("- When you are woken with an Owner Attention section: list changes with\n")
+	b.WriteString("  agentwork_get_change, then integrate each ready one with\n")
+	b.WriteString("  agentwork_integrate_change(change_id) — the platform merges it into\n")
+	b.WriteString("  your worktree. A conflict wakes the assignee automatically.\n")
+	b.WriteString("- Inspect details with agentwork_get_sub_goal / agentwork_get_verification.\n")
+	b.WriteString("- Cancel a stuck work item with agentwork_cancel_sub_goal(sub_goal_id).\n\n")
+
+	b.WriteString("### Verify a sub-goal (verifier)\n")
+	b.WriteString("- If you are a verify run: judge the work item, then issue your verdict\n")
+	b.WriteString("  ONCE via agentwork_verify_sub_goal(verdict=passed|rejected, summary,\n")
+	b.WriteString("  evidence) and end your turn.\n\n")
 
 	b.WriteString("### Inspect\n")
 	b.WriteString("- agentwork_goal_list / agentwork_agent_list / agentwork_squad_list — use\n")
-	b.WriteString("  agent_list to get UUIDs for mentions and handoffs.\n\n")
+	b.WriteString("  agent_list to get UUIDs for consults and handoffs.\n\n")
 
 	b.WriteString("### Team roster\n")
 	b.WriteString("If a task falls outside your role, delegate it — mention the teammate whose")

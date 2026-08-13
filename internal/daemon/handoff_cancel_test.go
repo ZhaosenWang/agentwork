@@ -98,7 +98,7 @@ func TestHandoffCancelsOldOwnerRun(t *testing.T) {
 	d.mu.Unlock()
 
 	// Hand off A → B (Assign publishes goal:assigned; the daemon cuts A's run).
-	if _, err := goalSvc.Assign(ctx, goal.ID, "agent", agentB.ID, "take over"); err != nil {
+	if _, err := goalSvc.Assign(ctx, goal.ID, "agent", agentB.ID, "take over", "", ""); err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 	waitHandled()
@@ -164,7 +164,7 @@ func TestHandoffToHumanCancelsAllRuns(t *testing.T) {
 	d.runCancels["run-a"] = func() { fired = true }
 	d.mu.Unlock()
 
-	if _, err := goalSvc.Assign(ctx, goal.ID, "human", "", ""); err != nil {
+	if _, err := goalSvc.Assign(ctx, goal.ID, "human", "", "", "", ""); err != nil {
 		t.Fatalf("assign to human: %v", err)
 	}
 	<-handled
@@ -252,5 +252,75 @@ func TestStopRunRejectsForeignRun(t *testing.T) {
 	// No run rows at all: any stop attempt must fail, not silently no-op.
 	if err := d.StopRun("goal-x", "run-y"); err == nil {
 		t.Fatal("StopRun for a nonexistent run: want error")
+	}
+}
+
+// TestHandoffWindowStampMarksHandedOff: a handoff landing in the
+// claim→register window (run status='running' but no registered cancel)
+// stamps the run cancelled with cancel_reason=handed_off (决策 6-6) — a handoff cut is an
+// ownership transition, the reason carries the semantics.
+func TestHandoffWindowStampMarksHandedOff(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	bus := events.NewBus()
+	goalSvc := service.NewGoalService(st, bus)
+	runSvc := service.NewRunService(st, bus)
+	goalSvc.SetRunService(runSvc)
+	runSvc.SetGoalService(goalSvc)
+	d := &Daemon{
+		st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc,
+		runCancels:       make(map[string]context.CancelFunc),
+		runCancelReasons: make(map[string]string),
+		ctx:              context.Background(),
+	}
+	handled := make(chan struct{})
+	bus.Subscribe("goal:assigned", func(ctx context.Context, e events.Event) {
+		d.onGoalAssigned(ctx, e)
+		close(handled)
+	})
+
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	if err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	agentSvc := service.NewAgentService(st, bus)
+	agentA, err := agentSvc.Create(ctx, service.Agent{Name: "a", RuntimeID: rt.ID})
+	if err != nil {
+		t.Fatalf("seed agent a: %v", err)
+	}
+	agentB, err := agentSvc.Create(ctx, service.Agent{Name: "b", RuntimeID: rt.ID})
+	if err != nil {
+		t.Fatalf("seed agent b: %v", err)
+	}
+	dom, err := service.NewDomainService(st, bus).Create(ctx, service.Domain{Name: "dom", GitURL: "https://e.com/d.git"})
+	if err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+	goal, err := goalSvc.Create(ctx, service.Goal{Title: "g", DomainID: dom.ID, AssigneeType: "agent", AssigneeID: agentA.ID, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	// A's run is running but NOT registered (the claim→register window).
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,status,attempt,queued_at,created_at) VALUES (?,?,?,?,?,?,?,?)`,
+		"run-a", goal.ID, agentA.ID, "worker", "running", 1, nowStr(), nowStr()); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+
+	if _, err := goalSvc.Assign(ctx, goal.ID, "agent", agentB.ID, "take over", "", ""); err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	<-handled
+
+	var status, reason string
+	if err := st.DB().QueryRowContext(ctx, `SELECT status, cancel_reason FROM run WHERE id='run-a'`).Scan(&status, &reason); err != nil {
+		t.Fatalf("load run: %v", err)
+	}
+	if status != "cancelled" || reason != "handed_off" {
+		t.Fatalf("window-stamped run must be cancelled + cancel_reason=handed_off, got %q / %q", status, reason)
 	}
 }

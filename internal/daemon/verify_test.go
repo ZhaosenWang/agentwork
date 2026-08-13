@@ -382,43 +382,6 @@ func TestBuildEvidence(t *testing.T) {
 	}
 }
 
-// TestUnattributedDirty: the worktree-dirty gate — AGENTWORK.md and domain-declared
-// excludes are expected (not blocking); anything else dirty at run start is
-// reported for the manual-review park.
-func TestUnattributedDirty(t *testing.T) {
-	dir := newTestRepo(t)
-	ctx := context.Background()
-	excludes := []string{"**/node_modules/**"}
-
-	if d := unattributedDirty(ctx, dir, excludes); d != "" {
-		t.Fatalf("clean worktree must be clean, got %q", d)
-	}
-	// AGENTWORK.md only → expected, not dirty.
-	if err := os.WriteFile(filepath.Join(dir, "AGENTWORK.md"), []byte("x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if d := unattributedDirty(ctx, dir, excludes); d != "" {
-		t.Fatalf("AGENTWORK.md must be expected, got %q", d)
-	}
-	// node_modules (excluded) → expected.
-	if err := os.MkdirAll(filepath.Join(dir, "web", "node_modules"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "web", "node_modules", "x.js"), []byte("x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if d := unattributedDirty(ctx, dir, excludes); d != "" {
-		t.Fatalf("excluded deps must be expected, got %q", d)
-	}
-	// A real manual edit → reported.
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\n// edited\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if d := unattributedDirty(ctx, dir, excludes); d == "" || !strings.Contains(d, "main.go") {
-		t.Fatalf("manual edit must be reported, got %q", d)
-	}
-}
-
 // TestGitCloneURL: the credential injection is the generic git-layer
 // capability (M4) — token as HTTPS username, SSH untouched, an already-
 // credentialed URL never overridden.
@@ -441,5 +404,55 @@ func TestGitCloneURL(t *testing.T) {
 		if got := gitCloneURL(tc.url, tc.cred); got != tc.want {
 			t.Errorf("gitCloneURL(%q, %q) = %q, want %q", tc.url, tc.cred, got, tc.want)
 		}
+	}
+}
+
+// TestGuestWorkspaceReset: the consult/review read-only enforcement (决策
+// 6-2/6-7) — the run's workspace starts CLEAN (fresh worktree from a ref), so
+// at run end EVERYTHING is discarded: tracked edits via reset --hard,
+// untracked files via clean, HEAD untouched (a guest commit is detected
+// separately and flagged, not reverted here). AGENTWORK.md (the platform's
+// injected guide) survives the clean for forensics.
+func TestGuestWorkspaceReset(t *testing.T) {
+	dir := newTestRepo(t)
+	ctx := context.Background()
+
+	// Base state committed.
+	if err := os.WriteFile(filepath.Join(dir, "tracked.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitRunChanges(ctx, dir, "x", nil); err != nil {
+		t.Fatalf("commit base: %v", err)
+	}
+	baseSHA := strings.TrimSpace(mustGitRun(ctx, dir, "rev-parse", "HEAD"))
+
+	// The guest run touches the workspace: tracked edit + untracked file +
+	// the platform's injected guide.
+	if err := os.WriteFile(filepath.Join(dir, "tracked.txt"), []byte("guest edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "guest-new.txt"), []byte("guest untracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "AGENTWORK.md"), []byte("guide\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	resetGuestWorkspace(ctx, dir)
+
+	// Tracked edit gone, untracked file gone.
+	if b, _ := os.ReadFile(filepath.Join(dir, "tracked.txt")); string(b) != "base\n" {
+		t.Fatalf("guest's tracked edit must be discarded, got %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "guest-new.txt")); !os.IsNotExist(err) {
+		t.Fatal("guest's untracked file must be cleaned")
+	}
+	// HEAD untouched (a commit is detected by the caller, not reverted here).
+	if got := strings.TrimSpace(mustGitRun(ctx, dir, "rev-parse", "HEAD")); got != baseSHA {
+		t.Fatalf("reset must not move HEAD: %s != %s", got, baseSHA)
+	}
+	// The platform's injected guide survives for forensics.
+	if _, err := os.Stat(filepath.Join(dir, "AGENTWORK.md")); err != nil {
+		t.Fatalf("AGENTWORK.md must survive the clean: %v", err)
 	}
 }

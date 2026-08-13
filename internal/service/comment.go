@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"regexp"
 
 	"github.com/eushing/agentwork/internal/events"
@@ -193,10 +194,22 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 		// non-active: comment lands, triggers suppressed.
 		return &c, nil
 	}
+	// Consult permission (Collaboration.md §6, 决策 5-2): only the goal's
+	// OWNER (agent run) may mention other agents from a comment — a guest run
+	// is itself a consult and cannot fan out further. Human comments are the
+	// human's consult and stay unrestricted.
+	agentCanConsult := true
+	if c.AuthorType == "agent" {
+		owns, err := s.goalSvc.AgentOwnsGoal(ctx, g, c.AuthorID)
+		if err != nil {
+			return nil, err
+		}
+		agentCanConsult = owns
+	}
 	for _, m := range ParseMentions(c.Content) {
 		switch m.Type {
 		case "agent":
-			if s.runSvc == nil {
+			if s.runSvc == nil || !agentCanConsult {
 				continue
 			}
 			// Mention-cycle guard: an agent-triggered run churn above the hard
@@ -205,12 +218,21 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 				s.forceMentionCycleFailed(ctx, c.GoalID)
 				continue
 			}
-			if _, e := s.runSvc.EnqueueForMention(ctx, c.GoalID, m.ID, c.ID); e != nil {
+			r, e := s.runSvc.EnqueueForMention(ctx, c.GoalID, m.ID, c.ID)
+			if e != nil {
 				// A bad/unknown agent UUID → drop, don't fail the whole comment.
 				continue
 			}
+			// Consult chain (决策 5-8): record the request — requester run /
+			// target / trigger comment / guest run — so the platform can
+			// auto-resume the requester once the guest answers.
+			if c.AuthorType == "agent" {
+				if err := s.recordConsult(ctx, c, m.ID, r.ID); err != nil {
+					log.Printf("comment: record consult: %v", err)
+				}
+			}
 		case "squad":
-			if s.runSvc == nil {
+			if s.runSvc == nil || !agentCanConsult {
 				continue
 			}
 			if exceeds, err := s.mentionCycleExceeds(ctx, c.GoalID, MaxMentionCycle); err == nil && exceeds {
@@ -279,6 +301,20 @@ func (s *CommentService) forceMentionCycleFailed(ctx context.Context, goalID str
 	s.bus.Publish(ctx, events.Event{Topic: "goal:finished", Payload: map[string]any{
 		"goal_id": goalID, "status": "failed", "summary": reason,
 	}})
+}
+
+// recordConsult appends a consult_request row (决策 5-8, Collaboration.md
+// §12): the full chain — requester (the owner run that asked) → trigger
+// comment → guest run — so the reconcile step can auto-resume the requester
+// when the guest's answer lands. response_comment_id is back-filled at guest
+// run end.
+func (s *CommentService) recordConsult(ctx context.Context, c Comment, targetAgentID, guestRunID string) error {
+	ts := now()
+	_, err := s.st.DB().ExecContext(ctx,
+		`INSERT INTO consult_request (id,goal_id,requester_agent_id,requester_run_id,target_agent_id,trigger_comment_id,guest_run_id,response_comment_id,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?)`,
+		newID(), c.GoalID, c.AuthorID, c.RunID, targetAgentID, c.ID, guestRunID, "", ts)
+	return err
 }
 
 // enqueueLeaderRunForMention resolves a squad's leader and enqueues a leader

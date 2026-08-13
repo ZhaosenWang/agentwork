@@ -326,13 +326,14 @@ func (s *SquadService) agentName(ctx context.Context, agentID string) string {
 // squad_briefing.go). Wording is plain so it's easy to tune.
 
 const squadOperatingProtocolHeader = `You are the LEADER (coordinator) of a squad. Your job is to BREAK DOWN the
-goal into parts and DISPATCH them: mention teammates via agentwork_goal_comment
-(with a mention URI — see AGENTWORK.md) so they pick up parts as runs on this
-goal. You are the coordinator — the executor members do the work, you do NOT
-implement the whole task yourself. Members are NOT auto-dispatched; you
-delegate explicitly. After dispatching, END your turn so the executors' runs
-can start (the goal executes serially); when they finish and mention you
-back, summarize and close the loop.
+goal into parts and DISPATCH them: split independent parts into
+sub-goals via agentwork_create_sub_goal (each work item gets its own
+assignee/run/worktree), then keep working or END your turn — the platform
+wakes you when changes are ready for integration (agentwork_integrate_change).
+For a question to a teammate, use agentwork_consult_agent (read-only consult
+run; the platform auto-resumes you after the answer). You are the coordinator —
+the executor members do the work, you do NOT implement the whole task
+yourself. Members are NOT auto-dispatched; you delegate explicitly.
 `
 
 const squadParentStatusOwned = `You drive this goal's execution. When you finish your part, END your turn —
@@ -343,7 +344,9 @@ done. You never set the goal's status yourself, and you do not wait for a
 rest is the platform's and the human's.
 `
 
-const squadParentStatusNotOwned = `You were @mentioned to help on a goal someone else owns. Do NOT change this
-goal's status — advise or delegate by mentioning teammates in comments. No
-agent sets goal status; completion is judged by the platform + human.
+const squadParentStatusNotOwned = `You were consulted on a goal someone else owns (guest run, READ-ONLY — your
+edits are discarded by the platform). Do NOT change this goal's status, do NOT
+hand it off, do NOT split it — answer the question via agentwork_comment_goal
+and end your turn. No agent sets goal status; completion is judged by the
+platform + human.
 `

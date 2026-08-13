@@ -241,8 +241,10 @@ func TestMCPFullClientRoundTrip(t *testing.T) {
 }
 
 // TestCollaborationTools: the collaboration tools act on the run's goal via
-// the injected services (no CLI, no HTTP hop) — goal_comment lands a comment
-// (mention parsing included), goal_list sees the goal.
+// the injected services (no CLI, no HTTP hop) — the four-behavior surface
+// (决策 5-2): comment_goal lands a plain comment, consult_agent pulls in a
+// guest run, handoff_goal transfers ownership (owner-only), goal_list sees
+// the goal.
 func TestCollaborationTools(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(":memory:")
@@ -271,22 +273,47 @@ func TestCollaborationTools(t *testing.T) {
 	session := connect(t, HTTPHandler(exec))
 	ctx2 := context.Background()
 
-	// goal_comment with a mention → comment lands + a run is enqueued for B.
+	// comment_goal: a plain comment lands; NO mention dispatch from it.
 	if _, err := session.CallTool(ctx2, &gmcp.CallToolParams{
-		Name: "goal_comment",
-		Arguments: map[string]any{
-			"content": "[@b](mention://agent/" + agentB.ID + ") please help",
-		},
+		Name:       "comment_goal",
+		Arguments:  map[string]any{"content": "progress note"},
 	}); err != nil {
-		t.Fatalf("goal_comment: %v", err)
+		t.Fatalf("comment_goal: %v", err)
 	}
 	var n int
 	if err := st.DB().QueryRowContext(ctx2, `SELECT COUNT(*) FROM comment WHERE goal_id=?`, goal.ID).Scan(&n); err != nil || n < 1 {
 		t.Fatalf("comment not landed (n=%d err=%v)", n, err)
 	}
+
+	// consult_agent (owner A → B): the platform's mention comment lands and a
+	// GUEST run is enqueued for B.
+	if _, err := session.CallTool(ctx2, &gmcp.CallToolParams{
+		Name:       "consult_agent",
+		Arguments:  map[string]any{"agent_id": agentB.ID, "question": "how should this be authed?"},
+	}); err != nil {
+		t.Fatalf("consult_agent: %v", err)
+	}
 	var pending int
-	if err := st.DB().QueryRowContext(ctx2, `SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND status='queued'`, goal.ID, agentB.ID).Scan(&pending); err != nil || pending < 1 {
-		t.Fatalf("mention run not enqueued (n=%d err=%v)", pending, err)
+	var role string
+	if err := st.DB().QueryRowContext(ctx2,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND status='queued'`, goal.ID, agentB.ID).Scan(&pending); err != nil || pending < 1 {
+		t.Fatalf("guest run not enqueued (n=%d err=%v)", pending, err)
+	}
+	if err := st.DB().QueryRowContext(ctx2,
+		`SELECT role FROM run WHERE goal_id=? AND agent_id=? ORDER BY queued_at DESC LIMIT 1`, goal.ID, agentB.ID).Scan(&role); err != nil || role != "consult" {
+		t.Fatalf("consult run must be role=guest, got %q (err=%v)", role, err)
+	}
+
+	// handoff_goal (owner A → B): ownership transfers + a fresh owner run.
+	if _, err := session.CallTool(ctx2, &gmcp.CallToolParams{
+		Name:       "handoff_goal",
+		Arguments:  map[string]any{"assignee_type": "agent", "assignee_id": agentB.ID, "reason": "backend work"},
+	}); err != nil {
+		t.Fatalf("handoff_goal: %v", err)
+	}
+	var assignee string
+	if err := st.DB().QueryRowContext(ctx2, `SELECT assignee_id FROM goal WHERE id=?`, goal.ID).Scan(&assignee); err != nil || assignee != agentB.ID {
+		t.Fatalf("handoff did not transfer ownership (assignee=%q err=%v)", assignee, err)
 	}
 
 	// goal_list sees the goal.
@@ -307,5 +334,54 @@ func TestCollaborationTools(t *testing.T) {
 	text = res.Content[0].(*gmcp.TextContent).Text
 	if !strings.Contains(text, agentA.ID) || !strings.Contains(text, agentB.ID) {
 		t.Fatalf("agent_list missing agents: %q", text)
+	}
+}
+
+// TestCollaborationPermissions: the owner-only rules (决策 5-6) — a guest
+// run's agent (B consulted into A's goal) cannot hand off, consult further,
+// split, or wait.
+func TestCollaborationPermissions(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	bus := events.NewBus()
+	goalSvc := service.NewGoalService(st, bus)
+	runSvc := service.NewRunService(st, bus)
+	commentSvc := service.NewCommentService(st, bus)
+	commentSvc.SetRunService(runSvc)
+	commentSvc.SetGoalService(goalSvc)
+	goalSvc.SetRunService(runSvc)
+	runSvc.SetGoalService(goalSvc)
+
+	rt, _ := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	agentSvc := service.NewAgentService(st, bus)
+	agentA, _ := agentSvc.Create(ctx, service.Agent{Name: "a", RuntimeID: rt.ID})
+	agentB, _ := agentSvc.Create(ctx, service.Agent{Name: "b", RuntimeID: rt.ID})
+	dom, _ := service.NewDomainService(st, bus).Create(ctx, service.Domain{Name: "dom", GitURL: "https://e.com/d.git"})
+	goal, _ := goalSvc.Create(ctx, service.Goal{Title: "g", DomainID: dom.ID, AssigneeType: "agent", AssigneeID: agentA.ID, Status: "active"})
+
+	// The executor acts as B — a guest on A's goal.
+	exec := NewExecutor(t.TempDir(), nil, newFakeHost())
+	exec.SetCollaboration(goal.ID, agentB.ID, "guest-run", commentSvc, goalSvc, runSvc, agentSvc, service.NewSquadService(st, bus))
+	session := connect(t, HTTPHandler(exec))
+	ctx2 := context.Background()
+
+	for _, tc := range []struct{ name, tool string; args map[string]any }{
+		{"handoff_goal", "handoff_goal", map[string]any{"assignee_type": "agent", "assignee_id": agentB.ID}},
+		{"consult_agent", "consult_agent", map[string]any{"agent_id": agentA.ID, "question": "q"}},
+		{"create_sub_goal", "create_sub_goal", map[string]any{"title": "t", "assignee_type": "agent", "assignee_id": agentB.ID}},
+	} {
+		res, err := session.CallTool(ctx2, &gmcp.CallToolParams{Name: tc.name, Arguments: tc.args})
+		if err == nil && res != nil && !res.IsError {
+			t.Fatalf("%s must be rejected for a non-owner agent", tc.tool)
+		}
+	}
+	// Ownership unchanged: B's attempts above must not have moved the goal.
+	var assignee string
+	if err := st.DB().QueryRowContext(ctx2, `SELECT assignee_id FROM goal WHERE id=?`, goal.ID).Scan(&assignee); err != nil || assignee != agentA.ID {
+		t.Fatalf("ownership moved by a guest (assignee=%q err=%v)", assignee, err)
 	}
 }

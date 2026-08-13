@@ -107,6 +107,11 @@ function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentNa
           <span className="h-2 w-2 rounded-full bg-indigo-400 shrink-0" />
           <span className="font-medium text-sm text-zinc-900">{run.agent_id ? agentName(run.agent_id) : "-"}</span>
           <Badge status={run.status} />
+          {(run.role === "consult" || run.role === "review" || run.role === "subgoal" || run.role === "verify") && (
+            <span className="text-[11px] px-1.5 py-0.5 rounded bg-violet-50 text-violet-600 border border-violet-100 shrink-0">
+              {run.role === "review" ? "审查" : run.role === "subgoal" ? "子任务" : run.role === "verify" ? "验证" : "咨询"}
+            </span>
+          )}
           <span className="text-xs text-zinc-400 shrink-0">#{run.attempt}</span>
           <span className="text-xs text-zinc-400 ml-auto hidden sm:block">{timeRange}</span>
           <span className="text-zinc-400 text-xs shrink-0">{open ? "▾" : "▸"}</span>

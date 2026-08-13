@@ -425,6 +425,11 @@ function FlowNode({ run, agentName, nowMs, active, loop, goalId }: {
           {name}
           {loop && <span className="text-violet-500 font-bold" title="此前已出现过（环）">↺</span>}
         </div>
+        {(run.role === "subgoal" || run.role === "consult" || run.role === "review" || run.role === "verify") && (
+          <span className="text-[9px] px-1 py-px rounded bg-violet-50 text-violet-600 border border-violet-100 leading-none">
+            {run.role === "subgoal" ? "子任务" : run.role === "verify" ? "验证" : run.role === "review" ? "审查" : "咨询"}
+          </span>
+        )}
         <div className={`text-[9.5px] font-medium leading-tight ${st.cls}`}>
           {st.text}{attempt}
         </div>

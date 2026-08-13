@@ -149,7 +149,7 @@ func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) err
 func (d *Daemon) enqueueSquadReview(ctx context.Context, goalID, reviewerID, name string) error {
 	ts := nowStr()
 	commentID := uuid.NewString()
-	content := "[@" + name + "](mention://agent/" + reviewerID + ") 请审查本次改动（squad 规矩：成员写完代码后由 reviewer 审查）。只提意见，不要修改任何文件。"
+	content := "[@" + name + "](mention://agent/" + reviewerID + ") Please review the current changes (squad rule: after a member implements, a reviewer reviews). Give your opinion ONLY — do not modify any file."
 	if _, err := d.st.DB().ExecContext(ctx,
 		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
 		commentID, goalID, content, ts); err != nil {

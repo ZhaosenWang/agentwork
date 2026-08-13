@@ -57,14 +57,19 @@ export const assignGoal = (
 ) => api<Goal>(`/goals/${id}/assign`, { method: "POST", body: JSON.stringify(body) });
 export const cancelGoal = (id: string) =>
   api<Goal>(`/goals/${id}/cancel`, { method: "POST" });
-export const waitGoalChildren = (id: string) =>
-  api<void>(`/goals/${id}/wait`, { method: "POST" });
 export const reopenGoal = (id: string, reason?: string) =>
   api<Goal>(`/goals/${id}/reopen`, { method: "POST", body: JSON.stringify({ reason: reason ?? "" }) });
 export const resolveGoalReview = (
   id: string,
   body: { decision: "approve" | "reject" | "redirect"; reason?: string }
 ) => api<Goal>(`/goals/${id}/review`, { method: "POST", body: JSON.stringify(body) });
+
+// ── Sub-goal ──
+export const listSubGoals = (goalId: string) => api<import("./types").SubGoal[]>(`/goals/${goalId}/sub-goals`);
+export const createSubGoal = (
+  goalId: string,
+  body: { title: string; description?: string; assignee_id: string; verifier_id?: string }
+) => api<import("./types").SubGoal>(`/goals/${goalId}/sub-goals`, { method: "POST", body: JSON.stringify(body) });
 
 // ── Run ──
 export const listGoalRuns = (goalId: string) =>

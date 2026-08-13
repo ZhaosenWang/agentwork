@@ -91,8 +91,8 @@ CREATE TABLE IF NOT EXISTS agent (
 
 -- A squad is a routing group. It does no work itself: assigning a goal to a
 -- squad or @mentioning a squad routes only to its leader agent, who then
--- delegates by assigning sub-goals. Designed per multica §7 (no member
--- fan-out). The leader must be an agent; squads cannot nest.
+-- splits work into sub-goals. Designed per multica §7 (no member fan-out).
+-- The leader must be an agent; squads cannot nest.
 CREATE TABLE IF NOT EXISTS squad (
     id           TEXT PRIMARY KEY,
     name         TEXT NOT NULL UNIQUE,
@@ -117,31 +117,29 @@ CREATE TABLE IF NOT EXISTS squad_member (
 
 -- goal: a work item (product plane). The sole holder of state authority.
 -- assignee is polymorphic (agent | squad | human).
--- parent_id makes a goal a sub-goal (coordination unit), not a sub-run.
 -- domain_id: agent-executed goals must belong to a domain — the domain owns
 -- the worktree and the acceptance policy (DESIGN.md §2/§5).
 -- status 'review' (v2): the goal is parked waiting for a human checkpoint
--- decision (the symmetric partner of 'blocked' = waiting on sub-goals).
+-- decision.
 CREATE TABLE IF NOT EXISTS goal (
     id               TEXT PRIMARY KEY,
     title            TEXT NOT NULL,
     description      TEXT NOT NULL DEFAULT '',
-    parent_id        TEXT REFERENCES goal(id),        -- sub-goal
     domain_id        TEXT REFERENCES domain(id),      -- owning domain (required for agent goals)
     assignee_type    TEXT NOT NULL DEFAULT 'agent',   -- agent | squad | human
     assignee_id      TEXT NOT NULL DEFAULT '',
-    status           TEXT NOT NULL DEFAULT 'backlog', -- backlog|active|done|failed|blocked|review|cancelled
+    status           TEXT NOT NULL DEFAULT 'backlog', -- backlog|active|done|failed|review|cancelled
     handoff_note     TEXT NOT NULL DEFAULT '',
     review_request   TEXT NOT NULL DEFAULT '',        -- gate trigger reason / evidence pointer
     human_iterations INTEGER NOT NULL DEFAULT 0,      -- human reject iterations (separate from run.attempt)
     created_by_type  TEXT NOT NULL DEFAULT 'human',   -- human | agent
     created_by_id    TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL,
-    wake_count       INTEGER NOT NULL DEFAULT 0,   -- bumped each blocked→active wakeup; bounded to break runaway re-fan-out loops
-    source_ref       TEXT NOT NULL DEFAULT ''      -- external source (M4-B): "github:owner/repo#123" — one goal per issue
+    source_ref       TEXT NOT NULL DEFAULT '',     -- external source (M4-B): "github:owner/repo#123" — one goal per issue
+    execution_attempt INTEGER NOT NULL DEFAULT 0,  -- v2 (决策 6-9): machine-retry counter, authoritative; run.attempt is just the instance ordinal
+    attention        TEXT NOT NULL DEFAULT ''      -- v2 (决策 6-8): derived OwnerAttention persisted by Reconcile ('' | integration|recovery|user_action)
 );
 
-CREATE INDEX IF NOT EXISTS idx_goal_parent ON goal(parent_id);
 CREATE INDEX IF NOT EXISTS idx_goal_assignee ON goal(assignee_type, assignee_id);
 CREATE INDEX IF NOT EXISTS idx_goal_status ON goal(status);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_goal_source_ref ON goal(source_ref) WHERE source_ref != '';
@@ -176,6 +174,11 @@ CREATE TABLE IF NOT EXISTS run (
     trigger_comment_id TEXT NOT NULL DEFAULT '',  -- which comment caused this run (mention/child-done)
     is_leader_run      INTEGER NOT NULL DEFAULT 0,-- 1 if a squad leader run
     squad_id           TEXT NOT NULL DEFAULT '',  -- the squad a leader run belongs to
+    role               TEXT NOT NULL DEFAULT 'owner', -- owner|subgoal|consult|review|verify ('' for processor runs); informational snapshot, authority stays dynamic at reconcile
+    sub_goal_id        TEXT NOT NULL DEFAULT '',  -- v2 (决策 6-9): the sub-goal this run executes (1:N with sub_goal; '' for goal-level runs)
+    base_ref           TEXT NOT NULL DEFAULT '',  -- subgoal runs: merge-base(goal branch, sub-goal branch) at run end — the Change revision's integration base
+    head_ref           TEXT NOT NULL DEFAULT '',  -- subgoal runs: the branch head SHA the Change revision delivers
+    dirty_snapshot     TEXT NOT NULL DEFAULT '',  -- retired (run-scoped workspaces, 决策 6-2); kept for now
     queued_at          TEXT NOT NULL,
     started_at         TEXT NOT NULL DEFAULT '',
     finished_at        TEXT NOT NULL DEFAULT '',
@@ -185,6 +188,110 @@ CREATE TABLE IF NOT EXISTS run (
 CREATE INDEX IF NOT EXISTS idx_run_goal ON run(goal_id);
 CREATE INDEX IF NOT EXISTS idx_run_agent ON run(agent_id);
 CREATE INDEX IF NOT EXISTS idx_run_status ON run(status);
+
+-- sub_goal: a work item split off a goal (v2 model, 决策 6-1) — NOT a child
+-- goal: no parent recursion, no own deliver/verification terminal semantics.
+-- The goal stays the sole lifecycle authority; a sub-goal carries work
+-- responsibility (assignee) + quality responsibility (verifier, '' = machine).
+-- execution_attempt (machine retry ≤3) and quality_iteration (verifier
+-- rejects, unbounded) are the AUTHORITATIVE counters (决策 6-9) — run.attempt
+-- is just the instance ordinal. No run_id column: the relationship truth is
+-- run.sub_goal_id → sub_goal.id (1:N); the active run is queried by status.
+CREATE TABLE IF NOT EXISTS sub_goal (
+    id                TEXT PRIMARY KEY,
+    goal_id           TEXT NOT NULL REFERENCES goal(id),
+    title             TEXT NOT NULL,
+    description       TEXT NOT NULL DEFAULT '',
+    assignee_id       TEXT NOT NULL,               -- the agent executing this work item
+    verifier_id       TEXT NOT NULL DEFAULT '',    -- '' = machine (domain verify commands); else agent id
+    status            TEXT NOT NULL DEFAULT 'pending', -- pending|running|done|verifying|verified|rejected|cancelled|failed
+    execution_attempt INTEGER NOT NULL DEFAULT 0,
+    quality_iteration INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sub_goal_goal ON sub_goal(goal_id, created_at);
+
+-- change: a logical deliverable produced by a sub-goal (v2 model, 决策 6-3).
+-- It is NOT a permanent branch: change_revision binds each revision to the
+-- integration base it was built against. The Change row and its FIRST
+-- revision are created atomically (Ready ⇔ a persisted Revision exists).
+CREATE TABLE IF NOT EXISTS change (
+    id          TEXT PRIMARY KEY,
+    goal_id     TEXT NOT NULL REFERENCES goal(id),
+    sub_goal_id TEXT NOT NULL REFERENCES sub_goal(id),
+    status      TEXT NOT NULL DEFAULT 'ready', -- ready|integrating|integrated|conflict
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_goal ON change(goal_id, created_at);
+
+CREATE TABLE IF NOT EXISTS change_revision (
+    id         TEXT PRIMARY KEY,
+    change_id  TEXT NOT NULL REFERENCES change(id),
+    seq        INTEGER NOT NULL,        -- 1..N; conflict resolution appends N+1
+    base_ref   TEXT NOT NULL,           -- the integration base this revision was built on
+    head_ref   TEXT NOT NULL,           -- the revision's commit ref
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_change_revision_change ON change_revision(change_id, seq);
+
+-- verification_result: one verification round of a sub-goal (v2 model,
+-- 决策 6-5). Verifier runs produce verdicts via the structured tool; machine
+-- verification (verifier_id='') records one row per run-end check. Rounds ≠
+-- run.attempt (verifier runs retry their own machine failures separately).
+CREATE TABLE IF NOT EXISTS verification_result (
+    id              TEXT PRIMARY KEY,
+    goal_id         TEXT NOT NULL REFERENCES goal(id),
+    sub_goal_id     TEXT NOT NULL REFERENCES sub_goal(id),
+    verifier_run_id TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL, -- passed|rejected
+    summary         TEXT NOT NULL DEFAULT '',
+    evidence        TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_result_sub ON verification_result(sub_goal_id, created_at);
+
+-- handoff_event: one ownership transition (Collaboration.md §20). Append-only
+-- audit of who handed the goal to whom, from/to which runs, and why — the
+-- handoff-cycle signal (A→B→A→B ping-pong) is counted from here. to_run_id is
+-- back-filled by the caller after the new owner's run is enqueued.
+CREATE TABLE IF NOT EXISTS handoff_event (
+    id          TEXT PRIMARY KEY,
+    goal_id     TEXT NOT NULL REFERENCES goal(id),
+    from_type   TEXT NOT NULL,               -- agent|squad|human (assignee is polymorphic)
+    from_id     TEXT NOT NULL DEFAULT '',
+    to_type     TEXT NOT NULL,
+    to_id       TEXT NOT NULL DEFAULT '',
+    from_run_id TEXT NOT NULL DEFAULT '',    -- the old owner's run terminated by the handoff
+    to_run_id   TEXT NOT NULL DEFAULT '',    -- the new owner's run enqueued by the handoff
+    reason      TEXT NOT NULL DEFAULT '',
+    actor_type  TEXT NOT NULL DEFAULT 'human', -- who performed the handoff (agent|human|system)
+    actor_id    TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_handoff_event_goal ON handoff_event(goal_id, created_at);
+
+-- consult_request: one Consult (Collaboration.md §12) — an agent's mention of
+-- another agent for information/judgment. Links the full chain:
+-- trigger comment → guest run → response comment → (auto) requester resume.
+CREATE TABLE IF NOT EXISTS consult_request (
+    id                  TEXT PRIMARY KEY,
+    goal_id             TEXT NOT NULL REFERENCES goal(id),
+    requester_agent_id  TEXT NOT NULL DEFAULT '', -- '' = human/system-triggered (no auto-resume)
+    requester_run_id    TEXT NOT NULL DEFAULT '', -- the owner run that asked
+    target_agent_id     TEXT NOT NULL DEFAULT '',
+    trigger_comment_id  TEXT NOT NULL DEFAULT '', -- the mention comment that pulled in the guest
+    guest_run_id        TEXT NOT NULL DEFAULT '', -- the guest run answering the consult
+    response_comment_id TEXT NOT NULL DEFAULT '', -- the guest report comment (back-filled at run end)
+    created_at          TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_consult_request_guest ON consult_request(guest_run_id);
+CREATE INDEX IF NOT EXISTS idx_consult_request_goal ON consult_request(goal_id, created_at);
 
 -- gate_decision: checkpoint decision audit + the health-learning data source
 -- (per-gate approve/reject ratios feed the "suggest dropping/ tightening a

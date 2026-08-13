@@ -2,12 +2,13 @@
 
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import { useGoal, useGoals, useAgents, useSquads, useGoalEvents } from "@/lib/queries";
+import { useGoal, useAgents, useSquads, useGoalEvents } from "@/lib/queries";
 import { GoalActions } from "@/components/goal-actions";
 import { GoalComments } from "@/components/goal-comments";
 import { GoalRuns } from "@/components/goal-runs";
+import { GoalSubGoals } from "@/components/goal-subgoals";
 import { GoalStatusBar, GoalTimeline } from "@/components/goal-timeline";
-import { Badge, Empty } from "@/components/ui";
+import { Badge } from "@/components/ui";
 import type { Goal } from "@/lib/types";
 
 export default function GoalDetailPage() {
@@ -15,7 +16,6 @@ export default function GoalDetailPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
   const { data: goal, isLoading } = useGoal(id);
-  const { data: allGoals } = useGoals();
   const { data: agents } = useAgents();
   const { data: squads } = useSquads();
 
@@ -29,8 +29,6 @@ export default function GoalDetailPage() {
     : goal.assignee_id
       ? (agentName(goal.assignee_id) || goal.assignee_id)
       : "-";
-
-  const children = allGoals?.filter((t) => t.parent_id === id) ?? [];
 
   return (
     <div className="p-8 space-y-5 max-w-4xl page-enter">
@@ -72,40 +70,11 @@ export default function GoalDetailPage() {
       {/* Comments */}
       <GoalComments goalId={id} />
 
+      {/* Sub-goals（v2：goal 内部拆出的工作项，不是 child goal） */}
+      <GoalSubGoals goalId={id} />
+
       {/* Runs */}
       <GoalRuns goalId={id} />
-
-      {/* Sub-goals（机制休眠中——决策 3-6，非空才显示） */}
-      {children.length > 0 && (
-      <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">
-        <div className="px-4 py-2.5 border-b border-zinc-100 text-xs font-medium text-zinc-500 uppercase tracking-wide">
-          子 Goal{children.length > 0 && `（${children.length}）`}
-        </div>
-        <div className="p-4">
-          {children.length === 0 ? (
-            <Empty>没有子 Goal。</Empty>
-          ) : (
-            <ul className="space-y-2">
-              {children.map((c: Goal) => (
-                <li key={c.id} className="flex items-center gap-2 text-sm">
-                  <Link href={`/goals/${c.id}`} className="font-medium text-zinc-900 hover:text-blue-600 hover:underline">
-                    {c.title}
-                  </Link>
-                  <Badge status={c.status} />
-                  <span className="text-zinc-400 text-xs">
-                    {c.assignee_type === "squad"
-                      ? (squadName(c.assignee_id) || c.assignee_id)
-                      : c.assignee_id
-                        ? (agentName(c.assignee_id) || c.assignee_id)
-                        : "-"}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      </div>
-      )}
     </div>
   );
 }

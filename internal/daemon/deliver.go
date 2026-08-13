@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -87,20 +88,20 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		d.finishDeliver(ctx, goalID, false, "deliver: goal has no domain: "+err.Error())
 		return
 	}
-	// No in-flight run before the merge touches the worktree: a review-window
-	// run (the squad review checkpoint) is the usual waiter — wait for it to
-	// finish (bounded), never race it. The approve/reject guard keeps the
-	// goal in review while deliver runs, so the wait cannot be invalidated by
-	// a concurrent decision.
+	// No in-flight OWNER run before the merge touches the goal branch (决策
+	// 6-6: deliver waits only for the goal-branch writer — consult/review
+	// runs are read-only snapshots and never block delivery). Bounded wait,
+	// never race it. The approve/reject guard keeps the goal in review while
+	// deliver runs, so the wait cannot be invalidated by a concurrent decision.
 	waitDeadline := time.Now().Add(deliverWaitForRuns)
 	for {
 		var running int
 		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='running'`, goalID).Scan(&running); err == nil && running == 0 {
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='running' AND role='owner'`, goalID).Scan(&running); err == nil && running == 0 {
 			break
 		}
 		if time.Now().After(waitDeadline) {
-			d.finishDeliver(ctx, goalID, false, "deliver: 等待运行中的 run 结束超时（5 分钟），请稍后再次批准")
+			d.finishDeliver(ctx, goalID, false, "deliver: 等待运行中的 owner run 结束超时（5 分钟），请稍后再次批准")
 			return
 		}
 		select {
@@ -112,25 +113,31 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// Deliver INTO the domain's configured default branch (DESIGN.md §7).
 	// Wrong config fails loudly with the branch name — the owner fixes the
 	// domain, no silent fallbacks.
-	repo := domainRepoPath(domainID)
-	if _, err := d.ensureGoalWorktree(ctx, domainID, goalID, gitURL, gitCredentials, defaultBranch); err != nil {
-		d.finishDeliver(ctx, goalID, false, "deliver: prepare worktree: "+err.Error())
-		return
-	}
 	if defaultBranch == "" {
 		defaultBranch = "main"
 	}
 	branchName := goalBranchName(goalID)
-	wt := goalWorktreePath(domainID, goalID)
 
 	// All git writes on the shared repo are serialized per domain (decision
 	// 2-10): concurrent deliveries (or a fetch) would collide.
 	unlock := d.lockDomain(domainID)
 	defer unlock()
 
+	repo := domainRepoPath(domainID)
+	if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
+		d.finishDeliver(ctx, goalID, false, "deliver: prepare repo: "+err.Error())
+		return
+	}
+	// Fresh origin/<default> BEFORE the branch checks (the merge base must be
+	// the remote's current tip).
+	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
+		d.finishDeliver(ctx, goalID, false, "deliver: fetch: "+err.Error()+": "+string(out))
+		return
+	}
+
 	// The goal branch must have commits AHEAD of the base — an empty branch
-	// (equal to the worktree base, e.g. after a shared-repo wipe orphaned the
-	// branch) must NOT be treated as "already merged" and delivered empty.
+	// (equal to the base) must NOT be treated as "already merged" and
+	// delivered empty.
 	base, err := gitRun(ctx, repo, "rev-parse", "origin/"+defaultBranch)
 	if err != nil {
 		d.finishDeliver(ctx, goalID, false, "deliver: resolve base: "+err.Error())
@@ -154,26 +161,27 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 
 	// Idempotency: already merged (crash between merge and push)?
 	if _, err := gitRunCtx(ctx, repo, "merge-base", "--is-ancestor", branchName, "origin/"+defaultBranch); err == nil {
-		// Branch already in origin/default — nothing to merge; push again is a
+		// Branch already in origin/default — nothing to merge; the push is a
 		// no-op and MarkDelivered closes.
 		log.Printf("daemon: deliver %s: branch already merged (resume after crash?)", goalID)
-		if _, perr := gitRunCtx(ctx, wt, "push", "origin", defaultBranch); perr != nil {
-			d.finishDeliver(ctx, goalID, false, "deliver: push: "+perr.Error())
-			return
-		}
-		d.finishDeliver(ctx, goalID, true, "already merged; pushed")
+		d.finishDeliver(ctx, goalID, true, "already merged; nothing to push")
 		return
 	}
 
-	// Switch the worktree to the default branch and sync.
-	if _, err := gitRunCtx(ctx, wt, "checkout", defaultBranch); err != nil {
-		d.finishDeliver(ctx, goalID, false, "deliver: checkout "+defaultBranch+": "+err.Error())
+	// Ephemeral deliver worktree (决策 6-2): a detached checkout of
+	// origin/<default> used ONLY for this merge — the merge commit lives on
+	// the detached HEAD and is pushed as <default>. Removed afterwards; a
+	// crashed deliver leaves the dir behind for the startup sweep.
+	wt := deliverWorktreePath(goalID)
+	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "--detach", wt, "origin/"+defaultBranch).CombinedOutput(); err != nil {
+		d.finishDeliver(ctx, goalID, false, "deliver: worktree add: "+err.Error()+": "+string(out))
 		return
 	}
-	if _, err := gitRunCtx(ctx, wt, "pull", "--ff-only", "origin", defaultBranch); err != nil {
-		d.finishDeliver(ctx, goalID, false, "deliver: pull origin/"+defaultBranch+": "+err.Error())
-		return
-	}
+	defer func() {
+		if out, err := exec.CommandContext(context.Background(), "git", "-C", repo, "worktree", "remove", "--force", wt).CombinedOutput(); err != nil {
+			log.Printf("daemon: deliver worktree remove %s: %v %s", goalID, err, out)
+		}
+	}()
 	// Post-merge guards measure the merge's own diff (default-branch tip before
 	// the merge .. merge commit).
 	mergeBaseSHA := strings.TrimSpace(mustGitRun(ctx, wt, "rev-parse", "HEAD"))
@@ -200,10 +208,9 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// change an explicit, revertible unit).
 	mergeOut, err := gitRunCtx(ctx, wt, "merge", "--no-ff", branchName, "-m", "Merge "+branchName+" (agentwork deliver)")
 	if err != nil {
-		// Conflict: abort, hand the worktree back to the goal branch (the
-		// agent's work stays intact for a reject-and-fix cycle), and report.
+		// Conflict: abort and report — the ephemeral worktree is removed by
+		// the defer; the goal branch stays intact for a reject-and-fix cycle.
 		_, _ = gitRunCtx(ctx, wt, "merge", "--abort")
-		_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
 		d.finishDeliver(ctx, goalID, false, "deliver: merge conflict:\n"+mergeOut)
 		return
 	}
@@ -217,32 +224,21 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	if checksFrozen {
 		verifyReport, ok, _ := runVerification(ctx, wt, checks, timeout)
 		if !ok {
-			// Verification red after merge: reset the default branch, hand the
-			// worktree back to the goal branch, and report.
-			_, _ = gitRunCtx(ctx, wt, "reset", "--hard", "origin/"+defaultBranch)
-			_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
 			d.finishDeliver(ctx, goalID, false, "deliver: post-merge verification failed:\n"+verifyReport)
 			return
 		}
 		if guardReport, ok := checkGuards(ctx, wt, mergeBaseSHA, checks, baseline); !ok {
-			_, _ = gitRunCtx(ctx, wt, "reset", "--hard", "origin/"+defaultBranch)
-			_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
 			d.finishDeliver(ctx, goalID, false, "deliver: post-merge guards failed:\n"+guardReport)
 			return
 		}
 	}
 
-	if _, err := gitRunCtx(ctx, wt, "push", "origin", defaultBranch); err != nil {
-		// Push failed (e.g. remote moved): reset local default, restore the
-		// goal branch; the human can retry deliver.
-		_, _ = gitRunCtx(ctx, wt, "reset", "--hard", "origin/"+defaultBranch)
-		_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
+	// The merge commit lives on the detached HEAD — push it as the default
+	// branch (the ephemeral worktree has no local default branch).
+	if _, err := gitRunCtx(ctx, wt, "push", "origin", "HEAD:"+defaultBranch); err != nil {
 		d.finishDeliver(ctx, goalID, false, "deliver: push: "+err.Error())
 		return
 	}
-	// Leave the worktree on the goal branch so a later reject/resume finds
-	// the agent's state where it was.
-	_, _ = gitRunCtx(ctx, wt, "checkout", branchName)
 
 	// The delivered note carries the merge info; the fix commits travel
 	// STRUCTURED to the delivered event (the close comment links them).

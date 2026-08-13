@@ -75,6 +75,35 @@ func (n *Notifier) Subscribe(bus *events.Bus) {
 	bus.Subscribe("goal:deliver_failed", n.onGoalDeliverFailed)
 	bus.Subscribe("goal:finished", n.onGoalFinished)
 	bus.Subscribe("run:cancelled", n.onRunCancelled)
+	// v2 (决策 6-8): a human-owned goal needs its owner's attention — the
+	// goal has no agent run to spawn, so the IM push IS the wakeup.
+	bus.Subscribe("goal.attention_needed", n.onGoalAttentionNeeded)
+}
+
+// onGoalAttentionNeeded pushes the "owner attention" card for a human-owned
+// goal (all sub-goals verified / changes ready / recovery needed — no agent
+// run exists to act, the human is the owner).
+func (n *Notifier) onGoalAttentionNeeded(_ context.Context, e events.Event) {
+	ctx := context.Background()
+	m, _ := e.Payload.(map[string]any)
+	goalID, _ := m["goal_id"].(string)
+	attention, _ := m["attention"].(string)
+	if goalID == "" {
+		return
+	}
+	title := n.goalTitle(ctx, goalID)
+	if title == "" {
+		title = short(goalID)
+	}
+	reason := map[string]string{
+		"integration": "有 Change 等待集成",
+		"recovery":    "有子任务失败，需要处理",
+		"user_action": "需要人工决策",
+	}[attention]
+	if reason == "" {
+		reason = attention
+	}
+	n.sendMilestoneCard("👤", "purple", "需要你处理", fmt.Sprintf("**%s**  \n`goal %s`  \n%s", title, short(goalID), reason))
 }
 
 // NOTE: the published event carries the PUBLISHER's ctx (often an HTTP

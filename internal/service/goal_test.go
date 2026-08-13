@@ -1,7 +1,6 @@
 package service
 
 import (
-	"strings"
 	"context"
 	"testing"
 	"time"
@@ -126,7 +125,7 @@ func TestHandoffDoesNotClobber(t *testing.T) {
 	}
 
 	// Hand off to B while A's run is in flight. This enqueues a B run.
-	if _, err := gs.Assign(ctx, g.ID, "agent", agentB, "handoff note"); err != nil {
+	if _, err := gs.Assign(ctx, g.ID, "agent", agentB, "handoff note", "", ""); err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 	if _, err := rs.EnqueueForGoal(ctx, Goal{ID: g.ID, AssigneeType: "agent", AssigneeID: agentB}); err != nil {
@@ -210,66 +209,6 @@ func TestCancelNotClobbered(t *testing.T) {
 
 // TestSubGoalCoordination: parent waits on children; when all children finish,
 // the parent is woken (re-queued) with a wakeup note. Proves the dynamic
-// wait-set + child→parent notification path.
-func TestSubGoalCoordination(t *testing.T) {
-	gs, rs, _, st := newTestCluster(t)
-	ctx := context.Background()
-	agentA := seedAgent(t, st, "A")
-	domID := seedDomain(t, st)
-	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
-	pr := enqueueFirst(t, rs, parent)
-	c1, _ := gs.Create(ctx, Goal{Title: "child1", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
-	c2, _ := gs.Create(ctx, Goal{Title: "child2", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
-	_ = enqueueFirst(t, rs, c1)
-	_ = enqueueFirst(t, rs, c2)
-	if err := gs.WaitChildren(ctx, parent.ID); err != nil {
-		t.Fatalf("wait: %v", err)
-	}
-	// The parent's first run ends (it called wait). It should NOT advance the
-	// goal — the goal is blocked.
-	if err := rs.Finish(ctx, pr.ID, "completed", "parent spawned children"); err != nil {
-		t.Fatalf("finish parent run1: %v", err)
-	}
-	pAfter, _ := gs.Get(ctx, parent.ID)
-	if pAfter.Status != "blocked" {
-		t.Fatalf("parent should be blocked, got %q", pAfter.Status)
-	}
-
-	// Children complete. The LAST child's completion should wake the parent.
-	rc1 := enqueueFirst(t, rs, c1)
-	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-	if err := rs.Finish(ctx, rc1.ID, "completed", "c1 done"); err != nil {
-		t.Fatalf("finish c1: %v", err)
-	}
-	// c2 still inflight → parent should NOT wake yet.
-	pAfter, _ = gs.Get(ctx, parent.ID)
-	if pAfter.Status != "blocked" {
-		t.Fatalf("parent should still be blocked (c2 inflight), got %q", pAfter.Status)
-	}
-
-	rc2 := enqueueFirst(t, rs, c2)
-	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
-		t.Fatalf("claim c2: %v", err)
-	}
-	if err := rs.Finish(ctx, rc2.ID, "completed", "c2 done"); err != nil {
-		t.Fatalf("finish c2: %v", err)
-	}
-
-	// Now all children terminal → parent woken: status active + a new run queued.
-	pAfter, _ = gs.Get(ctx, parent.ID)
-	if pAfter.Status != "active" {
-		t.Fatalf("parent should be woken to active, got %q", pAfter.Status)
-	}
-	runs, _ := rs.List(ctx, parent.ID)
-	if len(runs) < 2 {
-		t.Fatalf("parent should have a second (wakeup) run; got %d runs", len(runs))
-	}
-	if pAfter.HandoffNote == "" {
-		t.Fatalf("parent should carry a wakeup note")
-	}
-}
 
 // TestCoalescePending: enqueuing a second run for the same (goal,agent) while
 // one is pending coalesces — exactly one queued/running run per pair.
@@ -281,7 +220,7 @@ func TestCoalescePending(t *testing.T) {
 	g, _ := gs.Create(ctx, Goal{Title: "x", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	r1 := enqueueFirst(t, rs, g)
 	// Hand off to A again (re-enqueue) while r1 is still queued.
-	if _, err := gs.Assign(ctx, g.ID, "agent", agentA, "again"); err != nil {
+	if _, err := gs.Assign(ctx, g.ID, "agent", agentA, "again", "", ""); err != nil {
 		t.Fatalf("assign: %v", err)
 	}
 	if _, err := rs.EnqueueForGoal(ctx, Goal{ID: g.ID, AssigneeType: "agent", AssigneeID: agentA}); err != nil {
@@ -303,66 +242,10 @@ func TestCoalescePending(t *testing.T) {
 // maxWakeCycles times already, another child-done does NOT wake it again —
 // instead the goal is force-failed, so a runaway re-fan-out loop is bounded
 // and surfaced rather than burning runs forever. (Guard is a state-machine
-// invariant, not prompt wording.)
-func TestWakeRunawayGuarded(t *testing.T) {
-	gs, rs, _, st := newTestCluster(t)
-	ctx := context.Background()
-	agentA := seedAgent(t, st, "A")
-	domID := seedDomain(t, st)
-	parent, _ := gs.Create(ctx, Goal{Title: "parent", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
-	// One child, already done (so inflight==0 → wake conditions otherwise met).
-	child, _ := gs.Create(ctx, Goal{Title: "c", AssigneeType: "agent", AssigneeID: agentA, Status: "active", ParentID: parent.ID, DomainID: domID})
-	cr := enqueueFirst(t, rs, child)
-	// Parent must be waiting (blocked) for a child-done to wake it.
-	if err := gs.WaitChildren(ctx, parent.ID); err != nil {
-		t.Fatalf("wait parent: %v", err)
-	}
-	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
-		t.Fatalf("claim: %v", err)
-	}
-	if err := rs.Finish(ctx, cr.ID, "completed", "ok"); err != nil {
-		t.Fatalf("finish child: %v", err)
-	}
-	// The parent was just woken once (child done). Verify it went active.
-	p, _ := gs.Get(ctx, parent.ID)
-	if p.Status != "active" || p.WakeCount != 1 {
-		t.Fatalf("expected active wake_count=1, got %s/%d", p.Status, p.WakeCount)
-	}
-	// Simulate the loop: agent waited again and we've now bumped wake_count to
-	// the limit. Force the parent back to blocked, then push wake_count to the
-	// cap, and trigger a final wake — it must fail, not wake.
-	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='blocked', wake_count=? WHERE id=?`, maxWakeCycles, parent.ID); err != nil {
-		t.Fatalf("set blocked+maxed: %v", err)
-	}
-	runsBefore, _ := rs.List(ctx, parent.ID)
-	pendingBefore := 0
-	for _, r := range runsBefore {
-		if r.Status == "queued" || r.Status == "running" {
-			pendingBefore++
-		}
-	}
-	if err := gs.NotifyChildDone(ctx, child.ID); err != nil {
-		t.Fatalf("notify: %v", err)
-	}
-	p, _ = gs.Get(ctx, parent.ID)
-	if p.Status != "failed" {
-		t.Fatalf("runaway parent must be force-failed, got %q", p.Status)
-	}
-	// No NEW parent run was enqueued beyond what existed before the over-limit wake.
-	runsAfter, _ := rs.List(ctx, parent.ID)
-	pendingAfter := 0
-	for _, r := range runsAfter {
-		if r.Status == "queued" || r.Status == "running" {
-			pendingAfter++
-		}
-	}
-	if pendingAfter != pendingBefore {
-		t.Fatalf("runaway force-fail must enqueue no new run; before=%d after=%d", pendingBefore, pendingAfter)
-	}
-}
 
 // Ensure the test binary doesn't time out on the background bus goroutines.
 var _ = time.Second
+
 // TestReopenFailedGoal: the human take-over path — failed/cancelled → active
 // with a fresh run (attempt resets), exactly like a reject iteration.
 func TestReopenFailedGoal(t *testing.T) {
@@ -397,70 +280,57 @@ func TestReopenFailedGoal(t *testing.T) {
 
 // TestParkForManualReview: the worktree-dirty path — a worktree with unattributed changes
 // parks the active goal in review (the human resolves, then the normal review
-// flow takes over).
-func TestParkForManualReview(t *testing.T) {
-	gs, _, _, st := newTestCluster(t)
-	ctx := context.Background()
-	agentA := seedAgent(t, st, "A")
-	domID := seedDomainWithGates(t, st)
-
-	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
-	if err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if err := gs.ParkForManualReview(ctx, g.ID, "worktree 有未归因改动"); err != nil {
-		t.Fatalf("park: %v", err)
-	}
-	got, _ := gs.Get(ctx, g.ID)
-	if got.Status != "review" || !strings.Contains(got.ReviewRequest, "未归因") {
-		t.Fatalf("parked goal must be in review with the reason, got %+v", got)
-	}
-}
 
 // TestClaimPerGoalSerialization: a queued run of a goal is NOT claimed while
 // another run of the same goal is running (the worktree is exclusive); it
 // becomes claimable once the running run finishes. Processor runs (no goal)
 // are never blocked.
-func TestClaimPerGoalSerialization(t *testing.T) {
+func TestClaimOwnerSingleFlight(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
-	agentB := seedAgent(t, st, "B") // reviewer — a DIFFERENT agent than the runner
+	agentB := seedAgent(t, st, "B")
+	agentC := seedAgent(t, st, "C")
 
 	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: seedDomainWithGates(t, st)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	first := enqueueFirst(t, rs, g)
-	// The writer's run is claimed (running).
+	// The owner's run is claimed (running).
 	if _, err := rs.Claim(ctx, []string{agentA}); err != nil {
 		t.Fatal(err)
 	}
-	// A mention-triggered run on ANOTHER agent (the reviewer) lands mid-run.
-	// Coalescing is per-(goal,agent), so this creates a NEW run — and it
-	// must WAIT: the goal's worktree is exclusive.
-	if _, err := rs.EnqueueForMention(ctx, g.ID, agentB, "c1"); err != nil {
+	// OWNER single-flight (决策 6-2): a second owner-role run of the same goal
+	// must NOT be claimable while the owner runs (one goal-branch writer).
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,status,role,attempt,queued_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		"owner-2", g.ID, agentB, "worker", "queued", "owner", 1, now(), now()); err != nil {
 		t.Fatal(err)
 	}
-	// Running run of the same goal → the queued one must NOT be claimable.
-	c, err := rs.Claim(ctx, []string{agentB})
+	if c, err := rs.Claim(ctx, []string{agentB}); err != nil {
+		t.Fatal(err)
+	} else if c != nil {
+		t.Fatalf("a second owner run must wait while the owner runs, claimed %s", c.RunID)
+	}
+	// A CONSULT run IS claimable in parallel (read-only workspace snapshot) —
+	// on a DIFFERENT agent than the waiting owner-2 run (the (goal,agent)
+	// coalesce would otherwise swallow it).
+	if _, err := rs.EnqueueForMention(ctx, g.ID, agentC, "c1"); err != nil {
+		t.Fatal(err)
+	}
+	c, err := rs.Claim(ctx, []string{agentC})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c != nil {
-		t.Fatalf("queued run must wait while the goal's run is running, claimed %s", c.RunID)
+	if c == nil || c.GoalID != g.ID {
+		t.Fatalf("consult run must run in parallel with the owner, got %+v", c)
 	}
-	// A DIFFERENT goal's run is still claimable (serialization is per-goal).
-	g2, _ := gs.Create(ctx, Goal{Title: "g2", AssigneeType: "agent", AssigneeID: agentB, Status: "active", DomainID: seedDomain(t, st)})
-	enqueueFirst(t, rs, g2)
-	c, err = rs.Claim(ctx, []string{agentB})
-	if err != nil {
+	// Finish the consult run.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE run SET status='completed', finished_at=? WHERE id=?`, now(), c.RunID); err != nil {
 		t.Fatal(err)
 	}
-	if c == nil {
-		t.Fatal("another goal's queued run must be claimable")
-	}
-	// Finish the writer's run → the reviewer's queued run becomes claimable.
+	// Finish the owner's run → the second owner run becomes claimable.
 	if _, err := st.DB().ExecContext(ctx, `UPDATE run SET status='completed', finished_at=? WHERE id=?`, now(), first.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +338,7 @@ func TestClaimPerGoalSerialization(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c == nil || c.GoalID != g.ID {
-		t.Fatalf("queued run must be claimable after the running run finishes, got %+v", c)
+	if c == nil || c.RunID != "owner-2" {
+		t.Fatalf("the waiting owner run must claim after the owner finishes, got %+v", c)
 	}
 }

@@ -15,7 +15,6 @@ import {
   deleteGoal,
   assignGoal,
   cancelGoal,
-  waitGoalChildren,
   resolveGoalReview,
   reopenGoal,
   listGoalRuns,
@@ -35,6 +34,8 @@ import {
   deleteSchedule,
   setScheduleEnabled,
   listDomains,
+  listSubGoals,
+  createSubGoal,
   getDomain,
   createDomain,
   updateDomain,
@@ -59,6 +60,7 @@ export const qk = {
   goalRuns: (goalId: string) => ["goals", goalId, "runs"] as const,
   goalComments: (goalId: string) => ["goals", goalId, "comments"] as const,
   goalTimeline: (goalId: string) => ["goals", goalId, "timeline"] as const,
+  goalSubGoals: (goalId: string) => ["goals", goalId, "sub-goals"] as const,
   squads: ["squads"] as const,
   squad: (id: string) => ["squads", id] as const,
   squadMembers: (squadId: string) => ["squads", squadId, "members"] as const,
@@ -167,13 +169,6 @@ export function useCancelGoal() {
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
   });
 }
-export function useWaitGoalChildren() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: waitGoalChildren,
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.goals }),
-  });
-}
 export function useReopenGoal() {
   const qc = useQueryClient();
   return useMutation({
@@ -207,6 +202,24 @@ export function useGoalRunMessages(goalId: string, runId: string, enabled = true
     queryKey: ["goal-runs", runId, "messages"],
     queryFn: () => listGoalRunMessages(goalId, runId),
     enabled: enabled && !!runId,
+  });
+}
+
+// ── Sub-goal hooks ──
+export function useSubGoals(goalId: string) {
+  return useQuery({
+    queryKey: qk.goalSubGoals(goalId),
+    queryFn: () => listSubGoals(goalId),
+  });
+}
+export function useCreateSubGoal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ goalId, ...body }: { goalId: string; title: string; description?: string; assignee_id: string; verifier_id?: string }) =>
+      createSubGoal(goalId, body),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: qk.goalSubGoals(vars.goalId) });
+    },
   });
 }
 

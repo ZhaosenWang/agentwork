@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -53,12 +54,13 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /goals/{id}", h.deleteGoal)
 	mux.HandleFunc("POST /goals/{id}/assign", h.assignGoal)
 	mux.HandleFunc("POST /goals/{id}/cancel", h.cancelGoal)
-	mux.HandleFunc("POST /goals/{id}/wait", h.waitGoal)
 	mux.HandleFunc("POST /goals/{id}/review", h.resolveGoalReview)
 	mux.HandleFunc("POST /goals/{id}/reopen", h.reopenGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/runs/{runId}/messages", h.listRunMessages)
 	mux.HandleFunc("GET /goals/{id}/timeline", h.goalTimeline)
+	mux.HandleFunc("GET /goals/{id}/sub-goals", h.listSubGoals)
+	mux.HandleFunc("POST /goals/{id}/sub-goals", h.createSubGoal)
 	mux.HandleFunc("GET /goals/{id}/comments", h.listComments)
 	mux.HandleFunc("POST /goals/{id}/comments", h.createComment)
 
@@ -174,9 +176,10 @@ func (h *Handlers) createGoal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A freshly-created active goal with an agent/squad assignee needs a first
-	// run enqueued (backlog goals do NOT — the semantic invariant).
-	if out.Status == "active" && (out.AssigneeType == "agent" || out.AssigneeType == "squad") {
-		_, _ = h.Run.EnqueueForGoal(r.Context(), *out)
+	// run enqueued (backlog goals do NOT — the semantic invariant). The
+	// unified owner-run spawn (P0.5) no-ops for backlog/human goals.
+	if _, err := h.Goal.EnqueueOwnerRun(r.Context(), out.ID); err != nil {
+		log.Printf("handler: enqueue owner for %s: %v", out.ID, err)
 	}
 	writeJSON(w, out, nil)
 }
@@ -224,28 +227,32 @@ func (h *Handlers) assignGoal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	out, err := h.Goal.Assign(r.Context(), r.PathValue("id"), body.AssigneeType, body.AssigneeID, body.HandoffNote)
+	// HTTP assign = the human's action (决策 5-6: the HTTP surface carries no
+	// agent identity; agent handoffs go through the MCP handoff_goal tool).
+	out, err := h.Goal.Assign(r.Context(), r.PathValue("id"), body.AssigneeType, body.AssigneeID, body.HandoffNote, "", "")
 	if err != nil {
 		writeJSON(w, nil, err)
 		return
 	}
-	// Enqueue a run for the new assignee (coalesces if one is pending). The
-	// prior run, if in flight, keeps running — reconcile discards its result.
+	// Enqueue a run for the new assignee (the unified owner-run spawn, P0.5 —
+	// coalesces if one is pending). The prior run, if in flight, keeps running
+	// — reconcile discards its result. The handoff event's to_run_id is
+	// back-filled from the spawned run.
 	if body.AssigneeType == "agent" || body.AssigneeType == "squad" {
-		_, _ = h.Run.EnqueueForGoal(r.Context(), *out)
+		run, err := h.Goal.EnqueueOwnerRun(r.Context(), out.ID)
+		if err != nil {
+			writeJSON(w, nil, err)
+			return
+		}
+		if run != nil {
+			_ = h.Goal.CompleteHandoff(r.Context(), out.ID, run.ID)
+		}
 	}
 	writeJSON(w, out, nil)
 }
 func (h *Handlers) cancelGoal(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Goal.Cancel(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
-}
-func (h *Handlers) waitGoal(w http.ResponseWriter, r *http.Request) {
-	if err := h.Goal.WaitChildren(r.Context(), r.PathValue("id")); err != nil {
-		writeJSON(w, nil, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handlers) resolveGoalReview(w http.ResponseWriter, r *http.Request) {
@@ -678,4 +685,25 @@ func writeErr(w http.ResponseWriter, code int, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
+func (h *Handlers) listSubGoals(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Goal.ListSubGoals(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+
+func (h *Handlers) createSubGoal(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		AssigneeID  string `json:"assignee_id"`
+		VerifierID  string `json:"verifier_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	// HTTP = the human's surface (决策 6-1: human can split work).
+	out, err := h.Goal.CreateSubGoal(r.Context(), r.PathValue("id"), body.Title, body.Description, body.AssigneeID, body.VerifierID, "human", "")
+	writeJSON(w, out, err)
 }

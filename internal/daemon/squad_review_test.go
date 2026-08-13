@@ -94,7 +94,7 @@ func TestSquadReviewTrigger(t *testing.T) {
 	if !strings.Contains(content, "[@reviewer](mention://agent/"+reviewerID+")") {
 		t.Fatalf("comment should carry the mention URI, got: %q", content)
 	}
-	if !strings.Contains(content, "不要修改任何文件") {
+	if !strings.Contains(content, "do not modify any file") {
 		t.Fatalf("comment should bound the reviewer's scope, got: %q", content)
 	}
 

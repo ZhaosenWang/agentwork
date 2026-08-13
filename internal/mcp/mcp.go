@@ -28,6 +28,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -51,8 +52,8 @@ type TerminalHost interface {
 // filesystem basis and the run environment for commands. The daemon builds
 // one per run and registers it under the run id.
 type Executor struct {
-	// Workdir is the run's worktree root — the workspace.
-	Workdir string
+	// Worktree is the run's worktree root — the execution directory.
+	Worktree string
 	// Env is the command environment (platform base + run context, PATH
 	// prepended with the agentwork-cli dir).
 	Env []string
@@ -76,13 +77,40 @@ type Executor struct {
 
 // NewExecutor binds an Executor to one run's workspace + terminal pool.
 func NewExecutor(workdir string, env []string, host TerminalHost) *Executor {
-	return &Executor{Workdir: workdir, Env: env, host: host}
+	return &Executor{Worktree: workdir, Env: env, host: host}
 }
 
 // SetCollaboration wires the services the collaboration tools need.
 func (e *Executor) SetCollaboration(goalID, agentID, runID string, commentSvc *service.CommentService, goalSvc *service.GoalService, runSvc *service.RunService, agentSvc *service.AgentService, squadSvc *service.SquadService) {
 	e.GoalID, e.AgentID, e.RunID = goalID, agentID, runID
 	e.commentSvc, e.goalSvc, e.runSvc, e.agentSvc, e.squadSvc = commentSvc, goalSvc, runSvc, agentSvc, squadSvc
+}
+
+// requireOwner enforces the handoff/consult/sub-goal/wait permission on THIS
+// run's goal (决策 5-6): the calling run's agent must be the goal's current
+// owner. Guest runs (consults/reviews) and non-owner agents are rejected.
+func (e *Executor) requireOwner(ctx context.Context) error {
+	return e.requireOwnerOf(ctx, e.GoalID)
+}
+
+// requireOwnerOf is requireOwner for an explicit goal id (create_sub_goal may
+// split from a named parent).
+func (e *Executor) requireOwnerOf(ctx context.Context, goalID string) error {
+	if e.goalSvc == nil {
+		return errors.New("collaboration not wired for this run")
+	}
+	g, err := e.goalSvc.Get(ctx, goalID)
+	if err != nil {
+		return err
+	}
+	owns, err := e.goalSvc.AgentOwnsGoal(ctx, g, e.AgentID)
+	if err != nil {
+		return err
+	}
+	if !owns {
+		return errors.New("permission denied: only the goal's current owner can do this (guest/consult runs cannot)")
+	}
+	return nil
 }
 
 // NewServer builds the MCP server with the workspace tools registered.
@@ -152,7 +180,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 		if args.Args != nil {
 			argv = *args.Args
 		}
-		cwd := exec.Workdir
+		cwd := exec.Worktree
 		if args.Cwd != nil && *args.Cwd != "" {
 			cwd = *args.Cwd
 		}
@@ -232,15 +260,17 @@ func NewServer(exec *Executor) *gmcp.Server {
 		return &gmcp.CallToolResult{Content: []gmcp.Content{&gmcp.TextContent{Text: "released " + args.TerminalID}}}, nil, nil
 	})
 
-	// ── Collaboration tools (决策 4-13): the agent coordinates through MCP
-	// tools, not a CLI — structured args, schema-described, no command
-	// syntax to learn. The CLI channel is retired from agent guidance.
+	// ── Collaboration tools (决策 5-2, the four-behavior model): Comment（说）
+	// / Consult（问）/ Handoff（接力）/ Sub-goal（拆活）. Structured args,
+	// schema-described, permission-checked — the calling run's agent (exec)
+	// is the identity anchor (决策 5-6: only the goal's owner can consult /
+	// hand off / split / wait).
 	type commentArgs struct {
-		Content string `json:"content" jsonschema:"the comment text; embed a structured mention like [@Name](mention://agent/<id>) to trigger a run on that agent"`
+		Content string `json:"content" jsonschema:"the comment text — a plain coordination message. Mentions in it do NOT trigger runs; use consult_agent to ask another agent."`
 	}
 	gmcp.AddTool(srv, &gmcp.Tool{
-		Name:        "goal_comment",
-		Description: "Post a comment on THIS goal as your agent — the collaboration surface. Embed a mention ([@Name](mention://agent/<uuid>) or mention://squad/<uuid>) to trigger a run on that agent; resolve uuids with agent_list / squad_list. Bare @handle does NOT trigger anything.",
+		Name:        "comment_goal",
+		Description: "Comment on THIS goal as your agent — say something (progress, findings, notes). Never triggers another agent's run, never changes ownership.",
 	}, func(ctx context.Context, req *gmcp.CallToolRequest, args commentArgs) (*gmcp.CallToolResult, any, error) {
 		if exec.commentSvc == nil || exec.GoalID == "" {
 			return nil, nil, errors.New("collaboration not wired for this run")
@@ -253,30 +283,275 @@ func NewServer(exec *Executor) *gmcp.Server {
 		return toolResult(map[string]any{"ok": true}), nil, nil
 	})
 
-	type assignArgs struct {
-		AssigneeType string `json:"assignee_type" jsonschema:"agent | squad | human"`
-		AssigneeID   string `json:"assignee_id" jsonschema:"the agent/squad id to hand the goal to ('' with human)"`
-		Note         string `json:"note,omitempty" jsonschema:"scoping instruction for the new owner — becomes their next run's scope"`
+	type consultArgs struct {
+		AgentID  string `json:"agent_id" jsonschema:"the agent to consult (resolve with agent_list)"`
+		Question string `json:"question" jsonschema:"what you need to know / want judged"`
 	}
 	gmcp.AddTool(srv, &gmcp.Tool{
-		Name:        "goal_assign",
-		Description: "Hand THIS goal to another agent/squad (or back to the human). END YOUR TURN right after — the platform terminates your run, the new owner's run drives the goal. Include a note that scopes the work for the new owner.",
-	}, func(ctx context.Context, req *gmcp.CallToolRequest, args assignArgs) (*gmcp.CallToolResult, any, error) {
-		if exec.goalSvc == nil || exec.GoalID == "" {
+		Name:        "consult_agent",
+		Description: "Consult another agent — ask for information/judgment. The platform posts a mention comment for you and enqueues a READ-ONLY guest run on that agent; their answer lands in the comment feed, and the platform automatically resumes YOUR next run after they answer. Only the goal's owner can consult.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args consultArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil || exec.commentSvc == nil || exec.GoalID == "" {
 			return nil, nil, errors.New("collaboration not wired for this run")
 		}
-		g, err := exec.goalSvc.Assign(ctx, exec.GoalID, args.AssigneeType, args.AssigneeID, args.Note)
+		if err := exec.requireOwner(ctx); err != nil {
+			return nil, nil, err
+		}
+		if strings.TrimSpace(args.AgentID) == "" || strings.TrimSpace(args.Question) == "" {
+			return nil, nil, errors.New("consult_agent: agent_id and question are required")
+		}
+		label := args.AgentID
+		if exec.agentSvc != nil {
+			if a, err := exec.agentSvc.Get(ctx, args.AgentID); err == nil && a.Name != "" {
+				label = a.Name
+			}
+		}
+		content := "[@" + label + "](mention://agent/" + args.AgentID + ") " + args.Question
+		c, err := exec.commentSvc.Create(ctx, service.Comment{
+			GoalID: exec.GoalID, AuthorType: "agent", AuthorID: exec.AgentID, Content: content, RunID: exec.RunID,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return toolResult(map[string]any{"ok": true, "comment_id": c.ID, "note": "guest run enqueued; your next run resumes automatically after the answer"}), nil, nil
+	})
+
+	type handoffArgs struct {
+		AssigneeType string `json:"assignee_type" jsonschema:"agent | squad | human"`
+		AssigneeID   string `json:"assignee_id" jsonschema:"the new owner's id ('' with human)"`
+		Reason       string `json:"reason,omitempty" jsonschema:"why you're handing off — becomes the new owner's scope"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "handoff_goal",
+		Description: "Hand THIS goal's ownership to another agent/squad (or back to the human). Only the current owner can. END YOUR TURN immediately after: the platform terminates your run and enqueues the new owner's run; the goal's branch state is preserved.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args handoffArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil || exec.runSvc == nil || exec.GoalID == "" {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		if err := exec.requireOwner(ctx); err != nil {
+			return nil, nil, err
+		}
+		g, err := exec.goalSvc.Assign(ctx, exec.GoalID, args.AssigneeType, args.AssigneeID, args.Reason, "agent", exec.AgentID)
 		if err != nil {
 			return nil, nil, err
 		}
 		// Enqueue the new owner's run (same as the Web handler): Assign moves
 		// ownership; the run drives the goal forward. Coalesces if pending.
 		if args.AssigneeType == "agent" || args.AssigneeType == "squad" {
-			if _, err := exec.runSvc.EnqueueForGoal(ctx, *g); err != nil {
+			run, err := exec.runSvc.EnqueueForGoal(ctx, *g)
+			if err != nil {
 				return nil, nil, err
+			}
+			if run != nil {
+				_ = exec.goalSvc.CompleteHandoff(ctx, g.ID, run.ID)
 			}
 		}
 		return toolResult(map[string]any{"ok": true}), nil, nil
+	})
+
+	type subGoalArgs struct {
+		ParentGoalID string `json:"parent_goal_id,omitempty" jsonschema:"the goal to split work off — defaults to THIS goal"`
+		Title        string `json:"title" jsonschema:"the sub-goal's title"`
+		Description  string `json:"description,omitempty" jsonschema:"what the sub-goal is about"`
+		AssigneeType string `json:"assignee_type" jsonschema:"agent — the sub-goal's assignee (executes the work item)"`
+		AssigneeID   string `json:"assignee_id" jsonschema:"the assignee agent's id"`
+		VerifierID   string `json:"verifier_id,omitempty" jsonschema:"optional agent verifier id ('' = machine verification)"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "create_sub_goal",
+		Description: "Split a work item off a goal — a sub-goal with its own assignee, run, worktree and machine verification; a verified sub-goal produces a Change the goal owner integrates. The goal's owner never changes; the platform wakes the owner when changes are ready. Only the goal's owner can split.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args subGoalArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil || exec.GoalID == "" {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		parentID := args.ParentGoalID
+		if parentID == "" {
+			parentID = exec.GoalID
+		}
+		if err := exec.requireOwnerOf(ctx, parentID); err != nil {
+			return nil, nil, err
+		}
+		if args.AssigneeType != "" && args.AssigneeType != "agent" {
+			return nil, nil, errors.New("sub-goal assignee must be an agent")
+		}
+		sg, err := exec.goalSvc.CreateSubGoal(ctx, parentID, args.Title, args.Description, args.AssigneeID, args.VerifierID, "agent", exec.AgentID)
+		if err != nil {
+			return nil, nil, err
+		}
+		return toolResult(map[string]any{"ok": true, "sub_goal_id": sg.ID, "note": "the platform wakes you when the change is ready for integration"}), nil, nil
+	})
+
+	type cancelSubGoalArgs struct {
+		SubGoalID string `json:"sub_goal_id" jsonschema:"the sub-goal to cancel"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "cancel_sub_goal",
+		Description: "Cancel one of THIS goal's sub-goals (owner management): the work item stops, its queued run is dropped and a running one is terminated. History (verification rounds, changes) is kept. Only the goal's owner can cancel.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args cancelSubGoalArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil || exec.GoalID == "" {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		sg, err := exec.goalSvc.GetSubGoal(ctx, args.SubGoalID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if sg.GoalID != exec.GoalID {
+			return nil, nil, errors.New("the sub-goal does not belong to this goal")
+		}
+		if err := exec.requireOwner(ctx); err != nil {
+			return nil, nil, err
+		}
+		if _, err := exec.goalSvc.CancelSubGoal(ctx, args.SubGoalID); err != nil {
+			return nil, nil, err
+		}
+		return toolResult(map[string]any{"ok": true, "sub_goal_id": args.SubGoalID}), nil, nil
+	})
+
+	type getSubGoalArgs struct {
+		SubGoalID string `json:"sub_goal_id,omitempty" jsonschema:"a sub-goal id; omit to list THIS goal's sub-goals"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "get_sub_goal",
+		Description: "Inspect sub-goals: one by id, or THIS goal's sub-goals (status, assignee, verification state — the resume context's detail view).",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args getSubGoalArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		if args.SubGoalID != "" {
+			sg, err := exec.goalSvc.GetSubGoal(ctx, args.SubGoalID)
+			if err != nil {
+				return nil, nil, err
+			}
+			return toolResult(map[string]any{"sub_goal": map[string]any{"id": sg.ID, "title": sg.Title, "description": sg.Description, "assignee_id": sg.AssigneeID, "verifier_id": sg.VerifierID, "status": sg.Status, "execution_attempt": sg.ExecutionAttempt, "quality_iteration": sg.QualityIteration}}), nil, nil
+		}
+		if exec.GoalID == "" {
+			return nil, nil, errors.New("no goal context — pass a sub_goal_id")
+		}
+		list, err := exec.goalSvc.ListSubGoals(ctx, exec.GoalID)
+		if err != nil {
+			return nil, nil, err
+		}
+		out := []map[string]any{}
+		for _, sg := range list {
+			out = append(out, map[string]any{"id": sg.ID, "title": sg.Title, "status": sg.Status, "assignee_id": sg.AssigneeID, "quality_iteration": sg.QualityIteration})
+		}
+		return toolResult(map[string]any{"sub_goals": out}), nil, nil
+	})
+
+	type getVerificationArgs struct {
+		SubGoalID string `json:"sub_goal_id" jsonschema:"the sub-goal whose verification rounds to inspect"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "get_verification",
+		Description: "Inspect a sub-goal's verification rounds (verdict, summary, evidence) — the audit trail behind verified/rejected.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args getVerificationArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		list, err := exec.goalSvc.ListVerificationResults(ctx, args.SubGoalID)
+		if err != nil {
+			return nil, nil, err
+		}
+		out := []map[string]any{}
+		for _, v := range list {
+			out = append(out, map[string]any{"status": v.Status, "summary": v.Summary, "evidence": v.Evidence, "created_at": v.CreatedAt})
+		}
+		return toolResult(map[string]any{"verifications": out}), nil, nil
+	})
+
+	type verifyArgs struct {
+		Verdict  string `json:"verdict" jsonschema:"passed | rejected"`
+		Summary  string `json:"summary" jsonschema:"what was verified, or the CONCRETE problems on rejection (the assignee fixes from this)"`
+		Evidence string `json:"evidence,omitempty" jsonschema:"key evidence: test output excerpts, file references"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "verify_sub_goal",
+		Description: "Issue your verifier verdict on THIS sub-goal — the structured judgment, never stdout. Only a verify run's agent can call this; the platform makes the verified/rejected transition from it. Give it ONCE, then end your turn.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args verifyArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		if err := exec.goalSvc.VerifySubGoal(ctx, exec.RunID, args.Verdict, args.Summary, args.Evidence); err != nil {
+			return nil, nil, err
+		}
+		return toolResult(map[string]any{"ok": true, "verdict": args.Verdict}), nil, nil
+	})
+
+	type integrateArgs struct {
+		ChangeID string `json:"change_id" jsonschema:"the change to integrate (resolve with agentwork_get_change)"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "integrate_change",
+		Description: "Integrate a sub-goal's Change into THIS run's worktree: the platform merges the change's head ref into your branch — success marks the Change integrated; a conflict marks it conflicted and wakes the sub-goal's assignee to rework. Only the goal's owner can integrate.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args integrateArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil || exec.GoalID == "" {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		if err := exec.requireOwner(ctx); err != nil {
+			return nil, nil, err
+		}
+		ch, err := exec.goalSvc.GetChange(ctx, args.ChangeID)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ch.GoalID != exec.GoalID {
+			return nil, nil, errors.New("the change does not belong to this goal")
+		}
+		if ch.Status == "integrated" {
+			return toolResult(map[string]any{"ok": true, "status": "integrated", "note": "already integrated"}), nil, nil
+		}
+		if err := exec.goalSvc.MarkChangeIntegrating(ctx, ch.ID); err != nil {
+			return nil, nil, err
+		}
+		// The deterministic merge runs in THIS run's worktree (the owner's
+		// workspace — the change head is a ref in the shared bare repo, so no
+		// fetch is needed).
+		cmd := execCommand(ctx, exec.Worktree, "git", "merge", "--no-ff", ch.HeadRef, "-m", "Integrate "+ch.ID)
+		out, mergeErr := cmd.CombinedOutput()
+		if mergeErr != nil {
+			// Conflict: abort the merge in the worktree, record the Change
+			// conflict — the assignee gets woken to rework on a new base.
+			_ = execCommand(ctx, exec.Worktree, "git", "merge", "--abort").Run()
+			if err := exec.goalSvc.MarkChangeIntegrated(ctx, ch.ID, false); err != nil {
+				return nil, nil, err
+			}
+			return toolResult(map[string]any{"ok": false, "status": "conflict", "output": string(out), "note": "change marked conflicted — the sub-goal assignee has been woken to rework"}), nil, nil
+		}
+		if err := exec.goalSvc.MarkChangeIntegrated(ctx, ch.ID, true); err != nil {
+			return nil, nil, err
+		}
+		return toolResult(map[string]any{"ok": true, "status": "integrated", "output": string(out)}), nil, nil
+	})
+
+	type getChangeArgs struct {
+		ChangeID string `json:"change_id,omitempty" jsonschema:"a change id; omit to list THIS goal's changes"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "get_change",
+		Description: "Inspect changes: one by id, or THIS goal's changes (the owner's integration list — status + head ref).",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args getChangeArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.goalSvc == nil {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		if args.ChangeID != "" {
+			c, err := exec.goalSvc.GetChange(ctx, args.ChangeID)
+			if err != nil {
+				return nil, nil, err
+			}
+			return toolResult(map[string]any{"change": map[string]any{"id": c.ID, "sub_goal_id": c.SubGoalID, "status": c.Status, "head_ref": c.HeadRef}}), nil, nil
+		}
+		if exec.GoalID == "" {
+			return nil, nil, errors.New("no goal context — pass a change_id")
+		}
+		list, err := exec.goalSvc.ListChanges(ctx, exec.GoalID)
+		if err != nil {
+			return nil, nil, err
+		}
+		out := []map[string]any{}
+		for _, c := range list {
+			out = append(out, map[string]any{"id": c.ID, "sub_goal_id": c.SubGoalID, "status": c.Status, "head_ref": c.HeadRef})
+		}
+		return toolResult(map[string]any{"changes": out}), nil, nil
 	})
 
 	type listArgs struct {
@@ -309,7 +584,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 
 	gmcp.AddTool(srv, &gmcp.Tool{
 		Name:        "agent_list",
-		Description: "List all agents — resolve agent uuids for mentions (goal_comment) and handoffs (goal_assign).",
+		Description: "List all agents — resolve agent uuids for consults (consult_agent) and handoffs (handoff_goal).",
 	}, func(ctx context.Context, req *gmcp.CallToolRequest, args struct{}) (*gmcp.CallToolResult, any, error) {
 		if exec.agentSvc == nil {
 			return nil, nil, errors.New("collaboration not wired for this run")
@@ -327,7 +602,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 
 	gmcp.AddTool(srv, &gmcp.Tool{
 		Name:        "squad_list",
-		Description: "List all squads — resolve squad uuids for mentions and handoffs.",
+		Description: "List all squads — resolve squad uuids for consults and handoffs.",
 	}, func(ctx context.Context, req *gmcp.CallToolRequest, args struct{}) (*gmcp.CallToolResult, any, error) {
 		if exec.squadSvc == nil {
 			return nil, nil, errors.New("collaboration not wired for this run")
@@ -391,6 +666,17 @@ func HTTPHandler(exec *Executor) http.Handler {
 		return NewServer(exec)
 	}, &gmcp.StreamableHTTPOptions{Stateless: true})
 }
+
+// execCommand runs a command in dir (the integrate_change tool executes the
+// deterministic git merge in the owner run's worktree — the run's workspace
+// is the integration surface, per 决策 6-3).
+func execCommand(ctx context.Context, dir, name string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	return cmd
+}
+
+var _ = exec.Command // keep the import bound (execCommand covers all uses)
 
 func dirOf(path string) string {
 	i := strings.LastIndexByte(path, '/')

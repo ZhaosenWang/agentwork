@@ -32,7 +32,7 @@ import (
 func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, prompt, agentID string) {
 	// Scratch workdir (no repo): the parser works from the prompt alone and
 	// writes its result file here.
-	workdir := filepath.Join(workspaceRoot(), "proc", q.RunID)
+	workdir := filepath.Join(runsRoot(), "proc", q.RunID)
 	if err := os.MkdirAll(workdir, 0o755); err != nil {
 		d.failIntakeRun(ctx, q, "mkdir workdir: "+err.Error())
 		return
@@ -103,7 +103,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		delete(d.mcpExecs, q.RunID)
 		d.mu.Unlock()
 	}()
-	prompt += workspaceGuidance(workdir)
+	prompt += worktreeGuidance(workdir)
 
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {

@@ -1,0 +1,960 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/eushing/agentwork/internal/events"
+)
+
+// ── Collaboration semantics tests (决策 5-x, Collaboration.md adopted) ──
+
+// TestAssignPermissionOnlyOwner: an agent actor can only hand off a goal it
+// owns (决策 5-6) — agent-assigned → the assignee; anyone else is rejected;
+// human actors (HTTP surface) stay unrestricted.
+func TestAssignPermissionOnlyOwner(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	owner := seedAgent(t, st, "owner")
+	intruder := seedAgent(t, st, "intruder")
+	target := seedAgent(t, st, "target")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: owner, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+
+	// A non-owner agent actor is rejected and ownership does not move.
+	if _, err := gs.Assign(ctx, g.ID, "agent", target, "mine now", "agent", intruder); err == nil {
+		t.Fatal("non-owner agent handoff must be rejected")
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.AssigneeID != owner {
+		t.Fatalf("ownership moved by an intruder: %s", after.AssigneeID)
+	}
+
+	// The owner agent actor succeeds.
+	if _, err := gs.Assign(ctx, g.ID, "agent", target, "backend work", "agent", owner); err != nil {
+		t.Fatalf("owner handoff must succeed: %v", err)
+	}
+	// Human actor (HTTP surface) unrestricted — hands it back.
+	if _, err := gs.Assign(ctx, g.ID, "agent", owner, "", "", ""); err != nil {
+		t.Fatalf("human handoff must succeed: %v", err)
+	}
+
+	// Squad goals: only the squad's CURRENT leader may hand off.
+	squadSvc := NewSquadService(st, events.NewBus())
+	sq, err := squadSvc.Create(ctx, Squad{Name: "sq", LeaderID: owner})
+	if err != nil {
+		t.Fatalf("create squad: %v", err)
+	}
+	sg, err := gs.Create(ctx, Goal{Title: "sg", Description: "d", DomainID: domID, AssigneeType: "squad", AssigneeID: sq.ID, Status: "active"})
+	if err != nil {
+		t.Fatalf("create squad goal: %v", err)
+	}
+	if _, err := gs.Assign(ctx, sg.ID, "agent", target, "", "agent", intruder); err == nil {
+		t.Fatal("non-leader handoff of a squad goal must be rejected")
+	}
+	if _, err := gs.Assign(ctx, sg.ID, "agent", target, "", "agent", owner); err != nil {
+		t.Fatalf("leader handoff of a squad goal must succeed: %v", err)
+	}
+}
+
+// TestHandoffEventRecorded: every handoff appends a handoff_event with
+// from/to + the terminated run; CompleteHandoff back-fills the new owner's
+// run (决策 5-9).
+func TestHandoffEventRecorded(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	// The owner's run is enqueued and claimed (running) — it is the handoff's
+	// from_run.
+	ownerRun, err := rs.EnqueueForGoal(ctx, *g)
+	if err != nil {
+		t.Fatalf("enqueue owner: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='running', started_at=? WHERE id=?`, now(), ownerRun.ID); err != nil {
+		t.Fatalf("stamp running: %v", err)
+	}
+
+	if _, err := gs.Assign(ctx, g.ID, "agent", b, "take it", "human", ""); err != nil {
+		t.Fatalf("assign: %v", err)
+	}
+	var fromID, toID, fromRunID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT from_id, to_id, from_run_id FROM handoff_event WHERE goal_id=?`, g.ID).Scan(&fromID, &toID, &fromRunID); err != nil {
+		t.Fatalf("handoff_event row: %v", err)
+	}
+	if fromID != a || toID != b || fromRunID != ownerRun.ID {
+		t.Fatalf("handoff_event mismatch: from=%s to=%s from_run=%s (want %s→%s run %s)", fromID, toID, fromRunID, a, b, ownerRun.ID)
+	}
+
+	newRun, err := rs.EnqueueForGoal(ctx, *g)
+	if err != nil {
+		t.Fatalf("enqueue new owner: %v", err)
+	}
+	if err := gs.CompleteHandoff(ctx, g.ID, newRun.ID); err != nil {
+		t.Fatalf("complete handoff: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT to_run_id FROM handoff_event WHERE goal_id=?`, g.ID).Scan(&toID); err != nil || toID != newRun.ID {
+		t.Fatalf("to_run_id not back-filled: %q err=%v", toID, err)
+	}
+}
+
+// TestHandoffCycleWarnAndPark: ≥4 handoffs write a system warning comment;
+// ≥8 park the goal in review — approve releases it (NO deliver), reject
+// fails it (决策 5-7: a collaboration anomaly is not an automatic failure).
+func TestHandoffCycleWarnAndPark(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	handoff := func(to string) {
+		t.Helper()
+		if _, err := gs.Assign(ctx, g.ID, "agent", to, "", "", ""); err != nil {
+			t.Fatalf("assign → %s: %v", to, err)
+		}
+	}
+	// 1..3: silent. 4th: warning comment.
+	handoff(b) // 1
+	handoff(a) // 2
+	handoff(b) // 3
+	handoff(a) // 4
+	var warns int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system' AND content LIKE '⚠️ 所有权已交接%'`, g.ID).Scan(&warns); err != nil || warns != 1 {
+		t.Fatalf("expected 1 warning comment at 4 handoffs, got %d (err=%v)", warns, err)
+	}
+	// 5..8: the 8th parks the goal in review.
+	handoff(b) // 5
+	handoff(a) // 6
+	handoff(b) // 7
+	handoff(a) // 8
+	parked, _ := gs.Get(ctx, g.ID)
+	if parked.Status != "review" || !strings.HasPrefix(parked.ReviewRequest, "handoff_loop:") {
+		t.Fatalf("8th handoff must park review, got %q / %q", parked.Status, parked.ReviewRequest)
+	}
+	// Approve releases WITHOUT deliver: goal back to active, no goal:approved.
+	var approved bool
+	unsub := eventsBusTest(gs, "goal:approved", func() { approved = true })
+	defer unsub()
+	if _, err := gs.ResolveReview(ctx, g.ID, "", "approve", "继续"); err != nil {
+		t.Fatalf("approve handoff loop: %v", err)
+	}
+	if approved {
+		t.Fatal("handoff-loop approve must NOT trigger deliver (goal:approved)")
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "active" {
+		t.Fatalf("approve must release to active, got %q", after.Status)
+	}
+	// 9th handoff parks again (≥8). Reject fails the goal.
+	handoff(b) // 9 — parks again
+	if _, err := gs.ResolveReview(ctx, g.ID, "", "reject", "停"); err != nil {
+		t.Fatalf("reject handoff loop: %v", err)
+	}
+	failed, _ := gs.Get(ctx, g.ID)
+	if failed.Status != "failed" {
+		t.Fatalf("reject must fail the goal, got %q", failed.Status)
+	}
+	// A failed goal takes no queued runs.
+	runs, _ := rs.List(ctx, g.ID)
+	for _, r := range runs {
+		if r.Status == "queued" {
+			t.Fatalf("queued run survived the handoff-loop failure: %s", r.ID)
+		}
+	}
+}
+
+// TestCreateSubGoal: the SubGoal entity (决策 6-1) — a sub_goal row bound to
+// the goal (NOT a child goal), started running with a sub-goal run enqueued
+// on the assignee; the goal's owner/status are untouched.
+func TestCreateSubGoal(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	parent, err := gs.Create(ctx, Goal{Title: "p", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, parent.ID, "work item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	if sg.GoalID != parent.ID || sg.Status != "running" || sg.AssigneeID != b {
+		t.Fatalf("sub-goal shape wrong: goal=%s status=%s assignee=%s", sg.GoalID, sg.Status, sg.AssigneeID)
+	}
+	// The sub-goal's run is role=subgoal + bound via sub_goal_id, on B.
+	var runGoalID, role, boundID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT goal_id, role, sub_goal_id FROM run WHERE id=(
+		   SELECT id FROM run WHERE sub_goal_id=? LIMIT 1)`, sg.ID).
+		Scan(&runGoalID, &role, &boundID); err != nil {
+		t.Fatalf("sub-goal run row: %v", err)
+	}
+	if runGoalID != parent.ID || role != "subgoal" || boundID != sg.ID {
+		t.Fatalf("sub-goal run shape wrong: goal=%s role=%s bound=%s", runGoalID, role, boundID)
+	}
+	// The goal's run list DOES include the sub-goal run (run.goal_id = the
+	// goal) — distinguishable by role=subgoal.
+	runs, _ := rs.List(ctx, parent.ID)
+	if len(runs) != 1 || runs[0].Role != "subgoal" || runs[0].AgentID != b {
+		t.Fatalf("the goal's runs must show the sub-goal run, got %d runs (role=%q agent=%s)", len(runs), runs[0].Role, runs[0].AgentID)
+	}
+	// Parent ownership untouched; the goal stays active (owner keeps working —
+	// no wait, no blocked).
+	p2, _ := gs.Get(ctx, parent.ID)
+	if p2.AssigneeID != a || p2.Status != "active" {
+		t.Fatalf("sub-goal creation must not change the parent: owner=%s status=%s", p2.AssigneeID, p2.Status)
+	}
+}
+
+// TestSubGoalRunLifecycle: a completed sub-goal run (machine verification
+// passed in the daemon) → sub-goal verified + Change + Revision created
+// ATOMICALLY (Ready ⇔ persisted Revision) → the goal's attention flips to
+// integration → the Coordinator spawns the owner (决策 6-1/6-3/6-4).
+func TestSubGoalRunLifecycle(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var runID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? LIMIT 1`, sg.ID).Scan(&runID); err != nil {
+		t.Fatalf("sub-goal run: %v", err)
+	}
+	// The daemon stamps the revision refs at run end; simulate it.
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='base-sha', head_ref='head-sha' WHERE id=?`, runID); err != nil {
+		t.Fatalf("stamp refs: %v", err)
+	}
+	if err := rs.Finish(ctx, runID, "completed", "done the work item"); err != nil {
+		t.Fatalf("finish sub-goal run: %v", err)
+	}
+	// Verified + Change + Revision (atomic — one tx in ReconcileSubGoalRun).
+	after, err := gs.GetSubGoal(ctx, sg.ID)
+	if err != nil || after.Status != "verified" {
+		t.Fatalf("sub-goal must be verified, got %q err=%v", after.Status, err)
+	}
+	var changeID, revBase, revHead string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM change WHERE sub_goal_id=?`, sg.ID).Scan(&changeID); err != nil {
+		t.Fatalf("change row: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT base_ref, head_ref FROM change_revision WHERE change_id=?`, changeID).Scan(&revBase, &revHead); err != nil {
+		t.Fatalf("revision row: %v", err)
+	}
+	if revBase != "base-sha" || revHead != "head-sha" {
+		t.Fatalf("revision refs wrong: base=%q head=%q", revBase, revHead)
+	}
+	// The sub_goal.verified event → daemon's ReconcileGoal (simulate the
+	// subscription by calling directly): attention=integration + owner spawned.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var attention string
+	if err := st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, g.ID).Scan(&attention); err != nil || attention != "integration" {
+		t.Fatalf("attention must be integration, got %q err=%v", attention, err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	var ownerRuns int
+	for _, r := range runs {
+		if r.Role == "owner" {
+			ownerRuns++
+		}
+	}
+	if ownerRuns != 1 {
+		t.Fatalf("owner must be spawned for integration, got %d owner runs", ownerRuns)
+	}
+}
+
+// TestSubGoalRetryThenFail: machine failures (failed/cancelled) drive the
+// execution_attempt chain ≤3 → sub-goal failed → recovery attention (决策
+// 6-5/6-9 — the two-layer failure semantics).
+func TestSubGoalRetryThenFail(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	// Fail the run 3 times — each failure bumps execution_attempt and
+	// enqueues a retry (coalescing keeps one pending at a time).
+	for i := 0; i < 3; i++ {
+		var runID string
+		if err := st.DB().QueryRowContext(ctx,
+			`SELECT id FROM run WHERE sub_goal_id=? AND status='queued' LIMIT 1`, sg.ID).Scan(&runID); err != nil {
+			t.Fatalf("pending sub-goal run %d: %v", i, err)
+		}
+		if err := rs.Finish(ctx, runID, "failed", "verification failed"); err != nil {
+			t.Fatalf("finish %d: %v", i, err)
+		}
+	}
+	after, err := gs.GetSubGoal(ctx, sg.ID)
+	if err != nil {
+		t.Fatalf("get sub-goal: %v", err)
+	}
+	if after.Status != "failed" || after.ExecutionAttempt != 3 {
+		t.Fatalf("exhausted sub-goal must fail with 3 attempts, got status=%q attempts=%d", after.Status, after.ExecutionAttempt)
+	}
+	// Recovery attention.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var attention string
+	if err := st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, g.ID).Scan(&attention); err != nil || attention != "recovery" {
+		t.Fatalf("attention must be recovery, got %q err=%v", attention, err)
+	}
+}
+
+// TestConsultAutoResume: an owner's consult of another agent creates a guest
+// run; when the guest completes, the platform auto-resumes the requester
+// (attempt 1, trigger empty — must not stack the mention-cycle counter) and
+// back-fills the response comment (决策 5-8).
+func TestConsultAutoResume(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	owner := seedAgent(t, st, "owner")
+	expert := seedAgent(t, st, "expert")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: owner, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	// The owner's comment (from its run) consults the expert.
+	c, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "agent", AuthorID: owner, RunID: "owner-run-1", Content: "[@e](mention://agent/" + expert + ") how?"})
+	if err != nil {
+		t.Fatalf("consult comment: %v", err)
+	}
+	var guestID, requesterRun, response string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT guest_run_id, requester_run_id, response_comment_id FROM consult_request WHERE trigger_comment_id=?`, c.ID).
+		Scan(&guestID, &requesterRun, &response); err != nil {
+		t.Fatalf("consult_request row: %v", err)
+	}
+	if guestID == "" || requesterRun != "owner-run-1" || response != "" {
+		t.Fatalf("consult_request shape: guest=%q requester_run=%q response=%q", guestID, requesterRun, response)
+	}
+	var guestRole string
+	if err := st.DB().QueryRowContext(ctx, `SELECT role FROM run WHERE id=?`, guestID).Scan(&guestRole); err != nil || guestRole != "consult" {
+		t.Fatalf("consult run must be role=consult, got %q err=%v", guestRole, err)
+	}
+
+	// The guest completes with a report → requester auto-resumed + response
+	// back-filled + the resume run carries NO trigger comment.
+	if err := rs.Finish(ctx, guestID, "completed", "the answer is X"); err != nil {
+		t.Fatalf("finish guest: %v", err)
+	}
+	var resumeTrigger, resumeAttempt, resumeAgent string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT trigger_comment_id, attempt, agent_id FROM run WHERE goal_id=? AND agent_id=? AND id != ? ORDER BY queued_at DESC LIMIT 1`,
+		g.ID, owner, guestID).Scan(&resumeTrigger, &resumeAttempt, &resumeAgent); err != nil {
+		t.Fatalf("resume run: %v", err)
+	}
+	if resumeTrigger != "" || resumeAgent != owner {
+		t.Fatalf("resume run must carry no trigger and belong to the requester: trigger=%q agent=%q", resumeTrigger, resumeAgent)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT response_comment_id FROM consult_request WHERE guest_run_id=?`, guestID).Scan(&response); err != nil || response == "" {
+		t.Fatalf("response_comment_id not back-filled: %q err=%v", response, err)
+	}
+	// The resume must not count toward the mention cycle (决策 4-2 counter
+	// only counts agent-TRIGGERED runs).
+	if n, _ := cs.MentionCycleCount(ctx, g.ID); n != 1 {
+		t.Fatalf("mention cycle count must stay 1 (the consult itself), got %d", n)
+	}
+}
+
+// eventsBusTest subscribes a topic on the cluster's bus for the duration of a
+// test, returning an unsubscribe func.
+func eventsBusTest(gs *GoalService, topic string, fn func()) func() {
+	return gs.bus.Subscribe(topic, func(_ context.Context, _ events.Event) { fn() })
+}
+
+var _ = fmt.Sprintf // keep fmt imported if assertions change
+
+// TestReconcileGoalIdempotent: the Coordinator core (决策 6-4) — no
+// sub-goals/changes means empty attention and NO run; running the reconcile
+// repeatedly changes nothing (Reconcile is idempotent by construction).
+func TestReconcileGoalIdempotent(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+			t.Fatalf("reconcile %d: %v", i, err)
+		}
+	}
+	var attention string
+	if err := st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, g.ID).Scan(&attention); err != nil || attention != "" {
+		t.Fatalf("no attention expected, got %q err=%v", attention, err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) != 0 {
+		t.Fatalf("reconcile must not spawn runs without attention, got %d", len(runs))
+	}
+}
+
+// TestReconcileGoalSpawnsOwnerOnAttention: attention (a failed sub-goal) +
+// idle owner → exactly ONE owner run; repeated reconciles coalesce (决策 6-4
+// conditional enqueue — event storms produce a single run).
+func TestReconcileGoalSpawnsOwnerOnAttention(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	// A failed sub-goal → need_recovery attention (raw row — the sub-goal
+	// flow fills these; the predicate reads authoritative state).
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO sub_goal (id,goal_id,title,assignee_id,status,created_at) VALUES (?,?,?,?,?,?)`,
+		"sg-1", g.ID, "broken", a, "failed", now()); err != nil {
+		t.Fatalf("seed sub-goal: %v", err)
+	}
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var attention string
+	if err := st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, g.ID).Scan(&attention); err != nil || attention != "recovery" {
+		t.Fatalf("attention must be recovery, got %q err=%v", attention, err)
+	}
+	// Storm: reconcile again (the run.terminal of the spawned run would fire
+	// it once the run ends) — still ONE owner run.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) != 1 || runs[0].Role != "owner" {
+		t.Fatalf("exactly one owner run expected, got %d (role=%q)", len(runs), runs[0].Role)
+	}
+}
+
+// TestReconcileGoalSkipsBusyOwner: attention + an already-pending owner run
+// → no duplicate (the latch's ownerIdle condition).
+func TestReconcileGoalSkipsBusyOwner(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	if _, err := rs.EnqueueForGoal(ctx, *g); err != nil {
+		t.Fatalf("enqueue owner: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO sub_goal (id,goal_id,title,assignee_id,status,created_at) VALUES (?,?,?,?,?,?)`,
+		"sg-1", g.ID, "broken", a, "failed", now()); err != nil {
+		t.Fatalf("seed sub-goal: %v", err)
+	}
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) != 1 {
+		t.Fatalf("busy owner must not be double-spawned, got %d runs", len(runs))
+	}
+}
+
+// TestReconcileGoalHumanOwner: attention persists but NO run spawns for a
+// human owner (决策 6-8 — attention + notify, never a run).
+func TestReconcileGoalHumanOwner(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "human", Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO sub_goal (id,goal_id,title,assignee_id,status,created_at) VALUES (?,?,?,?,?,?)`,
+		"sg-1", g.ID, "broken", "anyone", "failed", now()); err != nil {
+		t.Fatalf("seed sub-goal: %v", err)
+	}
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var attention string
+	if err := st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, g.ID).Scan(&attention); err != nil || attention != "recovery" {
+		t.Fatalf("human owner attention must persist, got %q err=%v", attention, err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) != 0 {
+		t.Fatalf("human owner must never get a spawned run, got %d", len(runs))
+	}
+}
+
+// TestRunTerminalEvent: every terminal run publishes run.terminal (决策 6-4,
+// P2-5) — the latch's second edge (owner run terminal → Reconcile).
+func TestRunTerminalEvent(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	r, err := rs.EnqueueForGoal(ctx, *g)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	got := make(chan string, 1)
+	unsub := eventsBusTest(gs, "run.terminal", func() { got <- r.ID })
+	defer unsub()
+	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run.terminal not published")
+	}
+}
+
+// TestVerifierFlow: the optional agent verifier (决策 6-5) — machine checks
+// pass → verifying + verify run; rejected → verification_result +
+// quality_iteration++ + assignee rework; passed → verified + Change.
+func TestVerifierFlow(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	qa := seedAgent(t, st, "qa")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, qa, "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	// Assignee run completes (machine checks passed in the daemon).
+	var assigneeRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&assigneeRun); err != nil {
+		t.Fatalf("assignee run: %v", err)
+	}
+	// The daemon stamps the revision refs at run end; simulate it.
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, assigneeRun); err != nil {
+		t.Fatalf("stamp refs: %v", err)
+	}
+	if err := rs.Finish(ctx, assigneeRun, "completed", "implemented"); err != nil {
+		t.Fatalf("finish assignee: %v", err)
+	}
+	after, _ := gs.GetSubGoal(ctx, sg.ID)
+	if after.Status != "verifying" {
+		t.Fatalf("named verifier must park verifying, got %q", after.Status)
+	}
+	var verifyRunID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='verify' LIMIT 1`, sg.ID).Scan(&verifyRunID); err != nil {
+		t.Fatalf("verify run must be enqueued: %v", err)
+	}
+
+	// Round 1: rejected.
+	if err := gs.VerifySubGoal(ctx, verifyRunID, "rejected", "error handling is wrong", "see auth.go"); err != nil {
+		t.Fatalf("verdict rejected: %v", err)
+	}
+	after, _ = gs.GetSubGoal(ctx, sg.ID)
+	if after.Status != "running" || after.QualityIteration != 1 {
+		t.Fatalf("reject must rework: status=%q iter=%d", after.Status, after.QualityIteration)
+	}
+	var vrStatus string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT status FROM verification_result WHERE sub_goal_id=? ORDER BY created_at DESC LIMIT 1`, sg.ID).Scan(&vrStatus); err != nil || vrStatus != "rejected" {
+		t.Fatalf("verification_result must record rejected: %q err=%v", vrStatus, err)
+	}
+	// The assignee's successor run is queued; complete it → verifying again.
+	var assigneeRun2 string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' AND status='queued' LIMIT 1`, sg.ID).Scan(&assigneeRun2); err != nil {
+		t.Fatalf("assignee rework run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b2', head_ref='h2' WHERE id=?`, assigneeRun2); err != nil {
+		t.Fatalf("stamp refs 2: %v", err)
+	}
+	if err := rs.Finish(ctx, assigneeRun2, "completed", "fixed"); err != nil {
+		t.Fatalf("finish rework: %v", err)
+	}
+	after, _ = gs.GetSubGoal(ctx, sg.ID)
+	if after.Status != "verifying" {
+		t.Fatalf("rework must park verifying again, got %q", after.Status)
+	}
+	var verifyRunID2 string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='verify' AND status='queued' LIMIT 1`, sg.ID).Scan(&verifyRunID2); err != nil {
+		t.Fatalf("second verify run: %v", err)
+	}
+	// Round 2: passed → verified + Change.
+	if err := gs.VerifySubGoal(ctx, verifyRunID2, "passed", "looks good", "tests green"); err != nil {
+		t.Fatalf("verdict passed: %v", err)
+	}
+	after, _ = gs.GetSubGoal(ctx, sg.ID)
+	if after.Status != "verified" {
+		t.Fatalf("pass must verify, got %q", after.Status)
+	}
+	var chStatus string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT status FROM change WHERE sub_goal_id=?`, sg.ID).Scan(&chStatus); err != nil || chStatus != "ready" {
+		t.Fatalf("change must be ready, got %q err=%v", chStatus, err)
+	}
+}
+
+// TestVerifySubGoalPermission: only the sub-goal's verify run can issue the
+// verdict (决策 6-5 — the authority lives in the run, not the caller's word).
+func TestVerifySubGoalPermission(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	qa := seedAgent(t, st, "qa")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, qa, "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var assigneeRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&assigneeRun); err != nil {
+		t.Fatalf("assignee run: %v", err)
+	}
+	// The ASSIGNEE's run must not issue the verdict (sub-goal is running —
+	// also a status guard; the role guard fires first).
+	if err := gs.VerifySubGoal(ctx, assigneeRun, "passed", "trust me", ""); err == nil {
+		t.Fatal("a non-verify run must not issue verdicts")
+	}
+	// And once in verifying, a verdict from an unrelated run is refused too.
+	if err := rs.Finish(ctx, assigneeRun, "completed", "done"); err != nil {
+		t.Fatalf("finish assignee: %v", err)
+	}
+	after, _ := gs.GetSubGoal(ctx, sg.ID)
+	if after.Status != "verifying" {
+		t.Fatalf("must park verifying, got %q", after.Status)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,status,role,attempt,queued_at,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		"owner-r", g.ID, a, "worker", "queued", "owner", 1, now(), now()); err != nil {
+		t.Fatalf("insert owner run: %v", err)
+	}
+	if err := gs.VerifySubGoal(ctx, "owner-r", "passed", "hijack", ""); err == nil {
+		t.Fatal("an owner run must not issue sub-goal verdicts")
+	}
+	// Double verdict from the SAME verify run is refused (conditional status).
+	var verifyRunID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='verify' LIMIT 1`, sg.ID).Scan(&verifyRunID); err != nil {
+		t.Fatalf("verify run: %v", err)
+	}
+	if err := gs.VerifySubGoal(ctx, verifyRunID, "passed", "ok", ""); err != nil {
+		t.Fatalf("verdict: %v", err)
+	}
+	if err := gs.VerifySubGoal(ctx, verifyRunID, "rejected", "changed my mind", ""); err == nil {
+		t.Fatal("a second verdict from the same run must be refused")
+	}
+}
+
+// TestMarkChangeIntegratedConflict: an integration conflict sends the
+// sub-goal back to running (quality_iteration++) and wakes the assignee;
+// success marks the Change integrated (决策 6-3).
+func TestMarkChangeIntegratedConflict(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var runID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? LIMIT 1`, sg.ID).Scan(&runID); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, runID); err != nil {
+		t.Fatalf("stamp: %v", err)
+	}
+	if err := rs.Finish(ctx, runID, "completed", "done"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	var changeID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM change WHERE sub_goal_id=?`, sg.ID).Scan(&changeID); err != nil {
+		t.Fatalf("change: %v", err)
+	}
+
+	// Conflict → rework round.
+	if err := gs.MarkChangeIntegrated(ctx, changeID, false); err != nil {
+		t.Fatalf("mark conflict: %v", err)
+	}
+	after, _ := gs.GetSubGoal(ctx, sg.ID)
+	if after.Status != "running" || after.QualityIteration != 1 {
+		t.Fatalf("conflict must rework: status=%q iter=%d", after.Status, after.QualityIteration)
+	}
+	var chStatus string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT status FROM change WHERE id=?`, changeID).Scan(&chStatus); err != nil || chStatus != "conflict" {
+		t.Fatalf("change must be conflicted, got %q err=%v", chStatus, err)
+	}
+	var reworkRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' AND status='queued' LIMIT 1`, sg.ID).Scan(&reworkRun); err != nil {
+		t.Fatalf("assignee rework run: %v", err)
+	}
+
+	// Rework completes → the SAME change gets revision seq 2 (base = the new
+	// integration base) and returns to ready (决策 6-3).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b2', head_ref='h2' WHERE id=?`, reworkRun); err != nil {
+		t.Fatalf("stamp 2: %v", err)
+	}
+	if err := rs.Finish(ctx, reworkRun, "completed", "fixed"); err != nil {
+		t.Fatalf("finish rework: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT status FROM change WHERE id=?`, changeID).Scan(&chStatus); err != nil || chStatus != "ready" {
+		t.Fatalf("the conflicted change must return to ready, got %q err=%v", chStatus, err)
+	}
+	var seq int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT MAX(seq) FROM change_revision WHERE change_id=?`, changeID).Scan(&seq); err != nil || seq != 2 {
+		t.Fatalf("revision 2 must be appended, got seq=%d err=%v", seq, err)
+	}
+	var revBase string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT base_ref FROM change_revision WHERE change_id=? ORDER BY seq DESC LIMIT 1`, changeID).Scan(&revBase); err != nil || revBase != "b2" {
+		t.Fatalf("revision 2 must rebase onto the new base, got %q err=%v", revBase, err)
+	}
+	// Success path: the same change integrates.
+	if err := gs.MarkChangeIntegrated(ctx, changeID, true); err != nil {
+		t.Fatalf("mark integrated: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT status FROM change WHERE id=?`, changeID).Scan(&chStatus); err != nil || chStatus != "integrated" {
+		t.Fatalf("the change must be integrated, got %q err=%v", chStatus, err)
+	}
+	// A change count of exactly ONE for the whole lifecycle.
+	var count int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM change WHERE sub_goal_id=?`, sg.ID).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("the lifecycle must be ONE change with revisions, got %d err=%v", count, err)
+	}
+}
+
+// TestGoalCancelDeleteCascade: goal cancel cascades to sub-goals (terminal
+// ones keep history); goal delete cascades all v2 rows (决策 6-8).
+func TestGoalCancelDeleteCascade(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var runID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? LIMIT 1`, sg.ID).Scan(&runID); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, runID); err != nil {
+		t.Fatalf("stamp: %v", err)
+	}
+	if err := rs.Finish(ctx, runID, "completed", "done"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	// Cancel: the verified sub-goal keeps its status (terminal history), the
+	// goal dies.
+	if _, err := gs.Cancel(ctx, g.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	after, _ := gs.GetSubGoal(ctx, sg.ID)
+	if after.Status != "verified" {
+		t.Fatalf("verified sub-goal keeps history on cancel, got %q", after.Status)
+	}
+	// A second goal with a RUNNING sub-goal: cancel stops the work item.
+	g2, err := gs.Create(ctx, Goal{Title: "g2", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal2: %v", err)
+	}
+	sg2, err := gs.CreateSubGoal(ctx, g2.ID, "work item 2", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal 2: %v", err)
+	}
+	if _, err := gs.Cancel(ctx, g2.ID); err != nil {
+		t.Fatalf("cancel 2: %v", err)
+	}
+	after2, _ := gs.GetSubGoal(ctx, sg2.ID)
+	if after2.Status != "cancelled" {
+		t.Fatalf("running sub-goal must cancel with the goal, got %q", after2.Status)
+	}
+
+	// Delete: all v2 rows cascade (sub_goal/change/revision/verification +
+	// handoff/consult audit).
+	if _, err := gs.Assign(ctx, g2.ID, "agent", b, "", "", ""); err != nil {
+		t.Fatalf("assign (for handoff rows): %v", err)
+	}
+	if err := gs.Delete(ctx, g2.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	for _, q := range []struct{ table, where string }{
+		{"sub_goal", "goal_id=?"}, {"change", "goal_id=?"}, {"change_revision", "change_id IN (SELECT id FROM change WHERE goal_id=?)"},
+		{"verification_result", "goal_id=?"}, {"handoff_event", "goal_id=?"}, {"consult_request", "goal_id=?"},
+	} {
+		var n int
+		_ = st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM `+q.table+` WHERE `+q.where, g2.ID).Scan(&n)
+		if n != 0 {
+			t.Fatalf("%s rows survived the goal delete: %d", q.table, n)
+		}
+	}
+}
+
+// TestOwnerRunStaysActiveWithPendingWork: the v2 finalization guard — an owner
+// run completing while sub-goals are still working or changes are ready must
+// NOT reach the gates/done judgment; the goal stays active and the attention
+// loop owns the next step. Only when nothing is pending does the owner run
+// finalize (决策 6-1/6-8).
+func TestOwnerRunStaysActiveWithPendingWork(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	// A FROZEN no-gate domain: a completed owner run would normally go done.
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	// The owner's dispatch run completes while the sub-goal is still running.
+	ownerRun, err := rs.EnqueueForGoal(ctx, *g)
+	if err != nil {
+		t.Fatalf("enqueue owner: %v", err)
+	}
+	if err := rs.Finish(ctx, ownerRun.ID, "completed", "dispatched"); err != nil {
+		t.Fatalf("finish owner: %v", err)
+	}
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "active" {
+		t.Fatalf("pending sub-goal must keep the goal active, got %q", after.Status)
+	}
+	// Sub-goal finishes + verified → change ready → the owner is still not
+	// finalized; the attention spawn fires (ReconcileGoal).
+	var sgRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&sgRun); err != nil {
+		t.Fatalf("sub-goal run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, sgRun); err != nil {
+		t.Fatalf("stamp: %v", err)
+	}
+	if err := rs.Finish(ctx, sgRun, "completed", "done the work item"); err != nil {
+		t.Fatalf("finish sub-goal: %v", err)
+	}
+	after, _ = gs.Get(ctx, g.ID)
+	if after.Status != "active" {
+		t.Fatalf("ready change must keep the goal active, got %q", after.Status)
+	}
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	// The owner is woken for integration.
+	var ownerRuns int
+	runs, _ := rs.List(ctx, g.ID)
+	for _, r := range runs {
+		if r.Role == "owner" && (r.Status == "queued" || r.Status == "running") {
+			ownerRuns++
+		}
+	}
+	if ownerRuns != 1 {
+		t.Fatalf("the owner must be woken for integration, got %d pending owner runs", ownerRuns)
+	}
+	// Mark the change integrated → the NEXT owner completion finalizes (done).
+	var changeID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM change WHERE sub_goal_id=?`, sg.ID).Scan(&changeID); err != nil {
+		t.Fatalf("change: %v", err)
+	}
+	if err := gs.MarkChangeIntegrated(ctx, changeID, true); err != nil {
+		t.Fatalf("integrate: %v", err)
+	}
+	var woken string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND role='owner' AND status='queued' LIMIT 1`, g.ID).Scan(&woken); err != nil {
+		t.Fatalf("woken owner run: %v", err)
+	}
+	if err := rs.Finish(ctx, woken, "completed", "integrated"); err != nil {
+		t.Fatalf("finish woken owner: %v", err)
+	}
+	after, _ = gs.Get(ctx, g.ID)
+	if after.Status != "done" {
+		t.Fatalf("nothing pending + completed owner run must finalize done, got %q", after.Status)
+	}
+}
