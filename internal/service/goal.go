@@ -9,6 +9,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eushing/agentwork/internal/events"
@@ -36,7 +37,7 @@ type Goal struct {
 	SourceRef       string `json:"source_ref"` // external source (M4-B): "github:owner/repo#123"
 	// Attention is the v2 derived OwnerAttention persisted by ReconcileGoal
 	// (决策 6-8): '' | integration | recovery | user_action (comma-joined).
-	Attention       string `json:"attention"`
+	Attention string `json:"attention"`
 	// CurrentAgentID is the agent of the goal's latest running/queued run —
 	// the list card's "who is working right now" ('' = nobody in flight).
 	CurrentAgentID string `json:"current_agent_id"`
@@ -77,10 +78,34 @@ type GoalService struct {
 	st     *store.Store
 	bus    *events.Bus
 	runSvc *RunService // back-reference for retry/wake enqueue (same package)
+
+	// reconcileLocks serializes ReconcileGoal per goal (single-process): an
+	// event storm fires run.terminal + sub_goal.* concurrently, and racing
+	// write transactions surface as SQLITE_BUSY under load.
+	reconcileMu    sync.Mutex
+	reconcileLocks map[string]*sync.Mutex
 }
 
 func NewGoalService(st *store.Store, bus *events.Bus) *GoalService {
-	return &GoalService{st: st, bus: bus}
+	return &GoalService{st: st, bus: bus, reconcileLocks: make(map[string]*sync.Mutex)}
+}
+
+// lockReconcile serializes one goal's reconciles (cheap map entry per goal).
+func (s *GoalService) lockReconcile(goalID string) func() {
+	s.reconcileMu.Lock()
+	m, ok := s.reconcileLocks[goalID]
+	if !ok {
+		m = &sync.Mutex{}
+		s.reconcileLocks[goalID] = m
+	}
+	s.reconcileMu.Unlock()
+	m.Lock()
+	return func() {
+		m.Unlock()
+		s.reconcileMu.Lock()
+		delete(s.reconcileLocks, goalID)
+		s.reconcileMu.Unlock()
+	}
 }
 
 // SetRunService wires the RunService back-reference once both exist. Kept
@@ -319,9 +344,9 @@ func (s *GoalService) Timeline(ctx context.Context, goalID string) ([]TimelineIt
 		it.Kind = "action"
 		it.Action = "handoff"
 		det, _ := json.Marshal(map[string]string{
-			"from": ft.String + "/" + fi.String,
-			"to":   tt.String + "/" + ti.String,
-			"reason": rsn.String,
+			"from":        ft.String + "/" + fi.String,
+			"to":          tt.String + "/" + ti.String,
+			"reason":      rsn.String,
 			"from_run_id": fr.String,
 			"to_run_id":   tr.String,
 		})
@@ -578,7 +603,6 @@ func (s *GoalService) Cancel(ctx context.Context, goalID string) (*Goal, error) 
 	return s.Get(ctx, goalID)
 }
 
-
 // Delete removes a goal and dependents. Sub-goals are orphaned (parent_id
 // cleared) rather than deleted recursively — deleting a parent must not
 // silently destroy children the caller may not know about.
@@ -697,7 +721,7 @@ func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 // conversation — they do not exclude each other (an agent saying "搞定" must
 // not hide the full report, nor a report hide its words).
 // insertRunResultComment lands a completed run's report in the feed and
-// returns the inserted comment's id ('' when nothing was written) — the
+// returns the inserted comment's id (” when nothing was written) — the
 // consult chain (决策 5-8) back-fills it as the response_comment_id.
 func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) (string, error) {
 	if rc.Status != "completed" || strings.TrimSpace(rc.Summary) == "" {
@@ -1296,6 +1320,9 @@ func (s *GoalService) EnqueueOwnerRunTx(ctx context.Context, tx *sql.Tx, goalID 
 // sub-goal/change state (决策 6-1/6-3 — the predicates grow with the sub-goal
 // flow). Owner run creation goes through this path ONLY (P0.5).
 func (s *GoalService) ReconcileGoal(ctx context.Context, goalID string) error {
+	unlock := s.lockReconcile(goalID)
+	defer unlock()
+
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1327,11 +1354,17 @@ func (s *GoalService) ReconcileGoal(ctx context.Context, goalID string) error {
 	// Owner needed AND the goal can take a run AND the owner is idle → one
 	// conditional enqueue (coalesced on the pending (goal, agent) pair — the
 	// idempotency guard; two racing reconciles still produce ONE run).
-	// Loop guard: a CANCELLED owner run (timeout/handoff) leaves the goal
-	// active with attention still pending — auto-spawning would loop the stuck
-	// agent (决策 2-6: a timeout is the human's call). The attention persists
-	// (UI/IM read it); only the spawn waits for a fresh event.
+	// Loop guards:
+	//   - a CANCELLED owner run (timeout/handoff) leaves the goal active with
+	//     attention still pending — auto-spawning would loop the stuck agent
+	//     (决策 2-6: a timeout is the human's call);
+	//   - PROGRESS guard: spawn only when an attention SIGNAL (a change
+	//     revision or a failed sub-goal's run) is NEWER than the goal's last
+	//     owner-run spawn — an owner woken for THIS set of changes that made
+	//     no progress must not be re-spawned in a loop (the E2E spun 7 wakes).
+	//     A new revision / failure re-arms the spawn.
 	lastOwnerCancelled := false
+	var newestSignal, lastOwnerSpawn string
 	if attention != "" {
 		var lastStatus string
 		err := tx.QueryRowContext(ctx,
@@ -1340,8 +1373,23 @@ func (s *GoalService) ReconcileGoal(ctx context.Context, goalID string) error {
 		if err == nil && lastStatus == "cancelled" {
 			lastOwnerCancelled = true
 		}
+		if err := tx.QueryRowContext(ctx, `
+			SELECT MAX(x.ts) FROM (
+			  SELECT COALESCE((SELECT MAX(r2.created_at) FROM change_revision r2 WHERE r2.change_id = c.id), c.created_at) AS ts
+			  FROM change c WHERE c.goal_id=? AND c.status IN ('ready','conflict')
+			  UNION ALL
+			  SELECT MAX(COALESCE((SELECT MAX(r3.finished_at) FROM run r3 WHERE r3.sub_goal_id = sg.id AND r3.role='subgoal'), sg.created_at))
+			  FROM sub_goal sg WHERE sg.goal_id=? AND sg.status='failed'
+			) x`, goalID, goalID).Scan(&newestSignal); err != nil {
+			return fmt.Errorf("attention signal recency: %w", err)
+		}
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COALESCE(MAX(queued_at),'') FROM run WHERE goal_id=? AND role='owner'`,
+			goalID).Scan(&lastOwnerSpawn); err != nil {
+			return fmt.Errorf("last owner spawn: %w", err)
+		}
 	}
-	if attention != "" && !lastOwnerCancelled {
+	if attention != "" && !lastOwnerCancelled && newestSignal > lastOwnerSpawn {
 		if err := s.EnqueueOwnerRunTx(ctx, tx, goalID, assigneeType, assigneeID, status); err != nil {
 			return fmt.Errorf("reconcile enqueue owner: %w", err)
 		}
@@ -1383,7 +1431,6 @@ func (s *GoalService) deriveOwnerAttentionTx(ctx context.Context, tx *sql.Tx, go
 	}
 	return strings.Join(bits, ","), nil
 }
-
 
 // resolveGateRule names the rule that actually parked the goal in review:
 //   - the named run's gates_hit[0] (the IM card carries the evidence run),

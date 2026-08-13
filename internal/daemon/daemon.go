@@ -228,6 +228,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.ctx = ctx
 	d.recoverWorkers(ctx)
 	d.sweepDeliverWorktrees(ctx)
+	d.sweepRunWorktrees(ctx)
 	if n, err := d.runSvc.RecoverStuckRunning(ctx); err != nil {
 		log.Printf("daemon: recover stuck running: %v", err)
 	} else if n > 0 {
@@ -1069,6 +1070,35 @@ func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 	}
 }
 
+// sweepRunWorktrees drops leftover RUN worktrees (a daemon crash leaves
+// runs/<runID> behind, still holding its branch checked out — the next run
+// would fail to create its worktree). Called at startup BEFORE any dispatch:
+// prune each bare repo's worktree metadata, then remove the run dirs. The
+// durable state is the commits; a crashed run's uncommitted WIP is lost (A5
+// recovery = transcript + committed state).
+func (d *Daemon) sweepRunWorktrees(ctx context.Context) {
+	repoRoot := filepath.Join(runsRoot(), "repos")
+	entries, err := os.ReadDir(repoRoot)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		repo := filepath.Join(repoRoot, e.Name())
+		if _, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "prune").CombinedOutput(); err != nil {
+			log.Printf("daemon: worktree prune %s: %v", e.Name(), err)
+		}
+	}
+	runsDir := filepath.Join(runsRoot(), "runs")
+	if err := os.RemoveAll(runsDir); err != nil {
+		log.Printf("daemon: sweep run worktrees: %v", err)
+	} else if _, err := os.Stat(runsDir); os.IsNotExist(err) {
+		log.Printf("daemon: swept stale run worktrees")
+	}
+}
+
 // sweepDeliverWorktrees drops leftover ephemeral deliver worktrees (a deliver
 // crashed mid-merge leaves runs/deliver-<goalID> behind). Called at startup —
 // the worktree is recreated per deliver, so dropping is always safe.
@@ -1161,6 +1191,19 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
 		return
 	}
+	// Release the workspace when the run ends — git allows ONE checkout per
+	// branch, and the goal/sub-goal branch is shared by every run of that
+	// goal: the NEXT run cannot create its worktree while this one holds it
+	// (the E2E hit "a branch named ... already exists" on the woken owner).
+	// The worktree is EPHEMERAL — durable state lives in the commits; crash
+	// leftovers are swept at startup (sweepRunWorktrees).
+	defer func() {
+		unlock := d.lockDomain(domainID)
+		if out, err := exec.CommandContext(context.Background(), "git", "-C", domainRepoPath(domainID), "worktree", "remove", "--force", runRowWorkdir).CombinedOutput(); err != nil {
+			log.Printf("daemon: release worktree %s: %v %s", q.RunID, err, out)
+		}
+		unlock()
+	}()
 
 	// Environment readiness BEFORE the agent starts (决策 3-1, the setup half):
 	// the acceptance policy's setup commands (dependency installs) prepare the

@@ -958,3 +958,62 @@ func TestOwnerRunStaysActiveWithPendingWork(t *testing.T) {
 		t.Fatalf("nothing pending + completed owner run must finalize done, got %q", after.Status)
 	}
 }
+
+// TestReconcileGoalNoRespawnWithoutProgress: the progress guard — an owner
+// woken for a set of changes that made NO progress (the changes are still
+// ready, nothing new arrived) must not be re-spawned; a NEW revision re-arms
+// the spawn (the E2E's 7-wake busy loop).
+func TestReconcileGoalNoRespawnWithoutProgress(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var sgRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&sgRun); err != nil {
+		t.Fatalf("sub-goal run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, sgRun); err != nil {
+		t.Fatalf("stamp: %v", err)
+	}
+	if err := rs.Finish(ctx, sgRun, "completed", "done"); err != nil {
+		t.Fatalf("finish sub-goal: %v", err)
+	}
+	// First reconcile: the change is NEW → owner spawned.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var woken string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND role='owner' AND status='queued' LIMIT 1`, g.ID).Scan(&woken); err != nil {
+		t.Fatalf("owner must be woken: %v", err)
+	}
+	// The woken owner completes WITHOUT integrating (no progress).
+	if err := rs.Finish(ctx, woken, "completed", "ended without integrating"); err != nil {
+		t.Fatalf("finish woken: %v", err)
+	}
+	// The run.terminal reconcile must NOT re-spawn: same signals, no progress.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	var pending int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='owner' AND status IN ('queued','running')`, g.ID).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("no-progress wake must not re-spawn, got %d pending (err=%v)", pending, err)
+	}
+	// The attention persists for the human/UI.
+	var attention string
+	if err := st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, g.ID).Scan(&attention); err != nil || attention != "integration" {
+		t.Fatalf("attention must persist, got %q err=%v", attention, err)
+	}
+}
