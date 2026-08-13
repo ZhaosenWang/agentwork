@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
@@ -325,5 +326,45 @@ func TestClaimOwnerSingleFlight(t *testing.T) {
 	}
 	if c == nil || c.RunID != "owner-2" {
 		t.Fatalf("the waiting owner run must claim after the owner finishes, got %+v", c)
+	}
+}
+
+// TestDeleteCarriesRunningRunIDs: Delete removes the run rows in its cascade,
+// so the daemon cannot find the running processes afterwards — the
+// goal:deleted payload must carry the ids captured BEFORE the cascade (the
+// daemon cuts the processes from them, same as goal cancel 决策 4-12).
+func TestDeleteCarriesRunningRunIDs(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomain(t, st)
+
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	r := enqueueFirst(t, rs, g)
+	// Mark it running (as the daemon's Claim would) so Delete must report it.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE run SET status='running' WHERE id=?`, r.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	payloadCh := make(chan map[string]any, 1)
+	gs.bus.Subscribe("goal:deleted", func(_ context.Context, e events.Event) {
+		if m, ok := e.Payload.(map[string]any); ok {
+			payloadCh <- m
+		}
+	})
+	if err := gs.Delete(ctx, g.ID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	select {
+	case m := <-payloadCh:
+		ids, ok := m["run_ids"].([]string)
+		if !ok || len(ids) != 1 || ids[0] != r.ID {
+			t.Fatalf("goal:deleted must carry the running run id, got %v", m["run_ids"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("goal:deleted event never arrived")
 	}
 }

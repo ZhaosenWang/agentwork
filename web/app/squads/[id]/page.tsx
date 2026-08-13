@@ -175,49 +175,6 @@ export default function SquadDetailPage() {
           </div>
         </Dialog>
       )}
-
-      {showEdit && (
-        <Dialog
-          title={`编辑 Squad：${squad.name}`}
-          onClose={() => setShowEdit(false)}
-          footer={
-            <>
-              <Button variant="outline" onClick={() => setShowEdit(false)}>取消</Button>
-              <Button
-                onClick={() =>
-                  updateSquad.mutate(
-                    { id, name: editName, description: editDesc, leader_id: editLeader, instructions: editInstr },
-                    { onSuccess: () => setShowEdit(false) }
-                  )
-                }
-                disabled={updateSquad.isPending || !editName.trim() || !editLeader}
-              >
-                {updateSquad.isPending ? "保存中…" : "保存"}
-              </Button>
-            </>
-          }
-        >
-          <div className="space-y-4">
-            <Field label="名称" hint="必填">
-              <input value={editName} onChange={(e) => setEditName(e.target.value)} className={inputCls} placeholder="Squad 名称…" />
-            </Field>
-            <Field label="Leader" hint="必填，leader 必须是 agent（角色动态生效：旧 leader 的 in-flight run 会孤儿化）">
-              <select value={editLeader} onChange={(e) => setEditLeader(e.target.value)} className={inputCls}>
-                <option value="">选择…</option>
-                {agents?.map((a) => (
-                  <option key={a.id} value={a.id}>{a.name}</option>
-                ))}
-              </select>
-            </Field>
-            <Field label="描述">
-              <textarea value={editDesc} onChange={(e) => setEditDesc(e.target.value)} className={inputCls} rows={2} />
-            </Field>
-            <Field label="Instructions" hint="leader 运行时会注入这些 instructions">
-              <textarea value={editInstr} onChange={(e) => setEditInstr(e.target.value)} className={inputCls} rows={3} placeholder="Squad 工作说明…" />
-            </Field>
-          </div>
-        </Dialog>
-      )}
     </div>
   );
 }

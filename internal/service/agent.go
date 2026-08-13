@@ -156,6 +156,13 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 		`DELETE FROM squad_member WHERE member_type='agent' AND member_id=?`,
 		`DELETE FROM schedule_run WHERE schedule_id IN (SELECT id FROM schedule WHERE assignee_type='agent' AND assignee_id=?)`,
 		`DELETE FROM schedule WHERE assignee_type='agent' AND assignee_id=?`,
+		// v2 (决策 6-1): sub_goal has no FK on assignee/verifier — a deleted
+		// agent must not leave work items that later enqueue a run on a dead
+		// agent id (the run's agent FK would reject it and the sub-goal would
+		// stall running forever). Cancel the agent's non-terminal sub-goals;
+		// terminal history (verified/failed/cancelled) stays, same as
+		// CancelSubGoal.
+		`UPDATE sub_goal SET status='cancelled' WHERE (assignee_id=?1 OR verifier_id=?1) AND status NOT IN ('verified','cancelled','failed')`,
 		`UPDATE goal SET assignee_type='human', assignee_id='' WHERE assignee_type='agent' AND assignee_id=?`,
 		`DELETE FROM agent WHERE id=?`,
 	} {

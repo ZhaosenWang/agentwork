@@ -604,10 +604,32 @@ func (s *GoalService) Cancel(ctx context.Context, goalID string) (*Goal, error) 
 	return s.Get(ctx, goalID)
 }
 
-// Delete removes a goal and dependents. Sub-goals are orphaned (parent_id
-// cleared) rather than deleted recursively — deleting a parent must not
-// silently destroy children the caller may not know about.
+// Delete removes a goal and dependents. The goal's running runs are NOT
+// terminated here — their rows are gone by the time the daemon could act, so
+// the ids are captured BEFORE the cascade and travel in the goal:deleted
+// payload; the daemon cuts the processes (same mechanism as goal cancel,
+// 决策 4-12). A deleted goal must not keep agents burning compute on work
+// whose rows no longer exist.
 func (s *GoalService) Delete(ctx context.Context, goalID string) error {
+	runningRows, err := s.st.DB().QueryContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND status='running'`, goalID)
+	if err != nil {
+		return fmt.Errorf("collect running runs: %w", err)
+	}
+	var runningRunIDs []string
+	for runningRows.Next() {
+		var id string
+		if err := runningRows.Scan(&id); err != nil {
+			runningRows.Close()
+			return err
+		}
+		runningRunIDs = append(runningRunIDs, id)
+	}
+	runningRows.Close()
+	if err := runningRows.Err(); err != nil {
+		return err
+	}
+
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -637,7 +659,9 @@ func (s *GoalService) Delete(ctx context.Context, goalID string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.bus.Publish(ctx, events.Event{Topic: "goal:deleted", Payload: map[string]string{"goal_id": goalID}})
+	s.bus.Publish(ctx, events.Event{Topic: "goal:deleted", Payload: map[string]any{
+		"goal_id": goalID, "run_ids": runningRunIDs,
+	}})
 	return nil
 }
 

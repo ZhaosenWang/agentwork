@@ -123,6 +123,53 @@ func TestCreateNoCommentWithoutDescription(t *testing.T) {
 	}
 }
 
+// TestCreateNoDispatchIsPureComment: the pure-Comment path (comment_goal's
+// contract, 决策 5-2) persists the comment but mentions in it NEVER trigger
+// runs — even for the goal's OWNER, whose Create-path comments would
+// dispatch a consult. "Saying" must not become "asking".
+func TestCreateNoDispatchIsPureComment(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "owner")
+	agentB := seedAgent(t, st, "other")
+	domID := seedDomain(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+
+	// The OWNER posts a pure comment carrying a mention URI.
+	if _, err := cs.CreateNoDispatch(ctx, Comment{
+		GoalID: g.ID, AuthorType: "agent", AuthorID: agentA,
+		Content: "[@other](mention://agent/" + agentB + ") 顺便看看", RunID: "",
+	}); err != nil {
+		t.Fatalf("pure comment: %v", err)
+	}
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=?`, g.ID).Scan(&n); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("pure comment must not dispatch a guest run, got %d", n)
+	}
+
+	// The dispatch path still works for the same content (the Consult
+	// mechanism, used by consult_agent / human mentions).
+	if _, err := cs.Create(ctx, Comment{
+		GoalID: g.ID, AuthorType: "agent", AuthorID: agentA,
+		Content: "[@other](mention://agent/" + agentB + ") 问一下", RunID: "",
+	}); err != nil {
+		t.Fatalf("dispatch comment: %v", err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=?`, g.ID, agentB).Scan(&n); err != nil {
+		t.Fatalf("count guest runs: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("Create must still dispatch the owner's mention, got %d guest runs", n)
+	}
+	_ = rs
+}
+
 // TestAgentCommentAutoThreadsToTrigger: an agent comment made inside a run
 // (run_id carried from AGENTWORK_RUN_ID) automatically replies to the
 // comment that triggered that run — mention → run → reply chains without

@@ -106,6 +106,24 @@ func HasMentionAll(content string) bool {
 //   - mention://squad/<id> → route to the squad's leader (leader run).
 //   - mention://human/<id> → just renders a link.
 func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error) {
+	return s.create(ctx, c, true)
+}
+
+// CreateNoDispatch is the pure-Comment path (comment_goal's contract,
+// 决策 5-2): the comment is persisted and published, but mentions in it
+// NEVER trigger runs — asking another agent is consult_agent's job, not the
+// comment's. The mention-dispatch below is the Consult mechanism, and a
+// comment that silently dispatched a guest run would turn "saying" into
+// "asking" against the tool's own description.
+func (s *CommentService) CreateNoDispatch(ctx context.Context, c Comment) (*Comment, error) {
+	return s.create(ctx, c, false)
+}
+
+// create is the shared core: persist + publish, then (when dispatch is set)
+// the mention dispatch — the comment-triggered reopen and the consult
+// enqueue are both dispatch-side effects, so a pure comment on a terminal
+// goal lands without reopening either.
+func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (*Comment, error) {
 	if c.GoalID == "" {
 		return nil, NewValidationError("goal_id is required")
 	}
@@ -157,6 +175,10 @@ func (s *CommentService) Create(ctx context.Context, c Comment) (*Comment, error
 	}
 
 	s.bus.Publish(ctx, events.Event{Topic: "comment:created", Payload: c})
+
+	if !dispatch {
+		return &c, nil // pure comment — no reopen, no mention-triggered runs
+	}
 
 	// Dispatch mentions AFTER the comment is durably stored. @all suppresses
 	// auto-trigger entirely (no runs); other mentions enqueue runs.

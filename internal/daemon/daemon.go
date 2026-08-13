@@ -201,6 +201,10 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	// cancelled goal must not keep an agent burning compute on work that is
 	// already decided dead. Same stop mechanism as StopRun.
 	bus.Subscribe("goal:finished", d.onGoalFinished)
+	// Delete likewise: the goal:deleted payload carries the running run ids
+	// captured before the cascade removed their rows (the DB can no longer
+	// answer the query by the time this handler fires).
+	bus.Subscribe("goal:deleted", d.onGoalDeleted)
 	// M4-B: a delivered issue-sourced goal closes its GitHub issue (the
 	// work is merged — the issue is done). The fix commits (structured, from
 	// the deliver) travel into the close comment so the issue records WHAT
@@ -473,6 +477,22 @@ func (d *Daemon) onSubGoalStateChanged(_ context.Context, e events.Event) {
 	}
 	if err := d.goalSvc.ReconcileGoal(d.ctx, goalID); err != nil {
 		log.Printf("daemon: reconcile goal %s: %v", goalID, err)
+	}
+}
+
+// onGoalDeleted terminates a deleted goal's running runs. Their rows are
+// already gone (the Delete cascade removed them), so the ids come from the
+// event payload — the cut is pure resource reclamation: the processes must
+// not keep burning compute writing into rows that no longer exist.
+func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]any)
+	if !ok {
+		return
+	}
+	ids, _ := m["run_ids"].([]string)
+	for _, id := range ids {
+		log.Printf("daemon: goal deleted — stopping run %s", id)
+		d.cancelRun(id, "stopped")
 	}
 }
 

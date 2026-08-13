@@ -275,7 +275,10 @@ func NewServer(exec *Executor) *gmcp.Server {
 		if exec.commentSvc == nil || exec.GoalID == "" {
 			return nil, nil, errors.New("collaboration not wired for this run")
 		}
-		if _, err := exec.commentSvc.Create(ctx, service.Comment{
+		// Pure Comment (决策 5-2): the description promises mentions never
+		// trigger runs — persist without mention dispatch so the contract and
+		// the behavior are the same thing.
+		if _, err := exec.commentSvc.CreateNoDispatch(ctx, service.Comment{
 			GoalID: exec.GoalID, AuthorType: "agent", AuthorID: exec.AgentID, Content: args.Content, RunID: exec.RunID,
 		}); err != nil {
 			return nil, nil, err
