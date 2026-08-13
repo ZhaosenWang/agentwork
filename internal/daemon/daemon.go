@@ -183,6 +183,16 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	// re-evaluates owner attention.
 	bus.Subscribe("sub_goal.verified", d.onSubGoalStateChanged)
 	bus.Subscribe("sub_goal.failed", d.onSubGoalStateChanged)
+	// change state changes → ReconcileGoal (决策 6-4, the Latch hard rule:
+	// ANY state change that can alter the attention judgment must reconcile).
+	// change.ready re-arms attention the moment a change materializes;
+	// change.integrated/conflict clear/re-arm it the moment the owner's
+	// integrate_change lands — without these edges the attention badge waits
+	// for the next run.terminal to catch up (the E2E watcher saw a ~40s stale
+	// "integration" after a successful integration).
+	bus.Subscribe("change.ready", d.onSubGoalStateChanged)
+	bus.Subscribe("change.integrated", d.onSubGoalStateChanged)
+	bus.Subscribe("change.conflict", d.onSubGoalStateChanged)
 	// A cancelled sub-goal's running run must stop (owner management, 决策
 	// 6-1) — same stop mechanism as goal cancel.
 	bus.Subscribe("sub_goal.cancelled", d.onSubGoalCancelled)

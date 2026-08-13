@@ -14,6 +14,8 @@ import (
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Goal is a work item (the product plane). It is the SOLE holder of state
@@ -773,7 +775,15 @@ func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) 
 	return id, nil
 }
 
+// ReconcileOnRunEnd runs under withBusyRetry for the same snapshot-upgrade
+// reason as ReconcileGoal — a BUSY here would drop the reconcile AND the
+// run.terminal publish (Finish returns the error), which is a worse failure
+// than the retry's cost.
 func (s *GoalService) ReconcileOnRunEnd(ctx context.Context, rc goalRunContext) error {
+	return withBusyRetry(func() error { return s.reconcileOnRunEndOnce(ctx, rc) })
+}
+
+func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunContext) error {
 	// Events are collected here and published ONLY after the tx commits, so a
 	// failed commit can never leave the bus with an event whose DB change
 	// rolled back (DESIGN "bus.Publish after commit"). Failure-side effects
@@ -1356,10 +1366,18 @@ func (s *GoalService) EnqueueOwnerRunTx(ctx context.Context, tx *sql.Tx, goalID 
 // times yields the same end state). The attention derivation covers
 // sub-goal/change state (决策 6-1/6-3 — the predicates grow with the sub-goal
 // flow). Owner run creation goes through this path ONLY (P0.5).
+//
+// The body runs under withBusyRetry: a WAL snapshot-upgrade race fires
+// SQLITE_BUSY immediately (busy_timeout does not apply), and because the
+// transaction is idempotent the retry is sound (the live 16:13:07
+// "persist attention: database is locked (5)" failure is exactly this).
 func (s *GoalService) ReconcileGoal(ctx context.Context, goalID string) error {
 	unlock := s.lockReconcile(goalID)
 	defer unlock()
+	return withBusyRetry(func() error { return s.reconcileGoalOnce(ctx, goalID) })
+}
 
+func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) error {
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1632,6 +1650,37 @@ func (s *GoalService) assigneeLabel(ctx context.Context, tx *sql.Tx, atype, aid 
 		return "", err
 	}
 	return name, nil
+}
+
+// isSQLiteBusy reports whether err is a SQLITE_BUSY / SQLITE_BUSY_SNAPSHOT
+// failure. WAL snapshot-upgrade races fail IMMEDIATELY with SQLITE_BUSY —
+// the busy_timeout pragma does not apply to them (the tx took a read
+// snapshot, another writer committed, and the write upgrade collides). The
+// live failure: ReconcileGoal's attention persist hit (5) SQLITE_BUSY at
+// exactly the moment the review-run enqueue committed alongside it.
+func isSQLiteBusy(err error) bool {
+	var se *sqlite.Error
+	if errors.As(err, &se) {
+		return se.Code() == sqlite3.SQLITE_BUSY || se.Code() == sqlite3.SQLITE_BUSY_SNAPSHOT
+	}
+	return false
+}
+
+// withBusyRetry re-runs fn when it fails with SQLITE_BUSY. Safe ONLY for
+// callers whose transaction is a conditional transition (rolled back on
+// failure, so the retry re-runs from a fresh snapshot) — the reconcile
+// family is idempotent by design (决策 6-4), which is exactly what makes the
+// retry sound.
+func withBusyRetry(fn func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = fn()
+		if err == nil || !isSQLiteBusy(err) {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return err
 }
 
 // mustExist is a tiny existence-check helper shared by the services.

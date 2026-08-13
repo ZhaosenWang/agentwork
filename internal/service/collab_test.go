@@ -1017,3 +1017,76 @@ func TestReconcileGoalNoRespawnWithoutProgress(t *testing.T) {
 		t.Fatalf("attention must persist, got %q err=%v", attention, err)
 	}
 }
+
+// TestAttentionClearsAfterIntegration: the latch's second edge — a change
+// integrated in the owner run must clear the goal's attention when the owner
+// run goes terminal (run.terminal → ReconcileGoal). The E2E watcher saw
+// attention=integration persist ~40s past the integration; this pins the
+// exact sequence: ready → attention+spawn → integrate → owner terminal →
+// reconcile → attention empty.
+func TestAttentionClearsAfterIntegration(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "owner")
+	b := seedAgent(t, st, "worker")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work item", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var sgRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&sgRun); err != nil {
+		t.Fatalf("sub-goal run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, sgRun); err != nil {
+		t.Fatalf("stamp refs: %v", err)
+	}
+	// Sub-goal verified (machine) → Change ready → event.
+	if err := rs.Finish(ctx, sgRun, "completed", "implemented"); err != nil {
+		t.Fatalf("finish sub-goal run: %v", err)
+	}
+	// Coordinator (latch edge 1): attention + owner spawn.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	g1, _ := gs.Get(ctx, g.ID)
+	if g1.Attention != "integration" {
+		t.Fatalf("ready change must arm attention=integration, got %q", g1.Attention)
+	}
+	var ownerRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND role='owner' ORDER BY queued_at DESC LIMIT 1`, g.ID).Scan(&ownerRun); err != nil {
+		t.Fatalf("owner run must be spawned: %v", err)
+	}
+
+	// The owner integrates the change in its run.
+	var changeID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM change WHERE goal_id=? AND status='ready' LIMIT 1`, g.ID).Scan(&changeID); err != nil {
+		t.Fatalf("ready change: %v", err)
+	}
+	if err := gs.MarkChangeIntegrating(ctx, changeID); err != nil {
+		t.Fatalf("mark integrating: %v", err)
+	}
+	if err := gs.MarkChangeIntegrated(ctx, changeID, true); err != nil {
+		t.Fatalf("mark integrated: %v", err)
+	}
+	// Owner run terminal (the run.terminal latch edge).
+	if err := rs.Finish(ctx, ownerRun, "completed", "integrated the change"); err != nil {
+		t.Fatalf("finish owner run: %v", err)
+	}
+	// The daemon's run.terminal subscription calls ReconcileGoal — simulate it.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile after terminal: %v", err)
+	}
+	g2, _ := gs.Get(ctx, g.ID)
+	if g2.Attention != "" {
+		t.Fatalf("attention must clear once the change is integrated and the owner run is terminal, got %q", g2.Attention)
+	}
+}
