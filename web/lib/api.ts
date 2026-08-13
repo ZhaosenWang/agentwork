@@ -1,4 +1,4 @@
-import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem } from "./types";
+import type { Runtime, RuntimeTestResult, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7373";
 
@@ -22,6 +22,8 @@ export const createRuntime = (body: Omit<Runtime, "id" | "created_at">) =>
   api<Runtime>("/runtimes", { method: "POST", body: JSON.stringify(body) });
 export const deleteRuntime = (id: string) =>
   api<void>(`/runtimes/${id}`, { method: "DELETE" });
+export const testRuntime = (id: string) =>
+  api<RuntimeTestResult>(`/runtimes/${id}/test`, { method: "POST" });
 
 // ── Agent ──
 export const listAgents = () => api<Agent[]>("/agents");

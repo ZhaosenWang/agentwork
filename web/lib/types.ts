@@ -12,6 +12,13 @@ export interface Runtime {
   created_at: string;
 }
 
+export interface RuntimeTestResult {
+  ok: boolean;
+  error?: string;
+  latency_ms: number;
+  details?: string;
+}
+
 export interface Agent {
   id: string;
   name: string;

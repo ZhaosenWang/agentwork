@@ -4,6 +4,8 @@ package server
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -100,6 +102,23 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	})
+	// Runtime connectivity check: opens the transport + does the protocol
+	// handshake without executing a task, so the owner can verify a runtime
+	// is usable right after creating it — instead of discovering a bad config
+	// in a failed run after assigning a goal.
+	mux.HandleFunc("POST /runtimes/{id}/test", func(w http.ResponseWriter, r *http.Request) {
+		out, err := s.d.TestRuntime(r.Context(), r.PathValue("id"))
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				http.Error(w, "runtime not found", http.StatusNotFound)
+			} else {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
 	})
 	h.Mount(mux)
 
