@@ -1495,9 +1495,17 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// an explicit "fix, don't redo" framing.
 	if q.Attempt > 1 {
 		var lastFail string
-		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT result_summary FROM run WHERE goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`,
-			q.GoalID).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
+		query := `SELECT result_summary FROM run WHERE goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`
+		args := []any{q.GoalID}
+		if subGoalID != "" {
+			// Sub-goal rework: the failure context must come from THIS
+			// sub-goal's own failed round — another sub-goal's failure
+			// summary would misdirect the fix ("fix the existing code"
+			// pointing at someone else's work).
+			query = `SELECT result_summary FROM run WHERE sub_goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`
+			args = []any{subGoalID}
+		}
+		if err := d.st.DB().QueryRowContext(ctx, query, args...).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
 			prompt += "\n\n## Why the previous round failed (machine verification did not pass — fix the existing code, do NOT start over)\n" + truncateIn(lastFail, 1500)
 		}
 	}
@@ -2129,7 +2137,7 @@ Your worktree lives on the PLATFORM machine — it is not your environment:
 
 - Worktree root: %s
 - It contains the repository code and AGENTWORK.md, the coordination guide — read it first
-- COLLABORATE through the platform's MCP collaboration tools (agentwork_comment_goal / agentwork_consult_agent / agentwork_handoff_goal / agentwork_create_sub_goal / agentwork_goal_list / agentwork_agent_list / agentwork_squad_list) — the coordination contract lives in AGENTWORK.md
+- COLLABORATE through the platform's MCP collaboration tools — the four behaviors (agentwork_comment_goal / agentwork_consult_agent / agentwork_handoff_goal / agentwork_create_sub_goal), integration and inspection (agentwork_integrate_change / agentwork_get_change / agentwork_get_sub_goal / agentwork_get_verification / agentwork_cancel_sub_goal / agentwork_verify_sub_goal), and the lists (agentwork_goal_list / agentwork_agent_list / agentwork_squad_list) — the full coordination contract lives in AGENTWORK.md
 - ACCESS THE WORKTREE ONLY THROUGH THE PLATFORM'S CHANNELS:
   * MCP server "agentwork" (advertised at session start) — its tools operate on the worktree: agentwork_read_file (read a file), agentwork_write_file (write a file), and the command trio agentwork_terminal_create → agentwork_terminal_output → agentwork_terminal_release (commands are ASYNC: create returns a terminal id immediately, poll output until exited=true passing the returned cursor back, then release to clean up)
   * Client capabilities over ACP — fs/read_text_file, fs/write_text_file, terminal/*
@@ -2419,8 +2427,8 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("  READ-ONLY — its edits are discarded by the platform. The answer comes back\n")
 	b.WriteString("  as a comment and YOUR next run starts automatically (attempt 1, full\n")
 	b.WriteString("  comment feed injected). Resolve uuids with agentwork_agent_list.\n")
-	b.WriteString("- Runs on this goal execute SERIALLY (one worktree): never wait INSIDE your\n")
-	b.WriteString("  run for an answer — ask, end your turn, and get resumed.\n\n")
+	b.WriteString("- Never wait INSIDE your run for an answer — ask, end your turn, and the\n")
+	b.WriteString("  platform resumes you (a fresh run with the answer in the feed).\n\n")
 
 	b.WriteString("### Split work into sub-goals\n")
 	b.WriteString("- Call agentwork_create_sub_goal(parent_goal_id defaults to THIS goal, title,\n")
@@ -2447,9 +2455,9 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("  agent_list to get UUIDs for consults and handoffs.\n\n")
 
 	b.WriteString("### Team roster\n")
-	b.WriteString("If a task falls outside your role, delegate it — mention the teammate whose")
-	b.WriteString(" role best matches in a comment (see @mention above) so they pick it up on")
-	b.WriteString(" this goal, or hand off the goal entirely.\n\n")
+	b.WriteString("If a task falls outside your role, delegate it with\n")
+	b.WriteString(" agentwork_create_sub_goal (owner only — the assignee runs it on their\n")
+	b.WriteString(" own worktree), or hand the goal off entirely.\n\n")
 	var n int
 	for rows.Next() {
 		var id, name, desc string
