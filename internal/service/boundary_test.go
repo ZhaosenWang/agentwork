@@ -465,3 +465,114 @@ func TestRecoverStuckRunningSkipsTerminalGoals(t *testing.T) {
 		t.Fatalf("active-goal run must be back to queued, got %q", status2)
 	}
 }
+
+// TestFinalizationGuardWaitsForConsult: the owner ended its turn waiting
+// for a consult answer — the goal must NOT reach the gate while the guest
+// is still in flight (the leader's plan is unfinished). Only after the
+// guest goes terminal and the resumed owner finishes does the gate fire.
+func TestFinalizationGuardWaitsForConsult(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "owner")
+	b := seedAgent(t, st, "guest")
+	domID := seedDomainWithGates(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	ownerRun := enqueueFirst(t, rs, g)
+
+	// The owner consults b (agent-authored comment → guest run + request).
+	if _, err := cs.Create(ctx, Comment{
+		GoalID: g.ID, AuthorType: "agent", AuthorID: a,
+		Content: "[@guest](mention://agent/" + b + ") 请你自我介绍", RunID: ownerRun.ID,
+	}); err != nil {
+		t.Fatalf("consult comment: %v", err)
+	}
+	var guestRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND role='consult' LIMIT 1`, g.ID, b).Scan(&guestRun); err != nil {
+		t.Fatalf("guest run: %v", err)
+	}
+
+	// The owner ends its turn while the guest is still in flight — the gate
+	// must NOT fire yet.
+	if err := rs.Finish(ctx, ownerRun.ID, "completed", "introduced myself, waiting for opencode's answer"); err != nil {
+		t.Fatalf("finish owner: %v", err)
+	}
+	g1, _ := gs.Get(ctx, g.ID)
+	if g1.Status != "active" {
+		t.Fatalf("goal must stay active while a consult is in flight, got %q", g1.Status)
+	}
+
+	// The guest answers → the requester resumes.
+	if err := rs.Finish(ctx, guestRun, "completed", "I am opencode, a coding agent"); err != nil {
+		t.Fatalf("finish guest: %v", err)
+	}
+	var resumedRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND role='owner' AND status IN ('queued','running') LIMIT 1`,
+		g.ID, a).Scan(&resumedRun); err != nil {
+		t.Fatalf("requester must resume after the answer: %v", err)
+	}
+
+	// The resumed owner finishes with nothing pending — now the gate fires.
+	// (The daemon stamps the fired gate on the run row; simulate it.)
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET gates_hit='["merge"]' WHERE id=?`, resumedRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Finish(ctx, resumedRun, "completed", "summarized both introductions"); err != nil {
+		t.Fatalf("finish resumed owner: %v", err)
+	}
+	g2, _ := gs.Get(ctx, g.ID)
+	if g2.Status != "review" {
+		t.Fatalf("gate must fire once the consult resolved, got %q", g2.Status)
+	}
+}
+
+// TestConsultFailureResumesRequester: a FAILED guest is itself the answer —
+// the requester resumes with the failure trace in the feed instead of its
+// plan silently dying (live: the self-introduction leader waited for an
+// answer a crashed consult never delivered).
+func TestConsultFailureResumesRequester(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "owner")
+	b := seedAgent(t, st, "guest")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	ownerRun := enqueueFirst(t, rs, g)
+	if _, err := cs.Create(ctx, Comment{
+		GoalID: g.ID, AuthorType: "agent", AuthorID: a,
+		Content: "[@guest](mention://agent/" + b + ") 请你自我介绍", RunID: ownerRun.ID,
+	}); err != nil {
+		t.Fatalf("consult comment: %v", err)
+	}
+	var guestRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND role='consult' LIMIT 1`, g.ID, b).Scan(&guestRun); err != nil {
+		t.Fatalf("guest run: %v", err)
+	}
+
+	// The guest FAILS — the requester must still be resumed.
+	if err := rs.Finish(ctx, guestRun, "failed", "guest crashed"); err != nil {
+		t.Fatalf("finish failed guest: %v", err)
+	}
+	var resumedRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND role='owner' AND status IN ('queued','running') LIMIT 1`,
+		g.ID, a).Scan(&resumedRun); err != nil {
+		t.Fatalf("a failed consult must still resume the requester: %v", err)
+	}
+	// The feed carries the failure trace for the resumed run's prompt.
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND author_type='system' AND content LIKE '协作 run 失败%'`,
+		g.ID).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("guest failure must leave a system comment, got %d (err %v)", n, err)
+	}
+}

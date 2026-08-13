@@ -340,17 +340,41 @@ func TestDoneCancelsQueuedRuns(t *testing.T) {
 		t.Fatalf("comment: %v", err)
 	}
 	r := enqueueFirst(t, rs, g)
+	// The in-flight consult keeps the goal active (the finalization guard,
+	// 决策 6-8: the owner ended its turn with a consult outstanding).
 	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "active" {
+		t.Fatalf("goal must stay active while the consult is pending, got %q", after.Status)
+	}
+	// The guest resolves the consult — the owner resumes and completes.
+	var guestRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND role='consult' LIMIT 1`, g.ID, agentB).Scan(&guestRun); err != nil {
+		t.Fatalf("guest run: %v", err)
+	}
+	if err := rs.Finish(ctx, guestRun, "completed", "answer"); err != nil {
+		t.Fatalf("finish guest: %v", err)
+	}
+	var resumedRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND role='owner' AND status IN ('queued','running') LIMIT 1`,
+		g.ID, agentA).Scan(&resumedRun); err != nil {
+		t.Fatalf("requester must resume: %v", err)
+	}
+	if err := rs.Finish(ctx, resumedRun, "completed", "done"); err != nil {
+		t.Fatalf("finish resumed owner: %v", err)
+	}
+	after, _ = gs.Get(ctx, g.ID)
 	if after.Status != "done" {
-		t.Fatalf("goal should be done, got %q", after.Status)
+		t.Fatalf("goal should be done once the consult resolved, got %q", after.Status)
 	}
 	runs, _ := rs.List(ctx, g.ID)
 	for _, run := range runs {
-		if run.AgentID == agentB && run.Status != "cancelled" {
-			t.Fatalf("queued mention run must be cancelled on done, got %q", run.Status)
+		if run.AgentID == agentB && run.Status != "completed" {
+			t.Fatalf("the guest run must be completed, got %q", run.Status)
 		}
 	}
 }

@@ -1015,6 +1015,24 @@ func (d *Daemon) ensureRunWorktreeFor(ctx context.Context, runID, domainID, goal
 		return wt, nil
 	}
 
+	// Consult/review runs are READ-ONLY participants (决策 6-2/6-7): DETACH
+	// from the goal branch (a read snapshot) instead of checking it out —
+	// the owner run may hold the branch's only checkout in parallel, and git
+	// allows one checkout per branch (live: a parallel consult hit "a branch
+	// named … already exists" because both runs tried to hold feat-<goal>).
+	if role == "consult" || role == "review" {
+		ref := "refs/heads/" + goalBranchName(goalID)
+		if _, err := exec.CommandContext(ctx, "git", "-C", repo, "rev-parse", "--verify", "--quiet", ref).CombinedOutput(); err != nil {
+			// The owner split before its first commit — read the base.
+			ref = "origin/" + defaultBranch
+		}
+		cmd := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "--detach", wt, ref)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("git worktree add (consult/review): %w: %s", err, string(out))
+		}
+		return wt, nil
+	}
+
 	// Owner workspace: the goal branch, created from the domain's configured
 	// default branch (DESIGN.md §6: the domain owns default_branch). If
 	// origin/{defaultBranch} does not exist, the error names it — the domain
@@ -1265,8 +1283,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// guarantee the judging environment is fresh). A failed setup here is an
 	// environment failure — the run fails with that attribution, the retry
 	// chain applies as usual.
+	// READ-ONLY runs (consult/review/verify) skip the whole machine-judgment
+	// pipeline — they produce opinions, not work, and the platform's
+	// verification judges work (决策 5-3/6-5).
+	readOnlyRun := consultRun || reviewRun || verifyRun
 	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
-	if checksFrozen && len(checks.Setup) > 0 {
+	if checksFrozen && len(checks.Setup) > 0 && !readOnlyRun {
 		setupReport, ok := runSetupOnly(ctx, runRowWorkdir, checks, timeout)
 		if !ok {
 			d.finishRun(ctx, q, "failed", "environment setup failed:\n"+setupReport)
@@ -1428,10 +1450,21 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			"\n\nYou are the consulted expert (a READ-ONLY consult run). Answer the question with your analysis and advice, and post the answer to the comment feed with agentwork_comment_goal.\n" +
 			"Do NOT modify any file in the worktree, do NOT git commit, do NOT execute the task itself — your edits are discarded by the platform. End your turn right after answering."
 	} else if reviewRun {
-		prompt = "You are a reviewer. Review the current changes (squad rule: after a member implements, a reviewer reviews).\n\n" +
+		// The review prompt carries the GOAL's identity — a reviewer who does
+		// not know what the goal is about can only stare at the diff. A
+		// no-code goal (self-introductions, a research summary) parks with an
+		// empty diff: the reviewer must judge the CONVERSATION's deliverable
+		// in the feed, not say "nothing to review" (live: the reviewer ran a
+		// code review on an introduction task and answered "no implementation
+		// changes to approve").
+		prompt = "You are a reviewer. Review the current goal's outcome (squad rule: after a member implements, a reviewer reviews).\n\n" +
+			"Goal: " + title + "\n\n" +
 			"Give your opinion ONLY — do not modify any file, do not execute the task itself.\n" +
-			"Inspect the changes in the worktree (diff, tests, quality), then post your opinion to the comment feed with agentwork_comment_goal (the approver reads it).\n" +
-			"Be specific: problems, risks, improvement suggestions. If the changes look good, say so explicitly."
+			"Inspect the changes in the worktree (diff, tests, quality) AND the goal's comment feed (the collaboration surface). " +
+			"If the diff is empty, the goal's deliverable lives in the feed — judge whether the goal's request was actually fulfilled there, " +
+			"and say so explicitly; never report a missing diff as the answer itself.\n" +
+			"Post your opinion to the comment feed with agentwork_comment_goal (the approver reads it).\n" +
+			"Be specific: problems, risks, improvement suggestions. If the outcome looks good, say so explicitly."
 	} else if verifyRun {
 		// A VERIFIER (决策 6-5): the sub-goal's quality gate — machine checks
 		// passed, now the named verifier judges. READ-ONLY workspace; the
@@ -1724,7 +1757,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// (the goal layer forces the human checkpoint instead). Evidence
 			// still carries the diff + agent summary for that checkpoint.
 			verifyReport, guardReport := "", ""
-			if checksFrozen {
+			if checksFrozen && !readOnlyRun {
 				verifyReport, ok, policyIssue := runVerification(ctx, runRowWorkdir, checks, timeout)
 				if !ok {
 					// Objective policy defect (POSIX exit 127 — missing command /

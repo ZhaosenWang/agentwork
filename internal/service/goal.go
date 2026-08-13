@@ -862,16 +862,24 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		// back-fill the response link, and auto-resume the requester (a fresh
 		// run, attempt 1, no trigger comment — the resume must not stack the
 		// mention-cycle counter) when the requester still owns an active goal.
-		if rc.Status == "completed" {
+		// A FAILED/CANCELLED guest is itself the answer ("your consult did not
+		// come back"; the feed carries the guest-failure comment) — the
+		// requester resumes on ANY terminal guest outcome, or its plan
+		// silently dies (live: the leader waited for an introduction that a
+		// crashed consult never delivered, and the goal went to the gate with
+		// an empty diff).
+		if rc.Status == "completed" || rc.Status == "failed" || rc.Status == "cancelled" {
 			var requesterAgent, requesterRunID string
 			err := tx.QueryRowContext(ctx,
 				`SELECT requester_agent_id, requester_run_id FROM consult_request WHERE guest_run_id=?`,
 				rc.RunID).Scan(&requesterAgent, &requesterRunID)
-			if err == nil && requesterAgent != "" && reportID != "" {
-				if _, uerr := tx.ExecContext(ctx,
-					`UPDATE consult_request SET response_comment_id=? WHERE guest_run_id=?`,
-					reportID, rc.RunID); uerr != nil {
-					return fmt.Errorf("back-fill consult response: %w", uerr)
+			if err == nil && requesterAgent != "" {
+				if rc.Status == "completed" && reportID != "" {
+					if _, uerr := tx.ExecContext(ctx,
+						`UPDATE consult_request SET response_comment_id=? WHERE guest_run_id=?`,
+						reportID, rc.RunID); uerr != nil {
+						return fmt.Errorf("back-fill consult response: %w", uerr)
+					}
 				}
 				owns, oerr := s.AgentOwnsGoal(ctx, &g, requesterAgent)
 				if oerr != nil {
@@ -881,7 +889,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 					// P0-3 (决策 6-13): the resume run is born IN this
 					// transaction — a crash can no longer lose the requester's
 					// successor run. An enqueue failure is only logged (the
-					// consult's answer is already in the feed).
+					// consult's outcome is already in the feed).
 					_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, requesterAgent, 1, false, "")
 					if err != nil {
 						afterCommit = append(afterCommit, func() {
@@ -917,12 +925,15 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		}
 		// v2 finalization guard (决策 6-1/6-8): the owner run only REACHES
 		// the acceptance judgment when nothing is pending — non-terminal
-		// sub-goals (still working) or ready/conflicted changes (not yet
-		// integrated) keep the goal active. The Coordinator's attention
-		// spawn (run.terminal → ReconcileGoal) wakes the owner again for
-		// integration/recovery; a sub-goal completing never completes the
-		// goal, and the human gate fires only on the FINAL state.
-		var pendingSG, pendingChanges int
+		// sub-goals (still working), ready/conflicted changes (not yet
+		// integrated), or IN-FLIGHT CONSULTS (the owner ended its turn
+		// waiting for an answer; the resume only lands when the guest goes
+		// terminal — success or failure) keep the goal active. The
+		// Coordinator's attention spawn (run.terminal → ReconcileGoal) wakes
+		// the owner again for integration/recovery; a sub-goal completing
+		// never completes the goal, and the human gate fires only on the
+		// FINAL state.
+		var pendingSG, pendingChanges, pendingConsults int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM sub_goal WHERE goal_id=? AND status NOT IN ('verified','cancelled','failed')`,
 			rc.GoalID).Scan(&pendingSG); err != nil {
@@ -933,7 +944,12 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			rc.GoalID).Scan(&pendingChanges); err != nil {
 			return fmt.Errorf("count pending changes: %w", err)
 		}
-		if pendingSG > 0 || pendingChanges > 0 {
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='consult' AND status IN ('queued','running')`,
+			rc.GoalID).Scan(&pendingConsults); err != nil {
+			return fmt.Errorf("count pending consults: %w", err)
+		}
+		if pendingSG > 0 || pendingChanges > 0 || pendingConsults > 0 {
 			break // stay active — the attention loop owns the next step
 		}
 		// A completed run that passed machine verification has reached the
