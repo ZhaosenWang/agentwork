@@ -749,17 +749,25 @@ func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 // platform guarantee), and an agent's own voluntary comment is additional
 // conversation — they do not exclude each other (an agent saying "搞定" must
 // not hide the full report, nor a report hide its words).
-// insertRunResultComment lands a completed run's report in the feed and
-// returns the inserted comment's id (” when nothing was written) — the
-// consult chain (决策 5-8) back-fills it as the response_comment_id.
+//
+// The report THREADS to the run's trigger comment when one exists — the
+// mention → run → answer chain (Collaboration.md §12: the guest's answer
+// goes back to the requester; the frontend renders parent_id as a quote
+// block). Owner runs (no trigger comment) land flat. Returns the inserted
+// comment's id ("" when nothing was written) — the consult chain (决策 5-8)
+// back-fills it as the response_comment_id.
 func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) (string, error) {
 	if rc.Status != "completed" || strings.TrimSpace(rc.Summary) == "" {
 		return "", nil
 	}
 	id := newID()
+	var parentID any
+	if rc.TriggerCommentID != "" {
+		parentID = rc.TriggerCommentID
+	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,NULL,?,?,?)`,
-		id, rc.GoalID, "agent", rc.AgentID, strings.TrimSpace(rc.Summary), now(), rc.RunID); err != nil {
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,?,?,?,?)`,
+		id, rc.GoalID, "agent", rc.AgentID, parentID, strings.TrimSpace(rc.Summary), now(), rc.RunID); err != nil {
 		return "", fmt.Errorf("insert run-result comment: %w", err)
 	}
 	return id, nil

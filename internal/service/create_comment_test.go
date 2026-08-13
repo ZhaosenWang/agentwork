@@ -170,6 +170,51 @@ func TestCreateNoDispatchIsPureComment(t *testing.T) {
 	_ = rs
 }
 
+// TestRunReportThreadsToTrigger: the platform's automatic run-report comment
+// (the guest's answer) threads to the mention that pulled the guest in — the
+// feed reads "mention → run → answer" without the agent cooperating
+// (Collaboration.md §12: the answer goes back to the requester).
+func TestRunReportThreadsToTrigger(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	agentB := seedAgent(t, st, "B")
+	domID := seedDomain(t, st)
+
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	trigger, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 请审查"})
+	if err != nil {
+		t.Fatalf("trigger comment: %v", err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	var guest *Run
+	for i := range runs {
+		if runs[i].AgentID == agentB {
+			guest = &runs[i]
+		}
+	}
+	if guest == nil {
+		t.Fatalf("mention must enqueue a guest run for B")
+	}
+
+	// The guest finishes WITHOUT commenting itself — the platform lands the
+	// run's report; it must reply to the mention.
+	if err := rs.Finish(ctx, guest.ID, "completed", "审查结论：通过"); err != nil {
+		t.Fatalf("finish guest run: %v", err)
+	}
+	var parentID, content string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(parent_id,''), content FROM comment WHERE run_id=?`, guest.ID).Scan(&parentID, &content); err != nil {
+		t.Fatalf("load run-report comment: %v", err)
+	}
+	if parentID != trigger.ID {
+		t.Fatalf("run report must thread to the trigger comment, got parent=%q want %q", parentID, trigger.ID)
+	}
+	if content != "审查结论：通过" {
+		t.Fatalf("run report content = %q", content)
+	}
+}
+
 // TestAgentCommentAutoThreadsToTrigger: an agent comment made inside a run
 // (run_id carried from AGENTWORK_RUN_ID) automatically replies to the
 // comment that triggered that run — mention → run → reply chains without
