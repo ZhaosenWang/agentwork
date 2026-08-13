@@ -6,7 +6,6 @@ package acpbackend
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"strings"
 	"sync"
 	"time"
@@ -64,14 +63,6 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 		// On any failure path, surface the agent's captured stderr (stdio
 		// transport) so a bad-args / missing-config agent isn't reported as a
 		// bare "transport closed".
-		withStderr := func(summary string) string {
-			if conn.Stderr != nil {
-				if b, err := io.ReadAll(conn.Stderr); err == nil && len(b) > 0 {
-					return summary + "\nstderr: " + string(b)
-				}
-			}
-			return summary
-		}
 
 		// Declare the execution-environment capabilities in the handshake:
 		// an agent only uses the client's fs/terminal RPCs when the client
@@ -94,13 +85,13 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			// connecting to the advertised MCP server left its run
 			// 'running' indefinitely after the idle watchdog fired).
 			close(events)
-			results <- proto.Result{Status: proto.StatusFailed, Output: withStderr("initialize: " + err.Error()), Err: err}
+			results <- proto.Result{Status: proto.StatusFailed, Output: proto.AppendStderr("initialize: "+err.Error(), conn.Stderr), Err: err}
 			return
 		}
 		newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{Cwd: spec.Cwd, McpServers: spec.McpServers})
 		if err != nil {
 			close(events)
-			results <- proto.Result{Status: proto.StatusFailed, Output: withStderr("new session: " + err.Error()), Err: err}
+			results <- proto.Result{Status: proto.StatusFailed, Output: proto.AppendStderr("new session: "+err.Error(), conn.Stderr), Err: err}
 			return
 		}
 		fwd := &eventForwarder{events: events}
@@ -122,7 +113,7 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			if ctx.Err() != nil {
 				status = proto.StatusCancelled
 			}
-			results <- proto.Result{Status: status, Output: withStderr("prompt: " + err.Error()), Err: err, SessionID: string(newResp.SessionID)}
+			results <- proto.Result{Status: status, Output: proto.AppendStderr("prompt: "+err.Error(), conn.Stderr), Err: err, SessionID: string(newResp.SessionID)}
 			return
 		}
 		// Carry the assistant's text (the final answer) as Result.Output so the

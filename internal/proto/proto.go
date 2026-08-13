@@ -22,6 +22,20 @@ import (
 // failure rather than a nil-deref.
 var ErrUnsupportedProvider = errors.New("proto: unsupported provider")
 
+// AppendStderr appends the transport's captured stderr (stdio only) to a
+// failure summary, so a bad-args / missing-config agent isn't reported as a
+// bare "transport closed". Returns summary unchanged if stderr is nil or empty.
+func AppendStderr(summary string, stderr io.Reader) string {
+	if stderr == nil {
+		return summary
+	}
+	b, err := io.ReadAll(stderr)
+	if err != nil || len(b) == 0 {
+		return summary
+	}
+	return summary + "\nstderr: " + string(b)
+}
+
 // Status is the terminal outcome of a run.
 type Status string
 
