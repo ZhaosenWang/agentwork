@@ -405,3 +405,63 @@ func TestCreateUnassignedBacklogGoal(t *testing.T) {
 		t.Fatalf("bare id must default to agent, got %s/%s", g2.AssigneeType, g2.AssigneeID)
 	}
 }
+
+// TestRecoverStuckRunningSkipsTerminalGoals (P0-4): a run left 'running' on
+// a goal the human CANCELLED while the daemon was down must not be
+// resurrected by the restart — it is stamped cancelled instead of burning
+// compute on already-decided work. Active-goal stuck runs still requeue.
+func TestRecoverStuckRunningSkipsTerminalGoals(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	domID := seedDomain(t, st)
+
+	// Goal cancelled while its run was in flight (the daemon died before
+	// killing it — Cancel only drops queued runs; running ones are the
+	// daemon's to cut).
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	r := enqueueFirst(t, rs, g)
+	if _, err := rs.Claim(ctx, []string{a}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := gs.Cancel(ctx, g.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	n, err := rs.RecoverStuckRunning(ctx)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("terminal-goal run must not be requeued, got %d", n)
+	}
+	var status, reason string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT status, cancel_reason FROM run WHERE id=?`, r.ID).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelled" || reason != "goal_terminal" {
+		t.Fatalf("terminal-goal run must be stamped cancelled/goal_terminal, got %s/%s", status, reason)
+	}
+
+	// An active goal's stuck run still requeues normally.
+	g2, err := gs.Create(ctx, Goal{Title: "g2", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal 2: %v", err)
+	}
+	r2 := enqueueFirst(t, rs, g2)
+	if _, err := rs.Claim(ctx, []string{a}); err != nil {
+		t.Fatalf("claim 2: %v", err)
+	}
+	n, err = rs.RecoverStuckRunning(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("active-goal stuck run must requeue, got n=%d err=%v", n, err)
+	}
+	var status2 string
+	_ = st.DB().QueryRowContext(ctx, `SELECT status FROM run WHERE id=?`, r2.ID).Scan(&status2)
+	if status2 != "queued" {
+		t.Fatalf("active-goal run must be back to queued, got %q", status2)
+	}
+}

@@ -1120,12 +1120,22 @@ func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 
 // sweepRunWorktrees drops leftover RUN worktrees (a daemon crash leaves
 // runs/<runID> behind, still holding its branch checked out — the next run
-// would fail to create its worktree). Called at startup BEFORE any dispatch:
-// prune each bare repo's worktree metadata, then remove the run dirs. The
-// durable state is the commits; a crashed run's uncommitted WIP is lost (A5
-// recovery = transcript + committed state).
+// would fail to create its worktree). Called at startup BEFORE any dispatch.
+// ORDER MATTERS: the dirs go first, THEN worktree prune — pruning while the
+// dirs still exist is a no-op, and after RemoveAll the metadata turns
+// 'prunable'; a stale prunable entry keeps git thinking the branch is still
+// checked out and the next run's worktree add fails with "a branch named …
+// already exists" (live: the cancelled smoke goal's recovered run hit this).
+// The durable state is the commits; a crashed run's uncommitted WIP is lost
+// (A5 recovery = transcript + committed state).
 func (d *Daemon) sweepRunWorktrees(ctx context.Context) {
 	repoRoot := filepath.Join(runsRoot(), "repos")
+	runsDir := filepath.Join(runsRoot(), "runs")
+	if err := os.RemoveAll(runsDir); err != nil {
+		log.Printf("daemon: sweep run worktrees: %v", err)
+	} else {
+		log.Printf("daemon: swept stale run worktrees")
+	}
 	entries, err := os.ReadDir(repoRoot)
 	if err != nil {
 		return
@@ -1138,12 +1148,6 @@ func (d *Daemon) sweepRunWorktrees(ctx context.Context) {
 		if _, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "prune").CombinedOutput(); err != nil {
 			log.Printf("daemon: worktree prune %s: %v", e.Name(), err)
 		}
-	}
-	runsDir := filepath.Join(runsRoot(), "runs")
-	if err := os.RemoveAll(runsDir); err != nil {
-		log.Printf("daemon: sweep run worktrees: %v", err)
-	} else if _, err := os.Stat(runsDir); os.IsNotExist(err) {
-		log.Printf("daemon: swept stale run worktrees")
 	}
 }
 

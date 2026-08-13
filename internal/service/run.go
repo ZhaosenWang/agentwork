@@ -542,8 +542,22 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 // Note: attempt is preserved — a run on its last attempt that the daemon lost
 // still has its remaining retry credit (DELTA from multica: their HandleFailedTasks
 // resets to todo; here we just keep the run queued, attempt unchanged).
+//
+// P0-4: only runs of goals that can still execute (active/review) are
+// requeued — a run left 'running' on a goal the human CANCELLED (or that
+// went terminal) while the daemon was down must NOT be resurrected by the
+// restart: it would burn compute on already-decided work (live: the
+// cancelled smoke goal's leftover run was re-claimed and re-ran after the
+// restart). Terminal-goal leftovers are stamped cancelled instead.
 func (s *RunService) RecoverStuckRunning(ctx context.Context) (int, error) {
 	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE run SET status='cancelled', cancel_reason='goal_terminal', finished_at=?
+		 WHERE status='running'
+		   AND goal_id IN (SELECT id FROM goal WHERE status IN ('done','failed','cancelled'))`, now())
+	if err != nil {
+		return 0, fmt.Errorf("cancel terminal-goal runs: %w", err)
+	}
+	res, err = s.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='queued', started_at='' WHERE status='running'`)
 	if err != nil {
 		return 0, err
