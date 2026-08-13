@@ -148,6 +148,41 @@ func (s *ScheduleService) Get(ctx context.Context, id string) (*Schedule, error)
 	return &sch, nil
 }
 
+// ScheduleRun is one firing of a schedule — the fired goal's identity and
+// current status (the web schedule detail's firing history).
+type ScheduleRun struct {
+	ID         string `json:"id"`
+	ScheduleID string `json:"schedule_id"`
+	GoalID     string `json:"goal_id"`
+	GoalTitle  string `json:"goal_title"`
+	GoalStatus string `json:"goal_status"`
+	PlannedAt  string `json:"planned_at"`
+	Status     string `json:"status"` // dispatched|failed
+	CreatedAt  string `json:"created_at"`
+}
+
+// ListRuns returns a schedule's firing history (newest first) with each
+// firing's goal title/status joined in.
+func (s *ScheduleService) ListRuns(ctx context.Context, scheduleID string) ([]ScheduleRun, error) {
+	rows, err := s.st.DB().QueryContext(ctx,
+		`SELECT sr.id, sr.schedule_id, sr.goal_id, COALESCE(g.title,''), COALESCE(g.status,''), sr.planned_at, sr.status, sr.created_at
+		 FROM schedule_run sr LEFT JOIN goal g ON g.id = sr.goal_id
+		 WHERE sr.schedule_id=? ORDER BY sr.created_at DESC`, scheduleID)
+	if err != nil {
+		return nil, fmt.Errorf("list schedule runs: %w", err)
+	}
+	defer rows.Close()
+	out := []ScheduleRun{}
+	for rows.Next() {
+		var r ScheduleRun
+		if err := rows.Scan(&r.ID, &r.ScheduleID, &r.GoalID, &r.GoalTitle, &r.GoalStatus, &r.PlannedAt, &r.Status, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // SetEnabled toggles a schedule without deleting it (the IM intake
 // "停掉定时任务" flow — the schedule row and its firing history stay, the
 // daemon's dispatchSchedules only fires enabled=1 rows).

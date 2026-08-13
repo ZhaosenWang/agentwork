@@ -280,7 +280,7 @@ active ──► cancelled
 </pre></div>
 
 <p><strong>blocked</strong> 表示系统无法继续；<strong>review</strong> 表示机器可以继续，但根据策略需要人或指定审批者决定。两者必须保持语义分离。</p>
-<p class="small"><strong>与现状差异：</strong>现状无独立 <code>delivery</code> 状态——approve 后平台执行 deliver（merge+re-verify+push），goal 保持 <code>review</code> 直至 MarkDelivered 才到 done；<code>blocked</code> 为子 goal 机制的残留状态（决策 3-6 子 goal 已休眠），现状协作走 mention 同 goal run，不创建 child goal。</p>
+<p class="small"><strong>与现状差异：</strong>现状无独立 <code>delivery</code> 状态——approve 后平台执行 deliver（merge+re-verify+push），goal 保持 <code>review</code> 直至 MarkDelivered 才到 done；<code>blocked</code> 已随 wait-children 机制退役（决策 6-10，goal 状态机五态）；协作走四行为模型（决策 5-1/5-2）+ sub_goal 实体（决策 6-1：不可递归、依附 goal 生命周期、Change+Revision 交付）。</p>
 
 <h2 id="squad">7. Squad & Delegation</h2>
 <p>Squad 不是执行池，而是 Agent 协作与路由组。Leader Agent 是实际的协作入口。</p>
@@ -301,7 +301,7 @@ Leader Agent
      └── create child Goal → Agent C</code></pre>
 
 <p>Delegation 的本质是创建/更新 Goal，而不是在 AgentWork 内部偷偷执行一个不可见 Workflow。</p>
-<div class="warn callout"><strong>与冻结决策冲突（决策 3-6）：</strong>本节的 child-goal 委派模型是<strong>愿景</strong>——子 goal 机制已休眠（leader 实测 wait 死锁：无子 goal 时永久 blocked，仅可 Cancel；实际协作是顺序流，mention 全覆盖）。现状协作走 <strong>mention</strong>（同 goal 协作 run），squad 以 leader run + role=reviewer 审查 checkpoint（决策 4-4）落地。恢复 child-goal 委派需重新满足"真实并行拆活需求 + 冲突自修复"前提。</div>
+<div class="warn callout"><strong>本节已更新（决策 5-1 撤销 3-6，6-1 重定义）：</strong>child-goal 委派已以 <strong>sub_goal 实体</strong>落地——不是 child goal：不可递归、依附 goal 生命周期、assignee/verifier 分离、Change+Revision 跨 workspace 交付、owner 集成（详见 Collaboration.v2.md）。squad 仍以 leader run + role=reviewer 审查 checkpoint（决策 4-4）运作。</div>
 <p class="small"><strong>交接语义（决策 4-9）：</strong>goal 易主时平台终止旧 owner 的 running run（per-run cancel 注册表）——旧 agent 已交接却不结束 run，会把新 owner 的 run 永远堵在 per-goal 串行队列后（死锁）；AGENTWORK.md 同步引导"交接后立即结束你的 turn"。</p>
 
 <h2 id="runtime">8. Runtime / Agent / Session</h2>
@@ -409,7 +409,7 @@ Goal Workspace / Runtime Context</code></pre>
 
 <p>Client RPC 是 AgentWork 的通用执行边界。现状（决策 4-8 已实现）为<strong>双通道</strong>：</p>
 <ul>
-<li><strong>ACP fs/terminal RPC</strong>——7 个 handler（read/write + terminal×5），握手声明 clientCapabilities。</li>
+<li><strong>ACP fs/terminal RPC</strong>——8 个 handler（read/write + terminal×5 + request_permission 自动放行），握手声明 clientCapabilities。</li>
 <li><strong>MCP 工作区 server</strong>——官方 go-sdk，streamable HTTP 挂在 /mcp/{runID}（GET+POST；GET 是 SSE 订阅，缺失会 405 导致工具不注册），session/new 的 McpServers 注入 URL。</li>
 </ul>
 <p class="small">统一模型：stdio/ws/tcp 同机制（注册 handler、声明能力、注入 Workspace 指引段——只说环境事实与协作契约，不指 agent 工具名）。遗留：fs 敏感文件拦截、MCP capability token（runID 即访问权）列后置。</p>
@@ -758,7 +758,7 @@ SQLite</code></pre>
 <li>Cron Trigger —— ✓ <span class="small">已实现（daemon dispatchSchedules + schedule 表）</span></li>
 <li>GitHub/GitLab Issue Trigger —— ✓ <span class="small">已实现（M4-B：issue poller + webhook，source_ref 链路）</span></li>
 <li>IM Trigger —— ✓ <span class="small">已实现（M3：notify 入站 + intake processor）</span></li>
-<li>Squad —— ✓ <span class="small">已实现（leader run + review checkpoint）；child-goal Delegation —— 冻结中（决策 3-6）</span></li>
+<li>Squad —— ✓ <span class="small">已实现（leader run + review checkpoint）；Delegation —— 已实现（sub_goal 实体，决策 5-1/6-1，撤销 3-6 的冻结）</span></li>
 <li>Processor Capability —— <span class="small">部分：compile/intake 已实现；summary/report/analysis 为规划（决策 4-7）</span></li>
 </ol>
 

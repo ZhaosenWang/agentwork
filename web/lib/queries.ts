@@ -35,6 +35,7 @@ import {
   createSchedule,
   deleteSchedule,
   setScheduleEnabled,
+  listScheduleRuns,
   listDomains,
   listSubGoals,
   createSubGoal,
@@ -445,6 +446,14 @@ export function useSetScheduleEnabled() {
   return useMutation({
     mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => setScheduleEnabled(id, enabled),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.schedules }),
+  });
+}
+// A schedule's firing history — fetched lazily when its detail opens.
+export function useScheduleRuns(scheduleId: string, enabled = true) {
+  return useQuery({
+    queryKey: ["schedules", scheduleId, "runs"],
+    queryFn: () => listScheduleRuns(scheduleId),
+    enabled: enabled && !!scheduleId,
   });
 }
 

@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { useSchedules, useAgents, useSquads, useDomains, useCreateSchedule, useDeleteSchedule, useSetScheduleEnabled, useGoalEvents } from "@/lib/queries";
-import { Button, PageHeader, Empty, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
+import Link from "next/link";
+import { useSchedules, useAgents, useSquads, useDomains, useCreateSchedule, useDeleteSchedule, useSetScheduleEnabled, useGoalEvents, useScheduleRuns } from "@/lib/queries";
+import { Button, PageHeader, Empty, Dialog, Field, inputCls, ConfirmDialog, Badge } from "@/components/ui";
 import type { Schedule } from "@/lib/types";
 
 export default function SchedulesPage() {
@@ -16,6 +17,7 @@ export default function SchedulesPage() {
   const setEnabled = useSetScheduleEnabled();
   const [showForm, setShowForm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [detail, setDetail] = useState<Schedule | null>(null);
 
   const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
   const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? sid;
@@ -52,7 +54,14 @@ export default function SchedulesPage() {
             <tbody>
               {schedules.map((s: Schedule) => (
                 <tr key={s.id} className="border-b border-zinc-50 last:border-0 hover:bg-zinc-50/60">
-                  <td className="px-4 py-3 font-medium text-zinc-900">{s.name}</td>
+                  <td className="px-4 py-3">
+                    <button
+                      onClick={() => setDetail(s)}
+                      className="font-medium text-zinc-900 hover:text-indigo-700 hover:underline transition-colors text-left"
+                    >
+                      {s.name}
+                    </button>
+                  </td>
                   <td className="px-4 py-3">
                     <code className="text-xs bg-zinc-100 px-1.5 py-0.5 rounded text-zinc-700">{s.cron_expression}</code>
                   </td>
@@ -90,6 +99,15 @@ export default function SchedulesPage() {
       )}
 
       {showForm && <NewScheduleForm agents={agents} squads={squads} domains={domains} onClose={() => setShowForm(false)} />}
+      {detail && (
+        <ScheduleDetail
+          schedule={detail}
+          agentName={agentName}
+          squadName={squadName}
+          domainName={domainName}
+          onClose={() => setDetail(null)}
+        />
+      )}
       {deleteTarget && (
         <ConfirmDialog
           title="确认删除"
@@ -100,6 +118,83 @@ export default function SchedulesPage() {
         />
       )}
     </div>
+  );
+}
+
+// ScheduleDetail is the schedule's firing history view (clicking the name):
+// the template config at the top, each firing below with the goal it
+// produced and that goal's current status, linked to the goal detail.
+function ScheduleDetail({
+  schedule,
+  agentName,
+  squadName,
+  domainName,
+  onClose,
+}: {
+  schedule: Schedule;
+  agentName: (id: string) => string;
+  squadName: (id: string) => string;
+  domainName: (id: string) => string;
+  onClose: () => void;
+}) {
+  const { data: runs, isLoading } = useScheduleRuns(schedule.id);
+  const assigneeLabel =
+    schedule.assignee_type === "squad" ? (squadName(schedule.assignee_id) || schedule.assignee_id) : (agentName(schedule.assignee_id) || schedule.assignee_id);
+
+  return (
+    <Dialog
+      title={`定时任务：${schedule.name}`}
+      onClose={onClose}
+      footer={<Button variant="outline" onClick={onClose}>关闭</Button>}
+    >
+      <div className="space-y-3">
+        {/* Template config */}
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-sm text-zinc-600">
+          <span><span className="text-zinc-400 text-xs">Cron：</span><code className="text-xs bg-zinc-100 px-1.5 py-0.5 rounded">{schedule.cron_expression}</code>（{schedule.timezone || "UTC"}）</span>
+          <span><span className="text-zinc-400 text-xs">负责人：</span>{assigneeLabel}</span>
+          <span><span className="text-zinc-400 text-xs">项目：</span>{domainName(schedule.domain_id)}</span>
+          <span>
+            <span className="text-zinc-400 text-xs">状态：</span>
+            <Badge status={schedule.enabled ? "running" : "cancelled"} className="scale-90" />
+          </span>
+          <span><span className="text-zinc-400 text-xs">下次触发：</span>{schedule.next_run_at ? new Date(schedule.next_run_at).toLocaleString("zh-CN") : "-"}</span>
+          <span><span className="text-zinc-400 text-xs">上次触发：</span>{schedule.last_run_at ? new Date(schedule.last_run_at).toLocaleString("zh-CN") : "从未"}</span>
+        </div>
+        {schedule.title_template && (
+          <p className="text-xs text-zinc-500">
+            <span className="text-zinc-400">标题模板：</span>{schedule.title_template}
+          </p>
+        )}
+
+        {/* Firing history */}
+        <div className="border-t border-zinc-100 pt-2">
+          <p className="text-xs font-medium text-zinc-500 uppercase tracking-wide mb-2">
+            触发历史{runs && runs.length > 0 && `（${runs.length}）`}
+          </p>
+          {isLoading ? (
+            <p className="text-xs text-zinc-400 py-3">加载中…</p>
+          ) : !runs || runs.length === 0 ? (
+            <p className="text-xs text-zinc-400 py-3">还没有触发过。</p>
+          ) : (
+            <ul className="space-y-1 max-h-64 overflow-y-auto">
+              {runs.map((r) => (
+                <li key={r.id} className="flex items-center gap-2 text-xs">
+                  <span className="text-zinc-400 shrink-0">{new Date(r.planned_at).toLocaleString("zh-CN")}</span>
+                  <Badge status={r.goal_status || "cancelled"} className="scale-90 shrink-0" />
+                  <Link
+                    href={`/goals/${r.goal_id}`}
+                    onClick={onClose}
+                    className="text-zinc-700 hover:text-indigo-700 hover:underline truncate"
+                  >
+                    {r.goal_title || r.goal_id.slice(0, 8)}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </Dialog>
   );
 }
 

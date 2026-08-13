@@ -79,6 +79,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /schedules", h.listSchedules)
 	mux.HandleFunc("POST /schedules", h.createSchedule)
 	mux.HandleFunc("GET /schedules/{id}", h.getSchedule)
+	mux.HandleFunc("GET /schedules/{id}/runs", h.listScheduleRuns)
 	mux.HandleFunc("DELETE /schedules/{id}", h.deleteSchedule)
 	mux.HandleFunc("PUT /schedules/{id}/enabled", h.setScheduleEnabled)
 
@@ -398,6 +399,14 @@ func (h *Handlers) listSchedules(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handlers) getSchedule(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Schedule.Get(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+
+// listScheduleRuns returns a schedule's firing history — each firing's
+// planned time, the goal it produced and that goal's current status (the
+// web schedule detail's history view).
+func (h *Handlers) listScheduleRuns(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Schedule.ListRuns(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
 }
 func (h *Handlers) deleteSchedule(w http.ResponseWriter, r *http.Request) {

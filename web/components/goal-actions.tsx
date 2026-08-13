@@ -76,7 +76,7 @@ function ReviewPanel({ goal }: { goal: Goal }) {
   const { data: comments } = useGoalComments(goal.id);
   const { data: agents } = useAgents();
   const [reason, setReason] = useState("");
-  const [showRejectForm, setShowRejectForm] = useState(false);
+  const [rejectForm, setRejectForm] = useState<"" | "reject" | "redirect">("");
   const [justResolved, setJustResolved] = useState<string | null>(null);
 
   const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
@@ -159,7 +159,7 @@ function ReviewPanel({ goal }: { goal: Goal }) {
           </details>
         )}
 
-        {/* 证据包（折叠） */}
+        {/* 证据包（折叠）——diff 统计 + 机器验证输出 + 结构化约束 + agent 自述 */}
         {evidence && (
           <details className="text-xs">
             <summary className="cursor-pointer text-amber-800">证据包（{lastRun?.id.slice(0, 8)}）</summary>
@@ -167,6 +167,8 @@ function ReviewPanel({ goal }: { goal: Goal }) {
               {String(evidence.diff_stat ?? "")}
               {"\n"}
               {String(evidence.verify ?? "")}
+              {evidence.guards ? `\n${String(evidence.guards)}` : ""}
+              {evidence.agent ? `\n\n—— agent 自述 ——\n${String(evidence.agent)}` : ""}
             </pre>
           </details>
         )}
@@ -200,7 +202,7 @@ function ReviewPanel({ goal }: { goal: Goal }) {
         <p className="text-sm text-red-700 font-medium">⚠️ 上次合入失败（冲突/验证红）——可重新批准重试合入，或驳回让 agent 修。</p>
       )}
 
-      {!showRejectForm ? (
+      {!rejectForm ? (
         <div className="flex gap-2">
           <Button
             onClick={() =>
@@ -213,8 +215,11 @@ function ReviewPanel({ goal }: { goal: Goal }) {
           >
             {resolve.isPending ? "处理中…" : resolveOutcome === "approved" ? "已批准，合入中…" : "批准并自动合入"}
           </Button>
-          <Button variant="outline" onClick={() => setShowRejectForm(true)} disabled={resolveOutcome === "approved"}>
+          <Button variant="outline" onClick={() => setRejectForm("reject")} disabled={resolveOutcome === "approved"}>
             驳回
+          </Button>
+          <Button variant="ghost" onClick={() => setRejectForm("redirect")} disabled={resolveOutcome === "approved"}>
+            改判
           </Button>
         </div>
       ) : (
@@ -222,8 +227,8 @@ function ReviewPanel({ goal }: { goal: Goal }) {
           onSubmit={(e) => {
             e.preventDefault();
             resolve.mutate(
-              { id: goal.id, decision: "reject", reason },
-              { onSuccess: () => { setShowRejectForm(false); setReason(""); setJustResolved("rejected"); } }
+              { id: goal.id, decision: rejectForm, reason },
+              { onSuccess: () => { setRejectForm(""); setReason(""); setJustResolved("rejected"); } }
             );
           }}
           className="space-y-2"
@@ -233,13 +238,13 @@ function ReviewPanel({ goal }: { goal: Goal }) {
             onChange={(e) => setReason(e.target.value)}
             className={inputCls}
             rows={3}
-            placeholder="驳回理由——会成为 agent 下一轮的执行范围"
+            placeholder={rejectForm === "reject" ? "驳回理由——会成为 agent 下一轮的执行范围" : "改判理由——会成为 agent 下一轮的执行范围"}
           />
           <div className="flex gap-2">
             <Button type="submit" variant="danger" disabled={resolve.isPending || !reason.trim()}>
-              {resolve.isPending ? "退回中…" : "驳回并退回 agent"}
+              {resolve.isPending ? "退回中…" : rejectForm === "reject" ? "驳回并退回 agent" : "改判并退回 agent"}
             </Button>
-            <Button variant="ghost" onClick={() => setShowRejectForm(false)}>返回</Button>
+            <Button variant="ghost" onClick={() => setRejectForm("")}>返回</Button>
           </div>
         </form>
       )}

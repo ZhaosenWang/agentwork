@@ -10,8 +10,8 @@
 > 1. §8「Mention 权限范围」的 workspace/squad 级访问过滤**未做**——单机单用户模型下所有 agent 可被 consult（与既有 trust boundary 一致），留作后置
 > 2. §21「Handoff Cycle」阈值具体化为 **4/8**：≥4 次写系统评论警告；≥8 次 goal 进 review 停靠（复用 ResolveReview，人 approve 继续/reject 驳回）
 > 3. §11 guest run「默认不能改文件」平台强制方式：run 结束丢弃 guest 窗口期新产生的未提交改动（entry 脏路径快照求差）；guest **直接 git commit** 进分支的改动不 revert（无法无损还原 entry 状态），检测到写系统评论提醒，交付前人工可见
-> 4. §40 `handed_off` 状态替代原 handoff→cancelled 路径；`cancel_reason=handoff` 保留，notify/收敛规则与 cancelled+handoff 相同
-> 5. §27 工具名落地为 `comment_goal` / `consult_agent` / `handoff_goal` / `create_sub_goal` / `goal_wait`；旧的 goal_comment/goal_assign 移除（决策 5-2）
+> 4. §40 `handed_off` 状态替代原 handoff→cancelled 路径；`cancel_reason=handoff` 保留，notify/收敛规则与 cancelled+handoff 相同。**已再被决策 6-6 撤销**：run.status 回五态，`cancel_reason=handed_off` 承担语义
+> 5. §27 工具名落地为 `comment_goal` / `consult_agent` / `handoff_goal` / `create_sub_goal` / `goal_wait`；旧的 goal_comment/goal_assign 移除（决策 5-2）。**经决策 6-10 修订**：goal_wait 随 blocked/wait 退役移除；工具面扩充 cancel_sub_goal / verify_sub_goal / integrate_change / get_change / get_sub_goal / get_verification
 > 6. §10「Answer → Requester」落地为 consult 闭环自动恢复（决策 5-8）：guest run completed 且 requester 仍是 owner 且 goal active → 平台自动 enqueue requester 的下一 run
 > 7. §6「Guest Run → Agent 不允许」落地：agent 作者评论中的 mention 只在作者是 owner run 时 dispatch；human 评论 mention 不受限（§7 human 语义）
 
@@ -509,6 +509,7 @@ Cycle Detected
 ⸻
 
 22. Sub-goal
+> **Superseded（决策 6-1）**：SubGoal 已重定义为独立实体——不是 child goal（不可递归、依附 goal 生命周期、assignee/verifier 分离、无独立交付），完整模型见 Collaboration.v2.md。
 22.1 定义
 Sub-goal 表示：
 当前 Goal 内的一块独立工作被拆出来，形成一个新的 Goal。
@@ -777,6 +778,7 @@ delegate = create_sub_goal
 ⸻
 
 32. 核心 Invariants
+> **Superseded**：v2 终稿的 16 条 Runtime Invariants（Collaboration.v2.md §13）取代本节 10 条。
 这些规则必须成为 Runtime 硬约束。
 Invariant 1
 A Goal has exactly one current Owner.
@@ -900,6 +902,7 @@ OwnerRun
 ⸻
 
 40. Run State
+> **Superseded（决策 6-6）**：`handed_off` 状态已撤销——handoff 是 Goal 层事件，不是 run 生命周期状态；run.status 保持五态，`cancel_reason=handed_off` 承担语义。
 建议明确：
 pending
 running

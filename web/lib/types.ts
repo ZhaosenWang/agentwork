@@ -231,6 +231,19 @@ export interface Schedule {
   created_at: string;
 }
 
+// ScheduleRun is one firing of a schedule — the fired goal's identity and
+// current status (the schedule detail's firing history).
+export interface ScheduleRun {
+  id: string;
+  schedule_id: string;
+  goal_id: string;
+  goal_title: string;
+  goal_status: string;
+  planned_at: string;
+  status: string; // dispatched|failed
+  created_at: string;
+}
+
 // WS event shape from the hub: {"topic":"goal:created","payload":{...}}
 export type WSTopic =
   | "goal:created" | "goal:assigned" | "goal:finished"
