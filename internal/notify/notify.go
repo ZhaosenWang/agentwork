@@ -169,7 +169,11 @@ func (n *Notifier) onGoalReviewing(_ context.Context, e events.Event) {
 			}
 		}
 	}
-	n.asyncSend(fmt.Sprintf("🔔 待审批：goal %s 等你决定\n%s\n（批准后平台自动合入）", short(goalID), reason)) // domain type unknown without the store — repo wording is the default
+	title := n.goalTitle(ctx, goalID)
+	if title == "" {
+		title = short(goalID)
+	}
+	n.asyncSend(fmt.Sprintf("🔔 待审批：**%s** 等你决定\n`goal %s`\n%s\n（批准后平台自动合入）", title, short(goalID), reason)) // domain type unknown without the store — repo wording is the default
 }
 
 // onGoalReviewReady patches the approval card once the review window closes:

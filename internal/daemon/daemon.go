@@ -738,7 +738,7 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 		}
 		d.mu.Unlock()
 		if ok {
-			logging.Infof("daemon: handoff cut run %s (agent %s no longer owns goal %s)", rr.id, rr.agentID, g.ID)
+			logging.Infof("daemon: handoff cut run %s (agent %s no longer owns goal %q (%s))", rr.id, rr.agentID, g.Title, g.ID)
 			cancel()
 			continue
 		}
@@ -753,7 +753,7 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 			`UPDATE run SET status='cancelled', cancel_reason='handoff', finished_at=? WHERE id=? AND status='running'`, nowStr(), rr.id); err != nil {
 			logging.Infof("daemon: handoff terminal stamp %s: %v", rr.id, err)
 		} else {
-			logging.Infof("daemon: handoff stamped run %s terminal (claim→register window)", rr.id)
+			logging.Infof("daemon: handoff stamped run %s terminal (claim→register window, goal %q)", rr.id, g.Title)
 		}
 	}
 }
@@ -1496,8 +1496,9 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 WHERE r2.id = ?`, q.RunID).
 		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &runRole, &subGoalID)
 	// Claim visibility: which run, which agent, which role — the panel's
-	// answer to "who is doing what right now".
-	logging.Infof("run %s claimed: goal=%s agent=%s role=%s", q.RunID, q.GoalID, q.AgentID, runRole)
+	// answer to "who is doing what right now". The TITLE travels with the
+	// id: ids are for the system, humans read titles.
+	logging.Infof("run %s claimed: agent=%s role=%s goal=%q (%s)", q.RunID, q.AgentID, runRole, title, q.GoalID)
 	// Run role (决策 5-4/6-x, stamped at enqueue): review runs are the
 	// platform's review requests (SYSTEM trigger comment — "请审查本次改动…
 	// 只提意见"); consult runs are pulled in by an agent/human mention comment
@@ -3115,7 +3116,11 @@ func (d *Daemon) reapRunawayRuns(ctx context.Context) {
 		if n, _ := res.RowsAffected(); n == 0 {
 			continue // already terminal — someone else's business
 		}
-		logging.Infof("daemon: runaway run %s (running %s, budget %ds) — terminalizing", rr.id, time.Since(started).Round(time.Second), budget)
+		var rGoalTitle string
+		if rr.goalID != "" {
+			_ = d.st.DB().QueryRowContext(ctx, `SELECT title FROM goal WHERE id=?`, rr.goalID).Scan(&rGoalTitle)
+		}
+		logging.Infof("daemon: runaway run %s (running %s, budget %ds) — goal %q (%s)", rr.id, time.Since(started).Round(time.Second), budget, rGoalTitle, rr.goalID)
 		// Best-effort process cut through the cancel registry (the claim→
 		// register window is covered: runTask's post-register self-check sees
 		// the stamp and self-cancels).

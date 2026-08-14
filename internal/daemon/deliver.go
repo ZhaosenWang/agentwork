@@ -80,6 +80,10 @@ func (d *Daemon) recoverPendingDelivers(ctx context.Context) (int, error) {
 }
 
 func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
+	// The goal TITLE travels with every deliver log line — ids are for the
+	// system, humans read titles.
+	var goalTitle string
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT title FROM goal WHERE id=?`, goalID).Scan(&goalTitle)
 	var domainID, defaultBranch, gitURL, gitCredentials, domainType string
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT d.id, d.default_branch, d.git_url, d.git_credentials, COALESCE(d.type,'') FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
@@ -140,13 +144,13 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// Fresh origin/<default> BEFORE the branch checks (the merge base must be
 	// the remote's current tip).
 	start := time.Now()
-	logging.Infof("git: deliver %s: fetch ...", goalID)
+	logging.Infof("git: deliver %q (%s): fetch ...", goalTitle, goalID)
 	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
-		logging.Errorf("git: deliver %s: fetch failed (%s): %s", goalID, time.Since(start).Round(time.Second), strings.TrimSpace(string(out)))
+		logging.Errorf("git: deliver %q (%s): fetch failed (%s): %s", goalTitle, goalID, time.Since(start).Round(time.Second), strings.TrimSpace(string(out)))
 		d.finishDeliver(ctx, goalID, false, "deliver: fetch: "+err.Error()+": "+string(out))
 		return
 	}
-	logging.Infof("git: deliver %s: fetch done (%s)", goalID, time.Since(start).Round(time.Second))
+	logging.Infof("git: deliver %q (%s): fetch done (%s)", goalTitle, goalID, time.Since(start).Round(time.Second))
 
 	// The goal branch must have commits AHEAD of the base — an empty branch
 	// (equal to the base) must NOT be treated as "already merged" and
@@ -167,7 +171,7 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		// approval IS the outcome — closing done is correct, not a failure.
 		// (A real task that produced nothing surfaces through verification
 		// and the human's own review of the evidence before approving.)
-		logging.Infof("daemon: deliver %s: branch has no commits — approving as-is", goalID)
+		logging.Infof("daemon: deliver %q (%s): branch has no commits — approving as-is", goalTitle, goalID)
 		d.finishDeliver(ctx, goalID, true, "no changes to deliver — approved as-is")
 		return
 	}
@@ -176,7 +180,7 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	if _, err := gitRunCtx(ctx, repo, "merge-base", "--is-ancestor", branchName, "origin/"+defaultBranch); err == nil {
 		// Branch already in origin/default — nothing to merge; the push is a
 		// no-op and MarkDelivered closes.
-		logging.Infof("daemon: deliver %s: branch already merged (resume after crash?)", goalID)
+		logging.Infof("daemon: deliver %q (%s): branch already merged (resume after crash?)", goalTitle, goalID)
 		d.finishDeliver(ctx, goalID, true, "already merged; nothing to push")
 		return
 	}
@@ -220,7 +224,7 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// Merge the goal branch (--no-ff: a merge commit makes the delivered
 	// change an explicit, revertible unit).
 	start = time.Now()
-	logging.Infof("git: deliver %s: merge %s ...", goalID, branchName)
+	logging.Infof("git: deliver %q (%s): merge %s ...", goalTitle, goalID, branchName)
 	mergeOut, err := gitRunCtx(ctx, wt, "merge", "--no-ff", branchName, "-m", "Merge "+branchName+" (agentwork deliver)")
 	if err != nil {
 		// Conflict: abort and report — the ephemeral worktree is removed by
@@ -251,13 +255,13 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// The merge commit lives on the detached HEAD — push it as the default
 	// branch (the ephemeral worktree has no local default branch).
 	start = time.Now()
-	logging.Infof("git: deliver %s: push HEAD:%s ...", goalID, defaultBranch)
+	logging.Infof("git: deliver %q (%s): push HEAD:%s ...", goalTitle, goalID, defaultBranch)
 	if _, err := gitRunCtx(ctx, wt, "push", "origin", "HEAD:"+defaultBranch); err != nil {
-		logging.Errorf("git: deliver %s: push failed (%s): %v", goalID, time.Since(start).Round(time.Second), err)
+		logging.Errorf("git: deliver %q (%s): push failed (%s): %v", goalTitle, goalID, time.Since(start).Round(time.Second), err)
 		d.finishDeliver(ctx, goalID, false, "deliver: push: "+err.Error())
 		return
 	}
-	logging.Infof("git: deliver %s: push done (%s)", goalID, time.Since(start).Round(time.Second))
+	logging.Infof("git: deliver %q (%s): push done (%s)", goalTitle, goalID, time.Since(start).Round(time.Second))
 
 	// The delivered note carries the merge info; the fix commits travel
 	// STRUCTURED to the delivered event (the close comment links them).

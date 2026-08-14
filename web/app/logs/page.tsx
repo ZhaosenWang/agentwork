@@ -1,9 +1,36 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import Link from "next/link";
 import { fetchLogs, getLogLevel, setLogLevel } from "@/lib/api";
+import { useGoals } from "@/lib/queries";
 import { useWSEvent } from "@/lib/ws";
 import type { LogLine } from "@/lib/types";
+
+// goalIDRe matches a full goal uuid inside a log line — ids are for the
+// system, the panel renders them as TITLE links.
+const goalIDRe = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi;
+
+// renderText splits a log line on goal uuids and renders known goals as
+// titled links (unknown ids stay as the bare id).
+function renderText(text: string, goalById: Map<string, string>) {
+  const parts = text.split(goalIDRe);
+  return parts.map((part, i) => {
+    if (!goalIDRe.test(part)) return part; // plain segment
+    goalIDRe.lastIndex = 0;
+    const title = goalById.get(part);
+    return (
+      <Link
+        key={i}
+        href={`/goals/${part}`}
+        className="text-sky-400 underline decoration-sky-700 hover:text-sky-300"
+        title={part}
+      >
+        {title ?? part.slice(0, 8)}
+      </Link>
+    );
+  });
+}
 
 const LEVELS = ["debug", "info", "warn", "error"] as const;
 
@@ -26,6 +53,12 @@ const LEVEL_DOT: Record<string, string> = {
 // ALSO the runtime knob — it PUTs /logs/level, which persists.
 export default function LogsPage() {
   const [lines, setLines] = useState<LogLine[]>([]);
+  const { data: goals } = useGoals();
+  // goal id → title — the log lines resolve ids into human titles.
+  const goalById = useMemo(
+    () => new Map((goals ?? []).map((g) => [g.id, g.title])),
+    [goals]
+  );
   const [level, setLevel] = useState<string>("info");
   const [keyword, setKeyword] = useState("");
   const [after, setAfter] = useState("");
@@ -184,7 +217,7 @@ export default function LogsPage() {
           <div key={i} className="flex gap-2 hover:bg-zinc-900/60 rounded px-1">
             <span className={`shrink-0 mt-1.5 h-1.5 w-1.5 rounded-full ${LEVEL_DOT[l.level] ?? LEVEL_DOT.info}`} />
             <span className="shrink-0 text-zinc-500">{l.ts ? new Date(l.ts).toLocaleString("zh-CN") : ""}</span>
-            <span className={`break-all whitespace-pre-wrap ${LEVEL_STYLE[l.level] ?? LEVEL_STYLE.info}`}>{l.text}</span>
+            <span className={`break-all whitespace-pre-wrap ${LEVEL_STYLE[l.level] ?? LEVEL_STYLE.info}`}>{renderText(l.text, goalById)}</span>
           </div>
         ))}
       </div>

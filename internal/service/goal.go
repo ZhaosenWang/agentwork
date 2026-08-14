@@ -1214,11 +1214,13 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 		return false, "", fmt.Errorf("load domain gates: %w", err)
 	}
 	// A scratch domain has no diff — its diff-based gates NEVER fire, and
-	// the deliverable is a subjective report the machine cannot judge. The
+	// the deliverable is a subjective artifact the machine cannot judge. The
 	// human checkpoint is unconditional here (regardless of strength or
 	// configured gates): zero-checkpoint scratch goals must not auto-done.
+	// The reason is HUMAN words — the person reading the card never wrote a
+	// policy and must not see platform jargon.
 	if domainType == "scratch" {
-		return true, "merge (scratch): 交付物为项目目录里的产物，必须人工审批", nil
+		return true, "人工验收（无 Git 仓库项目）", nil
 	}
 	// The confirmation gate (决策 2-4/2-5): an UNFROZEN acceptance policy is
 	// no acceptance policy — nothing was run against it (the daemon skips
@@ -1227,7 +1229,7 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 	// only safe default: "define by the human" is enforced here, not hoped
 	// for.
 	if compiledAt == "" {
-		return true, "域验收策略未确认（checks 未冻结）——强制人工审批", nil
+		return true, "人工验收（未配置验收策略）", nil
 	}
 	var checks Checks
 	if err := json.Unmarshal([]byte(checksJSON), &checks); err != nil {
@@ -1237,7 +1239,7 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 		return false, "", nil // gates configured but none fired for this run
 	}
 	if strength == "weak" {
-		return true, "merge (default): 弱验证域强制人工审批", nil
+		return true, "人工验收（自动判定不可靠）", nil
 	}
 	return false, "", nil
 }

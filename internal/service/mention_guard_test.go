@@ -97,7 +97,7 @@ func TestUnfrozenPolicyForcesReview(t *testing.T) {
 	if after.Status != "review" {
 		t.Fatalf("unfrozen policy must park in review, got %q", after.Status)
 	}
-	if !strings.Contains(after.ReviewRequest, "未确认") {
+	if !strings.Contains(after.ReviewRequest, "未配置") {
 		t.Fatalf("review_request should name the unfrozen policy, got: %q", after.ReviewRequest)
 	}
 }

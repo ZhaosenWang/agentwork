@@ -115,8 +115,8 @@ func (d *Daemon) openReviewWindow(ctx context.Context, goalID string) {
 // and the fallback timer (a hung reviewer). The fired flag + timer stop make
 // the card exactly-once per window.
 func (d *Daemon) maybeFireReviewReady(ctx context.Context, goalID string) {
-	var status string
-	if err := d.st.DB().QueryRowContext(ctx, `SELECT status FROM goal WHERE id=?`, goalID).Scan(&status); err != nil {
+	var status, goalTitle string
+	if err := d.st.DB().QueryRowContext(ctx, `SELECT status, title FROM goal WHERE id=?`, goalID).Scan(&status, &goalTitle); err != nil {
 		return
 	}
 	if status != "review" {
@@ -179,7 +179,9 @@ func (d *Daemon) publishReviewReady(goalID string) {
 		delete(d.reviewReadyTimers, goalID)
 	}
 	d.mu.Unlock()
-	logging.Infof("daemon: review window ready for %s — notifying the human", goalID)
+	var goalTitle string
+	_ = d.st.DB().QueryRowContext(context.Background(), `SELECT title FROM goal WHERE id=?`, goalID).Scan(&goalTitle)
+	logging.Infof("daemon: review window ready for %q (%s) — notifying the human", goalTitle, goalID)
 	// The review_duration anchor: the human's decision window STARTS here
 	// (the reviewer's run time is not the human's decision time — the health
 	// metric must measure the latter). An invisible activity row (the
