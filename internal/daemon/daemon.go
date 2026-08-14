@@ -17,6 +17,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -82,6 +83,20 @@ const workerQueueDepth = 64
 // defaultListenAddr is used when no addr is configured.
 const defaultListenAddr = ":7373"
 
+// defaultMaxRunDurationSeconds is the platform's default per-run budget when
+// no domain configures one (DESIGN.md §4: 2h).
+const defaultMaxRunDurationSeconds = 7200
+
+// runawayScanInterval is how often the runaway reaper scans for runs whose
+// process outlived its budget (P1, 决策 6-15⑦) — a cheap scan, minute-scale.
+const runawayScanInterval = time.Minute
+
+// runawayGrace is the reaper's tolerance past the run's own budget: the
+// promptCtx timeout (maxRunDuration) should have ended the run at 1× — a run
+// still 'running' past budget+grace means the context-cancellation chain
+// broke and only the DB-level reaper can free the owner single-flight.
+const runawayGrace = 5 * time.Minute
+
 // idleWindow is the no-activity budget after which the idle watchdog cancels
 // a hung turn. An agent that emits nothing for this long is presumed stuck.
 const idleWindow = 2 * time.Minute
@@ -132,6 +147,13 @@ type Daemon struct {
 	// counter (a handoff cancel must not count as a watchdog stall). Guarded
 	// by mu.
 	runCancelReasons map[string]string
+	// reviewReadyTimers / reviewReadyFired implement the reviewer-first
+	// approval card (Option A): the human's card waits until this window's
+	// review runs are terminal (or the fallback elapses / no reviewer
+	// exists). The timer covers a hung reviewer; the fired flag dedupes the
+	// card to one per window. Guarded by mu.
+	reviewReadyTimers map[string]*time.Timer
+	reviewReadyFired  map[string]bool
 	// mcpExecs maps runID → the run's workspace MCP executor (DESIGN.md
 	// 决策 4-8: agents that don't delegate tools to client RPCs get the
 	// workspace through an MCP server advertised at session/new). Guarded
@@ -171,6 +193,8 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		mcpExecs:         make(map[string]*mcp.Executor),
 		runCancels:       make(map[string]context.CancelFunc),
 		runCancelReasons: make(map[string]string),
+		reviewReadyTimers: make(map[string]*time.Timer),
+		reviewReadyFired:  make(map[string]bool),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
@@ -266,6 +290,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if n > 0 {
 		log.Printf("daemon: reconciled %d active goal(s)", n)
 	}
+	// Option B recovery (Event≠Truth on the review window): the ready
+	// trigger, the fallback timers and the fired flags are all in-memory — a
+	// crash between a window's park and its ready publish leaves the human's
+	// card permanently unpatched. Re-derive from DB truth: every goal still
+	// in review re-opens its window (ready fires immediately when no review
+	// runs are pending; the fallback timer re-arms otherwise).
+	if n, err := d.recoverReviewWindows(ctx); err != nil {
+		log.Printf("daemon: recover review windows: %v", err)
+	} else if n > 0 {
+		log.Printf("daemon: recovered %d review window(s)", n)
+	}
 	// Decision 2-9, trigger side: an approve followed by a crash leaves the
 	// goal in review with the approve recorded and no deliver — re-run the
 	// deliver (its merge/push idempotency makes the replay safe).
@@ -279,11 +314,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	cleanupTick := time.NewTicker(worktreeCleanupInterval)
 	digestTick := time.NewTicker(digestTickInterval)
 	issueTick := time.NewTicker(issuePollInterval)
+	runawayTick := time.NewTicker(runawayScanInterval)
 	defer dispatchTick.Stop()
 	defer scheduleTick.Stop()
 	defer cleanupTick.Stop()
 	defer digestTick.Stop()
 	defer issueTick.Stop()
+	defer runawayTick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -300,6 +337,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.dispatchDigest(ctx)
 		case <-issueTick.C:
 			d.dispatchIssues(ctx)
+		case <-runawayTick.C:
+			d.reapRunawayRuns(ctx)
 		}
 	}
 }
@@ -387,7 +426,7 @@ func (d *Daemon) dispatchDigest(ctx context.Context) {
 		log.Printf("daemon: digest build: %v", err)
 		return
 	}
-	if err := notifier.SendCard(card); err != nil {
+	if _, err := notifier.SendCard(card); err != nil {
 		log.Printf("daemon: digest send: %v", err)
 		return
 	}
@@ -490,6 +529,10 @@ func (d *Daemon) onRunTerminal(_ context.Context, e events.Event) {
 	if err := d.goalSvc.ReconcileGoal(d.ctx, goalID); err != nil {
 		log.Printf("daemon: reconcile goal %s: %v", goalID, err)
 	}
+	// Option A (reviewer-first approval card): the last review run going
+	// terminal closes the window — fire the human's card with the opinions
+	// now in place.
+	d.maybeFireReviewReady(d.ctx, goalID)
 }
 
 // onSubGoalStateChanged funnels sub-goal state changes into the Coordinator
@@ -1454,9 +1497,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// A CONSULT (决策 5-1/5-2): the mention asked for information/judgment.
 		// READ-ONLY by platform contract (决策 5-3) — the worktree is the
 		// owner's state; edits made here are discarded at run end, commits are
-		// flagged. Answer the question, post the answer as a comment.
+		// flagged. The platform posts the final answer to the feed (threaded
+		// to the question) — instructing a comment_goal here DOUBLE-posted
+		// the answer (once by the agent, once as the run report): the feed
+		// noise the agents produced.
 		prompt = buildPrompt("Consultation request", "> "+triggerCommentContent, handoff) +
-			"\n\nYou are the consulted expert in a READ-ONLY consult run: answer the question with your analysis and advice, post it with agentwork_comment_goal, and end your turn. Do NOT modify files, do NOT commit, do NOT execute the task itself — your edits are discarded."
+			"\n\nYou are the consulted expert in a READ-ONLY consult run: answer the question with your analysis and advice, then end your turn — the platform posts your final answer to the feed automatically (threaded to the question). Do NOT post a duplicate with agentwork_comment_goal. Do NOT modify files, do NOT commit, do NOT execute the task itself — your edits are discarded.\n" +
+			"LANGUAGE: answer in the SAME language as the question."
 	} else if reviewRun {
 		// The review prompt carries the GOAL's identity — a reviewer who does
 		// not know what the goal is about can only stare at the diff. A
@@ -1471,7 +1518,8 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			"Inspect the changes in the worktree (diff, tests, quality) AND the goal's comment feed (the collaboration surface). " +
 			"If the diff is empty, the goal's deliverable lives in the feed — judge whether the goal's request was actually fulfilled there, " +
 			"and say so explicitly; never report a missing diff as the answer itself.\n" +
-			"Post your opinion to the comment feed with agentwork_comment_goal (the approver reads it).\n" +
+			"End your turn with your opinion as the final message — the platform posts it to the feed (the approver reads it there). Do NOT post a duplicate with agentwork_comment_goal.\n" +
+			"LANGUAGE: write your opinion in the SAME language as the goal's description and the human's comments.\n" +
 			"Be specific: problems, risks, improvement suggestions. If the outcome looks good, say so explicitly."
 	} else if verifyRun {
 		// A VERIFIER (决策 6-5): the sub-goal's quality gate — machine checks
@@ -1484,6 +1532,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			"Then issue your verdict ONCE with agentwork_verify_sub_goal:\n" +
 			"- verdict=\"passed\": summary states what you verified, evidence carries key artifacts (test output excerpts etc.)\n" +
 			"- verdict=\"rejected\": summary must list the CONCRETE problems (the assignee fixes from them)\n\n" +
+			"LANGUAGE: write the summary in the SAME language as the goal's description and the human's comments.\n" +
 			"Give the verdict once, then end your turn immediately."
 	}
 
@@ -1599,6 +1648,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				prompt += fmt.Sprintf("- %d sub-goal(s) verified\n", verified)
 			}
 			prompt += "Handle these attention items, then continue the goal's own work or end your turn.\n"
+		}
+		// P1-3 (决策 6-15⑨): the owner wakes BECAUSE its consults resolved
+		// (the finalization guard holds the goal until they do) — inject the
+		// answers directly instead of making it hunt through the feed.
+		if section := d.consultStatus(ctx, q.GoalID, q.AgentID, q.RunID); section != "" {
+			prompt += section
 		}
 	}
 
@@ -1849,10 +1904,14 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			"handoff":       "handoff",
 			"stopped":       "stopped", // human-initiated (StopRun / Cancel)
 			"timeout":       "timeout",
+			"runaway":       "runaway", // the reaper terminalized the run (P1, 决策 6-15⑦)
 		}[code]
 		summary := display + ": " + result.Output
+		// P0-5: the reason stamp is conditional — a run the reaper (or the
+		// handoff window stamp) already terminalized keeps THEIR reason; this
+		// late cancellation is not the run's terminal truth.
 		if _, err := d.st.DB().ExecContext(ctx,
-			`UPDATE run SET cancel_reason=? WHERE id=?`, code, q.RunID); err != nil {
+			`UPDATE run SET cancel_reason=? WHERE id=? AND status='running'`, code, q.RunID); err != nil {
 			log.Printf("daemon: stamp cancel_reason %s: %v", q.RunID, err)
 		}
 		var priorCancelled int
@@ -1870,13 +1929,19 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// cancel_reason ('handed_off') carries the semantics (handoff is a
 		// Goal-level event, not a run lifecycle state). Same non-retry,
 		// non-notify behavior as before.
-		d.finishRun(ctx, q, "cancelled", summary)
-		// Surface the stall so the notify layer can tell the owner a task
-		// stalled (cancelled runs leave the goal active with no pending run —
-		// the human decides, per decision 2-6).
-		d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
-			"run_id": q.RunID, "goal_id": q.GoalID, "reason": summary, "reason_code": code,
-		}})
+		//
+		// P0-5: the terminal event publishes ONLY when this writer's stamp
+		// won — a reaper-terminalized run publishes its own run:cancelled
+		// (from reapRunawayRuns); republishing here would double the notify
+		// card.
+		if d.finishRun(ctx, q, "cancelled", summary) {
+			// Surface the stall so the notify layer can tell the owner a task
+			// stalled (cancelled runs leave the goal active with no pending
+			// run — the human decides, per decision 2-6).
+			d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
+				"run_id": q.RunID, "goal_id": q.GoalID, "reason": summary, "reason_code": code,
+			}})
+		}
 	case proto.StatusFailed, proto.StatusAborted:
 		d.finishRun(ctx, q, "failed", result.Output)
 	}
@@ -2163,10 +2228,19 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 // compilation did not complete (manual checks input remains the fallback).
 func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, summary string) {
 	log.Printf("daemon: processor run %s failed: %s", q.RunID, summary)
-	if _, err := d.st.DB().ExecContext(ctx,
-		`UPDATE run SET status='failed', result_summary=?, finished_at=? WHERE id=?`,
-		summary, nowStr(), q.RunID); err != nil {
+	// P0-5: the stamp is conditional — a run the runaway reaper already
+	// terminalized keeps the reaper's terminal state; this late failure is
+	// dropped (and must not broadcast a stale compile-failed event).
+	res, err := d.st.DB().ExecContext(ctx,
+		`UPDATE run SET status='failed', result_summary=?, finished_at=? WHERE id=? AND status='running'`,
+		summary, nowStr(), q.RunID)
+	if err != nil {
 		log.Printf("daemon: mark processor run %s failed: %v", q.RunID, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		log.Printf("daemon: processor run %s already terminal — dropping late failure", q.RunID)
+		return
 	}
 	d.bus.Publish(ctx, events.Event{Topic: "domain:compile_failed", Payload: map[string]any{
 		"run_id": q.RunID, "error": summary,
@@ -2326,10 +2400,21 @@ func (d *Daemon) finishRunOK(ctx context.Context, q *service.ClaimedRow, output 
 // finishRun writes the run's terminal status + hands the outcome to the goal
 // layer. The goal layer (ReconcileOnRunEnd) is the SOLE authority over
 // goal.status; the daemon never writes goal.status directly.
-func (d *Daemon) finishRun(ctx context.Context, q *service.ClaimedRow, status, summary string) {
-	if err := d.runSvc.Finish(ctx, q.RunID, status, summary); err != nil {
+// Returns false when the stamp was refused — the run was already
+// terminalized by another writer (the runaway reaper, or the handoff
+// claim→register stamp) and this LATE outcome is dropped (P0-5, 决策 6-15⑥).
+// Callers gate their terminal events on the return: only the writer whose
+// stamp won publishes (the reaper publishes its own).
+func (d *Daemon) finishRun(ctx context.Context, q *service.ClaimedRow, status, summary string) bool {
+	err := d.runSvc.Finish(ctx, q.RunID, status, summary)
+	if errors.Is(err, service.ErrRunAlreadyTerminal) {
+		log.Printf("daemon: run %s already terminal — dropping late %s result", q.RunID, status)
+		return false
+	}
+	if err != nil {
 		log.Printf("daemon: finish run %s: %v", q.RunID, err)
 	}
+	return true
 }
 
 // goalOwnsSquadStatus mirrors multica's ownsIssueStatus: a leader run may only
@@ -2382,12 +2467,62 @@ func (d *Daemon) annotatePolicyIssue(ctx context.Context, goalID string) {
 
 // agentTriggeredRunCount counts the goal's runs triggered by AGENT-authored
 // comments (the mention-churn signal; platform system triggers excluded).
+// Sub-goal/verify runs are EXEMPT (P2-2, 决策 6-15⑩): their trigger is the
+// owner's dispatch comment — workflow execution, not mention churn. Same
+// query as service.MentionCycleCount; keep them in lockstep.
 func (d *Daemon) agentTriggeredRunCount(ctx context.Context, goalID string) (int, error) {
 	var n int
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM run r JOIN comment c ON c.id = r.trigger_comment_id
-		 WHERE r.goal_id=? AND c.author_type='agent'`, goalID).Scan(&n)
+		 WHERE r.goal_id=? AND c.author_type='agent'
+		   AND r.role NOT IN ('subgoal','verify')`, goalID).Scan(&n)
 	return n, err
+}
+
+// consultStatus renders the owner's resolved consults since its last turn —
+// the causal answer to "did my question come back?" (P1-3, 决策 6-15⑨). The
+// query is CAUSAL: consult_request links requester → guest → response comment
+// (response_comment_id is back-filled at guest run end); the finished_at
+// comparison is only the "since your last turn" scope filter. An owner
+// waking mid-consult cannot happen — the finalization guard holds the goal
+// active until its OWN consults resolve (P0-6) — so every row here is
+// resolved.
+func (d *Daemon) consultStatus(ctx context.Context, goalID, agentID, runID string) string {
+	rows, err := d.st.DB().QueryContext(ctx, `
+		SELECT COALESCE(a.name, cr.target_agent_id), COALESCE(c.content, ''), COALESCE(rc.content, ''), r.status
+		FROM consult_request cr
+		JOIN run r ON r.id = cr.guest_run_id
+		LEFT JOIN comment c ON c.id = cr.trigger_comment_id
+		LEFT JOIN comment rc ON rc.id = cr.response_comment_id
+		LEFT JOIN agent a ON a.id = cr.target_agent_id
+		WHERE cr.goal_id=? AND cr.requester_agent_id=?
+		  AND r.status IN ('completed','failed','cancelled')
+		  AND r.finished_at > COALESCE((
+		    SELECT MAX(r2.finished_at) FROM run r2
+		    WHERE r2.goal_id=? AND r2.role='owner' AND r2.id != ?
+		  ), '')
+		ORDER BY r.finished_at`, goalID, agentID, goalID, runID)
+	if err != nil {
+		log.Printf("daemon: consult status for %s: %v", goalID, err)
+		return ""
+	}
+	defer rows.Close()
+	var b strings.Builder
+	for rows.Next() {
+		var name, question, answer, status string
+		if err := rows.Scan(&name, &question, &answer, &status); err != nil {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString("\n\n## Consult status (your questions since your last turn)\n")
+		}
+		if status == "completed" && answer != "" {
+			fmt.Fprintf(&b, "- 问 %s：%s\n  回答：%s\n", name, truncateIn(question, 300), truncateIn(answer, 1000))
+		} else {
+			fmt.Fprintf(&b, "- 问 %s：%s\n  未成功（%s）——详见评论区\n", name, truncateIn(question, 300), status)
+		}
+	}
+	return b.String()
 }
 
 // goalAttention reads the persisted OwnerAttention ('' when none).
@@ -2472,10 +2607,16 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("You coordinate ONLY through the MCP tools of the \"agentwork\" server\n")
 	b.WriteString("(advertised at session start) — structured side effects, never shell,\n")
 	b.WriteString("never file edits to communicate intent.\n\n")
+	b.WriteString("LANGUAGE: write every comment/report in the SAME language as the goal's\n")
+	b.WriteString("description and the human's messages (do not switch to English when\n")
+	b.WriteString("echoing tool output).\n\n")
 
 	b.WriteString("### The four behaviors (pick by intent)\n")
-	b.WriteString("- COMMENT: agentwork_comment_goal(content) — say something (progress,\n")
-	b.WriteString("  findings). Never triggers another run. Anyone may.\n")
+	b.WriteString("- COMMENT: agentwork_comment_goal(content) — say something DURING your\n")
+	b.WriteString("  run (progress, findings, discussion). Never triggers another run.\n")
+	b.WriteString("  Anyone may. NOTE: your final message automatically becomes your run's\n")
+	b.WriteString("  report in the feed when you end your turn — do NOT re-post the same\n")
+	b.WriteString("  summary with comment_goal (double reports are feed noise).\n")
 	b.WriteString("- CONSULT: agentwork_consult_agent(agent_id, question) — ask for\n")
 	b.WriteString("  information/judgment. A READ-ONLY guest run answers; the answer lands\n")
 	b.WriteString("  in the feed and the platform auto-resumes YOUR next run. OWNER ONLY.\n")
@@ -2487,7 +2628,8 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 	b.WriteString("  split a work item off THIS goal (not a new goal). It runs on its own\n")
 	b.WriteString("  branch with machine verification; a verified sub-goal produces a Change\n")
 	b.WriteString("  and the platform wakes YOU to integrate. A sub-goal completing does NOT\n")
-	b.WriteString("  complete the goal. OWNER ONLY.\n\n")
+	b.WriteString("  complete the goal. OWNER ONLY. The platform writes the dispatch comment\n")
+	b.WriteString("  for you — do NOT announce the delegation again in a comment.\n\n")
 
 	b.WriteString("### Work the Change pipeline (owner)\n")
 	b.WriteString("- Woken with an Owner Attention section? agentwork_get_change lists the\n")
@@ -2503,7 +2645,10 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string
 
 	b.WriteString("### Lists\n")
 	b.WriteString("- agentwork_goal_list / agentwork_agent_list / agentwork_squad_list —\n")
-	b.WriteString("  resolve uuids with agent_list / squad_list before consults and handoffs.\n\n")
+	b.WriteString("  resolve uuids with agent_list / squad_list before consults and handoffs.\n")
+	b.WriteString("- agentwork_get_comments(goal_id?, after?, limit?) — READ-ONLY: pull NEW\n")
+	b.WriteString("  comments during a long run (your prompt snapshot is fixed at claim;\n")
+	b.WriteString("  pass the last comment id you saw as `after` for incremental reads).\n\n")
 
 	b.WriteString("### Team roster\n")
 	b.WriteString("Delegating work = agentwork_create_sub_goal or agentwork_handoff_goal —\n")
@@ -2582,6 +2727,105 @@ func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.In
 			return
 		}
 	}
+}
+
+// ── runaway reaper (P1, 决策 6-15⑦) ──
+
+// reapRunawayRuns is the DB-level runaway reaper: the process-side kill
+// chain (promptCtx → conn.Close → SIGKILL) is best-effort and can hang — a
+// run left 'running' forever blocks the goal's owner single-flight (a new
+// owner's run never claims). The reaper is the deterministic backstop: it
+// terminalizes the DB row itself, so Claim's guards release regardless of
+// whether the process ever dies.
+//
+// Threshold: the run's OWN budget (per-domain max_run_duration) + grace —
+// the run's context timeout already fires at 1×; surviving past it means the
+// cancellation chain broke (2× would just double the wait). The kill is
+// best-effort and never blocks; the LATE-result guard (P0-5: Finish stamps
+// conditionally on status='running') keeps a zombie process from
+// overwriting this terminal state, and the run:cancelled event publishes
+// exactly once (runTask's cancelled branch gates its publish on winning the
+// stamp).
+func (d *Daemon) reapRunawayRuns(ctx context.Context) {
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT id, goal_id, domain_id, started_at FROM run WHERE status='running' AND started_at != ''`)
+	if err != nil {
+		log.Printf("daemon: runaway scan: %v", err)
+		return
+	}
+	type runawayRow struct{ id, goalID, domainID, startedAt string }
+	var candidates []runawayRow
+	for rows.Next() {
+		var rr runawayRow
+		if err := rows.Scan(&rr.id, &rr.goalID, &rr.domainID, &rr.startedAt); err != nil {
+			continue
+		}
+		candidates = append(candidates, rr)
+	}
+	rows.Close()
+
+	for _, rr := range candidates {
+		started, err := time.Parse(time.RFC3339Nano, rr.startedAt)
+		if err != nil {
+			continue
+		}
+		budget := d.runBudgetSeconds(ctx, rr.goalID, rr.domainID)
+		if time.Since(started) < time.Duration(budget)*time.Second+runawayGrace {
+			continue
+		}
+		// Stamp FIRST (conditional — the stamp is the authority; a lost race
+		// means another writer terminalized it), then best-effort cut.
+		res, err := d.st.DB().ExecContext(ctx,
+			`UPDATE run SET status='cancelled', cancel_reason='runaway', finished_at=? WHERE id=? AND status='running'`,
+			nowStr(), rr.id)
+		if err != nil {
+			log.Printf("daemon: runaway stamp %s: %v", rr.id, err)
+			continue
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			continue // already terminal — someone else's business
+		}
+		log.Printf("daemon: runaway run %s (running %s, budget %ds) — terminalizing", rr.id, time.Since(started).Round(time.Second), budget)
+		// Best-effort process cut through the cancel registry (the claim→
+		// register window is covered: runTask's post-register self-check sees
+		// the stamp and self-cancels).
+		d.mu.Lock()
+		cancel, ok := d.runCancels[rr.id]
+		if ok {
+			d.runCancelReasons[rr.id] = "runaway"
+		}
+		d.mu.Unlock()
+		if ok {
+			cancel()
+		}
+		if rr.goalID != "" {
+			// The notify layer turns this into the 任务中断 card — the owner
+			// must know the run was killed over budget (决策 2-6: the goal
+			// stays active, the human decides).
+			d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
+				"run_id": rr.id, "goal_id": rr.goalID, "reason": "runaway", "reason_code": "runaway",
+			}})
+		}
+	}
+}
+
+// runBudgetSeconds resolves a running run's own time budget: the goal's
+// domain max_run_duration (worker runs), the processor run's domain, or the
+// platform default (7200s).
+func (d *Daemon) runBudgetSeconds(ctx context.Context, goalID, domainID string) int {
+	var budget int
+	if goalID != "" {
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT COALESCE(d.max_run_duration, 7200) FROM domain d JOIN goal g ON g.domain_id = d.id WHERE g.id=?`,
+			goalID).Scan(&budget)
+	} else if domainID != "" {
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT COALESCE(max_run_duration, 7200) FROM domain WHERE id=?`, domainID).Scan(&budget)
+	}
+	if budget <= 0 {
+		budget = 7200
+	}
+	return budget
 }
 
 // ── schedule dispatch ──

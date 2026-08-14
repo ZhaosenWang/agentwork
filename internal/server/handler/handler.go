@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -180,12 +179,8 @@ func (h *Handlers) createGoal(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, nil, err)
 		return
 	}
-	// A freshly-created active goal with an agent/squad assignee needs a first
-	// run enqueued (backlog goals do NOT — the semantic invariant). The
-	// unified owner-run spawn (P0.5) no-ops for backlog/human goals.
-	if _, err := h.Goal.EnqueueOwnerRun(r.Context(), out.ID); err != nil {
-		log.Printf("handler: enqueue owner for %s: %v", out.ID, err)
-	}
+	// P0-2 (决策 6-15②): an active agent/squad goal's first run is born IN
+	// Create's transaction — no caller-side enqueue here anymore.
 	writeJSON(w, out, nil)
 }
 
@@ -239,20 +234,9 @@ func (h *Handlers) assignGoal(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, nil, err)
 		return
 	}
-	// Enqueue a run for the new assignee (the unified owner-run spawn, P0.5 —
-	// coalesces if one is pending). The prior run, if in flight, keeps running
-	// — reconcile discards its result. The handoff event's to_run_id is
-	// back-filled from the spawned run.
-	if body.AssigneeType == "agent" || body.AssigneeType == "squad" {
-		run, err := h.Goal.EnqueueOwnerRun(r.Context(), out.ID)
-		if err != nil {
-			writeJSON(w, nil, err)
-			return
-		}
-		if run != nil {
-			_ = h.Goal.CompleteHandoff(r.Context(), out.ID, run.ID)
-		}
-	}
+	// P0-2 (决策 6-15②): the new owner's run and the handoff_event back-fill
+	// happen inside Assign's transaction — one handoff semantic, no
+	// caller-side enqueue (or CompleteHandoff) here anymore.
 	writeJSON(w, out, nil)
 }
 func (h *Handlers) cancelGoal(w http.ResponseWriter, r *http.Request) {

@@ -93,6 +93,11 @@ func NewGoalService(st *store.Store, bus *events.Bus) *GoalService {
 }
 
 // lockReconcile serializes one goal's reconciles (cheap map entry per goal).
+// The mutex is NEVER deleted (P0-3, 决策 6-15③): deleting it races — a waiter
+// blocked on the old mutex while a newcomer creates a fresh one ends up
+// running two reconciles of the same goal in parallel, defeating the exact
+// serialization this mutex exists for (the SQLITE_BUSY storm mitigation).
+// One mutex per goal ever reconciled is cheap at single-user scale.
 func (s *GoalService) lockReconcile(goalID string) func() {
 	s.reconcileMu.Lock()
 	m, ok := s.reconcileLocks[goalID]
@@ -102,12 +107,7 @@ func (s *GoalService) lockReconcile(goalID string) func() {
 	}
 	s.reconcileMu.Unlock()
 	m.Lock()
-	return func() {
-		m.Unlock()
-		s.reconcileMu.Lock()
-		delete(s.reconcileLocks, goalID)
-		s.reconcileMu.Unlock()
-	}
+	return m.Unlock
 }
 
 // SetRunService wires the RunService back-reference once both exist. Kept
@@ -115,8 +115,8 @@ func (s *GoalService) lockReconcile(goalID string) func() {
 func (s *GoalService) SetRunService(rs *RunService) { s.runSvc = rs }
 
 // Create inserts a goal. backlog (the semantic invariant) does not enqueue a
-// run; an active assignee to an agent/squad does. Enqueuing itself happens in
-// RunService to keep this method about goal rows + validation.
+// run; an ACTIVE agent/squad goal births its first run IN the same
+// transaction (P0-2, 决策 6-15②) — no caller-side enqueue exists anymore.
 func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	if g.Title == "" {
 		return nil, NewValidationError("title is required")
@@ -208,9 +208,9 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	// feed's timeline is uniform: "@dev-team 给 test-repo 添加 …" renders as a
 	// highlighted chip, exactly like an agent-to-agent handoff. Written
 	// directly (not via CommentService.Create) so creation never
-	// dispatch-triggers: the assignee's run is enqueued by the caller, and a
-	// description that mentions other agents must not double-trigger at
-	// creation.
+	// dispatch-triggers: the assignee's run is born in THIS transaction
+	// (below), and a description that mentions other agents must not
+	// double-trigger at creation.
 	if g.Description != "" && (g.AssigneeType == "agent" || g.AssigneeType == "squad") {
 		label, err := s.assigneeLabel(ctx, tx, g.AssigneeType, g.AssigneeID)
 		if err != nil {
@@ -223,10 +223,26 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 			return nil, fmt.Errorf("insert creation comment: %w", err)
 		}
 	}
+	// P0-2 (决策 6-15②): an ACTIVE agent/squad goal is born with its first
+	// run IN the same transaction — a crash after the commit can no longer
+	// leave a run-less active goal (the startup reconciles cannot resurrect
+	// it: attention derives only from changes/failed sub-goals). The run
+	// event is published after the commit (invariant 13).
+	var runEv *events.Event
+	if g.Status == "active" && (g.AssigneeType == "agent" || g.AssigneeType == "squad") {
+		_, ev, err := s.enqueueOwnerIntentTx(ctx, tx, g.ID, g.AssigneeType, g.AssigneeID, g.Status, "active")
+		if err != nil {
+			return nil, fmt.Errorf("enqueue first run: %w", err)
+		}
+		runEv = ev
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
+	if runEv != nil {
+		s.bus.Publish(ctx, *runEv)
+	}
 	s.bus.Publish(ctx, events.Event{Topic: "goal:created", Payload: g})
 	return &g, nil
 }
@@ -421,8 +437,10 @@ func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 // result is discarded without touching goal.status. The DAEMON layer does the
 // resource-level cut (决策 4-9): on the goal:assigned event it terminates the
 // old owner's running run via the runCancels registry, so the new owner's
-// queued run is not deadlocked behind per-goal serialization. The new
-// assignee's run is enqueued by the caller (RunService).
+// queued run is not deadlocked behind per-goal serialization.
+// The new owner's run is enqueued IN THIS TRANSACTION (P0-2, 决策 6-15②) —
+// both the HTTP assign surface and the MCP handoff_goal tool go through here,
+// one handoff semantic.
 //
 // actorType/actorID name WHO performs the handoff (决策 5-6, Invariant 2):
 // "agent" enforces that only the goal's CURRENT owner may hand it off
@@ -478,13 +496,25 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 		}
 	}
 
-	if _, err := s.st.DB().ExecContext(ctx,
+	// P0-2 (决策 6-15②): the ownership change, the audit rows, the
+	// handoff-cycle park, the comments AND the new owner's run are born in
+	// ONE transaction — a crash after the commit can no longer leave a
+	// reassigned goal without its successor run (the startup reconciles
+	// cannot resurrect it: attention derives only from changes/failed
+	// sub-goals). The run event is published after the commit (invariant 13).
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE goal SET assignee_type=?, assignee_id=?, handoff_note=? WHERE id=?`,
 		assigneeType, assigneeID, handoffNote, goalID); err != nil {
 		return nil, fmt.Errorf("assign goal: %w", err)
 	}
 	detail, _ := json.Marshal(map[string]string{"from": g.AssigneeType + "/" + g.AssigneeID, "to": assigneeType + "/" + assigneeID})
-	if _, err := s.st.DB().ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'handoff',?,?)`,
 		newID(), goalID, actorType, actorID, string(detail), now()); err != nil {
 		return nil, fmt.Errorf("insert activity: %w", err)
@@ -492,15 +522,16 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 	// Handoff audit (决策 5-9): the append-only ownership-transition record,
 	// richer than the activity row — from/to run links for the timeline and
 	// the cycle counter. from_run_id = the old owner's running run (the one
-	// the daemon terminates); to_run_id is back-filled by the caller via
-	// CompleteHandoff after enqueuing the new owner's run.
+	// the daemon terminates); to_run_id is back-filled IN THIS TRANSACTION
+	// from the enqueued run below (P0-2 — the audit row is complete the
+	// moment it commits; the caller-side CompleteHandoff is gone).
 	var fromRunID string
-	if err := s.st.DB().QueryRowContext(ctx,
+	if err := tx.QueryRowContext(ctx,
 		`SELECT id FROM run WHERE goal_id=? AND status='running' ORDER BY started_at DESC LIMIT 1`,
 		goalID).Scan(&fromRunID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("find from_run for handoff: %w", err)
 	}
-	if _, err := s.st.DB().ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO handoff_event (id,goal_id,from_type,from_id,to_type,to_id,from_run_id,to_run_id,reason,actor_type,actor_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		newID(), goalID, g.AssigneeType, g.AssigneeID, assigneeType, assigneeID, fromRunID, "", handoffNote, actorType, actorID, now()); err != nil {
 		return nil, fmt.Errorf("insert handoff event: %w", err)
@@ -510,28 +541,28 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 	// (approve continues, reject fails it) — a collaboration anomaly is not a
 	// task failure, unlike the mention pingpong guard (决策 4-2).
 	var handoffs int
-	if err := s.st.DB().QueryRowContext(ctx,
+	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM handoff_event WHERE goal_id=?`, goalID).Scan(&handoffs); err != nil {
 		return nil, fmt.Errorf("count handoffs: %w", err)
 	}
 	if handoffs == handoffWarnThreshold {
-		if _, err := s.st.DB().ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
 			newID(), goalID, fmt.Sprintf("⚠️ 所有权已交接 %d 次——协作循环风险。请确认任务方向，避免在 agent 之间来回推。", handoffs), now()); err != nil {
 			return nil, fmt.Errorf("insert handoff warning: %w", err)
 		}
 	} else if handoffs >= handoffCycleThreshold {
 		reason := fmt.Sprintf("handoff_loop: 所有权已交接 %d 次（超过上限 %d）——协作循环，需要人工决策", handoffs, handoffCycleThreshold)
-		if res, err := s.st.DB().ExecContext(ctx,
+		if res, err := tx.ExecContext(ctx,
 			`UPDATE goal SET status='review', review_request=? WHERE id=? AND status='active'`, reason, goalID); err != nil {
 			return nil, fmt.Errorf("park handoff loop: %w", err)
 		} else if n, _ := res.RowsAffected(); n > 0 {
-			if _, err := s.st.DB().ExecContext(ctx,
+			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,'system','','entered_review',?,?)`,
 				newID(), goalID, `{"reason":"handoff_loop"}`, now()); err != nil {
 				return nil, fmt.Errorf("insert handoff-loop activity: %w", err)
 			}
-			if _, err := s.st.DB().ExecContext(ctx,
+			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
 				newID(), goalID, "任务停靠待审：agent 间所有权交接形成循环，请决定——批准继续（交接生效）/ 驳回（任务失败）。", now()); err != nil {
 				return nil, fmt.Errorf("insert handoff-loop comment: %w", err)
@@ -541,18 +572,18 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 	// The handoff note is the actor's words — it belongs in the comment
 	// feed (the collaboration surface), not only in the handoff_note field.
 	// Written directly (not via CommentService.Create) so the mention never
-	// double-triggers: the caller already enqueues the new assignee's run.
+	// double-triggers: the successor run is enqueued below, in-tx.
 	if handoffNote != "" {
 		var label string
-		_ = s.st.DB().QueryRowContext(ctx,
+		_ = tx.QueryRowContext(ctx,
 			`SELECT name FROM agent WHERE id=?`, assigneeID).Scan(&label)
 		if label == "" {
-			_ = s.st.DB().QueryRowContext(ctx,
+			_ = tx.QueryRowContext(ctx,
 				`SELECT name FROM squad WHERE id=?`, assigneeID).Scan(&label)
 		}
 		if label != "" {
 			content := "[@" + label + "](mention://" + assigneeType + "/" + assigneeID + ") " + handoffNote
-			if _, err := s.st.DB().ExecContext(ctx,
+			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
 				newID(), goalID, actorType, actorID, content, now()); err != nil {
 				return nil, fmt.Errorf("insert handoff comment: %w", err)
@@ -560,16 +591,69 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 		}
 	}
 
-	g.AssigneeType = assigneeType
-	g.AssigneeID = assigneeID
-	g.HandoffNote = handoffNote
-	s.bus.Publish(ctx, events.Event{Topic: "goal:assigned", Payload: g})
-	return g, nil
+	// The handoff supersedes any QUEUED owner-role runs of the previous
+	// owner (the daemon cuts the RUNNING one via goal:assigned) — otherwise
+	// the stale intents compete with the new one at claim time, and after a
+	// handoff-loop approve the OLDEST queued run wins, handing the goal back
+	// to the loop's first agent. Sub-goal/consult/verify runs are untouched
+	// (决策 6-6: handoff only cuts the owner role). Queued-cancelled runs
+	// have no reconcile semantics (never started) — the stamp is audit.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE run SET status='cancelled', cancel_reason='handed_off' WHERE goal_id=? AND role='owner' AND status='queued'`,
+		goalID); err != nil {
+		return nil, fmt.Errorf("cancel superseded owner runs: %w", err)
+	}
+
+	// The successor enqueue (P0-2 + 决策 2-3 revised): the goal's FINAL
+	// status decides — the handoff-loop park above may just have flipped it.
+	// active → the run claims immediately; review → the run queues as a
+	// DURABLE INTENT (Claim admits it when the human releases the freeze);
+	// backlog/terminal → no run (Activate / comment-triggered Reopen are
+	// those entries).
+	var runID string
+	var runEv *events.Event
+	if assigneeType == "agent" || assigneeType == "squad" {
+		var finalStatus string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM goal WHERE id=?`, goalID).Scan(&finalStatus); err != nil {
+			return nil, fmt.Errorf("load goal status for handoff enqueue: %w", err)
+		}
+		run, ev, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, assigneeType, assigneeID, finalStatus, "active", "review")
+		if err != nil {
+			return nil, fmt.Errorf("enqueue new owner run: %w", err)
+		}
+		if run != nil {
+			runID = run.ID
+		}
+		runEv = ev
+	}
+	if runID != "" {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE handoff_event SET to_run_id=? WHERE goal_id=? AND to_run_id='' AND id=(SELECT id FROM handoff_event WHERE goal_id=? AND to_run_id='' ORDER BY created_at DESC LIMIT 1)`,
+			runID, goalID, goalID); err != nil {
+			return nil, fmt.Errorf("back-fill to_run_id: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if runEv != nil {
+		s.bus.Publish(ctx, *runEv)
+	}
+	// The event payload carries the FRESH row — the park above may have
+	// changed the status inside this transaction.
+	out, err := s.Get(ctx, goalID)
+	if err != nil {
+		return nil, err
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "goal:assigned", Payload: out})
+	return out, nil
 }
 
 // CompleteHandoff back-fills the new owner's run id on the goal's latest
-// handoff_event (决策 5-9) — the caller enqueues the new owner's run after
-// Assign and calls this to close the audit row.
+// handoff_event (决策 5-9). Retired in production by P0-2 (决策 6-15②):
+// Assign enqueues the successor IN its transaction and back-fills to_run_id
+// itself — the audit row is complete the moment it commits. Kept for tests.
 func (s *GoalService) CompleteHandoff(ctx context.Context, goalID, toRunID string) error {
 	_, err := s.st.DB().ExecContext(ctx,
 		`UPDATE handoff_event SET to_run_id=? WHERE id=(
@@ -595,7 +679,7 @@ func (s *GoalService) Cancel(ctx context.Context, goalID string) (*Goal, error) 
 	// Drop queued runs; running runs are left to report in (their result is
 	// discarded by reconcile). A cancelled goal must not dispatch.
 	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
+		`UPDATE run SET status='cancelled', cancel_reason='goal_cancelled' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
 		return nil, fmt.Errorf("cancel queued runs: %w", err)
 	}
 	// v2 (决策 6-8): cascade-cancel the goal's sub-goals — terminal ones keep
@@ -701,28 +785,37 @@ func (s *GoalService) AgentOwnsGoal(ctx context.Context, g *Goal, agentID string
 }
 
 // ownRunByGoal reports whether the reporting run still belongs to the goal's
-// current assignee. This is the gate that makes handoff/cancel/reassign
-// self-consistent without an external authority (DESIGN.md).
+// current assignee AND carries owner authority. This is the gate that makes
+// handoff/cancel/reassign self-consistent without an external authority
+// (DESIGN.md).
 //
-//	agent-assigned goal: the run's agent must equal the goal's assignee.
+//	agent-assigned goal: the run's agent must equal the goal's assignee AND
+//	  the run must be role='owner' (P0-4, 决策 6-15④, Invariant 6). A
+//	  mention-triggered run (role=consult/review) landing on the assignee is
+//	  a GUEST — it is read-only and its completion must not advance the goal
+//	  (live hazard: a human asking the owner a question during the
+//	  timeout-cancelled window "completed" the goal on an empty diff).
+//	  All platform spawn paths (EnqueueOwnerRun/retry/consult-resume) enqueue
+//	  with an empty trigger and resolve to owner — unaffected.
 //	squad-assigned goal: the run's agent must be the squad's CURRENT leader
-//	  — judged dynamically at reconcile time, NOT from the run's static
-//	  is_leader_run mark (a leader mentioned by name via mention://agent is
-//	  still the owner: authority follows the assignee relationship, not how
-//	  the run was triggered). A leader change orphans the prior leader's
-//	  in-flight run for free.
+//	  (judged dynamically at reconcile time, NOT from the run's static
+//	  is_leader_run mark) AND role='owner' — same Invariant-6 gate as the
+//	  agent branch: a mention://agent/<leader> consult (role=consult) is a
+//	  guest, while a mention://squad/<id> mention (isLeader=true) and all
+//	  platform spawns resolve to owner and keep authority. A leader change
+//	  orphans the prior leader's in-flight run for free.
 //	human-assigned goal: never has an agent-run owner — fall through to false.
 func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunContext, g Goal) (bool, error) {
 	switch g.AssigneeType {
 	case "agent":
-		return rc.AgentID == g.AssigneeID && !rc.IsLeaderRun, nil
+		return rc.Role == "owner" && rc.AgentID == g.AssigneeID && !rc.IsLeaderRun, nil
 	case "squad":
 		var leaderID string
 		err := tx.QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, g.AssigneeID).Scan(&leaderID)
 		if err != nil {
 			return false, fmt.Errorf("load squad leader: %w", err)
 		}
-		return rc.AgentID == leaderID, nil
+		return rc.Role == "owner" && rc.AgentID == leaderID, nil
 	default:
 		return false, nil // human-assigned
 	}
@@ -944,9 +1037,18 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			rc.GoalID).Scan(&pendingChanges); err != nil {
 			return fmt.Errorf("count pending changes: %w", err)
 		}
+		// P0-6 (决策 6-15⑤): the guard protects the OWNER's unfinished plan —
+		// only consults THIS owner requested (consult_request.requester_agent_id
+		// = the completing run's agent) hold the goal open. A HUMAN's consult
+		// has no consult_request row and must not block the gate: its guest
+		// completes without a resume, and a counted-but-never-resumed consult
+		// left the goal dead active (no attention signal wakes the owner).
 		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='consult' AND status IN ('queued','running')`,
-			rc.GoalID).Scan(&pendingConsults); err != nil {
+			`SELECT COUNT(*) FROM run r
+			 JOIN consult_request cr ON cr.guest_run_id = r.id
+			 WHERE r.goal_id=? AND r.role='consult' AND r.status IN ('queued','running')
+			   AND cr.requester_agent_id=?`,
+			rc.GoalID, rc.AgentID).Scan(&pendingConsults); err != nil {
 			return fmt.Errorf("count pending consults: %w", err)
 		}
 		if pendingSG > 0 || pendingChanges > 0 || pendingConsults > 0 {
@@ -1009,7 +1111,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		// The goal reached a terminal state — queued runs (a mention that
 		// raced ahead) must not be claimed onto a finished goal.
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, rc.GoalID); err != nil {
+			`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, rc.GoalID); err != nil {
 			return fmt.Errorf("cancel queued runs on done: %w", err)
 		}
 		// goal:finished fires ONLY when the goal actually reached a terminal
@@ -1048,7 +1150,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			}
 			// Terminal state — drop queued runs (same rule as the done path).
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, rc.GoalID); err != nil {
+				`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, rc.GoalID); err != nil {
 				return fmt.Errorf("cancel queued runs on fail: %w", err)
 			}
 			// The goal ACTUALLY failed here (attempts exhausted) — the failure
@@ -1254,7 +1356,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 				return nil, fmt.Errorf("fail handoff loop: %w", err)
 			}
 			if _, err := s.st.DB().ExecContext(ctx,
-				`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
+				`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
 				return nil, fmt.Errorf("cancel queued runs on handoff-loop fail: %w", err)
 			}
 			s.bus.Publish(ctx, events.Event{Topic: "goal:finished", Payload: map[string]any{
@@ -1266,24 +1368,39 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		if reason != "" {
 			note += "\n" + reason
 		}
-		res, err := s.st.DB().ExecContext(ctx,
+		// P0-2 (决策 6-15②): the review → active transition and the successor
+		// run are born in ONE transaction — a crash between the UPDATE and
+		// the enqueue used to leave a run-less active goal that no startup
+		// reconcile can resurrect.
+		tx, err := s.st.DB().BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+		res, err := tx.ExecContext(ctx,
 			`UPDATE goal SET status='active', handoff_note=?, human_iterations=human_iterations+1, review_request='' WHERE id=? AND status='review'`,
 			note, goalID)
 		if err != nil {
+			_ = tx.Rollback()
 			return nil, fmt.Errorf("reject review: %w", err)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
+			_ = tx.Rollback()
 			return nil, NewValidationError("goal is no longer in review")
-		}
-		if s.runSvc == nil {
-			return nil, errors.New("goalSvc.runSvc not wired")
 		}
 		// Continue on the current assignee (the unified owner-run spawn, P0.5).
 		// attempt resets to 1: a reject iteration is a fresh human-directed
 		// cycle, not a machine retry — the reject count lives in
 		// goal.human_iterations (DESIGN.md §4).
-		if _, err := s.EnqueueOwnerRun(ctx, goalID); err != nil {
+		_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "active")
+		if err != nil {
+			_ = tx.Rollback()
 			return nil, fmt.Errorf("enqueue after reject: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		if runEv != nil {
+			s.bus.Publish(ctx, *runEv)
 		}
 	}
 	s.bus.Publish(ctx, events.Event{Topic: "goal:review_resolved", Payload: map[string]any{
@@ -1316,25 +1433,47 @@ func (s *GoalService) IssueSource(ctx context.Context, goalID string) (ref, toke
 // human-assigned goals activate without a run (manual placeholder), exactly
 // like creation.
 func (s *GoalService) Activate(ctx context.Context, goalID string) (*Goal, error) {
-	res, err := s.st.DB().ExecContext(ctx,
+	// P0-2 (决策 6-15②): the backlog → active transition and its successor
+	// run are born in ONE transaction — a crash between them used to leave a
+	// run-less active goal that no startup reconcile can resurrect.
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
 		`UPDATE goal SET status='active' WHERE id=? AND status='backlog'`, goalID)
 	if err != nil {
 		return nil, fmt.Errorf("activate goal: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		_ = tx.Rollback()
 		g, gerr := s.Get(ctx, goalID)
 		if gerr != nil {
 			return nil, gerr
 		}
 		return nil, NewValidationError(fmt.Sprintf("cannot activate: the goal is %s (only backlog goals can be activated)", g.Status))
 	}
-	if _, err := s.st.DB().ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'activated','{}',?)`,
 		newID(), goalID, "human", "", now()); err != nil {
 		return nil, fmt.Errorf("insert activity: %w", err)
 	}
-	if _, err := s.EnqueueOwnerRun(ctx, goalID); err != nil {
+	var g Goal
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id, assignee_type, assignee_id FROM goal WHERE id=?`, goalID).
+		Scan(&g.ID, &g.AssigneeType, &g.AssigneeID); err != nil {
+		return nil, fmt.Errorf("load goal for activate enqueue: %w", err)
+	}
+	_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "active")
+	if err != nil {
 		return nil, fmt.Errorf("enqueue after activate: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if runEv != nil {
+		s.bus.Publish(ctx, *runEv)
 	}
 	return s.Get(ctx, goalID)
 }
@@ -1357,12 +1496,21 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal,
 	if reason != "" {
 		note += ": " + reason
 	}
-	if _, err := s.st.DB().ExecContext(ctx,
+	// P0-2 (决策 6-15②): the terminal → active transition, the audit rows
+	// and the successor run are born in ONE transaction — a crash between the
+	// UPDATE and the enqueue used to leave a run-less active goal that no
+	// startup reconcile can resurrect.
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE goal SET status='active', handoff_note=?, review_request='' WHERE id=? AND status IN ('done','failed','cancelled')`,
 		note, goalID); err != nil {
 		return nil, fmt.Errorf("reopen goal: %w", err)
 	}
-	if _, err := s.st.DB().ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'reopened',?,?)`,
 		newID(), goalID, "human", "", "{}", now()); err != nil {
 		return nil, fmt.Errorf("insert activity: %w", err)
@@ -1371,16 +1519,23 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal,
 	// so the conversation stays complete (and the next run's prompt injects
 	// it via the recent-human-comments mechanism).
 	if reason != "" {
-		if _, err := s.st.DB().ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,'',NULL,?,?)`,
 			newID(), goalID, "human", "重开："+reason, now()); err != nil {
 			return nil, fmt.Errorf("insert reopen comment: %w", err)
 		}
 	}
 	// Fresh run on the current assignee (the unified owner-run spawn, P0.5;
-	// human-assigned goals stay manual — EnqueueOwnerRun no-ops for them).
-	if _, err := s.EnqueueOwnerRun(ctx, goalID); err != nil {
+	// human-assigned goals stay manual — the intent helper no-ops for them).
+	_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "active")
+	if err != nil {
 		return nil, fmt.Errorf("enqueue after reopen: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if runEv != nil {
+		s.bus.Publish(ctx, *runEv)
 	}
 	return s.Get(ctx, goalID)
 }
@@ -1413,21 +1568,53 @@ func (s *GoalService) EnqueueOwnerRun(ctx context.Context, goalID string) (*Run,
 	return s.runSvc.enqueue(ctx, goalID, agentID, 1, isLeader, squadID, "")
 }
 
-// EnqueueOwnerRunTx is EnqueueOwnerRun inside a caller's transaction (the
-// Coordinator's spawn path).
-func (s *GoalService) EnqueueOwnerRunTx(ctx context.Context, tx *sql.Tx, goalID string, assigneeType, assigneeID, status string) error {
-	if status != "active" || (assigneeType != "agent" && assigneeType != "squad") {
-		return nil // review/terminal/human goals take no fresh owner run
+// enqueueOwnerIntentTx is the shared transactional owner-run spawn (P0-2,
+// 决策 6-15②): it enqueues when the goal's status (read inside the CALLER's
+// transaction — the caller owns the snapshot) is in the allowed set. The
+// statuses name the semantics: the Coordinator passes active-only (attention
+// spawns fire only for active goals); the direct workflow transitions
+// (assign/activate/reopen/reject, create-active) pass what their transition
+// allows — a handoff landing while the goal is frozen passes active+review,
+// queuing a DURABLE INTENT that Claim admits when the human releases
+// (决策 2-3 revised: review freezes execution, not intent).
+// The run event is RETURNED — the caller publishes after its commit
+// (invariant 13).
+func (s *GoalService) enqueueOwnerIntentTx(ctx context.Context, tx *sql.Tx, goalID, assigneeType, assigneeID, status string, allowedStatuses ...string) (*Run, *events.Event, error) {
+	if assigneeType != "agent" && assigneeType != "squad" {
+		return nil, nil, nil // human-assigned: manual placeholder
 	}
-	agentID, isLeader, squadID, err := s.runSvc.resolveLeader(ctx, assigneeType, assigneeID)
+	if s.runSvc == nil {
+		// Unwired service (bare test constructions) — the daemon always wires
+		// it; skip so unwired tests keep their old caller-side enqueue shape.
+		return nil, nil, nil
+	}
+	allowed := false
+	for _, st := range allowedStatuses {
+		if status == st {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return nil, nil, nil // review/terminal/backlog take no fresh run (per the caller's set)
+	}
+	// The leader lookup runs ON the caller's tx — a pooled read here would
+	// deadlock single-connection test stores while the tx holds the only
+	// connection.
+	agentID, isLeader, squadID, err := s.runSvc.resolveLeaderTx(ctx, tx, assigneeType, assigneeID)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	if agentID == "" {
-		return nil
+		return nil, nil, nil
 	}
-	_, _, err = s.runSvc.EnqueueExistingTx(ctx, tx, goalID, agentID, 1, isLeader, squadID)
-	return err
+	return s.runSvc.EnqueueExistingTx(ctx, tx, goalID, agentID, 1, isLeader, squadID)
+}
+
+// EnqueueOwnerRunTx is the Coordinator's active-only spawn inside a caller's
+// transaction (决策 6-4): attention spawns fire only for active goals.
+func (s *GoalService) EnqueueOwnerRunTx(ctx context.Context, tx *sql.Tx, goalID, assigneeType, assigneeID, status string) (*Run, *events.Event, error) {
+	return s.enqueueOwnerIntentTx(ctx, tx, goalID, assigneeType, assigneeID, status, "active")
 }
 
 // ReconcileGoal is the Coordinator core (决策 6-4): events are only WAKEUP
@@ -1453,6 +1640,7 @@ func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) erro
 		return err
 	}
 	defer tx.Rollback()
+	var pendingEvents []events.Event
 
 	var assigneeType, assigneeID, status string
 	err = tx.QueryRowContext(ctx,
@@ -1526,12 +1714,22 @@ func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) erro
 		}
 	}
 	if attention != "" && !lastOwnerCancelled && newestSignal > lastOwnerSpawn {
-		if err := s.EnqueueOwnerRunTx(ctx, tx, goalID, assigneeType, assigneeID, status); err != nil {
+		// P0-2: the spawn is born IN this transaction — the run event is
+		// published after the commit (invariant 13), so the frontend also
+		// sees Coordinator spawns (previously the event was dropped here).
+		_, runEv, err := s.EnqueueOwnerRunTx(ctx, tx, goalID, assigneeType, assigneeID, status)
+		if err != nil {
 			return fmt.Errorf("reconcile enqueue owner: %w", err)
+		}
+		if runEv != nil {
+			pendingEvents = append(pendingEvents, *runEv)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	for _, e := range pendingEvents {
+		s.bus.Publish(ctx, e)
 	}
 	// Human owners get NO run — the attention event drives IM + the UI badge
 	// (决策 6-8). Published after commit (invariant 13).
@@ -1732,7 +1930,7 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 		}
 		// Terminal state — drop queued runs (same rule as the reconcile paths).
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
+			`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, goalID); err != nil {
 			return nil, fmt.Errorf("cancel queued runs on delivered: %w", err)
 		}
 		event = "goal:delivered"

@@ -25,6 +25,7 @@ import (
 	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -36,6 +37,12 @@ import (
 // Outbound delivery owns its tenant_access_token explicitly (the SDK's token
 // manager proved unreliable past expiry — 99991663 on the daily digest after
 // a night of uptime). token/tokenExp are guarded by mu.
+// approvalCardRec is one sent approval card's patch handle.
+type approvalCardRec struct {
+	messageID string
+	hadPending bool // the card showed a "审查中" hint — only then is the opinion patch meaningful
+}
+
 type Notifier struct {
 	appID, appSecret string
 	client           *lark.Client
@@ -45,6 +52,15 @@ type Notifier struct {
 	// send overrides the SDK delivery path (tests inject a mock; nil = the
 	// lark client path). Kept unexported on purpose.
 	send func(text string) error
+	// approvalCards maps goalID → the sent approval card's message_id +
+	// whether it carried a "审查中" hint (Option B: the review_ready patch
+	// updates the SAME card the human saw at park time; a card without the
+	// hint has nothing to patch). In-memory: a restart between park and
+	// ready takes the "send fresh" fallback instead. Guarded by mu.
+	approvalCards map[string]approvalCardRec
+	// updateCardFn overrides the card PATCH (tests inject a mock; nil = the
+	// SDK message-update path).
+	updateCardFn func(messageID, content string) error
 
 	mu       sync.Mutex
 	token    string
@@ -58,7 +74,10 @@ func New(appID, appSecret, receiveIDType, receiveID string) *Notifier {
 	if receiveIDType == "" {
 		receiveIDType = "chat_id"
 	}
-	return &Notifier{appID: appID, appSecret: appSecret, receiveIDType: receiveIDType, receiveID: receiveID}
+	return &Notifier{
+		appID: appID, appSecret: appSecret, receiveIDType: receiveIDType, receiveID: receiveID,
+		approvalCards: make(map[string]approvalCardRec),
+	}
 }
 
 // SetQueryStore wires the read-only store (M3): approval cards need the run
@@ -70,7 +89,13 @@ func (n *Notifier) SetQueryStore(qs QueryStore) { n.qs = qs }
 // goroutines (fire-and-forget with panic recovery); each send runs in its
 // own goroutine so a slow Feishu API call never blocks the bus.
 func (n *Notifier) Subscribe(bus *events.Bus) {
+	// Option B (reviewer-first opinions, zero wait): the card fires at park
+	// time with a "审查中" hint naming the reviewers; goal:review_ready (the
+	// daemon publishes it when this window's review runs are terminal, or
+	// the fallback elapsed / no reviewer exists) PATCHES the SAME card to
+	// replace the hint with the actual opinions.
 	bus.Subscribe("goal:reviewing", n.onGoalReviewing)
+	bus.Subscribe("goal:review_ready", n.onGoalReviewReady)
 	bus.Subscribe("goal:delivered", n.onGoalDelivered)
 	bus.Subscribe("goal:deliver_failed", n.onGoalDeliverFailed)
 	bus.Subscribe("goal:finished", n.onGoalFinished)
@@ -125,8 +150,14 @@ func (n *Notifier) onGoalReviewing(_ context.Context, e events.Event) {
 					if g.Title == "" {
 						g.Title = short(goalID)
 					}
-					if card, err := buildReviewCard(g); err == nil {
-						n.asyncSendCard(card)
+					// Option B: the card names the reviewers still working and
+					// suggests the human MAY wait for them.
+					var pending []string
+					if reviewers, err := n.qs.PendingReviewers(ctx, goalID); err == nil {
+						pending = reviewers
+					}
+					if card, err := buildReviewCard(g, pending); err == nil {
+						n.sendApprovalCard(goalID, card, len(pending) > 0)
 						return
 					}
 				}
@@ -134,6 +165,129 @@ func (n *Notifier) onGoalReviewing(_ context.Context, e events.Event) {
 		}
 	}
 	n.asyncSend(fmt.Sprintf("🔔 待审批：goal %s 等你决定\n%s\n（批准后平台自动合入）", short(goalID), reason))
+}
+
+// onGoalReviewReady patches the approval card once the review window closes:
+// the "审查中" hint is replaced by the actual opinions (the SAME card — the
+// human's context stays intact). If the card was never recorded (a daemon
+// restart between park and ready), a fresh card is sent instead.
+func (n *Notifier) onGoalReviewReady(_ context.Context, e events.Event) {
+	ctx := context.Background()
+	m, _ := e.Payload.(map[string]any)
+	goalID, _ := m["goal_id"].(string)
+	if goalID == "" {
+		return
+	}
+	if n.qs == nil {
+		return
+	}
+	// Locate the review goal (opinions are now in the store's review-run
+	// comments).
+	var g ReviewGoal
+	found := false
+	if goals, err := n.qs.ReviewGoals(ctx); err == nil {
+		for _, rg := range goals {
+			if rg.GoalID == goalID {
+				g, found = rg, true
+				break
+			}
+		}
+	}
+	if !found {
+		return // resolved already — the card will show processed via the buttons
+	}
+	if g.Title == "" {
+		g.Title = short(goalID)
+	}
+	card, err := buildReviewCard(g, nil)
+	if err != nil {
+		return
+	}
+	// The daemon's ready can fire BEFORE this notifier's own card send
+	// records the message_id (both run on separate bus goroutines, and a
+	// no-reviewer window is ready instantly). Wait briefly for the record;
+	// only a real miss (restart window) falls back to a fresh card.
+	n.mu.Lock()
+	rec, ok := n.approvalCards[goalID]
+	n.mu.Unlock()
+	if !ok {
+		deadline := time.Now().Add(reviewReadyPatchWait)
+		for time.Now().Before(deadline) {
+			time.Sleep(reviewReadyPatchPoll)
+			n.mu.Lock()
+			rec, ok = n.approvalCards[goalID]
+			n.mu.Unlock()
+			if ok {
+				break
+			}
+		}
+	}
+	if !ok || rec.messageID == "" {
+		// The card was never sent (restart window) — send it fresh.
+		n.asyncSendCard(card)
+		return
+	}
+	n.mu.Lock()
+	delete(n.approvalCards, goalID)
+	n.mu.Unlock()
+	if !rec.hadPending {
+		return // the card carried no hint — nothing to replace
+	}
+	n.updateCard(rec.messageID, card)
+}
+
+// reviewReadyPatchWait bounds how long the ready handler waits for the card
+// send to record its message_id (the two handlers race on separate bus
+// goroutines). Vars so tests shrink them.
+var (
+	reviewReadyPatchWait = 5 * time.Second
+	reviewReadyPatchPoll = 20 * time.Millisecond
+)
+
+// sendApprovalCard sends the approval card and records its message_id for
+// the review_ready patch.
+func (n *Notifier) sendApprovalCard(goalID, cardJSON string, hadPending bool) {
+	go func() {
+		msgID, err := n.SendCard(cardJSON)
+		if err != nil {
+			log.Printf("notify: feishu send card: %v", err)
+			return
+		}
+		if msgID != "" {
+			n.mu.Lock()
+			n.approvalCards[goalID] = approvalCardRec{messageID: msgID, hadPending: hadPending}
+			n.mu.Unlock()
+		}
+	}()
+}
+
+// updateCard PATCHes one sent card's content (the message-update API takes
+// ONLY content — msg_type is immutable). Used by the review_ready opinion
+// patch; the connector's processed-card replacement also goes through here.
+func (n *Notifier) updateCard(messageID, content string) {
+	if n.updateCardFn != nil {
+		if err := n.updateCardFn(messageID, content); err != nil {
+			log.Printf("notify: update approval card %s: %v", messageID, err)
+		}
+		return
+	}
+	if n.client == nil {
+		return
+	}
+	resp, err := n.client.Im.Message.Update(context.Background(),
+		larkim.NewUpdateMessageReqBuilder().
+			MessageId(messageID).
+			Body(larkim.NewUpdateMessageReqBodyBuilder().
+				Content(content).
+				Build()).
+			Build())
+	if err != nil {
+		log.Printf("notify: update approval card %s: %v", messageID, err)
+		return
+	}
+	if !resp.Success() {
+		log.Printf("notify: update approval card %s failed: code=%d msg=%s", messageID, resp.Code, resp.Msg)
+	}
 }
 
 // NOTE: the published event carries the PUBLISHER's ctx (often an HTTP
@@ -271,7 +425,7 @@ func (n *Notifier) asyncSend(text string) {
 // asyncSendCard pushes one interactive card without blocking the bus handler.
 func (n *Notifier) asyncSendCard(cardJSON string) {
 	go func() {
-		if err := n.SendCard(cardJSON); err != nil {
+		if _, err := n.SendCard(cardJSON); err != nil {
 			log.Printf("notify: feishu send card: %v", err)
 		}
 	}()
@@ -283,25 +437,28 @@ func (n *Notifier) Send(text string) error {
 	if n.send != nil {
 		return n.send(text)
 	}
-	return n.createMessage("text", fmt.Sprintf(`{"text":"%s"}`, escapeJSON(text)))
+	_, err := n.createMessage("text", fmt.Sprintf(`{"text":"%s"}`, escapeJSON(text)))
+	return err
 }
 
 // SendCard delivers an interactive card (JSON 2.0, M3). The card content is
 // a passthrough — msg_type=interactive with the card JSON as content.
-func (n *Notifier) SendCard(cardJSON string) error {
+// Returns the sent message's id ('' for the injected test send) — the
+// approval card records it for the review_ready patch (Option B).
+func (n *Notifier) SendCard(cardJSON string) (string, error) {
 	if n.send != nil {
-		return n.send(cardJSON)
+		return "", n.send(cardJSON)
 	}
 	return n.createMessage("interactive", cardJSON)
 }
 
-func (n *Notifier) createMessage(msgType, content string) error {
+func (n *Notifier) createMessage(msgType, content string) (string, error) {
 	if n.receiveID == "" {
-		return fmt.Errorf("notify: no receive target configured")
+		return "", fmt.Errorf("notify: no receive target configured")
 	}
 	token, err := n.tenantToken()
 	if err != nil {
-		return err
+		return "", err
 	}
 	body, _ := json.Marshal(map[string]string{
 		"receive_id": n.receiveID,
@@ -312,21 +469,24 @@ func (n *Notifier) createMessage(msgType, content string) error {
 		"https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type="+n.receiveIDType,
 		strings.NewReader(string(body)))
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("feishu send: %w", err)
+		return "", fmt.Errorf("feishu send: %w", err)
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Code int    `json:"code"`
+		Code int `json:"code"`
 		Msg  string `json:"msg"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return fmt.Errorf("feishu send: parse response: %w", err)
+		return "", fmt.Errorf("feishu send: parse response: %w", err)
 	}
 	if out.Code != 0 {
 		// A stale token is worth ONE refresh-retry (the token lives 2h and the
@@ -342,18 +502,21 @@ func (n *Notifier) createMessage(msgType, content string) error {
 				if err == nil {
 					defer resp2.Body.Close()
 					var out2 struct {
-						Code int    `json:"code"`
+						Code int `json:"code"`
 						Msg  string `json:"msg"`
+						Data struct {
+							MessageID string `json:"message_id"`
+						} `json:"data"`
 					}
 					if err := json.NewDecoder(resp2.Body).Decode(&out2); err == nil && out2.Code == 0 {
-						return nil
+						return out2.Data.MessageID, nil
 					}
 				}
 			}
 		}
-		return fmt.Errorf("feishu send failed: code=%d msg=%s", out.Code, out.Msg)
+		return "", fmt.Errorf("feishu send failed: code=%d msg=%s", out.Code, out.Msg)
 	}
-	return nil
+	return out.Data.MessageID, nil
 }
 
 // tenantToken returns a valid tenant_access_token, fetching or refreshing it

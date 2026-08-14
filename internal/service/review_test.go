@@ -282,7 +282,12 @@ func TestMarkDeliveredFailureStaysInReview(t *testing.T) {
 
 // TestMentionSuppressedDuringReview: decision 2-3 — a mention comment on a
 // goal parked in review lands in the timeline but triggers NO run.
-func TestMentionSuppressedDuringReview(t *testing.T) {
+// TestReviewMentionQueuesIntent (决策 2-3 REVISED, D-1): the freeze protects
+// EXECUTION, not intent — a mention landing during review enqueues a durable
+// queued run (the Claim gate holds it until the human releases). The
+// approve+deliver path drops the queued intent VISIBLY (cancelled run rows,
+// MarkDelivered's terminal cleanup); the reopen path then works as before.
+func TestReviewMentionQueuesIntentAndReopen(t *testing.T) {
 	gs, rs, cs, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
@@ -295,18 +300,25 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 		t.Fatalf("setup: expected review, got %q", got.Status)
 	}
 
-	// Mention B during review: comment lands, no run triggered.
+	// Mention B during review: the intent QUEUES (no execution — the Claim
+	// gate holds it), and the comment stays in the feed.
 	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 这里还有问题"}); err != nil {
 		t.Fatalf("comment: %v", err)
 	}
-	runs, _ := rs.List(ctx, g.ID)
-	for _, r := range runs {
-		if r.Status == "queued" || r.Status == "running" {
-			t.Fatalf("review must suppress mention-triggered runs, found %s", r.Status)
-		}
+	var queued string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND role='consult' AND status='queued' LIMIT 1`,
+		g.ID, agentB).Scan(&queued); err != nil {
+		t.Fatalf("review must queue the mention as a durable intent: %v", err)
+	}
+	if c, err := rs.Claim(ctx, []string{agentB}); err != nil {
+		t.Fatal(err)
+	} else if c != nil {
+		t.Fatalf("the queued intent must not claim while frozen, claimed %s", c.RunID)
 	}
 
-	// After the review resolves and the goal is delivered (terminal), a HUMAN
+	// After the review resolves and the goal is delivered (terminal), the
+	// queued intent is dropped VISIBLY (cancelled run row), and a HUMAN
 	// comment with an action mention REOPENS the goal (comment-triggered
 	// reopen — "this task is not over") and the mention then triggers. A
 	// plain comment would land only.
@@ -316,6 +328,11 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 	if _, err := gs.MarkDelivered(ctx, g.ID, true, "merged", nil); err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
+	var dropped string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT status FROM run WHERE id=?`, queued).Scan(&dropped); err != nil || dropped != "cancelled" {
+		t.Fatalf("approve+deliver must visibly drop the queued intent, got %q err=%v", dropped, err)
+	}
 	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 现在可以做了"}); err != nil {
 		t.Fatalf("comment 2: %v", err)
 	}
@@ -324,7 +341,7 @@ func TestMentionSuppressedDuringReview(t *testing.T) {
 		t.Fatalf("human mention on a terminal goal must reopen it, got %q", reopened.Status)
 	}
 	found := false
-	runs, _ = rs.List(ctx, g.ID)
+	runs, _ := rs.List(ctx, g.ID)
 	for _, r := range runs {
 		if r.AgentID == agentB && (r.Status == "queued" || r.Status == "running") {
 			found = true

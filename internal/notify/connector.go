@@ -464,13 +464,14 @@ func (c *Connector) onCardAction(ctx context.Context, event *callback.CardAction
 	}}, nil
 }
 
-// updateCardProcessed replaces the approval card with its processed state via
-// the IM message update API (PATCH /im/v1/messages/:message_id).
+// updateCardProcessed replaces the approval card with its processed state —
+// the PATCH itself lives on the Notifier (one message-update path shared
+// with the review_ready opinion patch).
 func (c *Connector) updateCardProcessed(messageID, goalID, decision string) {
 	c.mu.Lock()
 	n := c.notify
 	c.mu.Unlock()
-	if n == nil || n.client == nil {
+	if n == nil {
 		return
 	}
 	content, err := buildProcessedCard(goalID, decision)
@@ -481,20 +482,7 @@ func (c *Connector) updateCardProcessed(messageID, goalID, decision string) {
 	// content — a message's type is immutable and msg_type in the body is
 	// rejected (code 230001, "invalid msg_type"; regression found the first
 	// time a Feishu approval card was actually updated).
-	resp, err := n.client.Im.Message.Update(context.Background(),
-		larkim.NewUpdateMessageReqBuilder().
-			MessageId(messageID).
-			Body(larkim.NewUpdateMessageReqBodyBuilder().
-				Content(content).
-				Build()).
-			Build())
-	if err != nil {
-		log.Printf("notify: update approval card %s: %v", messageID, err)
-		return
-	}
-	if !resp.Success() {
-		log.Printf("notify: update approval card %s failed: code=%d msg=%s", messageID, resp.Code, resp.Msg)
-	}
+	n.updateCard(messageID, content)
 }
 
 // captureReceive records the first inbound user message's target as the

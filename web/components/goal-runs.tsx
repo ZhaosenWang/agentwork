@@ -219,7 +219,10 @@ function StoppingRun({ goalId, runId }: { goalId: string; runId: string }) {
             // re-pressed while the run is still winding down; the card
             // disappears once the run leaves 'running'.
             setStopping(false);
-            qc.invalidateQueries({ queryKey: ["goal-runs", goalId] });
+            // The real runs-list key is qk.goalRuns = ["goals", goalId,
+            // "runs"] — the old ["goal-runs", …] key matched nothing and the
+            // list only refreshed via the run:event refetch.
+            qc.invalidateQueries({ queryKey: ["goals", goalId, "runs"] });
           } catch (e) {
             setErr(String(e));
             setStopping(false);

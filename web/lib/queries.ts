@@ -485,8 +485,9 @@ export function useGoalEvents() {
   useWSEvent("goal:delivered", invalidateGoal);
   useWSEvent("goal:deliver_failed", invalidateGoal);
   // run.terminal re-derives the goal's attention (the Coordinator persists
-  // it) — the detail badge follows without a reload.
-  useWSEvent("run:terminal", (p) => {
+  // it) — the detail badge follows without a reload. NOTE the dot: the
+  // backend publishes "run.terminal" (P1-2, 决策 6-15⑧).
+  useWSEvent("run.terminal", (p) => {
     const m = p as Record<string, unknown> | undefined;
     const id = m?.goal_id;
     if (typeof id === "string" && id) {
@@ -501,9 +502,12 @@ export function useGoalEvents() {
   // Agent lifecycle events
   useWSEvent("agent:created", () => qc.invalidateQueries({ queryKey: qk.agents }));
   useWSEvent("agent:deleted", () => qc.invalidateQueries({ queryKey: qk.agents }));
-  // Squad events
+  // Squad events — the member events invalidate the whole "squads" prefix so
+  // an open squad detail page sees roster changes too (P1-2, 决策 6-15⑧).
   useWSEvent("squad:created", () => qc.invalidateQueries({ queryKey: qk.squads }));
   useWSEvent("squad:deleted", () => qc.invalidateQueries({ queryKey: qk.squads }));
+  useWSEvent("squad:member_added", () => qc.invalidateQueries({ queryKey: ["squads"] }));
+  useWSEvent("squad:member_removed", () => qc.invalidateQueries({ queryKey: ["squads"] }));
   // Schedule events
   useWSEvent("schedule:created", () => qc.invalidateQueries({ queryKey: qk.schedules }));
   // Domain events

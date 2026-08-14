@@ -22,7 +22,7 @@ type ReviewGoal struct {
 	Reason   string
 	RunID    string // the evidence run — recorded on the gate_decision (audit chain)
 	Evidence string // the run.evidence JSON bundle
-	Comments []string // latest agent-authored comments — the squad review opinions the approval card must show
+	Comments []string // REVIEW-role run comments — the squad review opinions (the worker's own report is evidence, not 审查意见)
 }
 
 // GoalBrief is one goal in a digest aggregation.
@@ -52,6 +52,10 @@ type NamedID struct {
 type QueryStore interface {
 	// ReviewGoals lists goals parked in review with their evidence run.
 	ReviewGoals(ctx context.Context) ([]ReviewGoal, error)
+	// PendingReviewers names the reviewers whose review runs are still
+	// queued/running on the goal — the approval card's "审查中" hint
+	// (Option B: the human may wait for their opinions).
+	PendingReviewers(ctx context.Context, goalID string) ([]string, error)
 	// GoalTitle resolves one goal's title (milestone cards carry it).
 	GoalTitle(ctx context.Context, goalID string) (string, error)
 	// GoalStatus resolves a goal by id OR id prefix (intake "状态 <id>"
@@ -84,8 +88,9 @@ func (q *SQLQueryStore) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) {
 		        COALESCE((SELECT r.evidence FROM run r WHERE r.goal_id=g.id AND r.status='completed'
 		                  ORDER BY r.finished_at DESC LIMIT 1), ''),
 		        COALESCE((SELECT GROUP_CONCAT(content, '\n---\n') FROM (
-		            SELECT content FROM comment WHERE goal_id=g.id AND author_type='agent'
-		            ORDER BY created_at DESC LIMIT 3
+		            SELECT c.content FROM comment c JOIN run r ON r.id = c.run_id
+		            WHERE c.goal_id=g.id AND c.author_type='agent' AND r.role='review'
+		            ORDER BY c.created_at DESC LIMIT 3
 		        )), '')
 		 FROM goal g WHERE g.status='review' ORDER BY g.created_at`)
 	if err != nil {
@@ -103,6 +108,28 @@ func (q *SQLQueryStore) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) {
 			r.Comments = strings.Split(comments, "\n---\n")
 		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// PendingReviewers names the reviewers whose review runs are still pending
+// on the goal — the approval card's "审查中" hint (Option B).
+func (q *SQLQueryStore) PendingReviewers(ctx context.Context, goalID string) ([]string, error) {
+	rows, err := q.st.DB().QueryContext(ctx,
+		`SELECT a.name FROM run r JOIN agent a ON a.id = r.agent_id
+		 WHERE r.goal_id=? AND r.role='review' AND r.status IN ('queued','running')
+		 ORDER BY r.queued_at`, goalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
 	}
 	return out, rows.Err()
 }

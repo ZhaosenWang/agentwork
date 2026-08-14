@@ -224,7 +224,7 @@ func (p *Poller) CreateGoalForIssue(ctx context.Context, domainID, assigneeID, a
 		title = fmt.Sprintf("Issue #%d", iss.Number)
 	}
 	desc := fmt.Sprintf("来自 GitHub issue #%d：%s\n%s", iss.Number, iss.Title, truncate(iss.Body, 1500))
-	g, err := p.goalSvc.Create(ctx, service.Goal{
+	_, err := p.goalSvc.Create(ctx, service.Goal{
 		Title:         title,
 		Description:   desc,
 		DomainID:      domainID,
@@ -244,9 +244,8 @@ func (p *Poller) CreateGoalForIssue(ctx context.Context, domainID, assigneeID, a
 		}
 		return false, fmt.Errorf("create goal for %s: %w", ref, err)
 	}
-	if _, err := p.runSvc.EnqueueForGoal(ctx, *g); err != nil {
-		return false, fmt.Errorf("enqueue %s: %w", ref, err)
-	}
+	// P0-2 (决策 6-15②): the active goal's first run is born in Create's
+	// transaction — no separate enqueue.
 	return true, nil
 }
 

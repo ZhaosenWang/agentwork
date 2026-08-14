@@ -75,3 +75,112 @@ func TestEscapeJSON(t *testing.T) {
 		t.Fatalf("unexpected escape: %q", out)
 	}
 }
+
+// fakeQS is a QueryStore stub for the Option B card tests.
+type fakeQS struct {
+	goals            []ReviewGoal
+	pendingReviewers []string
+}
+
+func (f *fakeQS) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) { return f.goals, nil }
+func (f *fakeQS) PendingReviewers(ctx context.Context, goalID string) ([]string, error) {
+	return f.pendingReviewers, nil
+}
+func (f *fakeQS) GoalTitle(ctx context.Context, goalID string) (string, error) { return "g", nil }
+func (f *fakeQS) GoalStatus(ctx context.Context, idPrefix string) (*GoalStatusView, error) {
+	return nil, nil
+}
+func (f *fakeQS) Agents(ctx context.Context) ([]NamedID, error)  { return nil, nil }
+func (f *fakeQS) Domains(ctx context.Context) ([]NamedID, error) { return nil, nil }
+func (f *fakeQS) TerminalSince(ctx context.Context, since, until string) ([]GoalBrief, error) {
+	return nil, nil
+}
+
+// TestReviewCardCarriesPendingHint (Option B): while reviewers are working,
+// the card names them and suggests the human MAY wait.
+func TestReviewCardCarriesPendingHint(t *testing.T) {
+	sent := make(chan string, 4)
+	n := New("app", "secret", "chat_id", "oc_mock")
+	n.send = func(text string) error { sent <- text; return nil }
+	n.SetQueryStore(&fakeQS{
+		goals:            []ReviewGoal{{GoalID: "abc123456789", Title: "g", Reason: "merge"}},
+		pendingReviewers: []string{"opencode", "claude"},
+	})
+	bus := events.NewBus()
+	n.Subscribe(bus)
+	bus.Publish(context.Background(), events.Event{
+		Topic: "goal:reviewing", Payload: map[string]any{"goal_id": "abc123456789", "reason": "merge"},
+	})
+	select {
+	case card := <-sent:
+		if !strings.Contains(card, "审查中") || !strings.Contains(card, "opencode") || !strings.Contains(card, "claude") {
+			t.Fatalf("the card must name the reviewing agents, got: %s", card)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no card sent")
+	}
+}
+
+// TestReviewReadyPatchesRecordedCard (Option B): goal:review_ready rebuilds
+// the card with the opinions and PATCHES the SAME message (the hint is gone).
+func TestReviewReadyPatchesRecordedCard(t *testing.T) {
+	var patchedMsgID, patchedContent string
+	n := New("app", "secret", "chat_id", "oc_mock")
+	n.updateCardFn = func(messageID, content string) error {
+		patchedMsgID, patchedContent = messageID, content
+		return nil
+	}
+	n.SetQueryStore(&fakeQS{
+		goals: []ReviewGoal{{GoalID: "abc123456789", Title: "g", Reason: "merge",
+			Comments: []string{"意见：实现符合目标，可以直接通过"}}},
+	})
+	n.mu.Lock()
+	n.approvalCards["abc123456789"] = approvalCardRec{messageID: "om_mock_message", hadPending: true}
+	n.mu.Unlock()
+	bus := events.NewBus()
+	n.Subscribe(bus)
+	bus.Publish(context.Background(), events.Event{
+		Topic: "goal:review_ready", Payload: map[string]any{"goal_id": "abc123456789"},
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for patchedMsgID == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if patchedMsgID != "om_mock_message" {
+		t.Fatalf("the SAME card must be patched, got %q", patchedMsgID)
+	}
+	if !strings.Contains(patchedContent, "审查意见") || !strings.Contains(patchedContent, "实现符合目标") {
+		t.Fatalf("the patch must carry the opinions, got: %s", patchedContent)
+	}
+	if strings.Contains(patchedContent, "审查中") {
+		t.Fatalf("the hint must be gone once opinions are in: %s", patchedContent)
+	}
+}
+
+// TestReviewReadySendsFreshWhenCardMissing: a daemon restart between park
+// and ready loses the in-memory message id — the ready event then sends a
+// fresh card instead of patching nothing.
+func TestReviewReadySendsFreshWhenCardMissing(t *testing.T) {
+	old := reviewReadyPatchWait
+	reviewReadyPatchWait = 50 * time.Millisecond
+	defer func() { reviewReadyPatchWait = old }()
+	sent := make(chan string, 4)
+	n := New("app", "secret", "chat_id", "oc_mock")
+	n.send = func(text string) error { sent <- text; return nil }
+	n.SetQueryStore(&fakeQS{
+		goals: []ReviewGoal{{GoalID: "abc123456789", Title: "g", Reason: "merge"}},
+	})
+	bus := events.NewBus()
+	n.Subscribe(bus)
+	bus.Publish(context.Background(), events.Event{
+		Topic: "goal:review_ready", Payload: map[string]any{"goal_id": "abc123456789"},
+	})
+	select {
+	case card := <-sent:
+		if !strings.Contains(card, "待审批") {
+			t.Fatalf("a fresh approval card must be sent, got: %s", card)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no card sent")
+	}
+}

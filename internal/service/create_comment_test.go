@@ -82,8 +82,19 @@ func TestCreateCommentDoesNotDispatchMentions(t *testing.T) {
 		`SELECT COUNT(*) FROM run WHERE goal_id=?`, g.ID).Scan(&n); err != nil {
 		t.Fatalf("count runs: %v", err)
 	}
-	if n != 0 {
-		t.Fatalf("creation must not enqueue runs (the caller does), got %d", n)
+	// P0-2 (决策 6-15②): creation births exactly the ASSIGNEE's owner run
+	// in-tx; the mention in the description must NOT dispatch a guest run on
+	// the mentioned agent.
+	if n != 1 {
+		t.Fatalf("creation must birth exactly the owner run, got %d", n)
+	}
+	var mentioned int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=?`, g.ID, agentB).Scan(&mentioned); err != nil {
+		t.Fatalf("count mentioned-agent runs: %v", err)
+	}
+	if mentioned != 0 {
+		t.Fatalf("the description's mention must stay inert, got %d runs on the mentioned agent", mentioned)
 	}
 	// The mention lives in the comment as written, inert.
 	cs := NewCommentService(st, nil)
@@ -145,10 +156,12 @@ func TestCreateNoDispatchIsPureComment(t *testing.T) {
 	}
 	var n int
 	if err := st.DB().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM run WHERE goal_id=?`, g.ID).Scan(&n); err != nil {
-		t.Fatalf("count runs: %v", err)
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='consult'`, g.ID).Scan(&n); err != nil {
+		t.Fatalf("count consult runs: %v", err)
 	}
 	if n != 0 {
+		// P0-2: the owner's birth run exists (role=owner) — the pure comment
+		// must not have added a GUEST run for the mention.
 		t.Fatalf("pure comment must not dispatch a guest run, got %d", n)
 	}
 

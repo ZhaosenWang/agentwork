@@ -110,7 +110,12 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		d.failIntakeRun(ctx, q, "provider "+provider+": "+err.Error())
 		return
 	}
-	run, err := backend.Execute(ctx, proto.ExecuteSpec{
+	// Intake runs get the same total-time budget as worker/compile runs (the
+	// runaway reaper's DB backstop also applies, but the in-process timeout
+	// is the first line) — a hung parser must not sit 'running' unbounded.
+	promptCtx, promptCancel := context.WithTimeout(ctx, time.Duration(defaultMaxRunDurationSeconds)*time.Second)
+	defer promptCancel()
+	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{
 		Conn:          conn,
 		Cwd:           workdir,
 		Prompt:        prompt,
@@ -164,7 +169,19 @@ func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summa
 			log.Printf("daemon: intake failure reply: %v", err)
 		}
 	}
-	d.failProcessorRun(ctx, q, summary)
+	// Stamp the run failed directly (P0-5 conditional — a reaper stamp
+	// wins) — NOT via failProcessorRun, whose domain:compile_failed event
+	// is the compile path's signal and would mislabel an intake failure.
+	res, err := d.st.DB().ExecContext(ctx,
+		`UPDATE run SET status='failed', result_summary=?, finished_at=? WHERE id=? AND status IN ('queued','running')`,
+		summary, nowStr(), q.RunID)
+	if err != nil {
+		log.Printf("daemon: mark intake run %s failed: %v", q.RunID, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		log.Printf("daemon: intake run %s already terminal — dropping late failure", q.RunID)
+	}
 }
 
 // intakeAction is the parser's output contract (see notify/intake.go's
@@ -247,7 +264,9 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 	if strings.TrimSpace(g.AssigneeID) == "" {
 		return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
 	}
-	goal, err := d.goalSvc.Create(ctx, service.Goal{
+	// P0-2 (决策 6-15②): the active goal's first run is born in Create's
+	// transaction — no separate enqueue.
+	created, err := d.goalSvc.Create(ctx, service.Goal{
 		Title:         g.Title,
 		Description:   g.Description,
 		DomainID:      g.DomainID,
@@ -259,14 +278,11 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 	if err != nil {
 		return "创建任务失败：" + err.Error()
 	}
-	if _, err := d.runSvc.EnqueueForGoal(ctx, *goal); err != nil {
-		return "任务已创建但启动失败：" + err.Error()
-	}
 	// The pending clarification (if any) is resolved — the task exists now.
 	if d.intakeSvc != nil {
 		_ = d.intakeSvc.ClearDraft(ctx)
 	}
-	return fmt.Sprintf("✅ 已创建任务：**%s**（`goal %s`），agent 开始执行", goal.Title, shortID(goal.ID))
+	return fmt.Sprintf("✅ 已创建任务：**%s**（`goal %s`），agent 开始执行", created.Title, shortID(created.ID))
 }
 
 // intakeDomainList lists the available domains for the clarification ask.

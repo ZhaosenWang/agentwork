@@ -99,16 +99,19 @@ func TestHandoffEventRecorded(t *testing.T) {
 		t.Fatalf("handoff_event mismatch: from=%s to=%s from_run=%s (want %s→%s run %s)", fromID, toID, fromRunID, a, b, ownerRun.ID)
 	}
 
-	newRun, err := rs.EnqueueForGoal(ctx, *g)
-	if err != nil {
-		t.Fatalf("enqueue new owner: %v", err)
-	}
-	if err := gs.CompleteHandoff(ctx, g.ID, newRun.ID); err != nil {
-		t.Fatalf("complete handoff: %v", err)
-	}
+	// P0-2 (决策 6-15②): Assign enqueues the successor and back-fills
+	// to_run_id IN its transaction — no caller-side EnqueueForGoal /
+	// CompleteHandoff exists anymore; the audit row is complete now.
+	var toRunID string
 	if err := st.DB().QueryRowContext(ctx,
-		`SELECT to_run_id FROM handoff_event WHERE goal_id=?`, g.ID).Scan(&toID); err != nil || toID != newRun.ID {
-		t.Fatalf("to_run_id not back-filled: %q err=%v", toID, err)
+		`SELECT to_run_id FROM handoff_event WHERE goal_id=?`, g.ID).Scan(&toRunID); err != nil || toRunID == "" {
+		t.Fatalf("to_run_id must be back-filled by Assign in-tx: %q err=%v", toRunID, err)
+	}
+	var pending int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND role='owner' AND status='queued'`,
+		g.ID, b).Scan(&pending); err != nil || pending != 1 {
+		t.Fatalf("the new owner's run must be queued by Assign, got %d (err=%v)", pending, err)
 	}
 }
 
@@ -213,11 +216,18 @@ func TestCreateSubGoal(t *testing.T) {
 	if runGoalID != parent.ID || role != "subgoal" || boundID != sg.ID {
 		t.Fatalf("sub-goal run shape wrong: goal=%s role=%s bound=%s", runGoalID, role, boundID)
 	}
-	// The goal's run list DOES include the sub-goal run (run.goal_id = the
-	// goal) — distinguishable by role=subgoal.
+	// The goal's run list includes the owner's born run AND the sub-goal run
+	// (run.goal_id = the goal) — distinguishable by role=subgoal (P0-2: the
+	// owner run is born with Create now).
 	runs, _ := rs.List(ctx, parent.ID)
-	if len(runs) != 1 || runs[0].Role != "subgoal" || runs[0].AgentID != b {
-		t.Fatalf("the goal's runs must show the sub-goal run, got %d runs (role=%q agent=%s)", len(runs), runs[0].Role, runs[0].AgentID)
+	var found bool
+	for _, r := range runs {
+		if r.Role == "subgoal" && r.AgentID == b {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the goal's runs must include the sub-goal run (role=subgoal, agent=%s), got %d runs", b, len(runs))
 	}
 	// Parent ownership untouched; the goal stays active (owner keeps working —
 	// no wait, no blocked).
@@ -430,7 +440,10 @@ func TestReconcileGoalIdempotent(t *testing.T) {
 		t.Fatalf("no attention expected, got %q err=%v", attention, err)
 	}
 	runs, _ := rs.List(ctx, g.ID)
-	if len(runs) != 0 {
+	if len(runs) != 1 {
+		// P0-2 (决策 6-15②): Create births the owner run in-tx — the
+		// reconcile must have added NOTHING beyond it (no attention → no
+		// spawn; three reconciles → still exactly the one birth run).
 		t.Fatalf("reconcile must not spawn runs without attention, got %d", len(runs))
 	}
 }

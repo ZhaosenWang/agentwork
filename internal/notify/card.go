@@ -16,7 +16,12 @@ import (
 // evidence summary + optional reject-reason input + approve/reject buttons.
 // The buttons carry {action, goal_id, run_id} — the run id is the evidence
 // run the card displays, recorded on the gate_decision (audit chain).
-func buildReviewCard(g ReviewGoal) (string, error) {
+//
+// pendingReviewers drives the Option B hint: while reviewers are still
+// working, the card names them and tells the human they MAY wait; the
+// review_ready patch rebuilds this card with the pending set empty, so the
+// hint is replaced by the actual 审查意见.
+func buildReviewCard(g ReviewGoal, pendingReviewers []string) (string, error) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**%s**  \n`goal %s`", g.Title, short(g.GoalID))
 	if g.Reason != "" {
@@ -24,6 +29,9 @@ func buildReviewCard(g ReviewGoal) (string, error) {
 	}
 	if ev := evidenceSummary(g.Evidence); ev != "" {
 		b.WriteString("\n\n" + ev)
+	}
+	if len(pendingReviewers) > 0 {
+		b.WriteString("\n\n🔎 审查中：" + strings.Join(pendingReviewers, "、") + "——可等待他们的意见后再决定")
 	}
 	// The squad review opinions — the approval decision reads the review,
 	// not just the worker's claim.

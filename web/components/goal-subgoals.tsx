@@ -89,8 +89,10 @@ export function GoalSubGoals({ goalId }: { goalId: string }) {
 
   // Sub-goal state changes arrive over WS (the same bus as the rest).
   useWSEvent("sub_goal.created", () => refetch());
+  useWSEvent("sub_goal.verifying", () => refetch());
   useWSEvent("sub_goal.verified", () => refetch());
   useWSEvent("sub_goal.rejected", () => refetch());
+  useWSEvent("sub_goal.retrying", () => refetch());
   useWSEvent("sub_goal.failed", () => refetch());
   useWSEvent("sub_goal.cancelled", () => refetch());
 

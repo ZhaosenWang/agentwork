@@ -22,7 +22,7 @@ func TestBuildReviewCard(t *testing.T) {
 		Reason:   "merge: 每次完成需人工审批",
 		RunID:    "r123456789",
 		Evidence: `{"diff_stat":" 3 files changed, +12 insertions, -8 deletions","verify":"$ go test ./...\nok","agent":"修复了布局"}`,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("build card: %v", err)
 	}

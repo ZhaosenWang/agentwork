@@ -19,12 +19,17 @@ import (
 // frontend.
 var topics = []string{
 	"goal:created", "goal:assigned", "goal:finished", "goal:retrying", "goal:retry_failed",
-	"goal:deleted", "goal:reviewing", "goal:approved", "goal:review_resolved",
+	"goal:deleted", "goal:reviewing", "goal:review_ready", "goal:approved", "goal:review_resolved",
 	"goal:delivered", "goal:deliver_failed",
-	"run:enqueued", "run:coalesced", "run:claimed", "run:discarded", "run:event", "run:cancelled", "run:terminal", "sub_goal.created", "sub_goal.verified", "sub_goal.rejected", "sub_goal.failed", "sub_goal.cancelled", "change.ready", "change.integrated", "change.conflict",
+	// NOTE: the Coordinator's terminal edge is "run.terminal" (dot — run.go
+	// publishes it; the daemon subscribes it). P1-2 (决策 6-15⑧) aligned this
+	// whitelist to the published spelling — the colon variant never fired.
+	"run:enqueued", "run:coalesced", "run:claimed", "run:discarded", "run:event", "run:cancelled", "run.terminal",
+	"sub_goal.created", "sub_goal.verifying", "sub_goal.verified", "sub_goal.rejected", "sub_goal.retrying", "sub_goal.failed", "sub_goal.cancelled",
+	"change.ready", "change.integrated", "change.conflict",
 	"comment:created",
 	"agent:created", "agent:deleted",
-	"squad:created", "squad:deleted", "squad:member_added",
+	"squad:created", "squad:deleted", "squad:member_added", "squad:member_removed",
 	"schedule:created", "schedule:fired",
 	"domain:created", "domain:deleted", "domain:compiled", "domain:compile_failed",
 }

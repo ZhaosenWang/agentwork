@@ -286,6 +286,43 @@ func NewServer(exec *Executor) *gmcp.Server {
 		return toolResult(map[string]any{"ok": true}), nil, nil
 	})
 
+	type getCommentsArgs struct {
+		GoalID string `json:"goal_id,omitempty" jsonschema:"the goal to read comments from — defaults to THIS goal"`
+		After  string `json:"after,omitempty" jsonschema:"a comment id cursor — only comments NEWER than it ('' = from the start)"`
+		Limit  *int   `json:"limit,omitempty" jsonschema:"max comments (default 50, hard max 100)"`
+	}
+	gmcp.AddTool(srv, &gmcp.Tool{
+		Name:        "get_comments",
+		Description: "Read the goal's comment feed (READ-ONLY): pull NEW comments during a long run — your prompt snapshot is fixed at claim, this is the live view. Pass the last comment id you saw as `after` for incremental reads; `limit` caps the batch.",
+	}, func(ctx context.Context, req *gmcp.CallToolRequest, args getCommentsArgs) (*gmcp.CallToolResult, any, error) {
+		if exec.commentSvc == nil {
+			return nil, nil, errors.New("collaboration not wired for this run")
+		}
+		goalID := args.GoalID
+		if goalID == "" {
+			if exec.GoalID == "" {
+				return nil, nil, errors.New("no goal context — pass goal_id")
+			}
+			goalID = exec.GoalID
+		}
+		limit := 50
+		if args.Limit != nil && *args.Limit > 0 {
+			limit = *args.Limit
+		}
+		list, err := exec.commentSvc.ListAfter(ctx, goalID, args.After, limit)
+		if err != nil {
+			return nil, nil, err
+		}
+		out := []map[string]any{}
+		for _, c := range list {
+			out = append(out, map[string]any{
+				"id": c.ID, "author": c.AuthorType + "/" + c.AuthorID,
+				"content": c.Content, "parent_id": c.ParentID, "created_at": c.CreatedAt,
+			})
+		}
+		return toolResult(map[string]any{"comments": out}), nil, nil
+	})
+
 	type consultArgs struct {
 		AgentID  string `json:"agent_id" jsonschema:"the agent to consult (resolve with agent_list)"`
 		Question string `json:"question" jsonschema:"what you need to know / want judged"`
@@ -334,20 +371,11 @@ func NewServer(exec *Executor) *gmcp.Server {
 		if err := exec.requireOwner(ctx); err != nil {
 			return nil, nil, err
 		}
-		g, err := exec.goalSvc.Assign(ctx, exec.GoalID, args.AssigneeType, args.AssigneeID, args.Reason, "agent", exec.AgentID)
-		if err != nil {
+		// P0-2 (决策 6-15②): Assign owns the successor — the new owner's run
+		// is born in its transaction (queued as a durable intent when the goal
+		// is frozen in review, 决策 2-3 revised). No caller-side enqueue.
+		if _, err := exec.goalSvc.Assign(ctx, exec.GoalID, args.AssigneeType, args.AssigneeID, args.Reason, "agent", exec.AgentID); err != nil {
 			return nil, nil, err
-		}
-		// Enqueue the new owner's run (same as the Web handler): Assign moves
-		// ownership; the run drives the goal forward. Coalesces if pending.
-		if args.AssigneeType == "agent" || args.AssigneeType == "squad" {
-			run, err := exec.runSvc.EnqueueForGoal(ctx, *g)
-			if err != nil {
-				return nil, nil, err
-			}
-			if run != nil {
-				_ = exec.goalSvc.CompleteHandoff(ctx, g.ID, run.ID)
-			}
 		}
 		return toolResult(map[string]any{"ok": true}), nil, nil
 	})

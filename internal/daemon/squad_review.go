@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/eushing/agentwork/internal/events"
@@ -33,7 +34,10 @@ import (
 // reviewer) keeps re-parks from stacking runs.
 
 // onGoalReviewing reacts to a goal parking in review: if the goal belongs to
-// a squad with reviewer members, trigger the squad's review checkpoint.
+// a squad with reviewer members, trigger the squad's review checkpoint, then
+// open the reviewer-first approval window (Option B): the human's card fires
+// on goal:review_ready — after this window's review runs are terminal — not
+// at park time with an empty opinion section.
 func (d *Daemon) onGoalReviewing(_ context.Context, e events.Event) {
 	m, ok := e.Payload.(map[string]any)
 	if !ok {
@@ -54,6 +58,130 @@ func (d *Daemon) onGoalReviewing(_ context.Context, e events.Event) {
 	if err := d.maybeTriggerSquadReview(d.ctx, goalID); err != nil {
 		log.Printf("daemon: squad review trigger for %s: %v", goalID, err)
 	}
+	d.openReviewWindow(d.ctx, goalID)
+}
+
+// recoverReviewWindows re-opens the review window for every goal still in
+// review — the startup face of Option B's Event≠Truth recovery: the ready
+// publish, the fallback timers and the fired flags are in-memory, so a crash
+// between a window's park and its ready publish would leave the human's card
+// permanently unpatched. maybeFireReviewReady is idempotent (DB-derived).
+func (d *Daemon) recoverReviewWindows(ctx context.Context) (int, error) {
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT id FROM goal WHERE status='review'`)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, id := range ids {
+		d.maybeFireReviewReady(ctx, id)
+	}
+	return len(ids), nil
+}
+
+// reviewReadyFallback bounds how long the human's approval card waits for
+// the reviewer — a hung reviewer must not hold the human's decision hostage.
+// A var (not const) so tests can shrink it.
+var reviewReadyFallback = 10 * time.Minute
+
+// openReviewWindow starts a NEW review window for the goal: the per-window
+// card dedupe resets, and when no review runs are pending (no squad, no
+// reviewers, or all excluded) the card fires immediately.
+func (d *Daemon) openReviewWindow(ctx context.Context, goalID string) {
+	d.mu.Lock()
+	if d.reviewReadyFired == nil {
+		d.reviewReadyFired = make(map[string]bool)
+	}
+	delete(d.reviewReadyFired, goalID) // a new park = a new window
+	d.mu.Unlock()
+	d.maybeFireReviewReady(ctx, goalID)
+}
+
+// maybeFireReviewReady publishes goal:review_ready when the goal is still in
+// review, the human has not approved, and no review runs are pending. Called
+// from openReviewWindow (park time), onRunTerminal (a review run finishing),
+// and the fallback timer (a hung reviewer). The fired flag + timer stop make
+// the card exactly-once per window.
+func (d *Daemon) maybeFireReviewReady(ctx context.Context, goalID string) {
+	var status string
+	if err := d.st.DB().QueryRowContext(ctx, `SELECT status FROM goal WHERE id=?`, goalID).Scan(&status); err != nil {
+		return
+	}
+	if status != "review" {
+		return // resolved/terminal — no card (the human already acted)
+	}
+	// An approve already on record means deliver is in flight (or done) —
+	// the human decided without the card; don't send it post-hoc.
+	var decided int
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM gate_decision WHERE goal_id=? AND decision='approve'`, goalID).Scan(&decided); err != nil {
+		return
+	}
+	if decided > 0 {
+		return
+	}
+	var pending int
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='review' AND status IN ('queued','running')`,
+		goalID).Scan(&pending); err != nil {
+		log.Printf("daemon: review-ready pending check %s: %v", goalID, err)
+		return
+	}
+	if pending > 0 {
+		d.armReviewReadyFallback(goalID)
+		return
+	}
+	d.publishReviewReady(goalID)
+}
+
+// armReviewReadyFallback schedules the one-shot fallback (once per window).
+func (d *Daemon) armReviewReadyFallback(goalID string) {
+	d.mu.Lock()
+	if d.reviewReadyTimers == nil {
+		d.reviewReadyTimers = make(map[string]*time.Timer)
+	}
+	if _, ok := d.reviewReadyTimers[goalID]; ok {
+		d.mu.Unlock()
+		return
+	}
+	t := time.AfterFunc(reviewReadyFallback, func() {
+		d.mu.Lock()
+		delete(d.reviewReadyTimers, goalID)
+		d.mu.Unlock()
+		d.publishReviewReady(goalID)
+	})
+	d.reviewReadyTimers[goalID] = t
+	d.mu.Unlock()
+}
+
+// publishReviewReady fires the human's card trigger exactly once per window.
+func (d *Daemon) publishReviewReady(goalID string) {
+	d.mu.Lock()
+	if d.reviewReadyFired[goalID] {
+		d.mu.Unlock()
+		return
+	}
+	d.reviewReadyFired[goalID] = true
+	if t, ok := d.reviewReadyTimers[goalID]; ok {
+		t.Stop()
+		delete(d.reviewReadyTimers, goalID)
+	}
+	d.mu.Unlock()
+	log.Printf("daemon: review window ready for %s — notifying the human", goalID)
+	d.bus.Publish(context.Background(), events.Event{Topic: "goal:review_ready", Payload: map[string]any{
+		"goal_id": goalID,
+	}})
 }
 
 // maybeTriggerSquadReview posts a system mention to each role="reviewer"
@@ -114,12 +242,17 @@ func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) err
 		if r.id == leaderID {
 			continue // leader cannot review its own work
 		}
-		// The reviewer already has a pending run on this goal — the agent
-		// mentioned it itself (or a previous park did) — the request is
-		// already out; a second comment would duplicate the ask.
+		// The reviewer already has a pending REVIEW request on this goal — the
+		// agent mentioned it itself (or a previous park did) — the request is
+		// already out; a second comment would duplicate the ask. Scoped to
+		// role='review' (P1-2, 决策 6-15⑧): under 决策 2-3 revised a HUMAN's
+		// consult queued during the review window also sits on this agent as
+		// a queued run — it must not suppress the platform's review request
+		// (the consult is Claim-gated until release; the review run IS the
+		// window's evidence and must fire).
 		var pending int
 		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND status IN ('queued','running')`,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND role='review' AND status IN ('queued','running')`,
 			goalID, r.id).Scan(&pending); err != nil {
 			log.Printf("daemon: squad review pending check %s → %s: %v", goalID, r.id, err)
 			continue

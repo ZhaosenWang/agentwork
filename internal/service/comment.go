@@ -182,11 +182,13 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 
 	// Dispatch mentions AFTER the comment is durably stored. @all suppresses
 	// auto-trigger entirely (no runs); other mentions enqueue runs.
-	// State freeze (DESIGN.md §4, decision 2-3): mentions only trigger on
-	// an ACTIVE goal. While the goal is in review (or blocked), a mention
-	// lands as a comment — no run — so the branch state under the human's
-	// decision is never mutated underneath the approval. The comment stays in
-	// the feed (never lost); the human decides whether to act on it.
+	// Execution freeze (DESIGN.md §4, decision 2-3 REVISED, 决策 6-15①): the
+	// freeze protects EXECUTION, not intent. An ACTIVE goal's mention
+	// enqueues and runs; a REVIEW goal's mention enqueues a DURABLE INTENT
+	// that the Claim gate holds queued until the human releases (the branch
+	// state under the human's decision is never mutated — nobody executes);
+	// terminal/backlog goals take no silent new work (terminal + human +
+	// action mention = the reopen path above).
 	//
 	// COMMENT-TRIGGERED REOPEN (GitHub's reopen-and-comment): a HUMAN comment
 	// on a TERMINAL goal (done/failed/cancelled) that carries an action
@@ -211,9 +213,11 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 			}
 		}
 	}
-	if HasMentionAll(c.Content) || g.Status != "active" {
+	if HasMentionAll(c.Content) || (g.Status != "active" && g.Status != "review") {
 		// @all: notify humans only (TBD: no inbox in MVP) and suppress triggers.
-		// non-active: comment lands, triggers suppressed.
+		// terminal/backlog: comment lands, triggers suppressed.
+		// REVIEW passes through: the mention enqueues as a queued intent —
+		// Claim's goal gate (P0-1) admits it only after the human releases.
 		return &c, nil
 	}
 	// Consult permission (Collaboration.md §6, 决策 5-2): only the goal's
@@ -274,12 +278,17 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 
 // MentionCycleCount counts a goal's agent-triggered runs (trigger_comment_id
 // pointing at an AGENT-authored comment). Platform triggers (system review
-// requests) and human triggers are not agent churn.
+// requests) and human triggers are not agent churn. Sub-goal/verify runs are
+// EXEMPT (P2-2, 决策 6-15⑩): their trigger is the owner's dispatch comment —
+// workflow execution, not mention churn (the counter's semantic is the
+// agent↔agent consult loop; this is the current approximation, not the final
+// interaction-edge definition).
 func (s *CommentService) MentionCycleCount(ctx context.Context, goalID string) (int, error) {
 	var n int
 	err := s.st.DB().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM run r JOIN comment c ON c.id = r.trigger_comment_id
-		 WHERE r.goal_id=? AND c.author_type='agent'`, goalID).Scan(&n)
+		 WHERE r.goal_id=? AND c.author_type='agent'
+		   AND r.role NOT IN ('subgoal','verify')`, goalID).Scan(&n)
 	return n, err
 }
 
@@ -319,7 +328,7 @@ func (s *CommentService) forceMentionCycleFailed(ctx context.Context, goalID str
 		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
 		newID(), goalID, "任务失败："+reason+"。agent 反复互相转移任务，请检查后重开。", ts)
 	_, _ = s.st.DB().ExecContext(ctx,
-		`UPDATE run SET status='cancelled' WHERE goal_id=? AND status='queued'`, goalID)
+		`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, goalID)
 	s.bus.Publish(ctx, events.Event{Topic: "goal:finished", Payload: map[string]any{
 		"goal_id": goalID, "status": "failed", "summary": reason,
 	}})
@@ -355,6 +364,48 @@ func (s *CommentService) enqueueLeaderRunForMention(ctx context.Context, squadID
 	// concurrently with the current assignee's run, which is intended.
 	_, err = s.runSvc.enqueue(ctx, goalID, leaderID, 1, true, squadID, triggerCommentID)
 	return err
+}
+
+// ListAfter lists a goal's comments NEWER than the given comment id (the
+// get_comments tool's incremental cursor — '' = from the start), capped at
+// limit (0 = default 50, hard max 100). Read-only; the long-run dynamic
+// context channel (决策 6-15⑪): the prompt snapshot is fixed at claim, this
+// is the live view.
+func (s *CommentService) ListAfter(ctx context.Context, goalID, afterID string, limit int) ([]Comment, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	var rows *sql.Rows
+	var err error
+	if afterID == "" {
+		rows, err = s.st.DB().QueryContext(ctx,
+			`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id FROM comment WHERE goal_id=? ORDER BY created_at LIMIT ?`,
+			goalID, limit)
+	} else {
+		rows, err = s.st.DB().QueryContext(ctx,
+			`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id FROM comment
+			 WHERE goal_id=? AND created_at > (SELECT created_at FROM comment WHERE id=?)
+			 ORDER BY created_at LIMIT ?`,
+			goalID, afterID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Comment{}
+	for rows.Next() {
+		var c Comment
+		var parentID sql.NullString
+		if err := rows.Scan(&c.ID, &c.GoalID, &c.AuthorType, &c.AuthorID, &parentID, &c.Content, &c.CreatedAt, &c.RunID); err != nil {
+			return nil, err
+		}
+		c.ParentID = parentID.String
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func (s *CommentService) List(ctx context.Context, goalID string) ([]Comment, error) {

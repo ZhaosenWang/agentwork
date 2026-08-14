@@ -85,8 +85,31 @@ func (s *RunService) resolveLeader(ctx context.Context, assigneeType, assigneeID
 	}
 }
 
-// hasPending reports whether goalID already has a queued/running run on agentID,
-// for the per-(goal,agent) pending coalesce (DESIGN.md).
+// resolveLeaderTx is resolveLeader inside a caller's transaction — the squad
+// leader lookup runs ON the tx: a pooled read while the tx holds the only
+// connection deadlocks the single-connection in-memory test stores.
+func (s *RunService) resolveLeaderTx(ctx context.Context, tx *sql.Tx, assigneeType, assigneeID string) (agentID string, isLeader bool, squadID string, err error) {
+	switch assigneeType {
+	case "agent":
+		return assigneeID, false, "", nil
+	case "squad":
+		var leader string
+		if e := tx.QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, assigneeID).Scan(&leader); e != nil {
+			if errors.Is(e, sql.ErrNoRows) {
+				return "", false, "", NewValidationError("squad not found")
+			}
+			return "", false, "", fmt.Errorf("load squad leader: %w", e)
+		}
+		return leader, true, assigneeID, nil
+	default:
+		return "", false, "", NewValidationError("goal assignee is not an agent or squad")
+	}
+}
+
+// hasPending reports whether goalID already has a queued/running run on agentID.
+// Retired from enqueueTx (the coalesce became per-(goal,agent,ROLE) — each
+// role's pending run is a distinct ask); kept for callers that still need the
+// coarse shape.
 func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID string) (bool, error) {
 	var n int
 	err := tx.QueryRowContext(ctx,
@@ -110,28 +133,47 @@ func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID
 // Note: EnqueueExistingTx (the Coordinator's path inside a goal tx) does not
 // publish — the goal layer's commitAndEmit covers goal events.
 func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, *events.Event, error) {
-	if pending, err := s.hasPending(ctx, tx, goalID, agentID); err != nil {
+	role, err := s.resolveRunRole(ctx, tx, isLeader, triggerCommentID)
+	if err != nil {
 		return nil, nil, err
-	} else if pending {
-		// Coalesce: a queued/running run for this (goal,agent) already exists
-		// (possibly just advanced to active by this same tx). Don't duplicate.
-		var id string
-		_ = tx.QueryRowContext(ctx,
-			`SELECT id FROM run WHERE goal_id=? AND agent_id=? AND status IN ('queued','running') ORDER BY queued_at LIMIT 1`,
-			goalID, agentID).Scan(&id)
+	}
+	// Coalesce per (goal, agent, ROLE): each role's pending run is a DISTINCT
+	// ask. A cross-role merge is a correctness bug, not a dedupe: an owner
+	// spawn merging into a pending consult swallows the WORK run and strands
+	// the goal (D-1 makes this reachable — a human's consult intent queued
+	// during review would absorb the reject/handoff/attention-spawn run, and
+	// the queued_at bump would then convince the no-progress guard the
+	// signal was answered — permanently); a review request merging into a
+	// consult left the round without its reviewer (P1-2). Same-role
+	// coalescing preserves the double-spawn idempotency.
+	var id, pstatus string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, status FROM run WHERE goal_id=? AND agent_id=? AND role=? AND status IN ('queued','running') ORDER BY queued_at LIMIT 1`,
+		goalID, agentID, role).Scan(&id, &pstatus)
+	if err == nil {
+		if id != "" && pstatus == "queued" {
+			// A coalesced intent IS the answer to the current signal — bump
+			// the pending run's spawn timestamp. Without it, a pending run
+			// created BEFORE the signal leaves lastOwnerSpawn stale, and
+			// after it finishes without progress the Coordinator re-wakes
+			// forever (the no-progress guard compares signal recency against
+			// this timestamp). A RUNNING run is NOT bumped — its prompt was
+			// built at claim, before the signal existed; the signal must
+			// survive its finish.
+			_, _ = tx.ExecContext(ctx, `UPDATE run SET queued_at=? WHERE id=?`, now(), id)
+		}
 		ev := &events.Event{Topic: "run:coalesced", Payload: map[string]any{
 			"goal_id": goalID, "agent_id": agentID,
 		}}
 		return &Run{ID: id, GoalID: goalID, AgentID: agentID}, ev, nil
 	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, err
+	}
 	ts := now()
 	leaderFlag := 0
 	if isLeader {
 		leaderFlag = 1
-	}
-	role, err := s.resolveRunRole(ctx, tx, isLeader, triggerCommentID)
-	if err != nil {
-		return nil, nil, err
 	}
 	r := Run{
 		ID:              newID(),
@@ -178,10 +220,13 @@ func (s *RunService) resolveRunRole(ctx context.Context, tx *sql.Tx, isLeader bo
 	return "consult", nil
 }
 
-// EnqueueForGoal creates the first run for a goal based on its current
-// assignee. Idempotent: if a pending run already exists for this (goal,agent),
-// it coalesces (returns it as a no-op success). Caller uses this when a goal
-// moves into active state (assign, activate, create-with-status=active).
+// EnqueueForGoal creates a run for a goal based on its current assignee.
+// Idempotent: if a pending run already exists for this (goal,agent), it
+// coalesces (returns it as a no-op success). P0-2 (决策 6-15②) moved the
+// production callers' successors INTO their transitions' transactions
+// (Create/Assign/Activate/Reopen/Reject); this entry remains for tests and
+// any future direct use — it carries NO goal-status gate (Claim is the
+// execution gate).
 func (s *RunService) EnqueueForGoal(ctx context.Context, g Goal) (*Run, error) {
 	if g.AssigneeType != "agent" && g.AssigneeType != "squad" {
 		return nil, nil // human-assigned: no run
@@ -238,7 +283,7 @@ func (s *RunService) EnqueueSubGoalRun(ctx context.Context, subGoalID string) (*
 		return nil, err
 	}
 	defer tx.Rollback()
-	r, ev, err := s.enqueueSubGoalRunTx(ctx, tx, subGoalID)
+	r, ev, err := s.enqueueSubGoalRunTx(ctx, tx, subGoalID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -253,9 +298,11 @@ func (s *RunService) EnqueueSubGoalRun(ctx context.Context, subGoalID string) (*
 
 // enqueueSubGoalRunTx inserts a sub-goal execution run under the caller's
 // transaction (P0-2: CreateSubGoal uses it so the sub_goal row and its first
-// run are born atomically). The run event is RETURNED — the caller publishes
-// after its commit (invariant 13).
-func (s *RunService) enqueueSubGoalRunTx(ctx context.Context, tx *sql.Tx, subGoalID string) (*Run, *events.Event, error) {
+// run are born atomically). triggerCommentID ('' for retry/rework rounds)
+// links the FIRST round to the dispatch comment (P2-1, 决策 6-15⑩): the
+// run's report threads to it, closing the leader→assignee causal chain. The
+// run event is RETURNED — the caller publishes after its commit (invariant 13).
+func (s *RunService) enqueueSubGoalRunTx(ctx context.Context, tx *sql.Tx, subGoalID, triggerCommentID string) (*Run, *events.Event, error) {
 	var goalID, assigneeID string
 	var execAttempt int
 	err := tx.QueryRowContext(ctx,
@@ -284,20 +331,21 @@ func (s *RunService) enqueueSubGoalRunTx(ctx context.Context, tx *sql.Tx, subGoa
 
 	ts := now()
 	r := Run{
-		ID:        newID(),
-		GoalID:    goalID,
-		AgentID:   assigneeID,
-		Role:      "subgoal",
-		SubGoalID: subGoalID,
-		Attempt:   execAttempt + 1,
-		Status:    "queued",
-		QueuedAt:  ts,
-		CreatedAt: ts,
+		ID:               newID(),
+		GoalID:           goalID,
+		AgentID:          assigneeID,
+		Role:             "subgoal",
+		SubGoalID:        subGoalID,
+		Attempt:          execAttempt + 1,
+		TriggerCommentID: triggerCommentID,
+		Status:           "queued",
+		QueuedAt:         ts,
+		CreatedAt:        ts,
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,sub_goal_id,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.SubGoalID, r.Attempt, "", "", 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
+		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.SubGoalID, r.Attempt, "", r.TriggerCommentID, 0, "", r.QueuedAt, "", "", r.CreatedAt); err != nil {
 		return nil, nil, fmt.Errorf("insert sub-goal run: %w", err)
 	}
 	ev := &events.Event{Topic: "run:enqueued", Payload: r}
@@ -485,6 +533,14 @@ type ClaimedRow struct {
 //   - consult/review/verify runs are read-only snapshots and run freely in
 //     parallel.
 //
+// EXECUTION GATE (P0-1, 决策 6-15①): Claim is the ONLY place that decides
+// whether a queued run may execute NOW — producers may enqueue intents, the
+// gate admits them. A run claims only when its goal is active; on a review
+// goal only the platform's review-request runs (role='review' — the squad
+// checkpoint, which exists to run during the freeze window) pass; terminal
+// goals admit nothing. The freeze therefore protects the branch under the
+// human's judgment while intents queue durably (决策 2-3 revised).
+//
 // Processor runs (goal_id='') are unaffected.
 func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedRow, error) {
 	if len(readyAgents) == 0 {
@@ -505,7 +561,11 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 		 WHERE id = (
 		   SELECT r.id FROM run r
 		   JOIN agent a ON a.id = r.agent_id
+		   LEFT JOIN goal g ON g.id = r.goal_id
 		   WHERE r.status='queued' AND r.agent_id IN (`+placeholders+`)
+		     AND (g.id IS NULL                              -- processor runs have no goal
+		          OR g.status = 'active'
+		          OR (g.status = 'review' AND r.role = 'review'))
 		     AND NOT EXISTS (
 		       SELECT 1 FROM run r2
 		       WHERE r2.status='running'
@@ -574,14 +634,30 @@ func (s *RunService) MarkSession(ctx context.Context, runID, sessionID, workdir 
 	return err
 }
 
+// ErrRunAlreadyTerminal reports that a late result was dropped: the run was
+// already terminalized by another writer (the runaway reaper, or the handoff
+// claim→register stamp) and the caller's outcome must not overwrite the
+// terminal state nor reconcile as if it had won (P0-5, 决策 6-15⑥).
+var ErrRunAlreadyTerminal = errors.New("run already terminal — late result dropped")
+
 // Finish records a run's terminal status + summary and reconciles the goal.
 // This is the daemon's single chokepoint to end a run: it writes the run row
 // then hands the outcome to the goal layer for authoritative state change.
+//
+// The stamp is CONDITIONAL on the run being non-terminal: once another
+// writer (runaway reaper / handoff window stamp) terminalized the row, a
+// LATE result from the still-running process must not resurrect it — the
+// stamp is the authority, the outcome is dropped (ErrRunAlreadyTerminal),
+// and the reaper's stamp stands as the run's terminal truth.
 func (s *RunService) Finish(ctx context.Context, runID, status, summary string) error {
-	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE run SET status=?, result_summary=?, finished_at=? WHERE id=?`,
-		status, summary, now(), runID); err != nil {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE run SET status=?, result_summary=?, finished_at=? WHERE id=? AND status IN ('queued','running')`,
+		status, summary, now(), runID)
+	if err != nil {
 		return fmt.Errorf("finish run: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrRunAlreadyTerminal
 	}
 	if err := s.reconcileRun(ctx, runID); err != nil {
 		return err

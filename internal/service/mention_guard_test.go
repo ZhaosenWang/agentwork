@@ -257,10 +257,18 @@ func TestGuestFailedRunLeavesTrace(t *testing.T) {
 		t.Fatalf("comment: %v", err)
 	}
 	runs, _ := rs.List(ctx, g.ID)
-	if len(runs) != 1 || runs[0].AgentID != agentB {
-		t.Fatalf("expected 1 guest run on B, got %d", len(runs))
+	var guest *Run
+	for i := range runs {
+		if runs[i].Role == "consult" && runs[i].AgentID == agentB {
+			guest = &runs[i]
+		}
 	}
-	if err := rs.Finish(ctx, runs[0].ID, "failed", "boom: broken model"); err != nil {
+	if guest == nil {
+		// P0-2: the owner's birth run also exists — the GUEST run on B is
+		// what the mention dispatched.
+		t.Fatalf("expected a guest run on B, got %d runs", len(runs))
+	}
+	if err := rs.Finish(ctx, guest.ID, "failed", "boom: broken model"); err != nil {
 		t.Fatalf("finish guest failed: %v", err)
 	}
 	var content string
@@ -278,11 +286,14 @@ func TestGuestFailedRunLeavesTrace(t *testing.T) {
 	}
 }
 
-// TestSquadLeaderMentionedRunHasAuthority: a squad leader mentioned BY NAME
-// (mention://agent/<leader>, not a leader-run mark) still owns the goal — its
-// completed run advances the goal (parks in review on the merge gate). The
-// authority follows the assignee relationship, judged dynamically.
-func TestSquadLeaderMentionedRunHasAuthority(t *testing.T) {
+// TestSquadLeaderMentionIsGuest: a squad leader mentioned BY NAME
+// (mention://agent/<leader>) gets a CONSULT run — a guest. P0-4 (决策 6-15④,
+// Invariant 6) stripped goal authority from mention-triggered runs even on
+// the assignee/leader: its completion must NOT advance the goal (the old
+// "authority is dynamic" behavior let a read-only run park the goal in
+// review on an empty diff). The leader's full authority comes from role=
+// owner runs (the birth run / mention://squad URIs).
+func TestSquadLeaderMentionIsGuest(t *testing.T) {
 	gs, rs, cs, st := newTestCluster(t)
 	ctx := context.Background()
 	leaderID := seedAgent(t, st, "L")
@@ -296,29 +307,47 @@ func TestSquadLeaderMentionedRunHasAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create goal: %v", err)
 	}
-	// A HUMAN consults the leader by name (决策 5-2: human mentions dispatch
+	// The timeout-cancelled window: the born leader run is cancelled — the
+	// goal stays active with no pending run, so the mention below dispatches
+	// a FRESH consult instead of coalescing into the pending birth run.
+	var born string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND role='owner' LIMIT 1`, g.ID).Scan(&born); err != nil {
+		t.Fatalf("create must birth the leader run in-tx: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='cancelled', cancel_reason='timeout', finished_at=? WHERE id=?`, now(), born); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.ReconcileOnRunEnd(ctx, goalRunContext{RunID: born, GoalID: g.ID, AgentID: leaderID, IsLeaderRun: true, Role: "owner", Status: "cancelled"}); err != nil {
+		t.Fatal(err)
+	}
+	// A HUMAN mentions the leader by name (决策 5-2: human mentions dispatch
 	// freely; non-owner agent mentions would be suppressed).
 	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "human", AuthorID: "", Content: "[@L](mention://agent/" + leaderID + ") 你来处理"}); err != nil {
 		t.Fatalf("comment: %v", err)
 	}
 	runs, _ := rs.List(ctx, g.ID)
-	if len(runs) != 1 {
-		t.Fatalf("expected 1 run, got %d", len(runs))
+	var consult *Run
+	for i := range runs {
+		if runs[i].Role == "consult" && runs[i].AgentID == leaderID {
+			consult = &runs[i]
+		}
 	}
-	r := runs[0]
-	if r.IsLeaderRun {
+	if consult == nil {
+		t.Fatalf("expected a consult run on the leader, got %d runs", len(runs))
+	}
+	if consult.IsLeaderRun {
 		t.Fatal("mention run must NOT carry the leader mark (authority is dynamic)")
 	}
-	if _, err := st.DB().ExecContext(ctx,
-		`UPDATE run SET gates_hit=? WHERE id=?`, `["merge: 合并到主分支前必须人工审批"]`, r.ID); err != nil {
-		t.Fatalf("set gates: %v", err)
-	}
-	if err := rs.Finish(ctx, r.ID, "completed", "done"); err != nil {
+	// The consult completes — the goal must NOT advance (guest semantics;
+	// the empty-diff hazard the role gate closed).
+	if err := rs.Finish(ctx, consult.ID, "completed", "here is my take"); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	after, _ := gs.Get(ctx, g.ID)
-	if after.Status != "review" {
-		t.Fatalf("leader's mentioned run must advance the goal to review, got %q", after.Status)
+	if after.Status != "active" {
+		t.Fatalf("a mention consult on the leader must not advance the goal, got %q", after.Status)
 	}
 }
 

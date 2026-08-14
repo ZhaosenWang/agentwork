@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -115,7 +116,26 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 		sg.ID, sg.GoalID, sg.Title, sg.Description, sg.AssigneeID, sg.VerifierID, sg.Status, sg.ExecutionAttempt, sg.QualityIteration, sg.CreatedAt); err != nil {
 		return nil, fmt.Errorf("insert sub_goal: %w", err)
 	}
-	_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID)
+	// P2-1 (决策 6-15⑩): the dispatch comment is born WITH the sub-goal and
+	// its first run — the run carries it as trigger_comment_id, so the
+	// assignee's report threads to the dispatch (the leader→assignee causal
+	// chain), and the assignee's feed always contains the dispatch BEFORE the
+	// run can claim (no dispatch-comment race).
+	label, err := s.assigneeLabel(ctx, tx, "agent", sg.AssigneeID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve assignee label: %w", err)
+	}
+	dispatchID := newID()
+	dispatchContent := fmt.Sprintf("[@%s](mention://agent/%s) 交给你一个子任务：**%s**", label, sg.AssigneeID, sg.Title)
+	if strings.TrimSpace(sg.Description) != "" {
+		dispatchContent += "——" + sg.Description
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
+		dispatchID, sg.GoalID, createdByType, createdByID, dispatchContent, ts); err != nil {
+		return nil, fmt.Errorf("insert dispatch comment: %w", err)
+	}
+	_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID, dispatchID)
 	if err != nil {
 		return nil, fmt.Errorf("enqueue sub-goal run: %w", err)
 	}
@@ -278,7 +298,7 @@ func (s *GoalService) reconcileSubGoalRunOnce(ctx context.Context, rc goalRunCon
 			evs = append(evs, events.Event{Topic: "sub_goal.retrying", Payload: map[string]any{
 				"goal_id": sg.GoalID, "sub_goal_id": sg.ID, "execution_attempt": attempt,
 			}})
-			_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID)
+			_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID, "")
 			if err != nil {
 				return fmt.Errorf("enqueue retry run: %w", err)
 			}
@@ -463,7 +483,7 @@ func (s *GoalService) VerifySubGoal(ctx context.Context, runID, verdict, summary
 		// P0-3 (决策 6-13): the assignee's rework run is born IN this
 		// transaction — a crash after the commit can no longer lose it. The
 		// run event is published after the commit below (invariant 13).
-		_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID)
+		_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sg.ID, "")
 		if err != nil {
 			return fmt.Errorf("enqueue rework run: %w", err)
 		}
@@ -534,7 +554,7 @@ func (s *GoalService) MarkChangeIntegrated(ctx context.Context, changeID string,
 	// transaction — the conflict transition and its successor run are one
 	// atomic unit. The run event is published after the commit (invariant 13).
 	var runEv *events.Event
-	if _, ev, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sgID); err != nil {
+	if _, ev, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, sgID, ""); err != nil {
 		return fmt.Errorf("enqueue rework run: %w", err)
 	} else {
 		runEv = ev
