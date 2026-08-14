@@ -1197,15 +1197,22 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 	}
 	// No gate fired for this run. Strength linkage: weak verification with no
 	// gates at all still demands a human checkpoint.
-	var checksJSON, strength, compiledAt string
+	var checksJSON, strength, compiledAt, domainType string
 	err = tx.QueryRowContext(ctx,
-		`SELECT d.checks, d.verification_strength, d.checks_compiled_at FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, rc.GoalID).
-		Scan(&checksJSON, &strength, &compiledAt)
+		`SELECT d.checks, d.verification_strength, d.checks_compiled_at, COALESCE(d.type,'') FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, rc.GoalID).
+		Scan(&checksJSON, &strength, &compiledAt, &domainType)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, "", nil // no domain → no gates
 	}
 	if err != nil {
 		return false, "", fmt.Errorf("load domain gates: %w", err)
+	}
+	// A scratch domain has no diff — its diff-based gates NEVER fire, and
+	// the deliverable is a subjective report the machine cannot judge. The
+	// human checkpoint is unconditional here (regardless of strength or
+	// configured gates): zero-checkpoint scratch goals must not auto-done.
+	if domainType == "scratch" {
+		return true, "merge (scratch): 交付物为汇报，必须人工审批", nil
 	}
 	// The confirmation gate (决策 2-4/2-5): an UNFROZEN acceptance policy is
 	// no acceptance policy — nothing was run against it (the daemon skips

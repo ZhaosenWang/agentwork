@@ -203,13 +203,16 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
     <div className="rounded-lg border border-gray-200 p-4 space-y-3">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="font-medium">{d.name}</span>
+        {d.type === "scratch" && (
+          <span className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded bg-sky-50 text-sky-700 ring-1 ring-sky-200">无仓库项目</span>
+        )}
         <span className={strengthBadge(d.verification_strength)}>{d.verification_strength} 验证</span>
         {compiled ? (
           <span className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200">策略已冻结</span>
         ) : needsConfirm ? (
           <span className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded bg-purple-50 text-purple-700 ring-1 ring-purple-200">待确认</span>
         ) : null}
-        <span className="text-xs text-gray-500 ml-auto break-all">{d.git_url}</span>
+        {d.type !== "scratch" && <span className="text-xs text-gray-500 ml-auto break-all">{d.git_url}</span>}
         <button
           onClick={() => setShowEdit(true)}
           className="text-xs text-indigo-600 hover:text-indigo-800 hover:underline shrink-0"
@@ -716,6 +719,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const { data: agents } = useAgents();
   const { data: squads } = useSquads();
   const [name, setName] = useState("");
+  const [domainType, setDomainType] = useState<"repo" | "scratch">("repo");
   const [gitUrl, setGitUrl] = useState("");
   const [policyText, setPolicyText] = useState("");
   const [processorAgent, setProcessorAgent] = useState("");
@@ -729,7 +733,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     create.mutate(
-      { name, git_url: gitUrl, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: issueRepo, issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: issueProvider, git_credentials: gitCredentials, git_identity: gitIdentity },
+      { name, type: domainType, git_url: domainType === "scratch" ? "" : gitUrl, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: issueRepo, issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: issueProvider, git_credentials: gitCredentials, git_identity: gitIdentity },
       {
         onSuccess: (d) => {
           if (policyText.trim() && processorAgent) {
@@ -748,7 +752,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
       footer={
         <>
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button type="submit" form="create-domain-form" disabled={create.isPending || !name.trim() || !gitUrl.trim()}>
+          <Button type="submit" form="create-domain-form" disabled={create.isPending || !name.trim() || (domainType === "repo" && !gitUrl.trim())}>
             {create.isPending ? "创建中…" : "创建"}
           </Button>
         </>
@@ -758,12 +762,31 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
         <Field label="名称">
           <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} placeholder="如：agentwork" required />
         </Field>
+        <Field label="项目类型">
+          <div className="flex gap-2">
+            <label className={`flex-1 flex items-center gap-2 rounded-lg border px-3 py-2 cursor-pointer text-sm ${domainType === "repo" ? "border-indigo-400 bg-indigo-50 text-indigo-700" : "border-zinc-200 text-zinc-600"}`}>
+              <input type="radio" className="accent-indigo-500" checked={domainType === "repo"} onChange={() => setDomainType("repo")} />
+              代码仓库
+            </label>
+            <label className={`flex-1 flex items-center gap-2 rounded-lg border px-3 py-2 cursor-pointer text-sm ${domainType === "scratch" ? "border-indigo-400 bg-indigo-50 text-indigo-700" : "border-zinc-200 text-zinc-600"}`}>
+              <input type="radio" className="accent-indigo-500" checked={domainType === "scratch"} onChange={() => setDomainType("scratch")} />
+              无仓库项目
+            </label>
+          </div>
+          {domainType === "scratch" && (
+            <p className="mt-1.5 text-xs text-zinc-500">研究/信息类任务：持久项目目录，产出是汇报，人卡点强制</p>
+          )}
+        </Field>
+        {domainType === "repo" && (
         <Field label="Git 仓库地址" hint="agentwork 会 clone 它作为共享仓库，每个 Goal 一个独立 worktree">
           <input value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} className={inputCls} placeholder="https://github.com/you/repo.git" required />
         </Field>
+        )}
+        {domainType === "repo" && (
         <Field label="Git 身份（commit 作者，可选）" hint='格式：名字 &lt;邮箱&gt;，如 agentwork[bot] &lt;bot@local&gt;——不填默认 agentwork[bot]'>
           <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
         </Field>
+        )}
         <Field label="自然语言验收要求（可选，创建后可再编译）" hint="例如：测试必须通过，改动要带测试">
           <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="用一句话描述这个项目怎么算“干对了”…" />
         </Field>
@@ -775,6 +798,8 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
             ))}
           </select>
         </Field>
+        {domainType === "repo" && (
+        <>
         <Field label="Issue 追踪（可选，M4-B）" hint="仓库的 open issue 自动变成任务，处理完自动 close">
           <input value={issueRepo} onChange={(e) => setIssueRepo(e.target.value)} className={inputCls} placeholder="owner/repo，如 yusheng-g/agentwork" />
           <div className="mt-2 flex gap-2 items-center">
@@ -810,6 +835,8 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
         <Field label="平台操作 token（git_credentials）" hint="bot 账号 token（决策 3-5）：issue 评论/close + git push 都以此身份出现。权限需覆盖：仓库读写（Contents）+ issues 读写。GitHub 用 fine-grained PAT 只授权本仓库；GitCode 用 token-classic">
           <input value={gitCredentials} onChange={(e) => setGitCredentials(e.target.value)} className={inputCls} placeholder="GitHub PAT 或 GitCode token（bot 账号，需仓库+issue 读写）" type="password" />
         </Field>
+        </>
+        )}
         {create.isError && <p className="text-sm text-red-500">{String(create.error)}</p>}
       </form>
     </Dialog>

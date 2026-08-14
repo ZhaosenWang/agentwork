@@ -111,17 +111,17 @@ const maxAttempts = 3
 
 // Daemon owns per-agent workers and the run dispatch loop.
 type Daemon struct {
-	st       *store.Store
-	bus      *events.Bus
-	addr     string
-	protoReg *proto.Registry
+	st         *store.Store
+	bus        *events.Bus
+	addr       string
+	protoReg   *proto.Registry
 	goalSvc    *service.GoalService
 	runSvc     *service.RunService
 	commentSvc *service.CommentService
 	agentSvc   *service.AgentService
 	squadSvc   *service.SquadService
-	schedSvc *service.ScheduleService
-	im       *notify.Connector // M3: daily digest + intake replies (the notifier
+	schedSvc   *service.ScheduleService
+	im         *notify.Connector // M3: daily digest + intake replies (the notifier
 	// is born when the long connection connects; fetch it live)
 	qs            notify.QueryStore     // M3: digest aggregation (may be nil)
 	issuePoll     *issue.Poller         // M4-B: open issues → goals
@@ -183,16 +183,16 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		st: st, bus: bus, addr: addr,
 		protoReg: protoReg, goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, agentSvc: agentSvc,
 		squadSvc: squadSvc, schedSvc: schedSvc,
-		im:               im,
-		qs:               qs,
-		intakeSvc:        intakeSvc,
-		issuePoll:        issue.NewPoller(st, goalSvc, runSvc),
-		issueCloser:      issue.NewCloser(st),
-		workers:          make(map[string]*agentWorker),
-		msgBuffers:       make(map[string]*msgBuffer),
-		mcpExecs:         make(map[string]*mcp.Executor),
-		runCancels:       make(map[string]context.CancelFunc),
-		runCancelReasons: make(map[string]string),
+		im:                im,
+		qs:                qs,
+		intakeSvc:         intakeSvc,
+		issuePoll:         issue.NewPoller(st, goalSvc, runSvc),
+		issueCloser:       issue.NewCloser(st),
+		workers:           make(map[string]*agentWorker),
+		msgBuffers:        make(map[string]*msgBuffer),
+		mcpExecs:          make(map[string]*mcp.Executor),
+		runCancels:        make(map[string]context.CancelFunc),
+		runCancelReasons:  make(map[string]string),
 		reviewReadyTimers: make(map[string]*time.Timer),
 		reviewReadyFired:  make(map[string]bool),
 	}
@@ -911,6 +911,76 @@ func domainRepoPath(domainID string) string {
 	return filepath.Join(runsRoot(), "repos", domainID)
 }
 
+// ── scratch domains (无仓库域) ──
+//
+// A scratch domain has no shared repository. Its persistent home is
+// runs/scratch/<sanitized-name>/ — the HUMAN-maintained shared root (input
+// material the agents read) plus per-goal directories under goals/. The
+// mapping to the repo model: the shared root ≙ the bare repo's origin
+// material; goals/<goalID> ≙ the goal's branch (durable state across runs);
+// owner runs work DIRECTLY in their goal dir (single writer: owner
+// single-flight), read-only runs get a copy snapshot.
+
+// sanitizeDirName turns a domain name into a safe directory name — a
+// hostile or odd name must not escape the scratch root (no /, no ..).
+func sanitizeDirName(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z',
+			r >= 0x4e00 && r <= 0x9fff, // CJK unified
+			r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_') // spaces, slashes, dots, everything else
+		}
+	}
+	out := strings.Trim(b.String(), "_-")
+	if len(out) > 64 {
+		out = out[:64]
+	}
+	if out == "" {
+		out = "domain"
+	}
+	return out
+}
+
+// scratchDomainRoot is a scratch domain's persistent project root (named by
+// the domain name — unique per schema — so a human can browse it).
+func scratchDomainRoot(domainName string) string {
+	return filepath.Join(runsRoot(), "scratch", sanitizeDirName(domainName))
+}
+
+// scratchGoalDir is a scratch goal's persistent project directory — the
+// branch analog: the goal's durable state lives HERE across runs.
+func scratchGoalDir(domainName, goalID string) string {
+	return filepath.Join(scratchDomainRoot(domainName), "goals", goalID)
+}
+
+// copyDir copies a directory tree (best-effort) — the read-only scratch
+// snapshot. A torn copy while the owner writes is accepted for v1 (see the
+// runTask branch).
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, info.Mode().Perm())
+	})
+}
+
 // runWorktreePath is the run's execution worktree — the workspace (决策 6-2:
 // path is the ownership boundary; a recovered run reuses its own dirty dir).
 func runWorktreePath(runID string) string {
@@ -1037,7 +1107,7 @@ func gitCloneURL(gitURL, credentials string) string {
 // ensureRunWorktreeFor allocates the run's worktree (决策 6-2): owner runs
 // check out the goal branch (created from the domain's default branch on the
 // first run; later runs reuse the branch — the A5 checkpoint now travels via
-// commits, not file state). Sub-goal runs (subGoalID != '') branch from the
+// commits, not file state). Sub-goal runs (subGoalID != ”) branch from the
 // goal branch's current HEAD on their own sub-goal branch — that HEAD is the
 // Change revision's integration base. Verify runs DETACH at the sub-goal
 // branch head (read-only review of a stable state). A recovered run reuses
@@ -1274,11 +1344,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.runProcessorTask(ctx, q)
 		return
 	}
-	var title, desc, handoff, domainID, gitURL, defaultBranch, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
+	var title, desc, handoff, domainID, gitURL, defaultBranch, domainType, domainName, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
 	var triggerAuthor, triggerCommentID, triggerCommentContent, runRole, subGoalID string
 	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, a.system_prompt,
+		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, COALESCE(d.type,''), COALESCE(d.name,''), a.system_prompt,
 		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
 		        g.source_ref, d.git_credentials,
 		        r2.trigger_comment_id, COALESCE(c.author_type, ''), COALESCE(c.content, ''), r2.role, r2.sub_goal_id
@@ -1289,7 +1359,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 JOIN runtime r ON r.id = a.runtime_id
 		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &runRole, &subGoalID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &runRole, &subGoalID)
 	// Run role (决策 5-4/6-x, stamped at enqueue): review runs are the
 	// platform's review requests (SYSTEM trigger comment — "请审查本次改动…
 	// 只提意见"); consult runs are pulled in by an agent/human mention comment
@@ -1301,6 +1371,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	consultRun := runRole == "consult"
 	subGoalRun := runRole == "subgoal"
 	verifyRun := runRole == "verify"
+	// READ-ONLY runs (consult/review/verify) skip the whole machine-judgment
+	// pipeline — they produce opinions, not work, and the platform's
+	// verification judges work (决策 5-3/6-5). Declared early: the scratch
+	// workdir branch below needs it.
+	readOnlyRun := consultRun || reviewRun || verifyRun
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -1330,18 +1405,48 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, "run's goal has no domain — cannot allocate a worktree")
 		return
 	}
-	runRowWorkdir, err := d.ensureRunWorktreeFor(ctx, q.RunID, domainID, q.GoalID, subGoalID, runRole, gitURL, gitCredentials, defaultBranch)
-	if err != nil {
-		d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
-		return
+	scratchDomain := domainType == "scratch"
+	var runRowWorkdir string
+	if scratchDomain {
+		// A scratch goal's project directory IS the branch: owner runs work
+		// DIRECTLY in it (persistent across runs — the file-state A5 model;
+		// owner single-flight makes the goal dir single-writer), read-only
+		// runs get a COPY snapshot (a torn copy is accepted for v1: report
+		// files are small and a racy read is re-readable).
+		if readOnlyRun {
+			runRowWorkdir = runWorktreePath(q.RunID)
+			if err := copyDir(scratchGoalDir(domainName, q.GoalID), runRowWorkdir); err != nil {
+				log.Printf("daemon: scratch snapshot for run %s: %v", q.RunID, err)
+				_ = os.MkdirAll(runRowWorkdir, 0o755)
+			}
+		} else {
+			runRowWorkdir = scratchGoalDir(domainName, q.GoalID)
+			if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
+				d.failRun(ctx, q, fmt.Sprintf("prepare scratch dir: %v", err))
+				return
+			}
+		}
+	} else {
+		runRowWorkdir, err = d.ensureRunWorktreeFor(ctx, q.RunID, domainID, q.GoalID, subGoalID, runRole, gitURL, gitCredentials, defaultBranch)
+		if err != nil {
+			d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
+			return
+		}
 	}
 	// Release the workspace when the run ends — git allows ONE checkout per
 	// branch, and the goal/sub-goal branch is shared by every run of that
 	// goal: the NEXT run cannot create its worktree while this one holds it
 	// (the E2E hit "a branch named ... already exists" on the woken owner).
 	// The worktree is EPHEMERAL — durable state lives in the commits; crash
-	// leftovers are swept at startup (sweepRunWorktrees).
+	// leftovers are swept at startup (sweepRunWorktrees). Scratch: the owner
+	// dir PERSISTS (it is the durable state); only the read-only copy goes.
 	defer func() {
+		if scratchDomain {
+			if readOnlyRun {
+				_ = os.RemoveAll(runRowWorkdir)
+			}
+			return
+		}
 		unlock := d.lockDomain(domainID)
 		if out, err := exec.CommandContext(context.Background(), "git", "-C", domainRepoPath(domainID), "worktree", "remove", "--force", runRowWorkdir).CombinedOutput(); err != nil {
 			log.Printf("daemon: release worktree %s: %v %s", q.RunID, err, out)
@@ -1357,10 +1462,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// guarantee the judging environment is fresh). A failed setup here is an
 	// environment failure — the run fails with that attribution, the retry
 	// chain applies as usual.
-	// READ-ONLY runs (consult/review/verify) skip the whole machine-judgment
-	// pipeline — they produce opinions, not work, and the platform's
-	// verification judges work (决策 5-3/6-5).
-	readOnlyRun := consultRun || reviewRun || verifyRun
 	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
 	if checksFrozen && len(checks.Setup) > 0 && !readOnlyRun {
 		setupReport, ok := runSetupOnly(ctx, runRowWorkdir, checks, timeout)
@@ -1372,8 +1473,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 
 	// The run's diff baseline: guards and evidence measure this run's changes
 	// as baseSHA..HEAD (the agent may commit itself, and the daemon commits
-	// leftover work at run end — both land in HEAD).
-	baseSHA := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
+	// leftover work at run end — both land in HEAD). Scratch domains have no
+	// git — every git-derived judgment (guards, gates, diff evidence) degrades
+	// to empty; the deliverable is the report.
+	baseSHA := ""
+	if !scratchDomain {
+		baseSHA = strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
+	}
 
 	// Inject the agent's identity + team roster / squad briefing into the
 	// workdir so the agent subprocess discovers who it is and who it can hand
@@ -1566,6 +1672,9 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// own tools — its toolset is its own business, agentwork states the
 	// environment facts and the collaboration contract.
 	prompt += worktreeGuidance(runRowWorkdir)
+	if scratchDomain {
+		prompt += "\n\n## Workspace contract (scratch domain)\nThis directory IS your task's persistent project directory — files you leave here survive between turns. The PARENT directory is human-maintained shared material: READ-ONLY for you. Write only inside this directory; your report (final message) is the deliverable."
+	}
 
 	// The domain's acceptance policy in NL (the "what counts as done" the
 	// OWNER defined) — the agent works toward it instead of finding out at
@@ -1828,7 +1937,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// GUEST and REVIEW runs are exempt (决策 5-3): their product is
 			// opinion/information, not code — nothing of theirs merges into
 			// the goal branch; window changes were already discarded above.
-			if !reviewRun && !consultRun && !verifyRun {
+			if !reviewRun && !consultRun && !verifyRun && !scratchDomain {
 				if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID), checks.Excludes); err != nil {
 					d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
 					return
@@ -1860,11 +1969,14 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				// Structural guards on the diff (DESIGN.md §5.1), measured as
 				// baseSHA..HEAD — the run's own changes. git status would be empty
 				// here: the daemon just committed the agent's work (and the agent
-				// may have committed itself), so the worktree is clean.
-				guardReport, ok = checkGuards(ctx, runRowWorkdir, baseSHA, checks, baseline)
-				if !ok {
-					d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
-					return
+				// may have committed itself), so the worktree is clean. Scratch
+				// domains have no diff — guards are repo-only.
+				if !scratchDomain {
+					guardReport, ok = checkGuards(ctx, runRowWorkdir, baseSHA, checks, baseline)
+					if !ok {
+						d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
+						return
+					}
 				}
 				// Gate evaluation (M2 rule engine): merge always fires; diff_*
 				// fire on the run's changed paths. The fired gates are recorded on
@@ -1873,7 +1985,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				// SUB-GOAL runs skip gates (决策 6-1): their work item has no
 				// human checkpoint — verification is machine (or the optional
 				// agent verifier, 决策 6-5), the human gates stay goal-level.
-				if !subGoalRun && !verifyRun {
+				if !subGoalRun && !verifyRun && !scratchDomain {
 					gatesHit := evalGates(ctx, runRowWorkdir, baseSHA, checks)
 					if len(gatesHit) > 0 {
 						gatesJSON, _ := json.Marshal(gatesHit)
@@ -2017,43 +2129,53 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	// scratch dir (no repo involved).
 	runRowWorkdir := filepath.Join(runsRoot(), "proc", q.RunID)
 	if runType == "compile" {
-		var gitURL, gitCredentials, defaultBranch string
+		var gitURL, gitCredentials, defaultBranch, domainType string
 		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT git_url, git_credentials, default_branch FROM domain WHERE id=?`, domainID).
-			Scan(&gitURL, &gitCredentials, &defaultBranch)
-		if gitURL == "" {
+			`SELECT git_url, git_credentials, default_branch, COALESCE(type,'') FROM domain WHERE id=?`, domainID).
+			Scan(&gitURL, &gitCredentials, &defaultBranch, &domainType)
+		// A scratch domain has no repo for the compile agent to inspect —
+		// it compiles from the policy text alone in its proc dir (the
+		// compile prompt carries the scratch variant).
+		if domainType != "scratch" && gitURL == "" {
 			d.failProcessorRun(ctx, q, "compile run: domain has no git_url")
 			return
 		}
-		unlock := d.lockDomain(domainID)
-		if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
-			unlock()
-			d.failProcessorRun(ctx, q, "prepare compile repo: "+err.Error())
-			return
-		}
-		repo := domainRepoPath(domainID)
-		if defaultBranch == "" {
-			defaultBranch = "main"
-		}
-		// Fresh refs before the checkout — a corrected default_branch must
-		// take effect on the next compile, not the one after (parity with the
-		// worker path's fetch).
-		if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
-			unlock()
-			d.failProcessorRun(ctx, q, "compile fetch: "+err.Error()+": "+string(out))
-			return
-		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", runRowWorkdir, "origin/"+defaultBranch).CombinedOutput(); err != nil {
-			unlock()
-			d.failProcessorRun(ctx, q, "compile worktree add: "+err.Error()+": "+string(out))
-			return
-		}
-		unlock()
-		defer func() {
+		if domainType == "scratch" {
+			if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
+				d.failProcessorRun(ctx, q, "mkdir compile workdir: "+err.Error())
+				return
+			}
+		} else {
 			unlock := d.lockDomain(domainID)
-			_, _ = exec.CommandContext(context.Background(), "git", "-C", repo, "worktree", "remove", "--force", runRowWorkdir).CombinedOutput()
+			if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
+				unlock()
+				d.failProcessorRun(ctx, q, "prepare compile repo: "+err.Error())
+				return
+			}
+			repo := domainRepoPath(domainID)
+			if defaultBranch == "" {
+				defaultBranch = "main"
+			}
+			// Fresh refs before the checkout — a corrected default_branch must
+			// take effect on the next compile, not the one after (parity with the
+			// worker path's fetch).
+			if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
+				unlock()
+				d.failProcessorRun(ctx, q, "compile fetch: "+err.Error()+": "+string(out))
+				return
+			}
+			if out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", runRowWorkdir, "origin/"+defaultBranch).CombinedOutput(); err != nil {
+				unlock()
+				d.failProcessorRun(ctx, q, "compile worktree add: "+err.Error()+": "+string(out))
+				return
+			}
 			unlock()
-		}()
+			defer func() {
+				unlock := d.lockDomain(domainID)
+				_, _ = exec.CommandContext(context.Background(), "git", "-C", repo, "worktree", "remove", "--force", runRowWorkdir).CombinedOutput()
+				unlock()
+			}()
+		}
 	} else if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
 		d.failProcessorRun(ctx, q, "mkdir workdir: "+err.Error())
 		return
@@ -2549,7 +2671,7 @@ func (d *Daemon) consultStatus(ctx context.Context, goalID, agentID, runID strin
 	return b.String()
 }
 
-// goalAttention reads the persisted OwnerAttention ('' when none).
+// goalAttention reads the persisted OwnerAttention (” when none).
 func (d *Daemon) goalAttention(ctx context.Context, goalID string) string {
 	var a string
 	_ = d.st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, goalID).Scan(&a)

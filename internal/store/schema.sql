@@ -30,7 +30,7 @@ PRAGMA foreign_keys = ON;
 -- (checks_compiled_at). See DESIGN.md §5 (triangle separation).
 CREATE TABLE IF NOT EXISTS domain (
     id                     TEXT PRIMARY KEY,
-    type                   TEXT NOT NULL DEFAULT 'repo', -- repo (M0); others deferred
+    type                   TEXT NOT NULL DEFAULT 'repo', -- repo（共享仓+worktree）| scratch（无仓库：持久项目目录 runs/scratch/<name>/goals/<goalID>，交付物=汇报；人卡点强制）
     name                   TEXT NOT NULL UNIQUE,
     git_url                TEXT NOT NULL DEFAULT '',     -- shared repo source
     default_branch         TEXT NOT NULL DEFAULT 'main',

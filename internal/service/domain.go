@@ -143,6 +143,9 @@ func (s *DomainService) CompilePolicy(ctx context.Context, domainID, policyText,
 // policy goes to {workdir}/checks.json — a FILE, not stdout: the platform
 // reads structured side effects, never agent output (DESIGN.md §5.3, §9).
 func compilePrompt(d *Domain, policyText string) string {
+	if d.Type == "scratch" {
+		return compilePromptScratch(d, policyText)
+	}
 	var b strings.Builder
 	b.WriteString("你是 agentwork 的验收策略编译器。用户用自然语言描述了这个域的验收要求：\n\n")
 	b.WriteString(policyText)
@@ -173,18 +176,49 @@ func compilePrompt(d *Domain, policyText string) string {
 	return b.String()
 }
 
+// compilePromptScratch is the scratch-domain variant: there is NO repo for
+// the compiler to inspect — no tech stack, no .gitignore, no diff-based
+// guards/gates. The deliverable is a report; the human checkpoint is forced
+// by the goal layer anyway (gatesForGoal). The compiled checks may still
+// carry setup/verify commands that run in the goal's project directory.
+func compilePromptScratch(d *Domain, policyText string) string {
+	var b strings.Builder
+	b.WriteString("你是 agentwork 的验收策略编译器。用户用自然语言描述了这个无仓库项目（scratch 域）的验收要求：\n\n")
+	b.WriteString(policyText)
+	b.WriteString("\n\n这个项目没有 git 仓库：任务的产出是汇报（评论区）和项目目录里的文件，没有代码 diff。请把要求编译成结构化验收策略 JSON，写入当前工作目录的 checks.json 文件（文件即结果，不要输出到 stdout）。\n\n")
+	b.WriteString(`checks.json 结构（无仓库域的子集）：
+{
+  "setup": ["<验证环境准备命令，幂等；不需要就留空数组>", ...],
+  "excludes": [],
+  "verify": ["<机器验证命令，在任务的项目目录里执行，exit 0 为通过；如检查某报告文件存在与否>", ...],
+  "guards": [],
+  "gates": [{"name": "merge", "when": "<该卡点触发条件的人话描述>"}]
+}`)
+	b.WriteString("\n\n另把验证强度（strong|medium|weak）写入当前工作目录的 strength.txt。\n\n再写 metrics.json：{\"test_count\": 0, \"coverage\": 0}（无仓库，无需统计）。\n\n规则：\n")
+	b.WriteString("- setup/verify 是真实可执行的命令；没有客观可验的就留空（平台会强制人工审批兜底）\n")
+	b.WriteString("- 不产出 diff_* guards/gates（无 diff 可判定）\n")
+	b.WriteString("- 完成后用一句话说明编译依据。")
+	return b.String()
+}
+
 func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 	if d.Name == "" {
 		return nil, NewValidationError("name is required")
 	}
-	if d.GitURL == "" {
-		return nil, NewValidationError("git_url is required")
-	}
 	if d.Type == "" {
 		d.Type = "repo"
 	}
-	if d.Type != "repo" {
-		return nil, NewValidationError("domain type must be repo (M0)")
+	switch d.Type {
+	case "repo":
+		if d.GitURL == "" {
+			return nil, NewValidationError("git_url is required for a repo domain")
+		}
+	case "scratch":
+		// A scratch domain has NO shared repository — its persistent home is
+		// runs/scratch/<name>/ (the human-maintained shared root + per-goal
+		// directories). git_url is meaningless here.
+	default:
+		return nil, NewValidationError("domain type must be repo or scratch")
 	}
 	if d.DefaultBranch == "" {
 		d.DefaultBranch = "main"
@@ -289,6 +323,9 @@ func (s *DomainService) Delete(ctx context.Context, id string) error {
 // the platform token is required, the provider is github|gitcode, and the
 // assignee may be an agent or a squad.
 func (s *DomainService) validateIssueTracking(ctx context.Context, d *Domain) error {
+	if d.Type == "scratch" && (d.IssueRepo != "" || d.IssueAssignee != "") {
+		return NewValidationError("issue tracking needs a repository — not available on a scratch domain")
+	}
 	if d.IssueRepo != "" || d.IssueAssignee != "" {
 		if d.IssueRepo == "" || d.IssueAssignee == "" {
 			return NewValidationError("issue tracking needs both issue_repo and issue_assignee")

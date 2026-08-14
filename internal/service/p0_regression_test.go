@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/eushing/agentwork/internal/events"
 )
 
 // ── P0 regression batch (决策 6-15): the execution-safety gate fixes ──
@@ -441,5 +443,84 @@ func TestRejectSpawnsOwnerDespitePendingConsult(t *testing.T) {
 	}
 	if ownerRun == consult {
 		t.Fatal("the owner run must not coalesce into the pending consult")
+	}
+}
+
+// TestScratchDomainValidation: a scratch domain needs no git_url; issue
+// tracking is repo-only; a repo domain still requires git_url.
+func TestScratchDomainValidation(t *testing.T) {
+	st := newTestStore(t)
+	ds := NewDomainService(st, events.NewBus())
+	ctx := context.Background()
+
+	d, err := ds.Create(ctx, Domain{Name: "research", Type: "scratch", PolicyText: "总结要客观"})
+	if err != nil {
+		t.Fatalf("a scratch domain needs no git_url: %v", err)
+	}
+	if d.Type != "scratch" || d.GitURL != "" {
+		t.Fatalf("scratch domain shape wrong: %s %q", d.Type, d.GitURL)
+	}
+	// Issue tracking is meaningless without a repo.
+	if _, err := ds.Create(ctx, Domain{Name: "bad-issue", Type: "scratch", IssueRepo: "o/r"}); err == nil {
+		t.Fatal("scratch domains must reject issue tracking")
+	}
+	// A repo domain still requires git_url.
+	if _, err := ds.Create(ctx, Domain{Name: "no-url", Type: "repo"}); err == nil {
+		t.Fatal("repo domains must require git_url")
+	}
+}
+
+// TestScratchGoalForcesHumanGate: the scratch deliverable is a report — no
+// diff-based gate can ever fire, so the human checkpoint is unconditional
+// (a strong scratch domain with configured gates must NOT auto-done).
+func TestScratchGoalForcesHumanGate(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "A")
+	ds := NewDomainService(st, events.NewBus())
+	d, err := ds.Create(ctx, Domain{Name: "research", Type: "scratch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Strong strength + configured gates — on a repo domain this would
+	// auto-done with no gate hit; on scratch it MUST still park.
+	if _, err := ds.FreezeChecks(ctx, d.ID, Checks{
+		Verify: []string{"test -f report.md"},
+		Gates:  []GateRule{{Name: "merge", When: "人工审批"}},
+	}, "strong"); err != nil {
+		t.Fatal(err)
+	}
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: d.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := enqueueFirst(t, rs, g)
+	if err := rs.Finish(ctx, run.ID, "completed", "调研完成，报告见目录"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	got, _ := gs.Get(ctx, g.ID)
+	if got.Status != "review" {
+		t.Fatalf("a scratch goal must park in review regardless of strength/gates, got %q", got.Status)
+	}
+}
+
+// TestScratchRejectsSubGoals: Change/integration is git-ref based — a
+// scratch goal cannot split.
+func TestScratchRejectsSubGoals(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "A")
+	b := seedAgent(t, st, "B")
+	ds := NewDomainService(st, events.NewBus())
+	d, err := ds.Create(ctx, Domain{Name: "research", Type: "scratch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: d.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.CreateSubGoal(ctx, g.ID, "拆活", "子任务", b, "", "agent", a); err == nil {
+		t.Fatal("scratch goals must reject sub-goals")
 	}
 }

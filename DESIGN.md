@@ -83,7 +83,7 @@ cron/Web  goal→run→   (域策略      (仲裁事务内)  review    合入/me
 
 ```
 + domain 表:
-    id, type(repo), name,
+    id, type(repo|scratch), name,
     git_url, default_branch, git_identity(用户/邮箱), git_credentials,
     policy_text(TEXT, NL 意图源真相), checks(JSON, 编译产物),
     verification_strength(强/中/弱),    -- LLM 推断（决策 2-5），用户确认后与产物一起冻结
@@ -91,7 +91,8 @@ cron/Web  goal→run→   (域策略      (仲裁事务内)  review    合入/me
     checks_compiled_at, metrics_baseline(JSON, 演进指标基线——测试数/覆盖率，M0 建域时记录),
     created_at
     -- 处理器 agent（processor_agent_id）：全局配置默认，域可覆盖（决策 2-17）
-    -- M0 仅实现 type=repo；其他资产域类型（文档/配置/知识库/backlog）后置（§13）
+    -- type=scratch（决策 6-16）：无仓库项目——持久项目目录 runs/scratch/<sanitized 名>/goals/<goalID>（人维护的共享根 + 每 goal 目录），交付物=汇报，人卡点强制；git_url 可为空
+    -- 其他资产域类型（文档/配置/知识库/backlog）仍后置（§13）
 + goal 表新增:
     domain_id → domain.id（agent 执行的 goal 必须有域）
     review_request（卡点触发原因/证据包指针）
@@ -471,6 +472,7 @@ agent 通过它产生全部结构化副作用（mention / 审批请求 / 子任�
 | 决策6-12 | **边界钉死批次（P0-2/P1-1/P1-2/P1-3）**：① CreateSubGoal 与初始 run 同事务（幽灵 sub-goal 不可能）；② 仅 active goal 可拆活（review = execution freeze 点，terminal/backlog 拒绝——状态机不自环）；③ verifier verdict 强校验（role=verify + sub_goal_id + agent_id==verifier_id + sg.verifying + run.running）；④ conflict 不武装 owner attention（rework 是 assignee 的责任，新 revision 回 ready 才唤醒 owner；终局守卫仍把 conflict 算 pending，goal 不会带冲突进卡点）——**已实现** |
 | 决策6-13 | **Successor Run 与状态转移同事务 + 启动全量 reconcile（P0-3）**：所有 afterCommit enqueue（sub-goal 重试/verifier/reject rework/conflict rework、owner 重试、consult 恢复）搬进各自 reconcile 事务——状态转移与其后继 run 同生共死，崩溃窗口不再丢后继 run（事件只负责 publish，DB 写全在事务内）；daemon 启动 `ReconcileAllActive` 遍历 active goal 重跑幂等 ReconcileGoal——latch 事件在提交后丢失也能从 DB 真相重推导 attention 并补 spawn。Event≠Truth 的完整恢复面——**已实现** |
 | 决策6-14 | **backlog 激活路径（`POST /goals/{id}/activate`）**：backlog → active 的第三入口（此前只有创建与 Reopen）——未指派而创建的 goal 有了回到流水线的路。条件转移（仅 backlog），spawn 走 P0.5 统一入口；顺带修正 `EnqueueOwnerRun` 的 human 契约（文档声称 no-op、实现报错——Reopen 人工 goal 的潜在雷同处修复）——**已实现** |
+| 决策6-16 | **scratch 域（无仓库项目）**：`domain.type` 增加 scratch——研究/信息类任务不依赖仓库。布局映射：共享根 `runs/scratch/<sanitized 域名>/`（人维护的资料，agent 只读契约）≙ 共享仓；`goals/<goalID>/` 持久目录 ≙ goal 分支（owner 直接干活、跨 run 保留、crash 复用——文件态 A5 模型；只读 run 拷贝快照，撕裂接受并注记）。规则：**人卡点强制**（diff-based gates 永不触发，无视 strength/gates 配置恒 merge 卡点——交付物是主观汇报）；**sub-goal 禁用**（Change/integration 是 git ref 机制）；deliver 跳过 git 直接 MarkDelivered；策略编译在 proc 目录跑（无仓库上下文，checks 子集）；issue 追踪禁用；目录名 sanitize（防路径逃逸）。schedule 挂 scratch 域即得"每 N 小时调研"类任务——**已实现** |
 | 决策6-15 | **执行安全闸门批次（协作状态机收敛）**：① **Claim 是唯一执行闸门**——`goal.status='active'` 才可 claim，`review` 仅 `role='review'`（平台审查 run）可 claim，其余不可；processor run（无 goal）豁免。review 冻结 execution 不冻结 intent（决策 2-3 修订）——入口只负责产生 queued intent，Claim 负责放行；② **Successor 原子化**——Create-active/Assign(handoff)/Activate/Reopen/Reject 的状态转移与后继 run 同事务（Assign 在事务内按最终 status 决策 enqueue 并回填 handoff_event.to_run_id；HTTP assign 与 MCP handoff_goal 的调用方 enqueue 删除，统一走 Assign）；③ **Reconcile per-goal mutex 永不删除**（删除与等待者竞态会让同 goal 两个 Reconcile 并行）；④ **ownRunByGoal 加 role 门**——agent 目标要求 `role='owner'`：mention 触发的 consult run 落在 assignee 身上不再拥有 goal 权威（Invariant 6），走 guest 语义；⑤ **终局守卫口径**——pendingConsults 只统计 requester 是当前 owner 的 consult（human mention 的 guest 不拦卡点；修"human consult 在飞 + owner turn 结束 → 无人恢复 → 死 active"）；⑥ **late-result 防护**——`Finish`/`failProcessorRun` 条件更新 `WHERE status='running'`：runaway reaper/交接窗口戳已终态的 run，迟到的 agent 结果不得覆盖终态、不得推进 goal；run:cancelled 事件由"实际完成覆盖的一方"单发；⑦ **runaway reaper**——daemon 周期扫描超过 per-domain max_run_duration+300s 宽限仍 running 的 run，条件盖 cancelled + reason=`runaway`（kill 走 cancel 注册表，不阻塞），notify 推"任务中断"卡交人；⑧ **事件路由修正**——`run.terminal`（点）与前端/hub 的 `run:terminal`（冒号）统一为点；hub 白名单补 sub_goal.verifying/retrying、squad:member_removed；squad 审查 dedupe 只数 role='review'（D-1 下 review 期排队的 human mention 不得顶掉审查请求）；⑨ **consult status 注入**——owner prompt 增加 "## Consult status"：以 consult_request（requester_run_id/response_comment_id 因果）为主查询、时间仅作 scope 过滤，注入"问→答/失败"；⑩ **sub-goal 派发链**——create_sub_goal 的派发评论与 sub_goal、初始 run 同事务，run.trigger_comment_id 指向派发评论（汇报自动引用）；pingpong 计数豁免 role IN ('subgoal','verify')（当前近似口径，最终语义 = interaction edge，非 role）；⑪ **get_comments MCP 工具**——只读、after cursor + limit，长 run 主动拉新评论——**已实现** |
 
 ---

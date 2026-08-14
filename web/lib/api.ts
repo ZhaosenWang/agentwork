@@ -142,7 +142,7 @@ export const getDomain = (id: string) => api<Domain>(`/domains/${id}`);
 export const createDomain = (body: {
   name: string;
   git_url: string;
-  type?: string;
+  type?: string; // repo | scratch（无仓库项目：持久项目目录，人卡点强制）
   default_branch?: string;
   git_identity?: string;
   git_credentials?: string;

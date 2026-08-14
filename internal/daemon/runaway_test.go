@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,4 +109,49 @@ func TestReapRunawayRun(t *testing.T) {
 	if status2 != "running" {
 		t.Fatalf("a fresh run must survive the reaper, got %q", status2)
 	}
+}
+
+// TestScratchDirNames: the scratch root is named by the SANITIZED domain
+// name — hostile names cannot escape the scratch root.
+func TestScratchDirNames(t *testing.T) {
+	if got := sanitizeDirName("../etc/passwd"); strings.Contains(got, "/") || strings.Contains(got, "..") {
+		t.Fatalf("sanitized name must not contain path separators: %q", got)
+	}
+	if got := sanitizeDirName("AI 动态·调研"); got != "AI_动态_调研" {
+		t.Fatalf("sanitized name wrong: %q", got)
+	}
+	if got := sanitizeDirName("///"); got != "domain" {
+		t.Fatalf("empty-after-sanitize must fall back: %q", got)
+	}
+	root := scratchDomainRoot("../etc")
+	if !strings.HasPrefix(root, runsRoot()) || strings.Contains(root, ".."+string(filepath.Separator)+"..") {
+		t.Fatalf("scratch root must stay under runsRoot: %q", root)
+	}
+}
+
+// TestScratchDeliverSkipsGit: approving a scratch goal closes the loop
+// directly — no branch, no merge, MarkDelivered succeeds.
+func TestScratchDeliverSkipsGit(t *testing.T) {
+	d, st, gs, runSvc, _ := newSquadReviewDaemon(t)
+	ctx := context.Background()
+	agent := seedReviewAgent(t, st, "researcher")
+	ds := service.NewDomainService(st, events.NewBus())
+	dom, err := ds.Create(ctx, service.Domain{Name: "research", Type: "scratch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := gs.Create(ctx, service.Goal{Title: "g", AssigneeType: "agent", AssigneeID: agent, Status: "active", DomainID: dom.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='review', review_request='merge (scratch): 交付物为汇报，必须人工审批' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	d.deliverGoal(ctx, g.ID)
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "done" {
+		t.Fatalf("scratch deliver must close the goal directly, got %q", after.Status)
+	}
+	_ = runSvc
 }

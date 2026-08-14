@@ -80,12 +80,20 @@ func (d *Daemon) recoverPendingDelivers(ctx context.Context) (int, error) {
 }
 
 func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
-	var domainID, defaultBranch, gitURL, gitCredentials string
+	var domainID, defaultBranch, gitURL, gitCredentials, domainType string
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT d.id, d.default_branch, d.git_url, d.git_credentials FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
-		Scan(&domainID, &defaultBranch, &gitURL, &gitCredentials)
+		`SELECT d.id, d.default_branch, d.git_url, d.git_credentials, COALESCE(d.type,'') FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
+		Scan(&domainID, &defaultBranch, &gitURL, &gitCredentials, &domainType)
 	if err != nil {
 		d.finishDeliver(ctx, goalID, false, "deliver: goal has no domain: "+err.Error())
+		return
+	}
+	// A scratch domain has nothing to merge — the goal dir IS the deliverable
+	// (the report in the feed references it). Approval closes the loop
+	// directly; no git steps, no branch-wait (owner runs already ended — the
+	// goal parked review on the owner's completion).
+	if domainType == "scratch" {
+		d.finishDeliver(ctx, goalID, true, "无仓库交付——按汇报验收", nil)
 		return
 	}
 	// No in-flight OWNER run before the merge touches the goal branch (决策

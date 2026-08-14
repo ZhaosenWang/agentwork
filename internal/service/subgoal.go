@@ -79,6 +79,17 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 	if gStatus != "active" {
 		return nil, NewValidationError(fmt.Sprintf("cannot create a sub-goal: the goal is %s (only active goals can be split)", gStatus))
 	}
+	// Scratch domains cannot split sub-goals: the Change/Revision/integrate
+	// machinery is git-ref based (base_ref/head_ref, merge-base). Research
+	// fan-out = multiple goals (schedule/web), not sub-goals.
+	var domainType string
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(d.type,'') FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).Scan(&domainType); err != nil {
+		return nil, fmt.Errorf("load domain type: %w", err)
+	}
+	if domainType == "scratch" {
+		return nil, NewValidationError("a scratch domain goal cannot split sub-goals (Change/integration needs a git repository)")
+	}
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, assigneeID, "assignee agent"); err != nil {
 		return nil, err
 	}
