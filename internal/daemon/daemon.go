@@ -2914,8 +2914,10 @@ func (d *Daemon) goalAttention(ctx context.Context, goalID string) string {
 // then.
 func (d *Daemon) commentsInjection(ctx context.Context, goalID string) string {
 	rows, err := d.st.DB().QueryContext(ctx,
-		`SELECT author_type, content FROM comment WHERE goal_id=?
-		 ORDER BY created_at ASC`, goalID)
+		`SELECT c.author_type, COALESCE(a.name, ''), c.content FROM comment c
+		 LEFT JOIN agent a ON a.id = c.author_id
+		 WHERE c.goal_id=?
+		 ORDER BY c.created_at ASC`, goalID)
 	if err != nil {
 		logging.Infof("daemon: load comments for run prompt (goal %s): %v", goalID, err)
 		return ""
@@ -2923,9 +2925,25 @@ func (d *Daemon) commentsInjection(ctx context.Context, goalID string) string {
 	defer rows.Close()
 	var b strings.Builder
 	for rows.Next() {
-		var at, content string
-		if rows.Scan(&at, &content) == nil && strings.TrimSpace(content) != "" {
-			b.WriteString("- " + at + "：" + content + "\n")
+		var at, name, content string
+		if rows.Scan(&at, &name, &content) == nil && strings.TrimSpace(content) != "" {
+			// The feed is read by HUMANS and agents alike — the author label
+			// must say WHO spoke: "user" for the human, the agent's NAME for
+			// agents (bare "agent：" hides which teammate said what — the PM's
+			// dispatch vs the coder's report became indistinguishable).
+			label := at
+			switch at {
+			case "human":
+				label = "user"
+			case "agent":
+				label = name
+			case "system":
+				label = "system"
+			}
+			if label == "" {
+				label = at
+			}
+			b.WriteString("- " + label + "：" + content + "\n")
 		}
 	}
 	if b.Len() == 0 {
@@ -3015,7 +3033,9 @@ func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID, role string) 
 		b.WriteString("  branch with machine verification; a verified sub-goal produces a Change\n")
 		b.WriteString("  and the platform wakes YOU to integrate. A sub-goal completing does NOT\n")
 		b.WriteString("  complete the goal. OWNER ONLY. The platform writes the dispatch comment\n")
-		b.WriteString("  for you — do NOT announce the delegation again in a comment.\n\n")
+		b.WriteString("  for you — do NOT announce the delegation again in a comment. Your FINAL\n")
+		b.WriteString("  message becomes your run report in the feed: after a dispatch-only turn\n")
+		b.WriteString("  keep it minimal, and never write agent ids into it (humans read it).\n\n")
 
 		b.WriteString("### Work the Change pipeline (owner)\n")
 		b.WriteString("- Woken with an Owner Attention section? agentwork_get_change lists the\n")

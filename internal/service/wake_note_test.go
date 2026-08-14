@@ -132,4 +132,7 @@ func TestWakeNoteRecoveryAndReadyEnglish(t *testing.T) {
 	if !strings.Contains(note, "1 change(s) ready to integrate") {
 		t.Fatalf("the wake note must name the ready change count, got %q", note)
 	}
+	if strings.Contains(note, "verified with no changes") {
+		t.Fatalf("a sub-goal WITH a change must not be named in the no-changes bullet, got %q", note)
+	}
 }

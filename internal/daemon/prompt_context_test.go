@@ -76,6 +76,17 @@ func TestFullCommentFeedInjected(t *testing.T) {
 			t.Fatalf("comments not in time order (%q after %q):\n%s", contents[i].content, contents[i-1].content, sec)
 		}
 	}
+	// The author label says WHO spoke: the human is "user", agents carry
+	// their NAME (bare "agent：" hides which teammate said what).
+	if !strings.Contains(sec, "- user：create this") {
+		t.Fatalf("the human's label is 'user', got:\n%s", sec)
+	}
+	if !strings.Contains(sec, "- B：i can help review") {
+		t.Fatalf("an agent's label is its NAME, got:\n%s", sec)
+	}
+	if strings.Contains(sec, "- agent：") || strings.Contains(sec, "- human：") {
+		t.Fatalf("bare author-type labels must not appear, got:\n%s", sec)
+	}
 }
 
 // TestAgentGuideTrimmedByRole (决策 6-20): the coordination guide carries
@@ -102,7 +113,7 @@ func TestAgentGuideTrimmedByRole(t *testing.T) {
 	}
 
 	owner := d.buildAgentGuide(ctx, other.ID, "owner")
-	for _, want := range []string{"agentwork_handoff_goal", "agentwork_create_sub_goal", "Work the Change pipeline"} {
+	for _, want := range []string{"agentwork_handoff_goal", "agentwork_create_sub_goal", "Work the Change pipeline", "do NOT announce the delegation again"} {
 		if !strings.Contains(owner, want) {
 			t.Fatalf("the owner guide must carry %q, got:\n%s", want, owner)
 		}

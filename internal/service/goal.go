@@ -1968,7 +1968,7 @@ func (s *GoalService) compileWakeNoteTx(ctx context.Context, tx *sql.Tx, goalID,
 			if ready > 0 {
 				bullets = append(bullets, fmt.Sprintf("- %d change(s) ready to integrate — inspect with agentwork_get_change, merge each with agentwork_integrate_change", ready))
 			}
-			titles, err := s.subGoalTitlesTx(ctx, tx, goalID, "verified")
+			titles, err := s.noChangeVerifiedTitlesTx(ctx, tx, goalID)
 			if err != nil {
 				return "", err
 			}
@@ -1985,6 +1985,31 @@ func (s *GoalService) compileWakeNoteTx(ctx context.Context, tx *sql.Tx, goalID,
 // titles; ids are system handles).
 func (s *GoalService) subGoalTitlesTx(ctx context.Context, tx *sql.Tx, goalID, status string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT title FROM sub_goal WHERE goal_id=? AND status=? ORDER BY created_at`, goalID, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var titles []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		titles = append(titles, t)
+	}
+	return titles, rows.Err()
+}
+
+// noChangeVerifiedTitlesTx lists VERIFIED sub-goals that produced NO Change —
+// the wrapup bullet's exact predicate (决策 6-8). A verified sub-goal WITH a
+// ready Change is the integration bullet's subject, not "no changes" — mixing
+// them described the same work item as both (live wording bug).
+func (s *GoalService) noChangeVerifiedTitlesTx(ctx context.Context, tx *sql.Tx, goalID string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT sg.title FROM sub_goal sg
+		 WHERE sg.goal_id=? AND sg.status='verified'
+		   AND NOT EXISTS (SELECT 1 FROM change c WHERE c.sub_goal_id=sg.id)
+		 ORDER BY sg.created_at`, goalID)
 	if err != nil {
 		return nil, err
 	}

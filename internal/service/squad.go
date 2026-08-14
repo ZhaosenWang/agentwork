@@ -338,6 +338,12 @@ REVIEWER-ONLY RULE: members with role="reviewer" REVIEW ONLY — never
 dispatch work items to them (create_sub_goal rejects it). After your turn
 ends the platform automatically pulls the reviewers in, then the human
 approves; you never hand work to a reviewer yourself.
+
+FINAL MESSAGE = your run report: your final message is posted to the feed
+verbatim when your turn ends. If this turn only dispatched sub-goals, keep
+it MINIMAL (e.g. one line of plan context at most) — the platform already
+wrote the dispatch comments, so do NOT repeat the delegation, and never
+write agent IDs into it (the feed is read by humans).
 `
 
 const squadParentStatusOwned = `You drive this goal's execution. When you finish your part, END your turn —
