@@ -1,29 +1,40 @@
 # agentwork
 
-> [中文](README.zh.md) | [Design](DESIGN.md) | [设计](DESIGN.md)
+> [中文](README.zh.md) | [Design](DESIGN.md) | [协作模型](Collaboration.v2.md)
 
-A multi-protocol AI agent task management and scheduling platform. Orchestrate
-CLI agents (Claude Code, Codex, OpenCode, custom agents) — create goals, assign
-them to agents or squads, and let the daemon schedule and execute runs
-automatically.
+An **AI task pipeline OS** — a single-user control plane that runs CLI agents
+unattended through the full loop: goal → execution → machine verification →
+human gate → delivery. You define acceptance policies in natural language,
+agents do the work, the platform judges, and you only appear at checkpoints.
 
 **Single process, single machine, single user, no auth.** Local SQLite for
-persistence, in-process event bus. Batteries included: daemon, CLI, and a
-Next.js web UI.
+state, in-process event bus, Go daemon + Next.js web UI.
 
-- **Multi-protocol** — ACP, JSONL, JSON-RPC
-- **Multi-transport** — stdio, WebSocket, TCP
-- **Goal/Run two-layer architecture** — goals own state authority, runs are
-  execution records
-- **Squad collaboration** — group agents into squads with a leader for
-  delegation
-- **Cron scheduling** — recurring goal creation on a schedule
-- **Real-time Web UI** — live event stream via WebSocket
+## Highlights
 
-> **One-line mental model:** A goal is a work item (who owns it, how far it's
-> progressed); a run is one execution (some agent's turn on it). The same goal
-> may be executed many times and handed off across agents, with full history
-> retained. A run has no authority — status is arbitrated by the goal layer.
+- **Full unattended loop** — goals, runs, machine verification, structural
+  guards, human gates, automatic delivery (merge + re-verify + push)
+- **Acceptance policy per domain** — you state "what done means" in natural
+  language; a processor agent compiles it into executable checks (verify
+  commands, guards, gates) which you confirm once
+- **Sub-goals with changes** — the owner splits work into sub-goals (own
+  assignee, own worktree, machine or agent verification); verified sub-goals
+  produce **Changes** with revisions the owner integrates — conflicts wake
+  the assignee to rework automatically
+- **Four collaboration behaviors** — Comment / Consult / Handoff / Sub-goal,
+  exposed as MCP tools with owner-only permissions
+- **Multi-protocol & transport** — ACP / JSONL / JSON-RPC over stdio / ws / tcp;
+  agents can carry their own extra MCP servers
+- **Triggers** — Web, cron schedules, GitHub/GitCode issues (webhook + poll),
+  Feishu IM inbound (@-bot task creation)
+- **Feishu notifications** — approval cards (approve/reject right in IM),
+  completion/failure pushes, a daily digest
+- **Real-time web UI** — live event stream, execution timeline, sub-goal /
+  change / verification panels
+
+> **One-line mental model:** a **goal** is a work item and the sole holder of
+> state authority; a **run** is one agent's turn on it — runs report up, never
+> decide. The platform judges completion; you hold the gates.
 
 ## Quick start
 
@@ -36,7 +47,6 @@ Next.js web UI.
 ### Backend
 
 ```bash
-# Build
 go build -o agentwork-daemon ./cmd/agentwork-daemon
 go build -o agentwork-cli ./cmd/agentwork-cli
 
@@ -52,75 +62,97 @@ npm install
 npm run build && npm start
 ```
 
-Open **http://localhost:3000** and create your first Runtime, Agent, and Goal
-through the UI.
+### First goal
 
-![Goal list](docs/images/goal-list.png)
+1. Create a **domain** (项目): repo URL + acceptance policy in natural language
+   (or leave it unfrozen to force a human checkpoint)
+2. Create a **runtime** (e.g. `opencode acp --pure`, stdio + acp) and an
+   **agent**
+3. Create a **goal**, assign the agent, and watch the loop run: execution →
+   verification → review → your approval → automatic delivery
 
 ## Core concepts
 
 | Concept | What it is |
 |---|---|
-| **Runtime** | A launch spec — how to connect to a protocol-speaking program. `transport` (stdio/ws/tcp) + `executable`+`args` or `endpoint` + `env`. |
-| **Provider** | A protocol kind — which wire protocol the agent speaks. `acp` / `jsonl` / `jsonrpc`. A field on the runtime. |
-| **Agent** | A runtime + a persona (system_prompt / model / workdir / max_concurrent). The concurrency unit: each agent has a worker + semaphore. |
-| **Squad** | A routing group that does no work itself. Has a leader (an agent). Assigning to a squad routes to the leader, who delegates sub-goals. |
-| **Goal** | A work item (product plane). Assignable to an agent / squad / human. Has a state machine and optional `parent_id` for sub-goal coordination. **The sole holder of state authority.** |
-| **Run** | One execution (execution plane): one agent's turn on one goal. On terminal status it reports to the goal layer — never writes goal status directly. |
+| **Domain** (Project) | An asset/evolution domain: shared repo + acceptance policy (NL intent compiled into checks) + default gates. |
+| **Goal** | A work item (product plane). Status: backlog → active → review → done / failed / cancelled. The sole holder of state authority. |
+| **Run** | One agent's turn on a goal. Status: queued → running → completed / failed / cancelled, plus a **role** (owner / subgoal / consult / review / verify). No authority — it reports to the goal layer. |
+| **Runtime** | A launch spec — transport (stdio/ws/tcp) + provider (acp/jsonl/jsonrpc) + executable/args or endpoint + env. |
+| **Agent** | A runtime + persona (system prompt / model / env / extra MCP servers / max concurrency). |
+| **Squad** | A routing group that does no work itself: goals route to its leader, who delegates via sub-goals; members with role=reviewer are auto-pulled into review checkpoints. |
+| **Sub-goal** | A work item split off a goal (not a child goal — no recursion). Own assignee + optional agent verifier; machine retries (≤3) and verifier rejections are counted separately. |
+| **Change** | A sub-goal's logical deliverable: ready → integrating → integrated, or conflict → assignee rework → revision N+1. The owner integrates it via the `integrate_change` tool. |
+| **Verifier** | Machine (domain verify commands) by default, or a named agent issuing structured verdicts (`verify_sub_goal`). |
+| **Gates** | Human checkpoint rules from the acceptance policy (merge, diff_contains, ...); weak verification forces a checkpoint. |
+| **Mention** | The Consult primitive: a structured URI in a comment pulls an agent into a read-only guest run; the requester resumes automatically after the answer. |
+| **Schedule** | A cron template that clones a goal per firing (idempotent, timezone-aware). |
+| **Trigger** | Web, cron, GitHub/GitCode issues (webhook + poll, deduped by source ref), Feishu IM inbound. |
+
+## Collaboration (four behaviors)
+
+| Behavior | Tool | Who may |
+|---|---|---|
+| **Comment** (say) | `comment_goal` | anyone |
+| **Consult** (ask) | `consult_agent` | the goal's owner |
+| **Handoff** (transfer) | `handoff_goal` | the goal's owner |
+| **Sub-goal** (split) | `create_sub_goal` / `cancel_sub_goal` | the goal's owner |
+
+Agents coordinate exclusively through the `agentwork` MCP tools advertised at
+every session (plus `verify_sub_goal`, `integrate_change`, `get_change`,
+`get_sub_goal`, `get_verification`, and the `*_list` tools). Full model in
+[Collaboration.v2.md](Collaboration.v2.md).
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  agentwork-daemon (single process)                        │
-│                                                           │
-│  HTTP API + WS hub  ──→  service layer  ──→  store(SQLite) │
-│        │                       │                           │
-│        │                       │ bus.Publish (after commit)│
-│        ▼                       ▼                           │
-│      WS fan-out            daemon scheduler                │
-│  (frontend / cli)          claim run → runTask             │
-│                                  │  by runtime.provider     │
-│                                  ▼                          │
-│                           runtime.Open(spec)               │
-│                                  │  returns transport R/W    │
-│                                  ▼                          │
-│                           backend.Execute(Session)         │
-│                                  │  acp|jsonl|jsonrpc        │
-│                                  ▼                          │
-│                           agent CLI subprocess             │
-│                                  │ calls agentwork-cli      │
-│                                  ▼  (+ env: SERVER_URL…)    │
-└──────────────────────────────────┼─────────────────────-─-┘
-                                   ▼
-                          agentwork-cli (agent-side tool)
+                    ┌────────────── HTTP API + WS hub ──────────┐
+                    │   goals/runs/sub-goals/changes/…           │
+                    ▼                                             ▼
+              service layer (state authority)             web UI (Next.js)
+                    │  bus.Publish (after commit)                │
+                    ▼                                            │
+               SQLite (truth) ── daemon scheduler ───────────────┤
+                                    │ claim run → runTask        │
+                                    ▼                            │
+                             runtime.Open(spec)                  │
+                                    │  acp | jsonl | jsonrpc     │
+                                    ▼                            │
+                             agent CLI subprocess                │
+                              (stdio/ws/tcp)                     │
+                              └─ fs/terminal RPC + agentwork MCP  │
+                                 (worktree, tools)               │
+                    ┌───────────────┬────────────────────────────┘
+                    ▼               ▼
+             machine verify /   review gate → deliver
+             guards (domain)    (human approve → merge+re-verify+push)
 ```
+
+- **Event ≠ truth** — the bus is a wakeup hint; every transition is a
+  conditional DB transaction, idempotent under replay
+- **Per-run worktrees** — `~/.agentwork/runs/<runID>` ephemeral git worktrees
+  against per-domain bare repos; crash recovery replays terminal runs and
+  re-derives attention at startup
+- **Coordinator** — derived OwnerAttention (integration / recovery /
+  user_action) wakes the owner exactly when there is work for it
 
 ## CLI tool
 
-`agentwork-cli` is the agent-side tool. The daemon injects it into each agent
-subprocess so agents can call back to produce structured side effects.
+`agentwork-cli` is a human debugging tool (agents use the MCP tools). It needs
+`AGENTWORK_SERVER_URL` (or runs against `http://localhost:7373` by default):
 
-| Command | Description |
-|---|---|
-| `goal list [--limit N] [--status S] [--json]` | List goals (JSON — the default format; `--json` requests it explicitly); `--limit N` caps to the N most recent (default all); `--status S` keeps only goals whose status equals S (exact match) |
-| `goal create --title T [--description D] [--assignee A] [--parent P] [--status S]` | Create a sub-goal |
-| `goal assign <to-agent-id> [--note N]` | Hand off the current goal to another agent |
-| `goal comment --text T [--role R]` | Post a comment; may contain `[@Name](mention://agent/<id>)` to enqueue a run on that agent |
-| `goal wait` | Mark the current goal as waiting for its sub-goals |
-| `agent list` | List all agents (JSON) |
-| `squad list` | List all squads (JSON) |
-| `stats` | Goal/run status statistics (JSON): total + per-status counts for goals (`backlog`/`active`/`blocked`/`done`/`failed`/`cancelled` from `GET /goals`) and for runs (`queued`/`running`/`completed`/`failed`/`cancelled`, aggregated across every goal's `GET /goals/{id}/runs`) |
-
-The daemon sets these environment variables for every agent subprocess:
-`AGENTWORK_SERVER_URL`, `AGENTWORK_GOAL_ID`, `AGENTWORK_RUN_ID`,
-`AGENTWORK_AGENT_ID`.
+```bash
+agentwork-cli goal list --limit 5
+agentwork-cli stats
+```
 
 ## Tech stack
 
 | Layer | Stack |
 |---|---|
-| **Backend** | Go 1.26, SQLite (modernc), gorilla/websocket, robfig/cron |
+| **Backend** | Go 1.26, SQLite (modernc), gorilla/websocket, robfig/cron, MCP go-sdk |
 | **Frontend** | Next.js 16, React 19, Tailwind CSS 4, TanStack React Query |
 | **Protocols** | ACP, JSONL, JSON-RPC |
 | **Transports** | stdio, WebSocket, TCP |
+| **Notifications** | Feishu (approval cards, digest, IM inbound) |
+| **Issue triggers** | GitHub, GitCode |

@@ -1,24 +1,35 @@
 # agentwork
 
-> [English](README.md) | [Design](DESIGN.md) | [设计](DESIGN.md)
+> [English](README.md) | [设计文档](DESIGN.md) | [协作模型](Collaboration.v2.md)
 
-多协议 AI Agent 任务管理与调度平台。统一管理 CLI Agent（Claude Code、Codex、
-OpenCode、自定义 Agent）—— 创建 Goal、分配给 Agent 或 Squad，由守护进程自动调度
-和执行 Run。
+**AI 干活的流水线操作系统**——单用户控制面，让 CLI agent 无人值守地跑完整闭环：
+任务 → 执行 → 机器验证 → 人工卡点 → 自动交付。你用自然语言定义验收策略，agent
+干活，平台判定，人只在卡点出现。
 
-**单进程、单机、单用户、无需认证。** 本地 SQLite 持久化，进程内事件总线。开箱即
-用：守护进程、CLI 工具、Next.js Web 界面。
+**单进程、单机、单用户、无需认证。** 本地 SQLite 持久化，进程内事件总线，Go
+daemon + Next.js Web 界面。
 
-- **多协议** — ACP、JSONL、JSON-RPC
-- **多传输** — stdio、WebSocket、TCP
-- **Goal/Run 两层架构** — Goal 持有状态权威，Run 是执行记录
-- **Squad 协作** — 将 Agent 编组为 Squad，由 Leader 统一分配
-- **Cron 定时调度** — 按计划周期性创建 Goal
-- **实时 Web UI** — 通过 WebSocket 推送实时事件流
+## 特性
 
-> **一句话脑图：** Goal 描述"要做什么、谁负责、进展如何"；Run 记录"某次执行由
-> 谁做的、结果怎样"。同一个 Goal 可以被执行多次、在不同 Agent 间交接，完整历史
-> 全部保留。Run 没有状态决定权 —— 状态由 Goal 层统一仲裁。
+- **全自动闭环** — goal / run / 机器验证 / 结构化约束 / 人工卡点 / 自动交付
+  （合并 + 复验 + 推送）
+- **验收策略属于域（项目）** — 用自然语言说"怎样算完成"，处理器 agent 编译成
+  可执行检查（验证命令、约束、卡点），你确认一次后冻结
+- **子任务 + 变更交付** — owner 拆活成子任务（独立负责人、独立 worktree、
+  机器或 agent 验证）；验证通过的子任务产出 **Change**（带修订版本），owner
+  集成——冲突会自动唤醒 assignee 返修
+- **四种协作行为** — Comment（说）/ Consult（问）/ Handoff（接力）/ Sub-goal
+  （拆活），以 MCP 工具暴露，owner 权限内联
+- **多协议多传输** — ACP / JSONL / JSON-RPC × stdio / ws / tcp；agent 可挂
+  自己的额外 MCP 服务器
+- **多触发渠道** — Web、cron 定时、GitHub/GitCode issue（webhook + 轮询）、
+  飞书入站（@机器人 建任务）
+- **飞书通知** — 审批卡（IM 内直接批/驳）、完成/失败推送、每日摘要
+- **实时 Web UI** — 事件流、执行时间线、子任务 / 变更 / 验证记录面板
+
+> **一句话脑图：** **goal** 是工作条目，状态权威的唯一持有者；**run** 是某个
+> agent 在它上面的一次执行——run 只汇报、不决策。完成与否由平台判定，卡点由人
+> 把关。
 
 ## 快速开始
 
@@ -31,11 +42,10 @@ OpenCode、自定义 Agent）—— 创建 Goal、分配给 Agent 或 Squad，�
 ### 后端
 
 ```bash
-# 构建
 go build -o agentwork-daemon ./cmd/agentwork-daemon
 go build -o agentwork-cli ./cmd/agentwork-cli
 
-# 启动守护进程（默认 :7373）
+# 启动 daemon（默认 :7373）
 ./agentwork-daemon
 ```
 
@@ -47,75 +57,93 @@ npm install
 npm run build && npm start
 ```
 
-打开 **http://localhost:3000**，通过 Web 界面创建你的第一个 Runtime、Agent 和
-Goal。
+### 第一个任务
 
-![Goal 列表](docs/images/goal-list.png)
+1. 创建**项目**（域）：仓库地址 + 自然语言验收策略（不确认冻结则强制人工卡点）
+2. 创建 **runtime**（如 `opencode acp --pure`，stdio + acp）和 **agent**
+3. 创建 **goal**、指派给 agent，看闭环跑起来：执行 → 验证 → 卡点 → 你审批 →
+   自动交付
 
 ## 核心概念
 
-| 概念 | 说明 |
+| 概念 | 含义 |
 |---|---|
-| **Runtime** | 启动规格 —— 如何连接一个讲某种协议的程序。`transport`（stdio/ws/tcp）+ `executable`+`args` 或 `endpoint` + `env`。 |
-| **Provider** | 协议类型 —— Agent 讲哪种线协议。`acp` / `jsonl` / `jsonrpc`。Runtime 的一个字段。 |
-| **Agent** | Runtime + 人设（system_prompt / model / workdir / max_concurrent）。并发单元：每个 Agent 有一个 Worker + 信号量。 |
-| **Squad** | 路由组，自己不干活。有一个 Leader（某个 Agent）。把 Goal 分配给 Squad / @mention Squad 时路由到 Leader，由 Leader 分配子 Goal。 |
-| **Goal** | 工作项（产品平面）。可分配给 agent / squad / human。有状态机和可选的 `parent_id` 用于子 Goal 协调。**状态权威的唯一持有者。** |
-| **Run** | 一次执行（执行平面）：某个 Agent 对某个 Goal 的一次执行。到终态后向 Goal 层报告 —— 绝不直接写 Goal 状态。 |
+| **项目（Domain）** | 资产/演进域：共享仓 + 验收策略（自然语言意图编译成检查清单）+ 默认卡点 |
+| **Goal** | 工作条目（产品面）。状态：backlog → active → review → done / failed / cancelled。状态权威的唯一持有者 |
+| **Run** | 某个 agent 在 goal 上的一次执行。状态五态 + **角色**（owner / subgoal / consult / review / verify）。无权威——终态上报 goal 层仲裁 |
+| **Runtime** | 启动规格——transport（stdio/ws/tcp）+ provider（acp/jsonl/jsonrpc）+ executable/args 或 endpoint + env |
+| **Agent** | runtime + 人设（system prompt / model / env / 额外 MCP 服务器 / 并发数） |
+| **Squad** | 路由组，不干活：goal 路由到 leader，由其拆子任务；role=reviewer 的成员在卡点时被平台自动拉入审查 |
+| **子任务（Sub-goal）** | 从 goal 拆出的工作项（不是 child goal，不可递归）。独立 assignee + 可选 agent verifier；机器重试（≤3）与验证驳回分开计数 |
+| **Change** | 子任务的逻辑交付物：ready → integrating → integrated，或 conflict → 返修 → 修订 N+1。owner 用 `integrate_change` 集成 |
+| **Verifier** | 默认机器（域验证命令），或指定 agent 发结构化裁决（`verify_sub_goal`） |
+| **卡点（Gate）** | 验收策略中的人工检查点规则（merge、diff_contains…）；弱验证强制人工段 |
+| **Mention** | Consult 原语：评论里的结构化 URI 把 agent 拉进只读 guest run，回答后平台自动恢复发起者 |
+| **定时任务（Schedule）** | cron 模板，每次触发克隆一个 goal（幂等、时区感知） |
+| **触发渠道** | Web、cron、GitHub/GitCode issue（webhook + 轮询，source_ref 去重）、飞书入站 |
+
+## 协作（四种行为）
+
+| 行为 | 工具 | 权限 |
+|---|---|---|
+| **Comment**（说） | `comment_goal` | 任何人 |
+| **Consult**（问） | `consult_agent` | goal 的 owner |
+| **Handoff**（接力） | `handoff_goal` | goal 的 owner |
+| **Sub-goal**（拆活） | `create_sub_goal` / `cancel_sub_goal` | goal 的 owner |
+
+agent 只通过每次会话广告的 `agentwork` MCP 工具协作（另有 `verify_sub_goal`、
+`integrate_change`、`get_change`、`get_sub_goal`、`get_verification` 及
+`*_list` 工具）。完整模型见 [Collaboration.v2.md](Collaboration.v2.md)。
 
 ## 架构
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  agentwork-daemon (单进程)                                 │
-│                                                           │
-│  HTTP API + WS hub  ──→  service layer  ──→  store(SQLite) │
-│        │                       │                           │
-│        │                       │ bus.Publish (事务提交后)    │
-│        ▼                       ▼                           │
-│      WS 广播              daemon 调度器                     │
-│  (前端 / CLI)             claim run → runTask              │
-│                                  │  by runtime.provider     │
-│                                  ▼                          │
-│                           runtime.Open(spec)               │
-│                                  │  返回 transport R/W       │
-│                                  ▼                          │
-│                           backend.Execute(Session)         │
-│                                  │  acp|jsonl|jsonrpc        │
-│                                  ▼                          │
-│                           agent CLI 子进程                  │
-│                                  │ 调用 agentwork-cli       │
-│                                  ▼  (+ env: SERVER_URL…)    │
-└──────────────────────────────────┼─────────────────────-─-┘
-                                   ▼
-                          agentwork-cli (Agent 侧工具)
+                    ┌────────────── HTTP API + WS hub ──────────┐
+                    │   goals/runs/sub-goals/changes/…           │
+                    ▼                                             ▼
+              service 层（状态权威）                       Web UI（Next.js）
+                    │  bus.Publish（commit 后）                  │
+                    ▼                                            │
+               SQLite（真相） ── daemon 调度器 ─────────────────┤
+                                    │ claim run → runTask        │
+                                    ▼                            │
+                             runtime.Open(spec)                  │
+                                    │  acp | jsonl | jsonrpc     │
+                                    ▼                            │
+                             agent CLI 子进程                    │
+                              （stdio/ws/tcp）                   │
+                              └─ fs/terminal RPC + agentwork MCP  │
+                                 （worktree、工具）               │
+                    ┌───────────────┬────────────────────────────┘
+                    ▼               ▼
+             机器验证 / 约束     卡点 → 交付
+             （域验收策略）      （人批 → 合并+复验+推送）
 ```
+
+- **Event ≠ 真相** — 事件总线只是唤醒提示；一切状态转移都是条件化 DB 事务，
+  重放幂等
+- **run 级 worktree** — `~/.agentwork/runs/<runID>` 临时 git worktree，基于每域
+  bare 仓；崩溃恢复在启动时重放未仲裁的终态 run 并重推导 attention
+- **Coordinator** — 派生的 OwnerAttention（integration / recovery /
+  user_action）在有活干时才唤醒 owner
 
 ## CLI 工具
 
-`agentwork-cli` 是 Agent 侧工具。守护进程会将其注入到每个 Agent 子进程中，Agent
-通过调用它来产生结构化的副作用。
+`agentwork-cli` 是人调试用的工具（agent 走 MCP 工具）。默认连
+`http://localhost:7373`（或设 `AGENTWORK_SERVER_URL`）：
 
-| 命令 | 说明 |
-|---|---|
-| `goal list [--limit N] [--status S] [--json]` | 列出 Goal（JSON —— 默认格式；`--json` 显式指定）；`--limit N` 限制为最近 N 条（默认全部）；`--status S` 只保留状态等于 S 的 Goal（精确匹配） |
-| `goal create --title T [--description D] [--assignee A] [--parent P] [--status S]` | 创建子 Goal |
-| `goal assign <目标-agent-id> [--note N]` | 将当前 Goal 交接给另一个 Agent |
-| `goal comment --text T [--role R]` | 发表评论；可包含 `[@Name](mention://agent/<id>)` 来在该 Agent 上创建 Run |
-| `goal wait` | 将当前 Goal 标记为等待子 Goal 完成 |
-| `agent list` | 列出所有 Agent（JSON） |
-| `squad list` | 列出所有 Squad（JSON） |
-| `stats` | Goal/Run 状态统计（JSON）：goal 总数 + 按状态计数（`backlog`/`active`/`blocked`/`done`/`failed`/`cancelled`，来自 `GET /goals`），run 总数 + 按状态计数（`queued`/`running`/`completed`/`failed`/`cancelled`，遍历每个 goal 的 `GET /goals/{id}/runs` 聚合） |
-
-守护进程为每个 Agent 子进程设置以下环境变量：
-`AGENTWORK_SERVER_URL`、`AGENTWORK_GOAL_ID`、`AGENTWORK_RUN_ID`、
-`AGENTWORK_AGENT_ID`。
+```bash
+agentwork-cli goal list --limit 5
+agentwork-cli stats
+```
 
 ## 技术栈
 
 | 层 | 技术 |
 |---|---|
-| **后端** | Go 1.26, SQLite (modernc), gorilla/websocket, robfig/cron |
-| **前端** | Next.js 16, React 19, Tailwind CSS 4, TanStack React Query |
-| **协议** | ACP, JSONL, JSON-RPC |
-| **传输** | stdio, WebSocket, TCP |
+| **后端** | Go 1.26、SQLite（modernc）、gorilla/websocket、robfig/cron、MCP go-sdk |
+| **前端** | Next.js 16、React 19、Tailwind CSS 4、TanStack React Query |
+| **协议** | ACP、JSONL、JSON-RPC |
+| **传输** | stdio、WebSocket、TCP |
+| **通知** | 飞书（审批卡、日报、IM 入站） |
+| **Issue 触发** | GitHub、GitCode |
