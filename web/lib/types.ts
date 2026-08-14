@@ -119,6 +119,7 @@ export interface Domain {
   issue_assignee_type: string; // M4-B: agent | squad
   issue_provider: string; // M4-B: github | gitcode
   created_at: string;
+  scratch_dir?: string; // scratch 域的项目目录（repo 域无）——人找产物的路径
 }
 
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";

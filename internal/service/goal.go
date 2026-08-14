@@ -708,8 +708,13 @@ func (s *GoalService) Cancel(ctx context.Context, goalID string) (*Goal, error) 
 // the ids are captured BEFORE the cascade and travel in the goal:deleted
 // payload; the daemon cuts the processes (same mechanism as goal cancel,
 // 决策 4-12). A deleted goal must not keep agents burning compute on work
-// whose rows no longer exist.
+// whose rows no longer exist. The domain identity ALSO travels: a scratch
+// goal's persistent project directory must be removed with the row.
 func (s *GoalService) Delete(ctx context.Context, goalID string) error {
+	var domainType, domainName string
+	_ = s.st.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(d.type,''), COALESCE(d.name,'') FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
+		Scan(&domainType, &domainName)
 	runningRows, err := s.st.DB().QueryContext(ctx,
 		`SELECT id FROM run WHERE goal_id=? AND status='running'`, goalID)
 	if err != nil {
@@ -760,6 +765,7 @@ func (s *GoalService) Delete(ctx context.Context, goalID string) error {
 	}
 	s.bus.Publish(ctx, events.Event{Topic: "goal:deleted", Payload: map[string]any{
 		"goal_id": goalID, "run_ids": runningRunIDs,
+		"domain_type": domainType, "domain_name": domainName,
 	}})
 	return nil
 }

@@ -213,6 +213,9 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
           <span className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded bg-purple-50 text-purple-700 ring-1 ring-purple-200">待确认</span>
         ) : null}
         {d.type !== "scratch" && <span className="text-xs text-gray-500 ml-auto break-all">{d.git_url}</span>}
+        {d.type === "scratch" && d.scratch_dir && (
+          <span className="text-xs text-gray-500 ml-auto break-all font-mono">{d.scratch_dir}</span>
+        )}
         <button
           onClick={() => setShowEdit(true)}
           className="text-xs text-indigo-600 hover:text-indigo-800 hover:underline shrink-0"
@@ -263,15 +266,17 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                     placeholder={"cd web && npm install"}
                   />
                 </Field>
-                <Field label="excludes（提交时排除的路径，每行一条）" hint="依赖目录，如 **/node_modules/**">
-                  <textarea
-                    value={editExcludes ?? (d.checks.excludes ?? []).join("\n")}
-                    onChange={(e) => setEditExcludes(e.target.value)}
-                    className={inputCls}
-                    rows={4}
-                    placeholder={"**/node_modules/**"}
-                  />
-                </Field>
+                {d.type !== "scratch" && (
+                  <Field label="excludes（提交时排除的路径，每行一条）" hint="依赖目录，如 **/node_modules/**">
+                    <textarea
+                      value={editExcludes ?? (d.checks.excludes ?? []).join("\n")}
+                      onChange={(e) => setEditExcludes(e.target.value)}
+                      className={inputCls}
+                      rows={4}
+                      placeholder={"**/node_modules/**"}
+                    />
+                  </Field>
+                )}
                 <Field label="verify（机器验证命令，每行一条）" hint="exit 0 = 通过">
                   <textarea
                     value={editVerify ?? (d.checks.verify ?? []).join("\n")}
@@ -419,6 +424,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                 <button onClick={() => setDlgSetup([...dlgSetup, ""])} className="text-xs text-indigo-600 hover:underline">+ 添加命令</button>
               </div>
             </Field>
+            {d.type !== "scratch" && (
             <Field label="提交排除 excludes（glob）">
               <div className="space-y-2">
                 {dlgExcludes.map((v, i) => (
@@ -435,6 +441,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                 <button onClick={() => setDlgExcludes([...dlgExcludes, ""])} className="text-xs text-indigo-600 hover:underline">+ 添加排除</button>
               </div>
             </Field>
+            )}
             <Field label="机器验证 verify（exit 0 为过）">
               <div className="space-y-2">
                 {dlgVerify.map((v, i) => (
@@ -451,6 +458,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                 <button onClick={() => setDlgVerify([...dlgVerify, ""])} className="text-xs text-indigo-600 hover:underline">+ 添加命令</button>
               </div>
             </Field>
+            {d.type !== "scratch" && (
             <Field label="结构化约束 guards（机器检查的硬约束）">
               <div className="space-y-2">
                 {dlgGuards.map((g, i) => (
@@ -498,6 +506,8 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                 </button>
               </div>
             </Field>
+            )}
+            {d.type !== "scratch" && (
             <Field label="卡点规则 gates（何时必须停给人审批）">
               <div className="space-y-2">
                 {dlgGates.map((g, i) => (
@@ -542,6 +552,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                 </button>
               </div>
             </Field>
+            )}
             <Field label="验证强度">
               <select value={dlgStrength} onChange={(e) => setDlgStrength(e.target.value)} className={inputCls}>
                 <option value="strong">strong（强验证，默认少卡点）</option>

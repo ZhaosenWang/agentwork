@@ -198,6 +198,7 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
+	bus.Subscribe("domain:deleted", d.onDomainDeleted)
 	// run.terminal → ReconcileGoal (决策 6-4): the latch's second edge — any
 	// terminal run re-evaluates whether the goal needs its owner. The event is
 	// only a wakeup hint; ReconcileGoal recomputes from DB state.
@@ -564,6 +565,37 @@ func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
 	for _, id := range ids {
 		log.Printf("daemon: goal deleted — stopping run %s", id)
 		d.cancelRun(id, "stopped")
+	}
+	// A scratch goal's persistent project directory dies with the row (the
+	// domain identity travels in the payload — the rows are already gone).
+	if t, _ := m["domain_type"].(string); t == "scratch" {
+		if name, _ := m["domain_name"].(string); name != "" {
+			if goalID, _ := m["goal_id"].(string); goalID != "" {
+				dir := service.ScratchGoalDir(name, goalID)
+				if err := os.RemoveAll(dir); err != nil {
+					log.Printf("daemon: remove scratch goal dir %s: %v", dir, err)
+				}
+			}
+		}
+	}
+}
+
+// onDomainDeleted removes a scratch domain's project root once its row is
+// gone (the name travels in the payload — repo domains have nothing on disk
+// to remove here; their bare repos die with the goals that used them).
+func (d *Daemon) onDomainDeleted(_ context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]string)
+	if !ok {
+		return
+	}
+	name := m["name"]
+	if name == "" {
+		return
+	}
+	// The payload does not carry the type (the row is gone) — a repo domain
+	// has no scratch/<name> dir, so the remove is a cheap no-op for it.
+	if err := os.RemoveAll(service.ScratchDomainRoot(name)); err != nil {
+		log.Printf("daemon: remove scratch domain root %s: %v", name, err)
 	}
 }
 
@@ -1284,10 +1316,17 @@ func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 			continue
 		}
 		// run worktrees were born in some domain's bare repo — find it via the
-		// run's goal; removal goes through git (worktree bookkeeping).
-		var domainID string
+		// run's goal; removal goes through git (worktree bookkeeping). A
+		// scratch domain's read-only snapshots are plain dirs — RemoveAll.
+		var domainID, domainType string
 		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT g.domain_id FROM goal g JOIN run r ON r.goal_id = g.id WHERE r.id=?`, r.runID).Scan(&domainID)
+			`SELECT g.domain_id, COALESCE(d.type,'') FROM goal g LEFT JOIN domain d ON d.id = g.domain_id JOIN run r ON r.goal_id = g.id WHERE r.id=?`, r.runID).Scan(&domainID, &domainType)
+		if domainType == "scratch" {
+			if err := os.RemoveAll(wt); err != nil {
+				log.Printf("daemon: cleanup scratch snapshot %s: %v", r.runID, err)
+			}
+			continue
+		}
 		if domainID == "" {
 			continue
 		}

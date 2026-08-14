@@ -45,6 +45,10 @@ type Domain struct {
 	IssueAssigneeType    string `json:"issue_assignee_type"`   // M4-B: agent | squad (default agent)
 	IssueProvider        string `json:"issue_provider"`        // M4-B: github | gitcode (default github)
 	CreatedAt            string `json:"created_at"`
+	// ScratchDir is the scratch domain's persistent project root on disk
+	// ('' for repo domains) — the UI shows it so the human can find the
+	// artifacts.
+	ScratchDir           string `json:"scratch_dir,omitempty"`
 }
 
 // Checks is the compiled acceptance policy (DESIGN.md §5): the frozen,
@@ -263,6 +267,13 @@ func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 	return &d, nil
 }
 
+// fillScratchDir computes the on-disk project root for a scratch domain.
+func fillScratchDir(d *Domain) {
+	if d.Type == "scratch" {
+		d.ScratchDir = ScratchDomainRoot(d.Name)
+	}
+}
+
 func (s *DomainService) List(ctx context.Context) ([]Domain, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
 		`SELECT id,type,name,git_url,default_branch,git_identity,git_credentials,policy_text,checks,verification_strength,max_run_duration,verify_timeout,processor_agent_id,checks_compiled_at,metrics_baseline,issue_repo,issue_assignee,issue_assignee_type,issue_provider,created_at
@@ -281,6 +292,9 @@ func (s *DomainService) List(ctx context.Context) ([]Domain, error) {
 		_ = json.Unmarshal([]byte(checksJSON), &d.Checks)
 		out = append(out, d)
 	}
+	for i := range out {
+		fillScratchDir(&out[i])
+	}
 	return out, rows.Err()
 }
 
@@ -298,6 +312,7 @@ func (s *DomainService) Get(ctx context.Context, id string) (*Domain, error) {
 		return nil, err
 	}
 	_ = json.Unmarshal([]byte(checksJSON), &d.Checks)
+	fillScratchDir(&d)
 	return &d, nil
 }
 
@@ -311,10 +326,14 @@ func (s *DomainService) Delete(ctx context.Context, id string) error {
 	if n > 0 {
 		return NewValidationError(fmt.Sprintf("domain %s has %d goal(s); delete or reassign them first", id, n))
 	}
+	// The name travels in the payload: the daemon removes a scratch
+	// domain's project root after the row is gone.
+	var name string
+	_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM domain WHERE id=?`, id).Scan(&name)
 	if _, err := s.st.DB().ExecContext(ctx, `DELETE FROM domain WHERE id=?`, id); err != nil {
 		return fmt.Errorf("delete domain: %w", err)
 	}
-	s.bus.Publish(ctx, events.Event{Topic: "domain:deleted", Payload: map[string]string{"id": id}})
+	s.bus.Publish(ctx, events.Event{Topic: "domain:deleted", Payload: map[string]string{"id": id, "name": name}})
 	return nil
 }
 

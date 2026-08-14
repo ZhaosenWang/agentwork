@@ -259,7 +259,7 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 				CreatedAt: nowStr(),
 			})
 		}
-		return "这个任务需要在哪个仓库执行？请回复仓库名：\n" + d.intakeDomainList(ctx)
+		return "这个任务需要在哪个项目执行？请回复项目名：\n" + d.intakeDomainList(ctx)
 	}
 	if strings.TrimSpace(g.AssigneeID) == "" {
 		return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
@@ -290,7 +290,7 @@ func (d *Daemon) intakeDomainList(ctx context.Context) string {
 	var b strings.Builder
 	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM domain ORDER BY name`)
 	if err != nil {
-		return "（当前没有可用仓库——先在 Web 建域）"
+		return "（当前没有可用项目——先在 Web 建域）"
 	}
 	defer rows.Close()
 	n := 0
@@ -303,7 +303,7 @@ func (d *Daemon) intakeDomainList(ctx context.Context) string {
 		n++
 	}
 	if n == 0 {
-		return "（当前没有可用仓库——先在 Web 建域）"
+		return "（当前没有可用项目——先在 Web 建域）"
 	}
 	return b.String()
 }
