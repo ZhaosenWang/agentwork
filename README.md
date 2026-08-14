@@ -49,7 +49,7 @@ go build -o agentwork-cli ./cmd/agentwork-cli
 ```bash
 cd web
 npm install
-npm run dev
+npm run build && npm start
 ```
 
 Open **http://localhost:3000** and create your first Runtime, Agent, and Goal

@@ -3,7 +3,14 @@
 import { useEffect, useRef, useCallback } from "react";
 import type { WSEvent } from "./types";
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:7373/ws";
+// 默认连同源的 /ws（由前置反代或部署侧路由到 daemon 7373；ws 无法用 Next
+// rewrites 之外的相对形式表达，故按浏览器 origin 推导）。本地直连场景可
+// 显式设置 NEXT_PUBLIC_WS_URL。
+const WS_URL =
+  process.env.NEXT_PUBLIC_WS_URL ||
+  (typeof window !== "undefined"
+    ? `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`
+    : "ws://localhost:7373/ws");
 
 type EventHandler = (payload: WSEvent["payload"]) => void;
 

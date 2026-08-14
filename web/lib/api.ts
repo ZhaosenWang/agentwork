@@ -1,6 +1,8 @@
 import type { Runtime, RuntimeTestResult, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:7373";
+// 默认走同源 /backend/*（Next rewrites 转发到本机 daemon 7373）——反代出
+// 去时浏览器无需直连 daemon。本地直连场景可显式设置 NEXT_PUBLIC_API_URL。
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/backend";
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {

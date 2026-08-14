@@ -44,7 +44,7 @@ go build -o agentwork-cli ./cmd/agentwork-cli
 ```bash
 cd web
 npm install
-npm run dev
+npm run build && npm start
 ```
 
 打开 **http://localhost:3000**，通过 Web 界面创建你的第一个 Runtime、Agent 和
