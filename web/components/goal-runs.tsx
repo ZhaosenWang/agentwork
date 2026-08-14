@@ -18,9 +18,15 @@ export function GoalRuns({ goalId }: { goalId: string }) {
   // Agent id → name (the runs table reads who is working, not a hex id).
   const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
 
-  // Refresh on run events
+  // Refresh on run events — the TERMINAL events matter most for the stop
+  // button: the stop request only fires the cancel; the run flips terminal
+  // when the backend reports back, and without these subscriptions the card
+  // stays "running" forever after a stop click (the immediate invalidation
+  // refetches while the run is still winding down).
   useWSEvent("run:enqueued", () => refetch());
   useWSEvent("run:event", () => refetch());
+  useWSEvent("run:cancelled", () => refetch());
+  useWSEvent("run.terminal", () => refetch());
 
   const activeRuns = useMemo(() => runs?.filter((r) => r.status === "queued" || r.status === "running") ?? [], [runs]);
   const pastRuns = useMemo(
@@ -224,35 +230,41 @@ function cancelReasonLabel(reason: string): string {
 function StoppingRun({ goalId, runId }: { goalId: string; runId: string }) {
   const qc = useQueryClient();
   const [stopping, setStopping] = useState(false);
+  const [requested, setRequested] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   return (
     <div className="flex items-center gap-2">
       {err && <span className="text-[11px] text-red-500">{err}</span>}
-      <button
-        onClick={async () => {
-          setStopping(true);
-          setErr(null);
-          try {
-            await stopRun(goalId, runId);
-            // The stop request is accepted; the run's terminal state lands
-            // async (cancel → backend returns). Reset the button so it can be
-            // re-pressed while the run is still winding down; the card
-            // disappears once the run leaves 'running'.
-            setStopping(false);
-            // The real runs-list key is qk.goalRuns = ["goals", goalId,
-            // "runs"] — the old ["goal-runs", …] key matched nothing and the
-            // list only refreshed via the run:event refetch.
-            qc.invalidateQueries({ queryKey: ["goals", goalId, "runs"] });
-          } catch (e) {
-            setErr(String(e));
-            setStopping(false);
-          }
-        }}
-        disabled={stopping}
-        className="text-[11px] text-red-500 hover:text-red-700 hover:underline disabled:opacity-50"
-      >
-        {stopping ? "停止中…" : "停止"}
-      </button>
+      {requested ? (
+        <span className="text-[11px] text-zinc-400">已请求停止，等待终止…</span>
+      ) : (
+        <button
+          onClick={async () => {
+            setStopping(true);
+            setErr(null);
+            try {
+              await stopRun(goalId, runId);
+              // The stop request is accepted; the run's terminal state lands
+              // async (cancel → backend reports back). Show the pending note;
+              // the run:cancelled/run.terminal subscriptions flip the card
+              // when the terminal state lands.
+              setRequested(true);
+              setStopping(false);
+              // The real runs-list key is qk.goalRuns = ["goals", goalId,
+              // "runs"] — the old ["goal-runs", …] key matched nothing and the
+              // list only refreshed via the run:event refetch.
+              qc.invalidateQueries({ queryKey: ["goals", goalId, "runs"] });
+            } catch (e) {
+              setErr(String(e));
+              setStopping(false);
+            }
+          }}
+          disabled={stopping}
+          className="text-[11px] text-red-500 hover:text-red-700 hover:underline disabled:opacity-50"
+        >
+          {stopping ? "停止中…" : "停止"}
+        </button>
+      )}
     </div>
   );
 }

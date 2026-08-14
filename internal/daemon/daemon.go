@@ -713,6 +713,27 @@ func (d *Daemon) StopRun(goalID, runID string) error {
 		}})
 		return nil
 	}
+	// The claim→register window: the run was claimed but runTask has not
+	// registered its cancel yet — the in-memory cut would silently no-op and
+	// the human's stop click would do NOTHING while reporting success. The
+	// DB stamp is the same fallback the handoff cut uses; runTask's
+	// post-register self-check sees the terminal stamp and self-cancels.
+	d.mu.Lock()
+	_, registered := d.runCancels[runID]
+	d.mu.Unlock()
+	if !registered {
+		res, err := d.st.DB().ExecContext(d.ctx,
+			`UPDATE run SET status='cancelled', cancel_reason='stopped', finished_at=? WHERE id=? AND status='running'`,
+			nowStr(), runID)
+		if err != nil {
+			return fmt.Errorf("stop window stamp: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			log.Printf("daemon: human stopped run %s (claim→register window stamp)", runID)
+			return nil
+		}
+		return fmt.Errorf("run %s is no longer running", runID)
+	}
 	d.cancelRun(runID, "stopped")
 	return nil
 }
@@ -1776,7 +1797,21 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				prompt += fmt.Sprintf("- %d sub-goal(s) failed (inspect with agentwork_get_sub_goal, then cancel or re-create)\n", failed)
 			}
 			if verified > 0 {
-				prompt += fmt.Sprintf("- %d sub-goal(s) verified\n", verified)
+				prompt += fmt.Sprintf("- %d sub-goal(s) verified", verified)
+				// A verified sub-goal with NO Change produced no code — the
+				// deliverable must live in the feed (决策 6-8) OR the round
+				// spun without doing the work (the live .gitignore case: the
+				// assignee "completed" without touching the repo). Name the
+				// count so the owner checks the feed before integrating
+				// nothing.
+				var noChange int
+				_ = d.st.DB().QueryRowContext(ctx,
+					`SELECT COUNT(*) FROM sub_goal sg WHERE sg.goal_id=? AND sg.status='verified' AND NOT EXISTS (SELECT 1 FROM change c WHERE c.sub_goal_id=sg.id)`,
+					q.GoalID).Scan(&noChange)
+				if noChange > 0 {
+					prompt += fmt.Sprintf("（其中 %d 个无代码变更——确认交付物在评论区，否则是空转）", noChange)
+				}
+				prompt += "\n"
 			}
 			prompt += "Handle these attention items, then continue the goal's own work or end your turn.\n"
 		}
@@ -1835,12 +1870,18 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// owner's run claims immediately instead of waiting out this one. The
 	// stamp is the only concurrent writer of status besides finishRun, and
 	// finishRun runs after this check, so there is no race.
-	var registeredStatus string
-	_ = d.st.DB().QueryRowContext(ctx, `SELECT status FROM run WHERE id=?`, q.RunID).Scan(&registeredStatus)
+	var registeredStatus, stampedReason string
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT status, cancel_reason FROM run WHERE id=?`, q.RunID).Scan(&registeredStatus, &stampedReason)
 	if registeredStatus != "running" {
-		log.Printf("daemon: run %s terminal-stamped before registration — self-cancelling", q.RunID)
+		// The stamp is the authority — carry ITS reason through the
+		// cancellation branch (a handoff stamp reports handoff; a human
+		// stop stamp reports stopped), not a hardcoded guess.
+		if stampedReason == "" {
+			stampedReason = "handoff"
+		}
+		log.Printf("daemon: run %s terminal-stamped before registration — self-cancelling (%s)", q.RunID, stampedReason)
 		d.mu.Lock()
-		d.runCancelReasons[q.RunID] = "handoff"
+		d.runCancelReasons[q.RunID] = stampedReason
 		d.mu.Unlock()
 		promptCancel()
 	}
