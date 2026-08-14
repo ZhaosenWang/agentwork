@@ -286,7 +286,10 @@ func TestCheckGuardsDiffContains(t *testing.T) {
 // root. This is the semantic path.Match lacks (it treats "**" as two plain
 // '*', which never crosses '/').
 func TestGlobMatchDoublestar(t *testing.T) {
-	cases := []struct{ pattern, name string; want bool }{
+	cases := []struct {
+		pattern, name string
+		want          bool
+	}{
 		{"**/*_test.go", "x_test.go", true},                // depth 0
 		{"**/*_test.go", "a/b/x_test.go", true},            // depth 2
 		{"**/*_test.go", "a/b/x.go", false},                // not a test

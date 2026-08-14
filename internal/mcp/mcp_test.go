@@ -31,14 +31,14 @@ type fakeHost struct {
 }
 
 type fakeTerm struct {
-	cmd      *exec.Cmd
-	out      bytes.Buffer
-	mu       sync.Mutex
-	exited   bool
-	code     int
-	signal   string
-	done     chan struct{}
-	started  time.Time
+	cmd     *exec.Cmd
+	out     bytes.Buffer
+	mu      sync.Mutex
+	exited  bool
+	code    int
+	signal  string
+	done    chan struct{}
+	started time.Time
 }
 
 func newFakeHost() *fakeHost {
@@ -189,7 +189,7 @@ func TestMCPFullClientRoundTrip(t *testing.T) {
 		Name: "terminal_create",
 		Arguments: map[string]any{
 			"command": "sh", "args": []any{"-c", "echo hello; exit 3"},
-			"cwd":     dir,
+			"cwd": dir,
 		},
 	})
 	if err != nil {
@@ -275,8 +275,8 @@ func TestCollaborationTools(t *testing.T) {
 
 	// comment_goal: a plain comment lands; NO mention dispatch from it.
 	if _, err := session.CallTool(ctx2, &gmcp.CallToolParams{
-		Name:       "comment_goal",
-		Arguments:  map[string]any{"content": "progress note"},
+		Name:      "comment_goal",
+		Arguments: map[string]any{"content": "progress note"},
 	}); err != nil {
 		t.Fatalf("comment_goal: %v", err)
 	}
@@ -288,8 +288,8 @@ func TestCollaborationTools(t *testing.T) {
 	// consult_agent (owner A → B): the platform's mention comment lands and a
 	// GUEST run is enqueued for B.
 	if _, err := session.CallTool(ctx2, &gmcp.CallToolParams{
-		Name:       "consult_agent",
-		Arguments:  map[string]any{"agent_id": agentB.ID, "question": "how should this be authed?"},
+		Name:      "consult_agent",
+		Arguments: map[string]any{"agent_id": agentB.ID, "question": "how should this be authed?"},
 	}); err != nil {
 		t.Fatalf("consult_agent: %v", err)
 	}
@@ -306,8 +306,8 @@ func TestCollaborationTools(t *testing.T) {
 
 	// handoff_goal (owner A → B): ownership transfers + a fresh owner run.
 	if _, err := session.CallTool(ctx2, &gmcp.CallToolParams{
-		Name:       "handoff_goal",
-		Arguments:  map[string]any{"assignee_type": "agent", "assignee_id": agentB.ID, "reason": "backend work"},
+		Name:      "handoff_goal",
+		Arguments: map[string]any{"assignee_type": "agent", "assignee_id": agentB.ID, "reason": "backend work"},
 	}); err != nil {
 		t.Fatalf("handoff_goal: %v", err)
 	}
@@ -369,7 +369,10 @@ func TestCollaborationPermissions(t *testing.T) {
 	session := connect(t, HTTPHandler(exec))
 	ctx2 := context.Background()
 
-	for _, tc := range []struct{ name, tool string; args map[string]any }{
+	for _, tc := range []struct {
+		name, tool string
+		args       map[string]any
+	}{
 		{"handoff_goal", "handoff_goal", map[string]any{"assignee_type": "agent", "assignee_id": agentB.ID}},
 		{"consult_agent", "consult_agent", map[string]any{"agent_id": agentA.ID, "question": "q"}},
 		{"create_sub_goal", "create_sub_goal", map[string]any{"title": "t", "assignee_type": "agent", "assignee_id": agentB.ID}},

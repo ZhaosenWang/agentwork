@@ -78,31 +78,31 @@ type ExecuteSpec struct {
 type EventType string
 
 const (
-	EventMessage  EventType = "message"   // an assistant message chunk
-	EventThought  EventType = "thought"   // agent reasoning chunk
-	EventToolUse  EventType = "tool_use"  // a tool call started
+	EventMessage    EventType = "message"     // an assistant message chunk
+	EventThought    EventType = "thought"     // agent reasoning chunk
+	EventToolUse    EventType = "tool_use"    // a tool call started
 	EventToolResult EventType = "tool_result" // a tool call finished
-	EventLog      EventType = "log"
-	EventError    EventType = "error"
+	EventLog        EventType = "log"
+	EventError      EventType = "error"
 )
 
 // Event is one streamed item during a turn.
 type Event struct {
-	Type    EventType `json:"type"`
-	Text    string    `json:"text,omitempty"`
-	Tool    string    `json:"tool,omitempty"`
-	CallID  string    `json:"call_id,omitempty"`
-	Input   string    `json:"input,omitempty"`
-	Output  string    `json:"output,omitempty"`
+	Type   EventType `json:"type"`
+	Text   string    `json:"text,omitempty"`
+	Tool   string    `json:"tool,omitempty"`
+	CallID string    `json:"call_id,omitempty"`
+	Input  string    `json:"input,omitempty"`
+	Output string    `json:"output,omitempty"`
 }
 
 // Result is the terminal outcome, delivered exactly once on the Run's Result
 // channel, which is then closed.
 type Result struct {
-	Status    Status  `json:"status"`
-	Output    string  `json:"output,omitempty"`
-	SessionID string  `json:"session_id,omitempty"`
-	Err       error   `json:"-"`
+	Status    Status `json:"status"`
+	Output    string `json:"output,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
+	Err       error  `json:"-"`
 }
 
 // Run is the handle a Backend returns. Events streams items as they arrive

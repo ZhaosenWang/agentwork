@@ -7,12 +7,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"log"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/issue"
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/server/handler"
@@ -72,6 +74,61 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Logs API: the Web logs panel's history (time/level filtered) and the
+	// runtime level knob (persisted — the daemon restores it at startup).
+	mux.HandleFunc("GET /logs", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		var after, before *time.Time
+		if v := q.Get("after"); v != "" {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				after = &t
+			}
+		}
+		if v := q.Get("before"); v != "" {
+			if t, err := time.Parse(time.RFC3339, v); err == nil {
+				before = &t
+			}
+		}
+		limit := 500
+		if v := q.Get("limit"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		minLevel := logging.ParseLevel(q.Get("level"))
+		lines, err := logging.ReadLogs(logging.DefaultPath(), after, before, limit, minLevel)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"level": logging.GetLevel().String(), "lines": lines})
+	})
+	mux.HandleFunc("GET /logs/level", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"level": logging.GetLevel().String()})
+	})
+	mux.HandleFunc("PUT /logs/level", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Level string `json:"level"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		lv := logging.ParseLevel(body.Level)
+		if lv.String() != body.Level {
+			http.Error(w, "level must be debug, info, warn, or error", http.StatusBadRequest)
+			return
+		}
+		logging.SetLevel(lv)
+		if err := settingsSvc.Set(context.Background(), "logging.level", lv.String()); err != nil {
+			logging.Errorf("server: persist log level: %v", err)
+		}
+		logging.Infof("logging: level set to %s (Web)", lv)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"level": lv.String()})
+	})
 	mux.HandleFunc("GET /ws", func(w http.ResponseWriter, r *http.Request) {
 		ws.ServeWS(s.hub, w, r)
 	})
@@ -88,7 +145,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			http.Error(w, "no active run with this id", http.StatusNotFound)
 			return
 		}
-		log.Printf("mcp: request on run %s", r.PathValue("runID"))
+		logging.Infof("mcp: request on run %s", r.PathValue("runID"))
 		mcp.HTTPHandler(exec).ServeHTTP(w, r)
 	}
 	mux.HandleFunc("POST /mcp/{runID}", serveMCP)
@@ -130,7 +187,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		_ = srv.Shutdown(context.Background())
 	}()
 
-	log.Printf("server: listening on %s", addr)
+	logging.Infof("server: listening on %s", addr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

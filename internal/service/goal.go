@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/store"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
@@ -996,7 +996,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 					_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, requesterAgent, 1, false, "")
 					if err != nil {
 						afterCommit = append(afterCommit, func() {
-							log.Printf("goal: consult resume enqueue for %s: %v", rc.GoalID, err)
+							logging.Infof("goal: consult resume enqueue for %s: %v", rc.GoalID, err)
 						})
 					} else if runEv != nil {
 						pendingEvents = append(pendingEvents, *runEv)
@@ -1785,7 +1785,7 @@ func (s *GoalService) ReconcileAllActive(ctx context.Context) (int, error) {
 	n := 0
 	for _, id := range ids {
 		if err := s.ReconcileGoal(ctx, id); err != nil {
-			log.Printf("service: reconcile all active (%s): %v", id, err)
+			logging.Infof("service: reconcile all active (%s): %v", id, err)
 			continue
 		}
 		n++
@@ -1974,7 +1974,7 @@ func (s *GoalService) MarkDelivered(ctx context.Context, goalID string, success 
 // runID (non-empty) stamps the run's reconciled_at INSIDE the same
 // transaction (P0-1, 决策 6-11): the run's terminal outcome and its
 // reconcile become one atomic unit — a crash before this commit leaves
-// reconciled_at='' and the startup replay re-runs the reconcile; the report
+// reconciled_at=” and the startup replay re-runs the reconcile; the report
 // comment and the stamp live or die together, so a replay never duplicates
 // them.
 func (s *GoalService) commitAndEmit(ctx context.Context, tx *sql.Tx, evs []events.Event, after []func(), runID string) error {

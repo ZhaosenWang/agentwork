@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/store"
 )
 
@@ -16,27 +16,27 @@ import (
 // GoalService.ReconcileOnRunEnd, which is the sole path that advances a goal.
 // See DESIGN.md §9.
 type Run struct {
-	ID               string `json:"id"`
-	GoalID           string `json:"goal_id"`
-	AgentID          string `json:"agent_id"`
-	RunKind          string `json:"run_kind"` // worker|processor (platform-internal)
-	RunType          string `json:"run_type"` // processor tasks: compile|intake (M3)
-	DomainID         string `json:"domain_id"`
-	Prompt           string `json:"prompt"` // processor runs only
-	SessionID        string `json:"session_id"`
-	Workdir          string `json:"workdir"`
-	Status           string `json:"status"`
+	ID        string `json:"id"`
+	GoalID    string `json:"goal_id"`
+	AgentID   string `json:"agent_id"`
+	RunKind   string `json:"run_kind"` // worker|processor (platform-internal)
+	RunType   string `json:"run_type"` // processor tasks: compile|intake (M3)
+	DomainID  string `json:"domain_id"`
+	Prompt    string `json:"prompt"` // processor runs only
+	SessionID string `json:"session_id"`
+	Workdir   string `json:"workdir"`
+	Status    string `json:"status"`
 	// CancelReason is the structured cancellation cause (idle_watchdog|
 	// handoff|stopped|timeout|runaway|goal_terminal|goal_cancelled) — the
 	// runs panel badges it so a dropped intent's fate is visible.
-	CancelReason     string `json:"cancel_reason,omitempty"`
+	CancelReason string `json:"cancel_reason,omitempty"`
 	// Role is the run's collaboration role stamped at enqueue (决策 5-4):
 	// owner|subgoal|consult|review|verify ('' for processor runs).
 	// Informational snapshot — goal authority is judged DYNAMICALLY at
 	// reconcile (ownRunByGoal), never from this column.
-	Role             string `json:"role"`
+	Role string `json:"role"`
 	// SubGoalID is the sub-goal this run executes ('' for goal-level runs).
-	SubGoalID        string `json:"sub_goal_id"`
+	SubGoalID string `json:"sub_goal_id"`
 	// BaseRef/HeadRef are the Change revision refs the daemon stamps at a
 	// sub-goal run's end (merge-base of goal branch and the sub-goal branch,
 	// and the branch head SHA).
@@ -180,17 +180,17 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		leaderFlag = 1
 	}
 	r := Run{
-		ID:              newID(),
-		GoalID:          goalID,
-		AgentID:         agentID,
-		Role:            role,
-		Attempt:         attempt,
-		IsLeaderRun:     isLeader,
-		SquadID:         squadID,
+		ID:               newID(),
+		GoalID:           goalID,
+		AgentID:          agentID,
+		Role:             role,
+		Attempt:          attempt,
+		IsLeaderRun:      isLeader,
+		SquadID:          squadID,
 		TriggerCommentID: triggerCommentID,
-		Status:          "queued",
-		QueuedAt:        ts,
-		CreatedAt:       ts,
+		Status:           "queued",
+		QueuedAt:         ts,
+		CreatedAt:        ts,
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
@@ -302,7 +302,7 @@ func (s *RunService) EnqueueSubGoalRun(ctx context.Context, subGoalID string) (*
 
 // enqueueSubGoalRunTx inserts a sub-goal execution run under the caller's
 // transaction (P0-2: CreateSubGoal uses it so the sub_goal row and its first
-// run are born atomically). triggerCommentID ('' for retry/rework rounds)
+// run are born atomically). triggerCommentID (” for retry/rework rounds)
 // links the FIRST round to the dispatch comment (P2-1, 决策 6-15⑩): the
 // run's report threads to it, closing the leader→assignee causal chain. The
 // run event is RETURNED — the caller publishes after its commit (invariant 13).
@@ -463,14 +463,14 @@ func (s *RunService) EnqueueProcessorRun(ctx context.Context, runType, domainID,
 
 	ts := now()
 	r := Run{
-		ID:       newID(),
-		DomainID: domainID,
-		AgentID:  agentID,
-		RunKind:  "processor",
-		RunType:  runType,
-		Prompt:   prompt,
-		Status:   "queued",
-		QueuedAt: ts,
+		ID:        newID(),
+		DomainID:  domainID,
+		AgentID:   agentID,
+		RunKind:   "processor",
+		RunType:   runType,
+		Prompt:    prompt,
+		Status:    "queued",
+		QueuedAt:  ts,
 		CreatedAt: ts,
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -545,7 +545,7 @@ type ClaimedRow struct {
 // goals admit nothing. The freeze therefore protects the branch under the
 // human's judgment while intents queue durably (决策 2-3 revised).
 //
-// Processor runs (goal_id='') are unaffected.
+// Processor runs (goal_id=”) are unaffected.
 func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedRow, error) {
 	if len(readyAgents) == 0 {
 		return nil, nil
@@ -747,7 +747,7 @@ func (s *RunService) ReconcilePendingTerminal(ctx context.Context) (int, error) 
 	n := 0
 	for _, id := range ids {
 		if err := s.reconcileRun(ctx, id); err != nil {
-			log.Printf("service: replay reconcile %s: %v", id, err)
+			logging.Infof("service: replay reconcile %s: %v", id, err)
 			continue
 		}
 		// Republish the Coordinator's latch edge (idempotent — ReconcileGoal
@@ -762,7 +762,6 @@ func (s *RunService) ReconcilePendingTerminal(ctx context.Context) (int, error) 
 	}
 	return n, nil
 }
-
 
 func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	rows, err := s.st.DB().QueryContext(ctx,

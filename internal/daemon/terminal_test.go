@@ -293,7 +293,6 @@ func TestFSHandlers(t *testing.T) {
 	}
 }
 
-
 // TestTerminalActiveCap: the per-run concurrent command cap rejects beyond
 // maxActiveTerms.
 func TestTerminalActiveCap(t *testing.T) {

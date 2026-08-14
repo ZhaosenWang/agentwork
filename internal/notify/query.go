@@ -17,13 +17,13 @@ import (
 // ReviewGoal is one goal parked in review plus the run whose evidence the
 // approval card shows (the latest completed run of the goal).
 type ReviewGoal struct {
-	GoalID   string
-	Title    string
-	Reason   string
-	RunID    string // the evidence run — recorded on the gate_decision (audit chain)
-	Evidence string // the run.evidence JSON bundle
-	Comments []string // REVIEW-role run comments — the squad review opinions (the worker's own report is evidence, not 审查意见)
-	DomainType string // repo|scratch — the approval wording branches on it (scratch has nothing to merge)
+	GoalID     string
+	Title      string
+	Reason     string
+	RunID      string   // the evidence run — recorded on the gate_decision (audit chain)
+	Evidence   string   // the run.evidence JSON bundle
+	Comments   []string // REVIEW-role run comments — the squad review opinions (the worker's own report is evidence, not 审查意见)
+	DomainType string   // repo|scratch — the approval wording branches on it (scratch has nothing to merge)
 }
 
 // GoalBrief is one goal in a digest aggregation.

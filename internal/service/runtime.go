@@ -17,8 +17,8 @@ import (
 type Runtime struct {
 	ID         string            `json:"id"`
 	Name       string            `json:"name"`
-	Transport  string            `json:"transport"`  // stdio|ws|tcp
-	Provider   string            `json:"provider"`   // acp|jsonl|jsonrpc → which backend
+	Transport  string            `json:"transport"` // stdio|ws|tcp
+	Provider   string            `json:"provider"`  // acp|jsonl|jsonrpc → which backend
 	Executable string            `json:"executable"`
 	Args       []string          `json:"args"`
 	Endpoint   string            `json:"endpoint"`

@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os/exec"
 	"path"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/service"
 )
 
@@ -111,7 +111,10 @@ func runVerification(ctx context.Context, dir string, checks service.Checks, tim
 	var b strings.Builder
 	for _, cmd := range checks.Setup {
 		b.WriteString("$ " + cmd + "\n")
+		start := time.Now()
+		logging.Infof("verify: setup running: %s", cmd)
 		out, code := runVerifiedCmd(ctx, dir, cmd, timeout)
+		logging.Infof("verify: setup done (%s): exit %d", time.Since(start).Round(time.Second), code)
 		b.WriteString(out)
 		if code != 0 {
 			b.WriteString(fmt.Sprintf("\n[setup failed (exit %d)]\n", code))
@@ -120,7 +123,10 @@ func runVerification(ctx context.Context, dir string, checks service.Checks, tim
 	}
 	for _, cmd := range checks.Verify {
 		b.WriteString("$ " + cmd + "\n")
+		start := time.Now()
+		logging.Infof("verify: verify running: %s", cmd)
 		out, code := runVerifiedCmd(ctx, dir, cmd, timeout)
+		logging.Infof("verify: verify done (%s): exit %d", time.Since(start).Round(time.Second), code)
 		b.WriteString(out)
 		if code != 0 {
 			b.WriteString(fmt.Sprintf("\n[verify failed (exit %d)]\n", code))
@@ -139,7 +145,10 @@ func runSetupOnly(ctx context.Context, dir string, checks service.Checks, timeou
 	var b strings.Builder
 	for _, cmd := range checks.Setup {
 		b.WriteString("$ " + cmd + "\n")
+		start := time.Now()
+		logging.Infof("verify: setup running: %s", cmd)
 		out, code := runVerifiedCmd(ctx, dir, cmd, timeout)
+		logging.Infof("verify: setup done (%s): exit %d", time.Since(start).Round(time.Second), code)
 		b.WriteString(out)
 		if code != 0 {
 			b.WriteString(fmt.Sprintf("\n[setup failed (exit %d)]\n", code))
@@ -253,12 +262,12 @@ func checkGuards(ctx context.Context, dir, baseSHA string, checks service.Checks
 // separately via guestCommittedLog and flagged, not reverted).
 func resetGuestWorkspace(ctx context.Context, dir string) {
 	if _, err := gitRun(ctx, dir, "reset", "--hard", "HEAD"); err != nil {
-		log.Printf("daemon: guest workspace reset: %v", err)
+		logging.Errorf("daemon: guest workspace reset: %v", err)
 	}
 	// -e must come BEFORE any pathspec separator: after "--", "-e" would be
 	// parsed as a path.
 	if _, err := gitRun(ctx, dir, "clean", "-fd", "-e", "AGENTWORK.md"); err != nil {
-		log.Printf("daemon: guest workspace clean: %v", err)
+		logging.Errorf("daemon: guest workspace clean: %v", err)
 	}
 }
 
@@ -371,11 +380,11 @@ func buildEvidence(ctx context.Context, dir, baseSHA, agentSummary, verifyReport
 		stats, _ = gitRun(ctx, dir, "diff", "--stat", baseSHA+"..HEAD")
 	}
 	ev := map[string]any{
-		"diff_stat":   strings.TrimSpace(stats),
-		"changed":     changedPaths(ctx, dir, baseSHA),
-		"verify":      verifyReport,
-		"guards":      guardReport,
-		"agent":       agentSummary,
+		"diff_stat": strings.TrimSpace(stats),
+		"changed":   changedPaths(ctx, dir, baseSHA),
+		"verify":    verifyReport,
+		"guards":    guardReport,
+		"agent":     agentSummary,
 	}
 	b, _ := json.Marshal(ev)
 	return string(b)

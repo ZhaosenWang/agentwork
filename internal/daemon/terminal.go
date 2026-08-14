@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os/exec"
 	"strings"
 	"sync"
@@ -36,6 +35,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/eushing/agentwork/internal/acp"
+	"github.com/eushing/agentwork/internal/logging"
 )
 
 // outputBuffer is a thread-safe append-only byte buffer with an
@@ -265,7 +265,7 @@ func (m *terminalManager) create(command string, args []string, env []string, cw
 					code = -1
 				}
 			} else {
-				log.Printf("daemon: terminal %s wait: %v", id, err)
+				logging.Infof("daemon: terminal %s wait: %v", id, err)
 				code = -1
 			}
 		}

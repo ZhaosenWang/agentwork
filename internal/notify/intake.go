@@ -177,7 +177,7 @@ func (s *IntakeService) LoadDraft(ctx context.Context) (*IntakeDraft, bool) {
 	return &d, true
 }
 
-// intakeAgent resolves the configured global parser agent ('' + nil when
+// intakeAgent resolves the configured global parser agent (” + nil when
 // unset — the caller surfaces the setup hint).
 func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
 	raw, err := s.store.Get(ctx, intakeAgentKey)

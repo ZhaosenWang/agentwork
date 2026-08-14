@@ -76,4 +76,3 @@ func describeGate(g service.GateRule, fallback string) string {
 	}
 	return g.Name + ": " + fallback
 }
-

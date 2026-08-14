@@ -92,17 +92,17 @@
 //
 // A typical session flows through these phases:
 //
-//	1. Client starts Agent subprocess (stdio pipes).
-//	2. Client → Agent: initialize (version + capabilities).
-//	3. Client → Agent: session/new (cwd, MCP servers).
-//	4. Client → Agent: session/prompt → streaming output begins.
-//	   - Agent → Client: agent_message_chunk (text deltas).
-//	   - Agent → Client: tool_call (tool invocation announced).
-//	   - Agent → Client: request_permission (optional approval).
-//	   - Agent → Client: tool_call_update (in_progress → completed/failed).
-//	   - (tool results fed back to LLM; loop until end_turn).
-//	5. Agent → Client: session/update (stopReason: end_turn).
-//	6. Client → Agent: session/close
+//  1. Client starts Agent subprocess (stdio pipes).
+//  2. Client → Agent: initialize (version + capabilities).
+//  3. Client → Agent: session/new (cwd, MCP servers).
+//  4. Client → Agent: session/prompt → streaming output begins.
+//     - Agent → Client: agent_message_chunk (text deltas).
+//     - Agent → Client: tool_call (tool invocation announced).
+//     - Agent → Client: request_permission (optional approval).
+//     - Agent → Client: tool_call_update (in_progress → completed/failed).
+//     - (tool results fed back to LLM; loop until end_turn).
+//  5. Agent → Client: session/update (stopReason: end_turn).
+//  6. Client → Agent: session/close
 //
 // # Capabilities
 //

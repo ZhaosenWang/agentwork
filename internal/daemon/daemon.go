@@ -14,12 +14,12 @@
 package daemon
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -29,6 +29,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/eushing/agentwork/internal/logging"
 
 	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/events"
@@ -269,27 +271,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.sweepDeliverWorktrees(ctx)
 	d.sweepRunWorktrees(ctx)
 	if n, err := d.runSvc.RecoverStuckRunning(ctx); err != nil {
-		log.Printf("daemon: recover stuck running: %v", err)
+		logging.Errorf("daemon: recover stuck running: %v", err)
 	} else if n > 0 {
-		log.Printf("daemon: recovered %d stuck running run(s)", n)
+		logging.Infof("daemon: recovered %d stuck running run(s)", n)
 	}
 	// P0-1 (决策 6-11): terminal runs whose reconcile never happened (a crash
 	// between the terminal UPDATE and the reconcile transaction) replay their
 	// reconcile here — every transition is conditional, so the replay is
 	// idempotent. This closes the durable-execution window.
 	if n, err := d.runSvc.ReconcilePendingTerminal(ctx); err != nil {
-		log.Printf("daemon: reconcile pending terminal runs: %v", err)
+		logging.Errorf("daemon: reconcile pending terminal runs: %v", err)
 	} else if n > 0 {
-		log.Printf("daemon: replayed reconcile for %d unreconciled terminal run(s)", n)
+		logging.Infof("daemon: replayed reconcile for %d unreconciled terminal run(s)", n)
 	}
 	// P0-3 (决策 6-13): latch events lost in a crash (their transactions
 	// committed but the publish never ran) are re-armed from DB truth —
 	// ReconcileGoal is idempotent, so re-deriving every active goal's
 	// attention re-spawns exactly what the state demands.
 	if n, err := d.goalSvc.ReconcileAllActive(ctx); err != nil {
-		log.Printf("daemon: reconcile all active goals: %v", err)
+		logging.Errorf("daemon: reconcile all active goals: %v", err)
 	} else if n > 0 {
-		log.Printf("daemon: reconciled %d active goal(s)", n)
+		logging.Infof("daemon: reconciled %d active goal(s)", n)
 	}
 	// Option B recovery (Event≠Truth on the review window): the ready
 	// trigger, the fallback timers and the fired flags are all in-memory — a
@@ -298,17 +300,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// in review re-opens its window (ready fires immediately when no review
 	// runs are pending; the fallback timer re-arms otherwise).
 	if n, err := d.recoverReviewWindows(ctx); err != nil {
-		log.Printf("daemon: recover review windows: %v", err)
+		logging.Errorf("daemon: recover review windows: %v", err)
 	} else if n > 0 {
-		log.Printf("daemon: recovered %d review window(s)", n)
+		logging.Infof("daemon: recovered %d review window(s)", n)
 	}
 	// Decision 2-9, trigger side: an approve followed by a crash leaves the
 	// goal in review with the approve recorded and no deliver — re-run the
 	// deliver (its merge/push idempotency makes the replay safe).
 	if n, err := d.recoverPendingDelivers(ctx); err != nil {
-		log.Printf("daemon: recover pending delivers: %v", err)
+		logging.Errorf("daemon: recover pending delivers: %v", err)
 	} else if n > 0 {
-		log.Printf("daemon: re-delivering %d goal(s) whose approve never delivered", n)
+		logging.Infof("daemon: re-delivering %d goal(s) whose approve never delivered", n)
 	}
 	dispatchTick := time.NewTicker(dispatchTickInterval)
 	scheduleTick := time.NewTicker(scheduleTickInterval)
@@ -316,6 +318,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	digestTick := time.NewTicker(digestTickInterval)
 	issueTick := time.NewTicker(issuePollInterval)
 	runawayTick := time.NewTicker(runawayScanInterval)
+	d.runLogTailer(ctx)
 	defer dispatchTick.Stop()
 	defer scheduleTick.Stop()
 	defer cleanupTick.Stop()
@@ -325,7 +328,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("daemon: shutting down")
+			logging.Infof("daemon: shutting down")
 			d.stopAll()
 			return ctx.Err()
 		case <-dispatchTick.C:
@@ -342,6 +345,51 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.reapRunawayRuns(ctx)
 		}
 	}
+}
+
+// runLogTailer streams new log lines to the bus (log:line) — the live
+// pane of the Web logs panel. A polling tailer: the writer is a plain file
+// and inotify is overkill at 500ms.
+func (d *Daemon) runLogTailer(ctx context.Context) {
+	path := logging.DefaultPath()
+	var off int64
+	go func() {
+		tick := time.NewTicker(500 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				f, err := os.Open(path)
+				if err != nil {
+					continue // not created yet / rolled away
+				}
+				st, err := f.Stat()
+				if err != nil {
+					f.Close()
+					continue
+				}
+				if st.Size() < off {
+					off = 0 // rolled — restart from the new file's start
+				}
+				if _, err := f.Seek(off, 0); err == nil && st.Size() > off {
+					sc := bufio.NewScanner(f)
+					sc.Buffer(make([]byte, 64*1024), 1024*1024)
+					for sc.Scan() {
+						l := logging.ParseLine(sc.Text())
+						d.bus.Publish(ctx, events.Event{Topic: "log:line", Payload: map[string]any{
+							"ts":    l.TS.Format(time.RFC3339),
+							"level": l.Level,
+							"text":  l.Text,
+						}})
+					}
+					off = st.Size()
+				}
+				f.Close()
+			}
+		}
+	}()
 }
 
 // dispatchIssues polls tracked repos for new open issues and turns them into
@@ -370,11 +418,11 @@ func (d *Daemon) dispatchIssues(ctx context.Context) {
 
 	n, err := d.issuePoll.Poll(ctx)
 	if err != nil {
-		log.Printf("daemon: issue poll: %v", err)
+		logging.Errorf("daemon: issue poll: %v", err)
 		return
 	}
 	if n > 0 {
-		log.Printf("daemon: issue poll created %d goal(s)", n)
+		logging.Infof("daemon: issue poll created %d goal(s)", n)
 	}
 }
 
@@ -412,7 +460,7 @@ func (d *Daemon) dispatchDigest(ctx context.Context) {
 	}
 	t, err := time.Parse("15:04", hhmm)
 	if err != nil {
-		log.Printf("daemon: digest time %q: %v", hhmm, err)
+		logging.Infof("daemon: digest time %q: %v", hhmm, err)
 		return
 	}
 	digestAt := time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, now.Location())
@@ -424,20 +472,20 @@ func (d *Daemon) dispatchDigest(ctx context.Context) {
 	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	card, err := notify.BuildDigestCard(ctx, d.qs, dayStart.Add(-24*time.Hour), dayStart, now)
 	if err != nil {
-		log.Printf("daemon: digest build: %v", err)
+		logging.Errorf("daemon: digest build: %v", err)
 		return
 	}
 	if _, err := notifier.SendCard(card); err != nil {
-		log.Printf("daemon: digest send: %v", err)
+		logging.Errorf("daemon: digest send: %v", err)
 		return
 	}
 	if _, err := d.st.DB().ExecContext(ctx,
 		`INSERT INTO app_settings (key,value,updated_at) VALUES ('notify.digest_last_sent',?,?)
 		 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
 		today, nowStr()); err != nil {
-		log.Printf("daemon: digest marker: %v", err)
+		logging.Errorf("daemon: digest marker: %v", err)
 	}
-	log.Printf("daemon: daily digest sent (%s)", today)
+	logging.Infof("daemon: daily digest sent (%s)", today)
 }
 
 // Poller exposes the issue poller for the server's webhook wiring (M4-B:
@@ -466,7 +514,7 @@ func (d *Daemon) imNotifier() *notify.Notifier {
 func (d *Daemon) recoverWorkers(ctx context.Context) {
 	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, max_concurrent FROM agent`)
 	if err != nil {
-		log.Printf("daemon: recover workers: %v", err)
+		logging.Errorf("daemon: recover workers: %v", err)
 		return
 	}
 	defer rows.Close()
@@ -481,7 +529,7 @@ func (d *Daemon) recoverWorkers(ctx context.Context) {
 		n++
 	}
 	if n > 0 {
-		log.Printf("daemon: recovered %d agent worker(s)", n)
+		logging.Infof("daemon: recovered %d agent worker(s)", n)
 	}
 }
 
@@ -493,7 +541,7 @@ func (d *Daemon) onAgentCreated(ctx context.Context, e events.Event) {
 		return
 	}
 	d.ensureWorker(a.ID, a.MaxConcurrent)
-	log.Printf("daemon: worker ready for agent %s", a.ID)
+	logging.Infof("daemon: worker ready for agent %s", a.ID)
 }
 
 func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
@@ -511,7 +559,7 @@ func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
 	if w != nil {
 		w.cancel() // stop the drain; in-flight runs finish on daemonCtx
 	}
-	log.Printf("daemon: worker removed for agent %s", id)
+	logging.Infof("daemon: worker removed for agent %s", id)
 }
 
 // onRunTerminal funnels a terminal run into the Coordinator (决策 6-4): the
@@ -528,7 +576,7 @@ func (d *Daemon) onRunTerminal(_ context.Context, e events.Event) {
 		return
 	}
 	if err := d.goalSvc.ReconcileGoal(d.ctx, goalID); err != nil {
-		log.Printf("daemon: reconcile goal %s: %v", goalID, err)
+		logging.Infof("daemon: reconcile goal %s: %v", goalID, err)
 	}
 	// Option A (reviewer-first approval card): the last review run going
 	// terminal closes the window — fire the human's card with the opinions
@@ -548,7 +596,7 @@ func (d *Daemon) onSubGoalStateChanged(_ context.Context, e events.Event) {
 		return
 	}
 	if err := d.goalSvc.ReconcileGoal(d.ctx, goalID); err != nil {
-		log.Printf("daemon: reconcile goal %s: %v", goalID, err)
+		logging.Infof("daemon: reconcile goal %s: %v", goalID, err)
 	}
 }
 
@@ -563,7 +611,7 @@ func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
 	}
 	ids, _ := m["run_ids"].([]string)
 	for _, id := range ids {
-		log.Printf("daemon: goal deleted — stopping run %s", id)
+		logging.Infof("daemon: goal deleted — stopping run %s", id)
 		d.cancelRun(id, "stopped")
 	}
 	// A scratch goal's persistent project directory dies with the row (the
@@ -573,7 +621,7 @@ func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
 			if goalID, _ := m["goal_id"].(string); goalID != "" {
 				dir := service.ScratchGoalDir(name, goalID)
 				if err := os.RemoveAll(dir); err != nil {
-					log.Printf("daemon: remove scratch goal dir %s: %v", dir, err)
+					logging.Infof("daemon: remove scratch goal dir %s: %v", dir, err)
 				}
 			}
 		}
@@ -595,7 +643,7 @@ func (d *Daemon) onDomainDeleted(_ context.Context, e events.Event) {
 	// The payload does not carry the type (the row is gone) — a repo domain
 	// has no scratch/<name> dir, so the remove is a cheap no-op for it.
 	if err := os.RemoveAll(service.ScratchDomainRoot(name)); err != nil {
-		log.Printf("daemon: remove scratch domain root %s: %v", name, err)
+		logging.Infof("daemon: remove scratch domain root %s: %v", name, err)
 	}
 }
 
@@ -613,7 +661,7 @@ func (d *Daemon) onSubGoalCancelled(_ context.Context, e events.Event) {
 	rows, err := d.st.DB().QueryContext(d.ctx,
 		`SELECT id FROM run WHERE sub_goal_id=? AND status='running'`, subGoalID)
 	if err != nil {
-		log.Printf("daemon: sub-goal cancel scan %s: %v", subGoalID, err)
+		logging.Infof("daemon: sub-goal cancel scan %s: %v", subGoalID, err)
 		return
 	}
 	var ids []string
@@ -625,7 +673,7 @@ func (d *Daemon) onSubGoalCancelled(_ context.Context, e events.Event) {
 	}
 	rows.Close()
 	for _, id := range ids {
-		log.Printf("daemon: sub-goal cancelled — stopping run %s", id)
+		logging.Infof("daemon: sub-goal cancelled — stopping run %s", id)
 		d.cancelRun(id, "stopped")
 	}
 }
@@ -663,7 +711,7 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 		// branch; per-run workspaces make them safe in parallel).
 		`SELECT id, agent_id FROM run WHERE goal_id=? AND status='running' AND role='owner'`, g.ID)
 	if err != nil {
-		log.Printf("daemon: handoff cancel scan for %s: %v", g.ID, err)
+		logging.Infof("daemon: handoff cancel scan for %s: %v", g.ID, err)
 		return
 	}
 	// Collect rows FIRST, then act: the stamp below writes to the DB, and a
@@ -690,7 +738,7 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 		}
 		d.mu.Unlock()
 		if ok {
-			log.Printf("daemon: handoff cut run %s (agent %s no longer owns goal %s)", rr.id, rr.agentID, g.ID)
+			logging.Infof("daemon: handoff cut run %s (agent %s no longer owns goal %s)", rr.id, rr.agentID, g.ID)
 			cancel()
 			continue
 		}
@@ -703,9 +751,9 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 		// so no race with finishRun.
 		if _, err := d.st.DB().ExecContext(d.ctx,
 			`UPDATE run SET status='cancelled', cancel_reason='handoff', finished_at=? WHERE id=? AND status='running'`, nowStr(), rr.id); err != nil {
-			log.Printf("daemon: handoff terminal stamp %s: %v", rr.id, err)
+			logging.Infof("daemon: handoff terminal stamp %s: %v", rr.id, err)
 		} else {
-			log.Printf("daemon: handoff stamped run %s terminal (claim→register window)", rr.id)
+			logging.Infof("daemon: handoff stamped run %s terminal (claim→register window)", rr.id)
 		}
 	}
 }
@@ -738,7 +786,7 @@ func (d *Daemon) StopRun(goalID, runID string) error {
 		if n, _ := res.RowsAffected(); n == 0 {
 			return fmt.Errorf("run %s is no longer queued", runID)
 		}
-		log.Printf("daemon: human stopped queued run %s", runID)
+		logging.Infof("daemon: human stopped queued run %s", runID)
 		// notify skips reason_code=stopped — the human did it, no card.
 		d.bus.Publish(d.ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
 			"run_id": runID, "goal_id": goalID, "reason": "stopped", "reason_code": "stopped",
@@ -761,7 +809,7 @@ func (d *Daemon) StopRun(goalID, runID string) error {
 			return fmt.Errorf("stop window stamp: %w", err)
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
-			log.Printf("daemon: human stopped run %s (claim→register window stamp)", runID)
+			logging.Infof("daemon: human stopped run %s (claim→register window stamp)", runID)
 			return nil
 		}
 		return fmt.Errorf("run %s is no longer running", runID)
@@ -780,7 +828,7 @@ func (d *Daemon) cancelRun(runID, reason string) {
 	}
 	d.mu.Unlock()
 	if ok {
-		log.Printf("daemon: cut run %s (%s)", runID, reason)
+		logging.Infof("daemon: cut run %s (%s)", runID, reason)
 		cancel()
 	}
 }
@@ -833,7 +881,7 @@ func (w *agentWorker) loop() {
 				defer func() { <-w.sem }()
 				defer func() {
 					if r := recover(); r != nil {
-						log.Printf("daemon: panic in runTask for run %s: %v", q.RunID, r)
+						logging.Infof("daemon: panic in runTask for run %s: %v", q.RunID, r)
 					}
 				}()
 				w.run(w.daemonCtx, q)
@@ -899,7 +947,7 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 	for claimed < totalFree {
 		q, err := d.runSvc.Claim(ctx, ready)
 		if err != nil {
-			log.Printf("daemon: claim: %v", err)
+			logging.Errorf("daemon: claim: %v", err)
 			return
 		}
 		if q == nil {
@@ -911,7 +959,7 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 		if !ok {
 			// Agent lost its worker mid-dispatch; requeue by finishing as
 			// failed+retry is wrong here — just leave queued for next tick.
-			log.Printf("daemon: no worker for agent %s (run %s)", q.AgentID, q.RunID)
+			logging.Infof("daemon: no worker for agent %s (run %s)", q.AgentID, q.RunID)
 			return
 		}
 		select {
@@ -923,10 +971,10 @@ func (d *Daemon) dispatchOnce(ctx context.Context) {
 			// a dead run that never reaches a worker (stuck until restart).
 			// Return it to queued — the next tick re-claims it, attempt
 			// untouched.
-			log.Printf("daemon: worker queue full for agent %s — returning run %s to queued", q.AgentID, q.RunID)
+			logging.Infof("daemon: worker queue full for agent %s — returning run %s to queued", q.AgentID, q.RunID)
 			if _, err := d.st.DB().ExecContext(ctx,
 				`UPDATE run SET status='queued', started_at='' WHERE id=?`, q.RunID); err != nil {
-				log.Printf("daemon: requeue overflow run %s: %v", q.RunID, err)
+				logging.Infof("daemon: requeue overflow run %s: %v", q.RunID, err)
 			}
 			return
 		}
@@ -1110,10 +1158,17 @@ func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL, gitCred
 		return err
 	}
 	cloneURL := gitCloneURL(gitURL, gitCredentials)
+	// The first pull of a domain's repo is the classic blockage point
+	// (network/auth/大仓) — log it with the credentials stripped so the
+	// panel shows exactly where a run is stuck.
+	start := time.Now()
+	logging.Infof("git: domain %s: clone --bare %s ...", domainID, sanitizeURL(cloneURL))
 	cmd := exec.CommandContext(ctx, "git", "clone", "--bare", cloneURL, repo)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		logging.Errorf("git: domain %s: clone failed (%s): %s", domainID, time.Since(start).Round(time.Second), strings.TrimSpace(string(out)))
 		return fmt.Errorf("git clone --bare %s: %w: %s", gitURL, err, string(out))
 	}
+	logging.Infof("git: domain %s: clone done (%s)", domainID, time.Since(start).Round(time.Second))
 	// A bare clone mirrors remote branches into LOCAL refs/heads/ (its
 	// remote.origin.fetch is "+refs/heads/*:refs/heads/*") and creates NO
 	// refs/remotes/origin/* — so resolveDefaultBranch, worktree add
@@ -1129,9 +1184,13 @@ func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL, gitCred
 	// fail "invalid reference" — the acceptance-policy compile being the
 	// usual first operation on a fresh domain (live: fixing a typo'd
 	// default_branch and recompiling "took no effect").
+	start = time.Now()
+	logging.Infof("git: domain %s: first fetch ...", domainID)
 	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
+		logging.Errorf("git: domain %s: first fetch failed (%s): %s", domainID, time.Since(start).Round(time.Second), strings.TrimSpace(string(out)))
 		return fmt.Errorf("git fetch: %w: %s", err, string(out))
 	}
+	logging.Infof("git: domain %s: first fetch done (%s)", domainID, time.Since(start).Round(time.Second))
 	return nil
 }
 
@@ -1146,6 +1205,18 @@ func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL, gitCred
 // Unknown hosts fall back to token-as-username. A URL that already carries
 // credentials (the owner embedded them explicitly) is left untouched; SSH
 // URLs are returned as-is.
+// sanitizeURL strips embedded credentials before a URL is logged — clone
+// URLs carry the platform token, and it must never reach the log file.
+func sanitizeURL(raw string) string {
+	if i := strings.Index(raw, "://"); i >= 0 {
+		rest := raw[i+3:]
+		if j := strings.Index(rest, "@"); j >= 0 && !strings.Contains(rest[:j], "/") {
+			return raw[:i+3] + rest[j+1:]
+		}
+	}
+	return raw
+}
+
 func gitCloneURL(gitURL, credentials string) string {
 	if credentials == "" || !strings.HasPrefix(gitURL, "https://") || strings.Contains(gitURL, "@") {
 		return gitURL
@@ -1178,9 +1249,13 @@ func (d *Daemon) ensureRunWorktreeFor(ctx context.Context, runID, domainID, goal
 		return "", err
 	}
 	repo := domainRepoPath(domainID)
+	start := time.Now()
+	logging.Infof("git: run %s: fetch domain %s ...", runID, domainID)
 	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
+		logging.Errorf("git: run %s: fetch failed (%s): %s", runID, time.Since(start).Round(time.Second), strings.TrimSpace(string(out)))
 		return "", fmt.Errorf("git fetch: %w: %s", err, string(out))
 	}
+	logging.Infof("git: run %s: fetch done (%s)", runID, time.Since(start).Round(time.Second))
 	if defaultBranch == "" {
 		defaultBranch = "main"
 	}
@@ -1291,7 +1366,7 @@ func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 		 WHERE status IN ('completed','failed','cancelled')
 		   AND finished_at != ''`)
 	if err != nil {
-		log.Printf("daemon: cleanup worktrees: query: %v", err)
+		logging.Errorf("daemon: cleanup worktrees: query: %v", err)
 		return
 	}
 	type row struct{ runID, finished string }
@@ -1323,7 +1398,7 @@ func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 			`SELECT g.domain_id, COALESCE(d.type,'') FROM goal g LEFT JOIN domain d ON d.id = g.domain_id JOIN run r ON r.goal_id = g.id WHERE r.id=?`, r.runID).Scan(&domainID, &domainType)
 		if domainType == "scratch" {
 			if err := os.RemoveAll(wt); err != nil {
-				log.Printf("daemon: cleanup scratch snapshot %s: %v", r.runID, err)
+				logging.Infof("daemon: cleanup scratch snapshot %s: %v", r.runID, err)
 			}
 			continue
 		}
@@ -1332,9 +1407,9 @@ func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 		}
 		unlock := d.lockDomain(domainID)
 		if out, err := gitRun(ctx, domainRepoPath(domainID), "worktree", "remove", "--force", wt); err != nil {
-			log.Printf("daemon: cleanup worktree %s: %v %s", r.runID, err, out)
+			logging.Infof("daemon: cleanup worktree %s: %v %s", r.runID, err, out)
 		} else {
-			log.Printf("daemon: removed worktree for terminal run %s (retention expired)", r.runID)
+			logging.Infof("daemon: removed worktree for terminal run %s (retention expired)", r.runID)
 		}
 		unlock()
 	}
@@ -1354,9 +1429,9 @@ func (d *Daemon) sweepRunWorktrees(ctx context.Context) {
 	repoRoot := filepath.Join(runsRoot(), "repos")
 	runsDir := filepath.Join(runsRoot(), "runs")
 	if err := os.RemoveAll(runsDir); err != nil {
-		log.Printf("daemon: sweep run worktrees: %v", err)
+		logging.Errorf("daemon: sweep run worktrees: %v", err)
 	} else {
-		log.Printf("daemon: swept stale run worktrees")
+		logging.Infof("daemon: swept stale run worktrees")
 	}
 	entries, err := os.ReadDir(repoRoot)
 	if err != nil {
@@ -1368,7 +1443,7 @@ func (d *Daemon) sweepRunWorktrees(ctx context.Context) {
 		}
 		repo := filepath.Join(repoRoot, e.Name())
 		if _, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "prune").CombinedOutput(); err != nil {
-			log.Printf("daemon: worktree prune %s: %v", e.Name(), err)
+			logging.Infof("daemon: worktree prune %s: %v", e.Name(), err)
 		}
 	}
 }
@@ -1386,9 +1461,9 @@ func (d *Daemon) sweepDeliverWorktrees(ctx context.Context) {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(runsRoot(), e.Name())); err != nil {
-			log.Printf("daemon: sweep deliver worktree %s: %v", e.Name(), err)
+			logging.Infof("daemon: sweep deliver worktree %s: %v", e.Name(), err)
 		} else {
-			log.Printf("daemon: swept stale deliver worktree %s", e.Name())
+			logging.Infof("daemon: swept stale deliver worktree %s", e.Name())
 		}
 	}
 }
@@ -1420,6 +1495,9 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 WHERE r2.id = ?`, q.RunID).
 		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &runRole, &subGoalID)
+	// Claim visibility: which run, which agent, which role — the panel's
+	// answer to "who is doing what right now".
+	logging.Infof("run %s claimed: goal=%s agent=%s role=%s", q.RunID, q.GoalID, q.AgentID, runRole)
 	// Run role (决策 5-4/6-x, stamped at enqueue): review runs are the
 	// platform's review requests (SYSTEM trigger comment — "请审查本次改动…
 	// 只提意见"); consult runs are pulled in by an agent/human mention comment
@@ -1481,7 +1559,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			if verifyRun {
 				runRowWorkdir = runWorktreePath(q.RunID)
 				if err := copyDir(sgDir, runRowWorkdir); err != nil {
-					log.Printf("daemon: scratch sg snapshot for run %s: %v", q.RunID, err)
+					logging.Infof("daemon: scratch sg snapshot for run %s: %v", q.RunID, err)
 					_ = os.MkdirAll(runRowWorkdir, 0o755)
 				}
 			} else {
@@ -1494,7 +1572,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		} else if readOnlyRun {
 			runRowWorkdir = runWorktreePath(q.RunID)
 			if err := copyDir(scratchGoalDir(domainName, q.GoalID), runRowWorkdir); err != nil {
-				log.Printf("daemon: scratch snapshot for run %s: %v", q.RunID, err)
+				logging.Infof("daemon: scratch snapshot for run %s: %v", q.RunID, err)
 				_ = os.MkdirAll(runRowWorkdir, 0o755)
 			}
 		} else {
@@ -1527,7 +1605,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		}
 		unlock := d.lockDomain(domainID)
 		if out, err := exec.CommandContext(context.Background(), "git", "-C", domainRepoPath(domainID), "worktree", "remove", "--force", runRowWorkdir).CombinedOutput(); err != nil {
-			log.Printf("daemon: release worktree %s: %v %s", q.RunID, err, out)
+			logging.Infof("daemon: release worktree %s: %v %s", q.RunID, err, out)
 		}
 		unlock()
 	}()
@@ -1575,7 +1653,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		}
 	}
 	if err := d.injectAgentProfile(runRowWorkdir, systemPrompt, roster, briefing); err != nil {
-		log.Printf("daemon: inject agent profile for run %s: %v", q.RunID, err)
+		logging.Infof("daemon: inject agent profile for run %s: %v", q.RunID, err)
 	}
 
 	// Parse runtime args + env.
@@ -1623,7 +1701,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				if comments, err := client.ListComments(ctx, repo, num); err == nil {
 					issueComments = comments
 				} else if err != nil {
-					log.Printf("daemon: issue comments for %s: %v", sourceRef, err)
+					logging.Infof("daemon: issue comments for %s: %v", sourceRef, err)
 				}
 			}
 		}
@@ -1940,7 +2018,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		if stampedReason == "" {
 			stampedReason = "handoff"
 		}
-		log.Printf("daemon: run %s terminal-stamped before registration — self-cancelling (%s)", q.RunID, stampedReason)
+		logging.Infof("daemon: run %s terminal-stamped before registration — self-cancelling (%s)", q.RunID, stampedReason)
 		d.mu.Lock()
 		d.runCancelReasons[q.RunID] = stampedReason
 		d.mu.Unlock()
@@ -2007,7 +2085,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			if _, err := d.st.DB().ExecContext(ctx,
 				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,'system','',NULL,?,?,?)`,
 				uuid.NewString(), q.GoalID, "⚠️ A read-only run committed changes directly (consult/review contract violated) — they stay on the goal branch and are visible before delivery:\n```\n"+committed+"\n```", nowStr(), q.RunID); err != nil {
-				log.Printf("daemon: guest commit warning for run %s: %v", q.RunID, err)
+				logging.Infof("daemon: guest commit warning for run %s: %v", q.RunID, err)
 			}
 		}
 	}
@@ -2096,7 +2174,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 					if len(gatesHit) > 0 {
 						gatesJSON, _ := json.Marshal(gatesHit)
 						if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET gates_hit=? WHERE id=?`, string(gatesJSON), q.RunID); err != nil {
-							log.Printf("daemon: record gates_hit for run %s: %v", q.RunID, err)
+							logging.Infof("daemon: record gates_hit for run %s: %v", q.RunID, err)
 						}
 					}
 				}
@@ -2111,13 +2189,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				head := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
 				if _, err := d.st.DB().ExecContext(ctx,
 					`UPDATE run SET base_ref=?, head_ref=? WHERE id=?`, base, head, q.RunID); err != nil {
-					log.Printf("daemon: stamp change refs for run %s: %v", q.RunID, err)
+					logging.Infof("daemon: stamp change refs for run %s: %v", q.RunID, err)
 				}
 			}
 			// Evidence bundle for the approval card (decision 2-3).
 			ev := buildEvidence(ctx, runRowWorkdir, baseSHA, report, verifyReport, guardReport)
 			if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET evidence=? WHERE id=?`, ev, q.RunID); err != nil {
-				log.Printf("daemon: store evidence for run %s: %v", q.RunID, err)
+				logging.Infof("daemon: store evidence for run %s: %v", q.RunID, err)
 			}
 		}
 		d.finishRunOK(ctx, q, report)
@@ -2152,7 +2230,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// late cancellation is not the run's terminal truth.
 		if _, err := d.st.DB().ExecContext(ctx,
 			`UPDATE run SET cancel_reason=? WHERE id=? AND status='running'`, code, q.RunID); err != nil {
-			log.Printf("daemon: stamp cancel_reason %s: %v", q.RunID, err)
+			logging.Infof("daemon: stamp cancel_reason %s: %v", q.RunID, err)
 		}
 		var priorCancelled int
 		_ = d.st.DB().QueryRowContext(ctx,
@@ -2162,7 +2240,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			var squadID string
 			_ = d.st.DB().QueryRowContext(ctx, `SELECT is_leader_run, squad_id FROM run WHERE id=?`, q.RunID).Scan(&isLeader, &squadID)
 			if err := d.runSvc.EnqueueExisting(ctx, q.GoalID, q.AgentID, q.Attempt, isLeader != 0, squadID); err != nil {
-				log.Printf("daemon: requeue cancelled run %s: %v", q.RunID, err)
+				logging.Infof("daemon: requeue cancelled run %s: %v", q.RunID, err)
 			}
 		}
 		// 决策 6-6: a handoff cut keeps status='cancelled' — the structured
@@ -2200,7 +2278,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		`SELECT r2.prompt, r2.run_type, r2.domain_id, r2.agent_id FROM run r2 WHERE r2.id=?`, q.RunID).
 		Scan(&prompt, &runType, &domainID, &agentID)
 	if err != nil {
-		log.Printf("daemon: processor run %s: load config: %v", q.RunID, err)
+		logging.Infof("daemon: processor run %s: load config: %v", q.RunID, err)
 		d.failProcessorRun(ctx, q, "load config: "+err.Error())
 		return
 	}
@@ -2461,12 +2539,12 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		if _, err := d.st.DB().ExecContext(ctx,
 			`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
 			result.Output, nowStr(), q.RunID); err != nil {
-			log.Printf("daemon: finish processor run %s: %v", q.RunID, err)
+			logging.Infof("daemon: finish processor run %s: %v", q.RunID, err)
 		}
 		d.bus.Publish(ctx, events.Event{Topic: "domain:compiled", Payload: map[string]any{
 			"domain_id": domainID, "run_id": q.RunID,
 		}})
-		log.Printf("daemon: domain %s acceptance policy compiled (strength=%s)", domainID, strength)
+		logging.Infof("daemon: domain %s acceptance policy compiled (strength=%s)", domainID, strength)
 	case proto.StatusCancelled:
 		d.failProcessorRun(ctx, q, "idle watchdog: "+result.Output)
 	case proto.StatusFailed, proto.StatusAborted:
@@ -2477,7 +2555,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 // failProcessorRun marks a processor run failed and notifies the frontend that
 // compilation did not complete (manual checks input remains the fallback).
 func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, summary string) {
-	log.Printf("daemon: processor run %s failed: %s", q.RunID, summary)
+	logging.Infof("daemon: processor run %s failed: %s", q.RunID, summary)
 	// P0-5: the stamp is conditional — a run the runaway reaper already
 	// terminalized keeps the reaper's terminal state; this late failure is
 	// dropped (and must not broadcast a stale compile-failed event).
@@ -2485,11 +2563,11 @@ func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, su
 		`UPDATE run SET status='failed', result_summary=?, finished_at=? WHERE id=? AND status='running'`,
 		summary, nowStr(), q.RunID)
 	if err != nil {
-		log.Printf("daemon: mark processor run %s failed: %v", q.RunID, err)
+		logging.Infof("daemon: mark processor run %s failed: %v", q.RunID, err)
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		log.Printf("daemon: processor run %s already terminal — dropping late failure", q.RunID)
+		logging.Infof("daemon: processor run %s already terminal — dropping late failure", q.RunID)
 		return
 	}
 	var domainID string
@@ -2603,7 +2681,7 @@ func (d *Daemon) insertChatMessage(ctx context.Context, runID, role, content, to
 	if _, err := d.st.DB().ExecContext(ctx,
 		`INSERT INTO chat_message (id, run_id, role, content, tool_calls, created_at) VALUES (?,?,?,?,?,?)`,
 		uuid.NewString(), runID, role, content, toolCalls, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
-		log.Printf("daemon: persist event for run %s: %v", runID, err)
+		logging.Infof("daemon: persist event for run %s: %v", runID, err)
 	}
 }
 
@@ -2619,7 +2697,7 @@ func (d *Daemon) extraMcpServers(ctx context.Context, agentID string) []acp.McpS
 	}
 	var extra []acp.McpServer
 	if err := json.Unmarshal([]byte(raw), &extra); err != nil {
-		log.Printf("daemon: agent %s mcp_servers parse: %v", agentID, err)
+		logging.Infof("daemon: agent %s mcp_servers parse: %v", agentID, err)
 		return nil
 	}
 	return extra
@@ -2640,7 +2718,7 @@ func (d *Daemon) loadAgentEnv(ctx context.Context, agentID string) (map[string]s
 // still flow through Finish → reconcile so the goal layer can retry/fail the
 // goal authoritatively.
 func (d *Daemon) failRun(ctx context.Context, q *service.ClaimedRow, summary string) {
-	log.Printf("daemon: run %s failed at launch: %s", q.RunID, summary)
+	logging.Infof("daemon: run %s failed at launch: %s", q.RunID, summary)
 	d.finishRun(ctx, q, "failed", summary)
 }
 
@@ -2660,11 +2738,11 @@ func (d *Daemon) finishRunOK(ctx context.Context, q *service.ClaimedRow, output 
 func (d *Daemon) finishRun(ctx context.Context, q *service.ClaimedRow, status, summary string) bool {
 	err := d.runSvc.Finish(ctx, q.RunID, status, summary)
 	if errors.Is(err, service.ErrRunAlreadyTerminal) {
-		log.Printf("daemon: run %s already terminal — dropping late %s result", q.RunID, status)
+		logging.Infof("daemon: run %s already terminal — dropping late %s result", q.RunID, status)
 		return false
 	}
 	if err != nil {
-		log.Printf("daemon: finish run %s: %v", q.RunID, err)
+		logging.Infof("daemon: finish run %s: %v", q.RunID, err)
 	}
 	return true
 }
@@ -2755,7 +2833,7 @@ func (d *Daemon) consultStatus(ctx context.Context, goalID, agentID, runID strin
 		  ), '')
 		ORDER BY r.finished_at`, goalID, agentID, goalID, runID)
 	if err != nil {
-		log.Printf("daemon: consult status for %s: %v", goalID, err)
+		logging.Infof("daemon: consult status for %s: %v", goalID, err)
 		return ""
 	}
 	defer rows.Close()
@@ -2797,7 +2875,7 @@ func (d *Daemon) commentsInjection(ctx context.Context, goalID string) string {
 		`SELECT author_type, content FROM comment WHERE goal_id=?
 		 ORDER BY created_at ASC`, goalID)
 	if err != nil {
-		log.Printf("daemon: load comments for run prompt (goal %s): %v", goalID, err)
+		logging.Infof("daemon: load comments for run prompt (goal %s): %v", goalID, err)
 		return ""
 	}
 	defer rows.Close()
@@ -2850,7 +2928,7 @@ func buildPrompt(title, desc, handoff string) string {
 func (d *Daemon) buildAgentGuide(ctx context.Context, selfAgentID string) string {
 	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name, description FROM agent ORDER BY name`)
 	if err != nil {
-		log.Printf("daemon: build team roster: %v", err)
+		logging.Errorf("daemon: build team roster: %v", err)
 		return ""
 	}
 	defer rows.Close()
@@ -2971,7 +3049,7 @@ func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.In
 			if time.Since(last) < threshold {
 				continue
 			}
-			log.Printf("daemon: idle watchdog firing for run %s (silent %s), force-stopping", runID, time.Since(last).Round(time.Second))
+			logging.Infof("daemon: idle watchdog firing for run %s (silent %s), force-stopping", runID, time.Since(last).Round(time.Second))
 			d.mu.Lock()
 			d.runCancelReasons[runID] = "idle_watchdog"
 			d.mu.Unlock()
@@ -3002,7 +3080,7 @@ func (d *Daemon) reapRunawayRuns(ctx context.Context) {
 	rows, err := d.st.DB().QueryContext(ctx,
 		`SELECT id, goal_id, domain_id, started_at FROM run WHERE status='running' AND started_at != ''`)
 	if err != nil {
-		log.Printf("daemon: runaway scan: %v", err)
+		logging.Errorf("daemon: runaway scan: %v", err)
 		return
 	}
 	type runawayRow struct{ id, goalID, domainID, startedAt string }
@@ -3031,13 +3109,13 @@ func (d *Daemon) reapRunawayRuns(ctx context.Context) {
 			`UPDATE run SET status='cancelled', cancel_reason='runaway', finished_at=? WHERE id=? AND status='running'`,
 			nowStr(), rr.id)
 		if err != nil {
-			log.Printf("daemon: runaway stamp %s: %v", rr.id, err)
+			logging.Infof("daemon: runaway stamp %s: %v", rr.id, err)
 			continue
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			continue // already terminal — someone else's business
 		}
-		log.Printf("daemon: runaway run %s (running %s, budget %ds) — terminalizing", rr.id, time.Since(started).Round(time.Second), budget)
+		logging.Infof("daemon: runaway run %s (running %s, budget %ds) — terminalizing", rr.id, time.Since(started).Round(time.Second), budget)
 		// Best-effort process cut through the cancel registry (the claim→
 		// register window is covered: runTask's post-register self-check sees
 		// the stamp and self-cancels).
@@ -3097,7 +3175,7 @@ func (d *Daemon) dispatchSchedules(ctx context.Context) {
 		`SELECT id, title_template, description, assignee_type, assignee_id, domain_id, cron_expression, timezone, next_run_at
 		 FROM schedule WHERE enabled=1 AND next_run_at != '' AND next_run_at <= ?`, nowStr)
 	if err != nil {
-		log.Printf("daemon: schedule query: %v", err)
+		logging.Errorf("daemon: schedule query: %v", err)
 		return
 	}
 	var due []scheduleDueRow
@@ -3105,7 +3183,7 @@ func (d *Daemon) dispatchSchedules(ctx context.Context) {
 		var r scheduleDueRow
 		if err := rows.Scan(&r.ScheduleID, &r.TitleTemplate, &r.Description, &r.AssigneeType, &r.AssigneeID, &r.DomainID, &r.CronExpression, &r.Timezone, &r.NextRunAt); err != nil {
 			rows.Close()
-			log.Printf("daemon: schedule scan: %v", err)
+			logging.Errorf("daemon: schedule scan: %v", err)
 			return
 		}
 		due = append(due, r)
@@ -3126,7 +3204,7 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := d.st.DB().BeginTx(ctx, nil)
 	if err != nil {
-		log.Printf("daemon: schedule %s begin tx: %v", r.ScheduleID, err)
+		logging.Infof("daemon: schedule %s begin tx: %v", r.ScheduleID, err)
 		return
 	}
 	defer tx.Rollback()
@@ -3135,7 +3213,7 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 	// handoff_note='', created_by_type='system' literal; created_by_id=
 	// schedule id, created_at=ts as parameters.
 	if err := insertFiredGoal(ctx, tx, goalID, r.TitleTemplate, r.Description, r.DomainID, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
-		log.Printf("daemon: schedule %s insert goal: %v", r.ScheduleID, err)
+		logging.Infof("daemon: schedule %s insert goal: %v", r.ScheduleID, err)
 		return
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -3147,13 +3225,13 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 			// runs on a separate connection, and an open tx would contend on
 			// the write lock (and deadlock single-connection test stores).
 			_ = tx.Rollback()
-			log.Printf("daemon: schedule %s already fired at %s, skipping", r.ScheduleID, plannedAt)
+			logging.Infof("daemon: schedule %s already fired at %s, skipping", r.ScheduleID, plannedAt)
 			d.advanceScheduleNextRun(ctx, r, plannedAt)
 			return
 		}
 		// A REAL insert error: do NOT advance — the next tick retries this
 		// firing instead of silently swallowing the failure and skipping it.
-		log.Printf("daemon: schedule %s insert schedule_run failed (not advanced): %v", r.ScheduleID, err)
+		logging.Infof("daemon: schedule %s insert schedule_run failed (not advanced): %v", r.ScheduleID, err)
 		return
 	}
 	// P0-3 (决策 6-13): the fired goal and its FIRST run are born in ONE
@@ -3163,11 +3241,11 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 		ID: goalID, AssigneeType: r.AssigneeType, AssigneeID: r.AssigneeID,
 	})
 	if err != nil {
-		log.Printf("daemon: schedule %s enqueue run: %v", r.ScheduleID, err)
+		logging.Infof("daemon: schedule %s enqueue run: %v", r.ScheduleID, err)
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		log.Printf("daemon: schedule %s commit: %v", r.ScheduleID, err)
+		logging.Infof("daemon: schedule %s commit: %v", r.ScheduleID, err)
 		return
 	}
 	if runEv != nil {
@@ -3177,7 +3255,7 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 	d.bus.Publish(ctx, events.Event{Topic: "schedule:fired", Payload: map[string]any{
 		"schedule_id": r.ScheduleID, "goal_id": goalID, "planned_at": plannedAt,
 	}})
-	log.Printf("daemon: schedule %s fired, created goal %s", r.ScheduleID, goalID)
+	logging.Infof("daemon: schedule %s fired, created goal %s", r.ScheduleID, goalID)
 }
 
 func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, plannedAt string) {
@@ -3187,12 +3265,12 @@ func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, p
 	}
 	next, err := service.ComputeNextRun(r.CronExpression, r.Timezone, anchor)
 	if err != nil {
-		log.Printf("daemon: schedule %s advance cron: %v", r.ScheduleID, err)
+		logging.Infof("daemon: schedule %s advance cron: %v", r.ScheduleID, err)
 		return
 	}
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE schedule SET next_run_at=?, last_run_at=? WHERE id=?`,
 		next.Format(time.RFC3339Nano), time.Now().UTC().Format(time.RFC3339Nano), r.ScheduleID); err != nil {
-		log.Printf("daemon: schedule %s advance next_run_at: %v", r.ScheduleID, err)
+		logging.Infof("daemon: schedule %s advance next_run_at: %v", r.ScheduleID, err)
 	}
 }

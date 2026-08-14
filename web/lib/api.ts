@@ -179,6 +179,20 @@ export const freezeDomainChecks = (
   body: { checks: Checks; verification_strength: string }
 ) => api<Domain>(`/domains/${id}/checks`, { method: "POST", body: JSON.stringify(body) });
 
+// ── Logs (daemon file log + runtime level) ──
+export const fetchLogs = (params: { after?: string; before?: string; limit?: number; level?: string }) => {
+  const qs = new URLSearchParams();
+  if (params.after) qs.set("after", params.after);
+  if (params.before) qs.set("before", params.before);
+  if (params.limit) qs.set("limit", String(params.limit));
+  if (params.level) qs.set("level", params.level);
+  const q = qs.toString();
+  return api<{ level: string; lines: import("./types").LogLine[] }>(`/logs${q ? "?" + q : ""}`);
+};
+export const getLogLevel = () => api<{ level: string }>("/logs/level");
+export const setLogLevel = (level: string) =>
+  api<{ level: string }>("/logs/level", { method: "PUT", body: JSON.stringify({ level }) });
+
 // ── Gate health (M2) ──
 export const getGateStats = () => api<import("./types").GateStat[]>("/gate-decisions/stats");
 

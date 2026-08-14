@@ -17,20 +17,20 @@ import (
 // status/pid columns are deliberately gone — they belong to the future
 // long-lived-session model and would be dead columns today.
 type Agent struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	Description   string            `json:"description"`
-	RuntimeID     string            `json:"runtime_id"`
-	SystemPrompt  string            `json:"system_prompt"`
-	Model         string            `json:"model"`
-	Env           map[string]string `json:"env"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Description  string            `json:"description"`
+	RuntimeID    string            `json:"runtime_id"`
+	SystemPrompt string            `json:"system_prompt"`
+	Model        string            `json:"model"`
+	Env          map[string]string `json:"env"`
 	// McpServers are EXTRA MCP servers advertised at session/new alongside
 	// the platform's workspace server — the agent's own tools (browser,
 	// database, an external ACP agent via an MCP bridge, ...). Type speaks
 	// acp.McpServer (type stdio|http|sse, name, url or command/args).
-	McpServers    []acp.McpServer   `json:"mcp_servers"`
-	MaxConcurrent int               `json:"max_concurrent"`
-	CreatedAt     string            `json:"created_at"`
+	McpServers    []acp.McpServer `json:"mcp_servers"`
+	MaxConcurrent int             `json:"max_concurrent"`
+	CreatedAt     string          `json:"created_at"`
 }
 
 type AgentService struct {

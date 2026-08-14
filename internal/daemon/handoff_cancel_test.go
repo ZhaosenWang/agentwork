@@ -173,7 +173,6 @@ func TestHandoffToHumanCancelsAllRuns(t *testing.T) {
 	}
 }
 
-
 // TestCancelStopsRunningRun: cancelling a goal (决策 4-12) terminates its
 // still-running run — a cancelled goal must not keep an agent burning
 // compute. The stop reuses the runCancels registry with reason "stopped".

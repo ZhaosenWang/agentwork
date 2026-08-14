@@ -58,9 +58,9 @@ type Executor struct {
 	// prepended with the agentwork-cli dir).
 	Env []string
 	// Run context: collaboration tools act on THIS goal as THIS agent.
-	GoalID string
+	GoalID  string
 	AgentID string
-	RunID  string
+	RunID   string
 	// Services for the collaboration tools (comment / assign / list). The
 	// daemon injects them — the tools act in-process, no CLI, no HTTP hop.
 	// The CLI was the old collaboration channel; an agent had to learn its
@@ -160,7 +160,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 	const defaultCreateWait = 10 * time.Second
 
 	type createArgs struct {
-		Command string   `json:"command" jsonschema:"the FINAL executable to run — no shell syntax; pass sh -c \"...\" for shell semantics"`
+		Command string    `json:"command" jsonschema:"the FINAL executable to run — no shell syntax; pass sh -c \"...\" for shell semantics"`
 		Args    *[]string `json:"args,omitempty" jsonschema:"command arguments"`
 		Cwd     *string   `json:"cwd,omitempty" jsonschema:"working directory override (defaults to the workspace root)"`
 		Timeout *int64    `json:"timeout,omitempty" jsonschema:"sync-wait budget in seconds (default 10): if the command finishes within it the result is returned directly; otherwise a terminal_id comes back and you poll terminal_output. 0 = return the id immediately (pure async)"`
@@ -244,7 +244,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 		}
 		return toolResult(map[string]any{
 			"output": resp.Output, "cursor": *next, "truncated": resp.Truncated,
-			"exited": resp.ExitStatus != nil,
+			"exited":    resp.ExitStatus != nil,
 			"exit_code": derefInt(exitCode(resp)), "signal": derefStr(exitSignal(resp)),
 			"elapsed": elapsed,
 		}), nil, nil

@@ -8,10 +8,10 @@ package ws
 import (
 	"context"
 	"encoding/json"
-	"log"
 	"sync"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 )
 
 // topics is the full set of bus topics the hub forwards to clients. New
@@ -28,6 +28,8 @@ var topics = []string{
 	"sub_goal.created", "sub_goal.verifying", "sub_goal.verified", "sub_goal.rejected", "sub_goal.retrying", "sub_goal.failed", "sub_goal.cancelled",
 	"change.ready", "change.integrated", "change.conflict",
 	"comment:created",
+	// the daemon's live log tail — the Web logs panel's real-time pane
+	"log:line",
 	"agent:created", "agent:deleted",
 	"squad:created", "squad:deleted", "squad:member_added", "squad:member_removed",
 	"schedule:created", "schedule:fired",
@@ -52,7 +54,7 @@ func (h *Hub) Run(ctx context.Context) {
 		h.bus.Subscribe(topic, func(_ context.Context, e events.Event) {
 			msg, err := json.Marshal(map[string]any{"topic": e.Topic, "payload": e.Payload})
 			if err != nil {
-				log.Printf("ws: marshal event %s: %v", e.Topic, err)
+				logging.Infof("ws: marshal event %s: %v", e.Topic, err)
 				return
 			}
 			h.broadcast(msg)

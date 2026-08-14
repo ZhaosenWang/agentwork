@@ -10,7 +10,7 @@ const (
 	writeWait  = 10 * time.Second
 	pongWait   = 60 * time.Second
 	pingPeriod = 30 * time.Second // well under pongWait so ping reliably refreshes the read deadline
-	readLimit  = 4096              // max incoming message size; MVP is server→client only so this just bounds junk
+	readLimit  = 4096             // max incoming message size; MVP is server→client only so this just bounds junk
 )
 
 // Client is one WS connection. readPump runs in the handler goroutine;

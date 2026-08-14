@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -28,6 +27,7 @@ import (
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 )
 
 // Notifier fans milestone events out to the Feishu long connection. The long
@@ -47,8 +47,8 @@ type approvalCardRec struct {
 type Notifier struct {
 	appID, appSecret string
 	client           *lark.Client
-	receiveIDType    string // chat_id | open_id
-	receiveID        string // the owner's chat / open id
+	receiveIDType    string     // chat_id | open_id
+	receiveID        string     // the owner's chat / open id
 	qs               QueryStore // M3: read-only store for card evidence/digest; may be nil
 	// send overrides the SDK delivery path (tests inject a mock; nil = the
 	// lark client path). Kept unexported on purpose.
@@ -278,7 +278,7 @@ func (n *Notifier) sendApprovalCard(goalID, cardJSON string, hadPending bool, do
 	go func() {
 		msgID, err := n.SendCard(cardJSON)
 		if err != nil {
-			log.Printf("notify: feishu send card: %v", err)
+			logging.Errorf("notify: feishu send card: %v", err)
 			return
 		}
 		if msgID != "" {
@@ -295,7 +295,7 @@ func (n *Notifier) sendApprovalCard(goalID, cardJSON string, hadPending bool, do
 func (n *Notifier) updateCard(messageID, content string) {
 	if n.updateCardFn != nil {
 		if err := n.updateCardFn(messageID, content); err != nil {
-			log.Printf("notify: update approval card %s: %v", messageID, err)
+			logging.Infof("notify: update approval card %s: %v", messageID, err)
 		}
 		return
 	}
@@ -310,11 +310,11 @@ func (n *Notifier) updateCard(messageID, content string) {
 				Build()).
 			Build())
 	if err != nil {
-		log.Printf("notify: update approval card %s: %v", messageID, err)
+		logging.Infof("notify: update approval card %s: %v", messageID, err)
 		return
 	}
 	if !resp.Success() {
-		log.Printf("notify: update approval card %s failed: code=%d msg=%s", messageID, resp.Code, resp.Msg)
+		logging.Infof("notify: update approval card %s failed: code=%d msg=%s", messageID, resp.Code, resp.Msg)
 	}
 }
 
@@ -422,7 +422,7 @@ func (n *Notifier) onRunCancelled(_ context.Context, e events.Event) {
 	n.sendMilestoneCard("⏱", "red", "任务中断", fmt.Sprintf("**%s**  \n`goal %s`  \n%s  \n\ngoal 保持 active，需人工处理", title, short(goalID), truncate(reason, 200)))
 }
 
-// goalTitle resolves a goal's title for milestone cards (best-effort; '' when
+// goalTitle resolves a goal's title for milestone cards (best-effort; ” when
 // the store is missing or the goal vanished).
 func (n *Notifier) goalTitle(ctx context.Context, goalID string) string {
 	if n.qs == nil {
@@ -450,7 +450,7 @@ func (n *Notifier) sendMilestoneCard(emoji, template, title, body string) {
 func (n *Notifier) asyncSend(text string) {
 	go func() {
 		if err := n.Send(text); err != nil {
-			log.Printf("notify: feishu send: %v", err)
+			logging.Errorf("notify: feishu send: %v", err)
 		}
 	}()
 }
@@ -459,7 +459,7 @@ func (n *Notifier) asyncSend(text string) {
 func (n *Notifier) asyncSendCard(cardJSON string) {
 	go func() {
 		if _, err := n.SendCard(cardJSON); err != nil {
-			log.Printf("notify: feishu send card: %v", err)
+			logging.Errorf("notify: feishu send card: %v", err)
 		}
 	}()
 }
@@ -476,7 +476,7 @@ func (n *Notifier) Send(text string) error {
 
 // SendCard delivers an interactive card (JSON 2.0, M3). The card content is
 // a passthrough — msg_type=interactive with the card JSON as content.
-// Returns the sent message's id ('' for the injected test send) — the
+// Returns the sent message's id (” for the injected test send) — the
 // approval card records it for the review_ready patch (Option B).
 func (n *Notifier) SendCard(cardJSON string) (string, error) {
 	if n.send != nil {
@@ -512,7 +512,7 @@ func (n *Notifier) createMessage(msgType, content string) (string, error) {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Code int `json:"code"`
+		Code int    `json:"code"`
 		Msg  string `json:"msg"`
 		Data struct {
 			MessageID string `json:"message_id"`
@@ -535,7 +535,7 @@ func (n *Notifier) createMessage(msgType, content string) (string, error) {
 				if err == nil {
 					defer resp2.Body.Close()
 					var out2 struct {
-						Code int `json:"code"`
+						Code int    `json:"code"`
 						Msg  string `json:"msg"`
 						Data struct {
 							MessageID string `json:"message_id"`
@@ -573,10 +573,10 @@ func (n *Notifier) tenantToken() (string, error) {
 	}
 	defer resp.Body.Close()
 	var out struct {
-		Code                 int    `json:"code"`
-		Msg                  string `json:"msg"`
-		TenantAccessToken    string `json:"tenant_access_token"`
-		Expire               int    `json:"expire"`
+		Code              int    `json:"code"`
+		Msg               string `json:"msg"`
+		TenantAccessToken string `json:"tenant_access_token"`
+		Expire            int    `json:"expire"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return "", fmt.Errorf("feishu token: parse: %w", err)

@@ -259,6 +259,13 @@ export interface ScheduleRun {
   created_at: string;
 }
 
+// LogLine is one daemon log line (GET /logs and the live log:line stream).
+export interface LogLine {
+  ts: string;
+  level: string; // debug | info | warn | error
+  text: string;
+}
+
 // WS event shape from the hub: {"topic":"goal:created","payload":{...}}
 export type WSTopic =
   | "goal:created" | "goal:assigned" | "goal:finished"
@@ -269,6 +276,7 @@ export type WSTopic =
   | "sub_goal.created" | "sub_goal.verifying" | "sub_goal.verified" | "sub_goal.rejected" | "sub_goal.retrying" | "sub_goal.failed" | "sub_goal.cancelled"
   | "change.ready" | "change.integrated" | "change.conflict"
   | "comment:created"
+  | "log:line"
   | "agent:created" | "agent:deleted"
   | "squad:created" | "squad:deleted" | "squad:member_added" | "squad:member_removed"
   | "schedule:created" | "schedule:fired"

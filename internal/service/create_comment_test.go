@@ -18,14 +18,14 @@ func TestCreateWritesAssignmentComment(t *testing.T) {
 	domID := seedDomain(t, st)
 
 	g, err := gs.Create(ctx, Goal{
-		Title:        "add string utils",
-		Description:  "作为 dev-team leader：给 test-repo 添加 string_utils.py + 对应测试",
-		DomainID:     domID,
-		AssigneeType: "agent",
-		AssigneeID:   agentA,
-		Status:       "active",
+		Title:         "add string utils",
+		Description:   "作为 dev-team leader：给 test-repo 添加 string_utils.py + 对应测试",
+		DomainID:      domID,
+		AssigneeType:  "agent",
+		AssigneeID:    agentA,
+		Status:        "active",
 		CreatedByType: "human",
-		CreatedByID:  "ui",
+		CreatedByID:   "ui",
 	})
 	if err != nil {
 		t.Fatalf("create goal: %v", err)

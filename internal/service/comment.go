@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"regexp"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/store"
 )
 
@@ -42,7 +42,7 @@ func NewCommentService(st *store.Store, bus *events.Bus) *CommentService {
 	return &CommentService{st: st, bus: bus}
 }
 
-func (s *CommentService) SetRunService(rs *RunService)  { s.runSvc = rs }
+func (s *CommentService) SetRunService(rs *RunService)   { s.runSvc = rs }
 func (s *CommentService) SetGoalService(gs *GoalService) { s.goalSvc = gs }
 
 // Mention is one parsed mention from a comment body.
@@ -59,8 +59,8 @@ type Mention struct {
 // circular handoffs; over maxMentionCycle the next trigger is refused and
 // the goal fails with the cycle count as the reason.
 const (
-	MaxMentionHints  = 4
-	MaxMentionCycle  = 8
+	MaxMentionHints = 4
+	MaxMentionCycle = 8
 )
 
 // MentionRe matches `[@Name](mention://(agent|squad|human|all)/(<uuid-ish>|all))`.
@@ -254,7 +254,7 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 			// auto-resume the requester once the guest answers.
 			if c.AuthorType == "agent" {
 				if err := s.recordConsult(ctx, c, m.ID, r.ID); err != nil {
-					log.Printf("comment: record consult: %v", err)
+					logging.Errorf("comment: record consult: %v", err)
 				}
 			}
 		case "squad":
@@ -367,7 +367,7 @@ func (s *CommentService) enqueueLeaderRunForMention(ctx context.Context, squadID
 }
 
 // ListAfter lists a goal's comments NEWER than the given comment id (the
-// get_comments tool's incremental cursor — '' = from the start), capped at
+// get_comments tool's incremental cursor — ” = from the start), capped at
 // limit (0 = default 50, hard max 100). Read-only; the long-run dynamic
 // context channel (决策 6-15⑪): the prompt snapshot is fixed at claim, this
 // is the live view.

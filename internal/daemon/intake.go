@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
@@ -166,7 +166,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summary string) {
 	if n := d.imNotifier(); n != nil {
 		if err := n.Send("⚠️ 消息解析失败：" + summary); err != nil {
-			log.Printf("daemon: intake failure reply: %v", err)
+			logging.Errorf("daemon: intake failure reply: %v", err)
 		}
 	}
 	// Stamp the run failed directly (P0-5 conditional — a reaper stamp
@@ -176,11 +176,11 @@ func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summa
 		`UPDATE run SET status='failed', result_summary=?, finished_at=? WHERE id=? AND status IN ('queued','running')`,
 		summary, nowStr(), q.RunID)
 	if err != nil {
-		log.Printf("daemon: mark intake run %s failed: %v", q.RunID, err)
+		logging.Infof("daemon: mark intake run %s failed: %v", q.RunID, err)
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		log.Printf("daemon: intake run %s already terminal — dropping late failure", q.RunID)
+		logging.Infof("daemon: intake run %s already terminal — dropping late failure", q.RunID)
 	}
 }
 
@@ -229,14 +229,14 @@ func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed 
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
 		reply, nowStr(), q.RunID); err != nil {
-		log.Printf("daemon: finish intake run %s: %v", q.RunID, err)
+		logging.Infof("daemon: finish intake run %s: %v", q.RunID, err)
 	}
 	if n := d.imNotifier(); n != nil {
 		if err := n.Send(reply); err != nil {
-			log.Printf("daemon: intake reply: %v", err)
+			logging.Errorf("daemon: intake reply: %v", err)
 		}
 	}
-	log.Printf("daemon: intake %s → %s", q.RunID, parsed.Intent)
+	logging.Infof("daemon: intake %s → %s", q.RunID, parsed.Intent)
 }
 
 // intakeCreateGoal creates the goal (active → first run enqueued) through the

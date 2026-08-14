@@ -101,9 +101,9 @@ func buildProcessedCard(goalID, decision string, scratch bool) (string, error) {
 
 func cardButton(text, typ string, value map[string]any) map[string]any {
 	return map[string]any{
-		"tag": "button",
-		"text": map[string]any{"tag": "plain_text", "content": text},
-		"type": typ,
+		"tag":   "button",
+		"text":  map[string]any{"tag": "plain_text", "content": text},
+		"type":  typ,
 		"value": value,
 	}
 }

@@ -207,8 +207,11 @@ type mapSettings struct {
 }
 
 func (m *mapSettings) Get(_ context.Context, key string) (string, error) { return m.vals[key], nil }
-func (m *mapSettings) Set(_ context.Context, key, value string) error    { m.vals[key] = value; return nil }
-func (m *mapSettings) Delete(_ context.Context, key string) error        { delete(m.vals, key); return nil }
+func (m *mapSettings) Set(_ context.Context, key, value string) error {
+	m.vals[key] = value
+	return nil
+}
+func (m *mapSettings) Delete(_ context.Context, key string) error { delete(m.vals, key); return nil }
 
 // TestIntakeDraftClarification: the multi-domain clarification — a pending
 // draft surfaces in the next parser prompt (so a bare repo name completes the

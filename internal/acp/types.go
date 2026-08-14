@@ -67,19 +67,19 @@ type Implementation struct {
 type AgentCapabilities struct {
 	Meta map[string]any `json:"_meta,omitempty"`
 
-	LoadSession         bool                `json:"loadSession,omitempty"`
-	McpCapabilities     McpCapabilities     `json:"mcpCapabilities,omitempty"`
-	PromptCapabilities  PromptCapabilities  `json:"promptCapabilities,omitempty"`
-	SessionCapabilities SessionCapabilities `json:"sessionCapabilities,omitempty"`
+	LoadSession         bool                  `json:"loadSession,omitempty"`
+	McpCapabilities     McpCapabilities       `json:"mcpCapabilities,omitempty"`
+	PromptCapabilities  PromptCapabilities    `json:"promptCapabilities,omitempty"`
+	SessionCapabilities SessionCapabilities   `json:"sessionCapabilities,omitempty"`
 	Auth                AgentAuthCapabilities `json:"auth,omitempty"`
 }
 
 // ClientCapabilities is sent by the Client during initialize.
 type ClientCapabilities struct {
-	Meta     map[string]any              `json:"_meta,omitempty"`
-	FS       FileSystemCapabilities      `json:"fs,omitempty"`
-	Session  *ClientSessionCapabilities  `json:"session,omitempty"`
-	Terminal bool                        `json:"terminal,omitempty"`
+	Meta     map[string]any             `json:"_meta,omitempty"`
+	FS       FileSystemCapabilities     `json:"fs,omitempty"`
+	Session  *ClientSessionCapabilities `json:"session,omitempty"`
+	Terminal bool                       `json:"terminal,omitempty"`
 }
 
 // PromptCapabilities advertises rich prompt content support.
@@ -99,12 +99,12 @@ type McpCapabilities struct {
 
 // SessionCapabilities advertises session lifecycle support.
 type SessionCapabilities struct {
-	Meta                   map[string]any                          `json:"_meta,omitempty"`
-	Close                  *SessionCloseCapabilities               `json:"close,omitempty"`
-	Delete                 *SessionDeleteCapabilities              `json:"delete,omitempty"`
-	List                   *SessionListCapabilities                `json:"list,omitempty"`
-	Resume                 *SessionResumeCapabilities              `json:"resume,omitempty"`
-	AdditionalDirectories  *SessionAdditionalDirectoriesCapabilities `json:"additionalDirectories,omitempty"`
+	Meta                  map[string]any                            `json:"_meta,omitempty"`
+	Close                 *SessionCloseCapabilities                 `json:"close,omitempty"`
+	Delete                *SessionDeleteCapabilities                `json:"delete,omitempty"`
+	List                  *SessionListCapabilities                  `json:"list,omitempty"`
+	Resume                *SessionResumeCapabilities                `json:"resume,omitempty"`
+	AdditionalDirectories *SessionAdditionalDirectoriesCapabilities `json:"additionalDirectories,omitempty"`
 }
 
 // AgentAuthCapabilities advertises auth feature support.
@@ -115,7 +115,7 @@ type AgentAuthCapabilities struct {
 
 // ClientSessionCapabilities advertises client session support.
 type ClientSessionCapabilities struct {
-	Meta          map[string]any                        `json:"_meta,omitempty"`
+	Meta          map[string]any                   `json:"_meta,omitempty"`
 	ConfigOptions *BooleanConfigOptionCapabilities `json:"configOptions,omitempty"`
 }
 
@@ -127,9 +127,9 @@ type BooleanConfigOptionCapabilities struct {
 
 // FileSystemCapabilities advertises file system RPC support.
 type FileSystemCapabilities struct {
-	Meta         map[string]any `json:"_meta,omitempty"`
-	ReadTextFile bool           `json:"readTextFile,omitempty"`
-	WriteTextFile bool          `json:"writeTextFile,omitempty"`
+	Meta          map[string]any `json:"_meta,omitempty"`
+	ReadTextFile  bool           `json:"readTextFile,omitempty"`
+	WriteTextFile bool           `json:"writeTextFile,omitempty"`
 }
 
 // ── Capability marker types (empty struct = supported) ──
@@ -176,11 +176,11 @@ type InitializeRequest struct {
 
 // InitializeResponse is the ACP handshake response.
 type InitializeResponse struct {
-	Meta              map[string]any     `json:"_meta,omitempty"`
-	ProtocolVersion   ProtocolVersion    `json:"protocolVersion"`
-	AgentCapabilities AgentCapabilities  `json:"agentCapabilities"`
-	AgentInfo         *Implementation    `json:"agentInfo,omitempty"`
-	AuthMethods       []AuthMethod       `json:"authMethods,omitempty"`
+	Meta              map[string]any    `json:"_meta,omitempty"`
+	ProtocolVersion   ProtocolVersion   `json:"protocolVersion"`
+	AgentCapabilities AgentCapabilities `json:"agentCapabilities"`
+	AgentInfo         *Implementation   `json:"agentInfo,omitempty"`
+	AuthMethods       []AuthMethod      `json:"authMethods,omitempty"`
 }
 
 // ── Authentication ──
@@ -219,50 +219,50 @@ type LogoutResponse struct {
 
 // NewSessionRequest creates a new session.
 type NewSessionRequest struct {
-	Meta                   map[string]any `json:"_meta,omitempty"`
-	Cwd                    string         `json:"cwd"` // absolute path
-	McpServers             []McpServer    `json:"mcpServers"`
-	AdditionalDirectories  []string       `json:"additionalDirectories,omitempty"`
+	Meta                  map[string]any `json:"_meta,omitempty"`
+	Cwd                   string         `json:"cwd"` // absolute path
+	McpServers            []McpServer    `json:"mcpServers"`
+	AdditionalDirectories []string       `json:"additionalDirectories,omitempty"`
 }
 
 // NewSessionResponse is returned after session creation.
 type NewSessionResponse struct {
-	Meta          map[string]any          `json:"_meta,omitempty"`
-	SessionID     SessionId               `json:"sessionId"`
-	ConfigOptions []SessionConfigOption   `json:"configOptions,omitempty"`
-	Modes         *SessionModeState       `json:"modes,omitempty"`
+	Meta          map[string]any        `json:"_meta,omitempty"`
+	SessionID     SessionId             `json:"sessionId"`
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
+	Modes         *SessionModeState     `json:"modes,omitempty"`
 }
 
 // LoadSessionRequest loads a session and replays its history.
 type LoadSessionRequest struct {
-	Meta                   map[string]any `json:"_meta,omitempty"`
-	SessionID              SessionId      `json:"sessionId"`
-	Cwd                    string         `json:"cwd"` // absolute path
-	McpServers             []McpServer    `json:"mcpServers"`
-	AdditionalDirectories  []string       `json:"additionalDirectories,omitempty"`
+	Meta                  map[string]any `json:"_meta,omitempty"`
+	SessionID             SessionId      `json:"sessionId"`
+	Cwd                   string         `json:"cwd"` // absolute path
+	McpServers            []McpServer    `json:"mcpServers"`
+	AdditionalDirectories []string       `json:"additionalDirectories,omitempty"`
 }
 
 // LoadSessionResponse is the result of loading a session.
 type LoadSessionResponse struct {
-	Meta          map[string]any          `json:"_meta,omitempty"`
-	ConfigOptions []SessionConfigOption   `json:"configOptions,omitempty"`
-	Modes         *SessionModeState       `json:"modes,omitempty"`
+	Meta          map[string]any        `json:"_meta,omitempty"`
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
+	Modes         *SessionModeState     `json:"modes,omitempty"`
 }
 
 // ResumeSessionRequest resumes an existing session without history replay.
 type ResumeSessionRequest struct {
-	Meta                   map[string]any `json:"_meta,omitempty"`
-	SessionID              SessionId      `json:"sessionId"`
-	Cwd                    string         `json:"cwd"` // absolute path
-	McpServers             []McpServer    `json:"mcpServers"`
-	AdditionalDirectories  []string       `json:"additionalDirectories,omitempty"`
+	Meta                  map[string]any `json:"_meta,omitempty"`
+	SessionID             SessionId      `json:"sessionId"`
+	Cwd                   string         `json:"cwd"` // absolute path
+	McpServers            []McpServer    `json:"mcpServers"`
+	AdditionalDirectories []string       `json:"additionalDirectories,omitempty"`
 }
 
 // ResumeSessionResponse is the result of resuming a session.
 type ResumeSessionResponse struct {
-	Meta          map[string]any          `json:"_meta,omitempty"`
-	ConfigOptions []SessionConfigOption   `json:"configOptions,omitempty"`
-	Modes         *SessionModeState       `json:"modes,omitempty"`
+	Meta          map[string]any        `json:"_meta,omitempty"`
+	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
+	Modes         *SessionModeState     `json:"modes,omitempty"`
 }
 
 // CloseSessionRequest closes a session.
@@ -330,11 +330,11 @@ type PromptResponse struct {
 type StopReason string
 
 const (
-	StopReasonEndTurn        StopReason = "end_turn"
-	StopReasonMaxTokens      StopReason = "max_tokens"
+	StopReasonEndTurn         StopReason = "end_turn"
+	StopReasonMaxTokens       StopReason = "max_tokens"
 	StopReasonMaxTurnRequests StopReason = "max_turn_requests"
-	StopReasonRefusal        StopReason = "refusal"
-	StopReasonCancelled      StopReason = "cancelled"
+	StopReasonRefusal         StopReason = "refusal"
+	StopReasonCancelled       StopReason = "cancelled"
 )
 
 // CancelNotification cancels an ongoing prompt turn.
@@ -403,11 +403,11 @@ type SessionConfigOptValue struct {
 // SetSessionConfigOptionRequest changes a config option value.
 // The Type field distinguishes boolean from select (value_id) variants.
 type SetSessionConfigOptionRequest struct {
-	Meta      map[string]any `json:"_meta,omitempty"`
-	SessionID SessionId      `json:"sessionId"`
+	Meta      map[string]any  `json:"_meta,omitempty"`
+	SessionID SessionId       `json:"sessionId"`
 	ConfigID  SessionConfigId `json:"configId"`
-	Type      string         `json:"type,omitempty"` // "boolean" selects the boolean variant
-	Value     any            `json:"value"`          // string for select, bool for boolean
+	Type      string          `json:"type,omitempty"` // "boolean" selects the boolean variant
+	Value     any             `json:"value"`          // string for select, bool for boolean
 }
 
 // SetSessionConfigOptionResponse always contains the full config state.
@@ -466,18 +466,18 @@ type EnvVariable struct {
 //	"resource"      — embedded resource (requires embeddedContext prompt capability)
 //	"resource_link" — URI reference to a resource (baseline, always supported)
 type ContentBlock struct {
-	Meta        map[string]any `json:"_meta,omitempty"`
-	Type        string         `json:"type"`
-	Text        string         `json:"text,omitempty"`        // "text"
-	Data        string         `json:"data,omitempty"`        // "image" / "audio" (base64)
-	MimeType    string         `json:"mimeType,omitempty"`    // "image" / "audio" / "resource" / "resource_link"
-	URI         string         `json:"uri,omitempty"`         // "image" / "resource_link" / "resource"
-	Name        string         `json:"name,omitempty"`        // "resource_link"
-	Title       string         `json:"title,omitempty"`       // "resource_link"
-	Description string         `json:"description,omitempty"` // "resource_link"
-	Size        *int64         `json:"size,omitempty"`        // "resource_link"
-	Resource    *EmbeddedResource `json:"resource,omitempty"`   // "resource"
-	Annotations *Annotations   `json:"annotations,omitempty"`
+	Meta        map[string]any    `json:"_meta,omitempty"`
+	Type        string            `json:"type"`
+	Text        string            `json:"text,omitempty"`        // "text"
+	Data        string            `json:"data,omitempty"`        // "image" / "audio" (base64)
+	MimeType    string            `json:"mimeType,omitempty"`    // "image" / "audio" / "resource" / "resource_link"
+	URI         string            `json:"uri,omitempty"`         // "image" / "resource_link" / "resource"
+	Name        string            `json:"name,omitempty"`        // "resource_link"
+	Title       string            `json:"title,omitempty"`       // "resource_link"
+	Description string            `json:"description,omitempty"` // "resource_link"
+	Size        *int64            `json:"size,omitempty"`        // "resource_link"
+	Resource    *EmbeddedResource `json:"resource,omitempty"`    // "resource"
+	Annotations *Annotations      `json:"annotations,omitempty"`
 }
 
 // EmbeddedResource is the payload for "resource" content blocks.
@@ -529,16 +529,16 @@ type ToolCallUpdate struct {
 // ToolCallContent carries output in a tool call update.
 type ToolCallContent struct {
 	Meta       map[string]any `json:"_meta,omitempty"`
-	Type       string         `json:"type"`                // "content", "diff", "terminal"
-	Content    *ContentBlock  `json:"content,omitempty"`   // "content"
-	Diff       *Diff          `json:"diff,omitempty"`      // "diff"
+	Type       string         `json:"type"`                 // "content", "diff", "terminal"
+	Content    *ContentBlock  `json:"content,omitempty"`    // "content"
+	Diff       *Diff          `json:"diff,omitempty"`       // "diff"
 	TerminalID *TerminalId    `json:"terminalId,omitempty"` // "terminal"
 }
 
 // ToolCallLocation associates a tool call with a file path and optional line.
 type ToolCallLocation struct {
 	Meta map[string]any `json:"_meta,omitempty"`
-	Path string         `json:"path"`          // absolute
+	Path string         `json:"path"`           // absolute
 	Line *int           `json:"line,omitempty"` // 1-based
 }
 
@@ -604,31 +604,31 @@ type PermissionOption struct {
 type PermissionOptionKind string
 
 const (
-	PermissionAllowOnce     PermissionOptionKind = "allow_once"
-	PermissionAllowAlways   PermissionOptionKind = "allow_always"
-	PermissionRejectOnce    PermissionOptionKind = "reject_once"
-	PermissionRejectAlways  PermissionOptionKind = "reject_always"
+	PermissionAllowOnce    PermissionOptionKind = "allow_once"
+	PermissionAllowAlways  PermissionOptionKind = "allow_always"
+	PermissionRejectOnce   PermissionOptionKind = "reject_once"
+	PermissionRejectAlways PermissionOptionKind = "reject_always"
 )
 
 // RequestPermissionRequest asks the client for user approval.
 type RequestPermissionRequest struct {
-	Meta      map[string]any  `json:"_meta,omitempty"`
-	SessionID SessionId       `json:"sessionId"`
-	ToolCall  ToolCallUpdate  `json:"toolCall"`
+	Meta      map[string]any     `json:"_meta,omitempty"`
+	SessionID SessionId          `json:"sessionId"`
+	ToolCall  ToolCallUpdate     `json:"toolCall"`
 	Options   []PermissionOption `json:"options"`
 }
 
 // RequestPermissionResponse is the client's decision.
 type RequestPermissionResponse struct {
-	Meta    map[string]any            `json:"_meta,omitempty"`
-	Outcome RequestPermissionOutcome  `json:"outcome"`
+	Meta    map[string]any           `json:"_meta,omitempty"`
+	Outcome RequestPermissionOutcome `json:"outcome"`
 }
 
 // RequestPermissionOutcome is a union of possible permission outcomes.
 type RequestPermissionOutcome struct {
-	Meta     map[string]any        `json:"_meta,omitempty"`
-	OptionID *PermissionOptionId   `json:"optionId,omitempty"` // present for "selected"
-	Cancelled bool                 `json:"cancelled,omitempty"`
+	Meta      map[string]any      `json:"_meta,omitempty"`
+	OptionID  *PermissionOptionId `json:"optionId,omitempty"` // present for "selected"
+	Cancelled bool                `json:"cancelled,omitempty"`
 }
 
 // ── File system (Agent → Client RPC) ──
@@ -637,7 +637,7 @@ type RequestPermissionOutcome struct {
 type ReadTextFileRequest struct {
 	Meta      map[string]any `json:"_meta,omitempty"`
 	SessionID SessionId      `json:"sessionId"`
-	Path      string         `json:"path"` // absolute
+	Path      string         `json:"path"`            // absolute
 	Line      *int           `json:"line,omitempty"`  // 1-based, min 0
 	Limit     *int           `json:"limit,omitempty"` // max lines, min 0
 }
@@ -670,7 +670,7 @@ type CreateTerminalRequest struct {
 	Command         string         `json:"command"`
 	Args            []string       `json:"args,omitempty"`
 	Env             []EnvVariable  `json:"env,omitempty"`
-	Cwd             *string        `json:"cwd,omitempty"` // absolute path
+	Cwd             *string        `json:"cwd,omitempty"`             // absolute path
 	OutputByteLimit *int           `json:"outputByteLimit,omitempty"` // min 0
 }
 
@@ -689,10 +689,10 @@ type TerminalOutputRequest struct {
 
 // TerminalOutputResponse holds the captured output and optional exit status.
 type TerminalOutputResponse struct {
-	Meta       map[string]any       `json:"_meta,omitempty"`
-	Output     string               `json:"output"`
-	Truncated  bool                 `json:"truncated"`
-	ExitStatus *TerminalExitStatus  `json:"exitStatus,omitempty"`
+	Meta       map[string]any      `json:"_meta,omitempty"`
+	Output     string              `json:"output"`
+	Truncated  bool                `json:"truncated"`
+	ExitStatus *TerminalExitStatus `json:"exitStatus,omitempty"`
 }
 
 // TerminalExitStatus describes how a terminal command exited.
@@ -811,6 +811,7 @@ type SessionUpdate struct {
 	// update object, not nested under a wrapper struct.
 	UpdatedAt *string `json:"updatedAt,omitempty"`
 }
+
 // ContentAsBlock unmarshals Content as a ContentBlock. Returns nil if
 // Content is empty or represents a different variant.
 func (u SessionUpdate) ContentAsBlock() *ContentBlock {
@@ -849,7 +850,6 @@ func (u *SessionUpdate) SetToolCallContent(tcc []ToolCallContent) {
 	u.Content, _ = json.Marshal(tcc)
 }
 
-
 // ── Cost / usage ──
 
 // Cost reports monetary cost in an ISO 4217 currency.
@@ -873,22 +873,22 @@ type Diff struct {
 
 // Error is a JSON-RPC 2.0 error object.
 type Error struct {
-	Code    ErrorCode   `json:"code"`
-	Message string      `json:"message"`
-	Data    any         `json:"data,omitempty"`
+	Code    ErrorCode `json:"code"`
+	Message string    `json:"message"`
+	Data    any       `json:"data,omitempty"`
 }
 
 // ErrorCode is a JSON-RPC 2.0 error code.
 type ErrorCode = int
 
 const (
-	ErrorCodeParse           ErrorCode = -32700
-	ErrorCodeInvalidRequest  ErrorCode = -32600
-	ErrorCodeMethodNotFound  ErrorCode = -32601
-	ErrorCodeInvalidParams   ErrorCode = -32602
-	ErrorCodeInternal        ErrorCode = -32603
+	ErrorCodeParse            ErrorCode = -32700
+	ErrorCodeInvalidRequest   ErrorCode = -32600
+	ErrorCodeMethodNotFound   ErrorCode = -32601
+	ErrorCodeInvalidParams    ErrorCode = -32602
+	ErrorCodeInternal         ErrorCode = -32603
 	ErrorCodeRequestCancelled ErrorCode = -32800
-	ErrorCodeAuthRequired    ErrorCode = -32000
+	ErrorCodeAuthRequired     ErrorCode = -32000
 	ErrorCodeResourceNotFound ErrorCode = -32002
 )
 

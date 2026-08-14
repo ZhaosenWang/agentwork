@@ -217,6 +217,7 @@ func (s *GoalService) ListSubGoals(ctx context.Context, goalID string) ([]SubGoa
 //	cancelled → same bounded retry chain (a watchdog stall is a machine
 //	            hiccup for a sub-goal — the goal-level "human decides" loop
 //	            exists for owner runs; sub-goal retries are cheap and bounded).
+//
 // ReconcileSubGoalRun runs under withBusyRetry (see ReconcileGoal): the
 // snapshot-upgrade race is equally possible on the sub-goal latch edges.
 func (s *GoalService) ReconcileSubGoalRun(ctx context.Context, rc goalRunContext) error {

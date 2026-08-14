@@ -43,11 +43,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"reflect"
-	"strings"
 	"fmt"
 	"io"
 	"os/exec"
+	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -124,9 +124,9 @@ func (c *Client) ConnectStdio(ctx context.Context, env []string, command string,
 // via [Session.SetEventHandler]. The handler must be set before
 // [Session.Prompt] to receive streaming output.
 type Session struct {
-	r       io.Reader       // agent→client (responses + notifications)
-	w       io.Writer       // client→agent (requests + responses to agent RPC)
-	closeFn func() error    // transport cleanup; called by Close
+	r       io.Reader    // agent→client (responses + notifications)
+	w       io.Writer    // client→agent (requests + responses to agent RPC)
+	closeFn func() error // transport cleanup; called by Close
 
 	stderrBuf *bytes.Buffer // optional: captured stderr (stdio transport only)
 

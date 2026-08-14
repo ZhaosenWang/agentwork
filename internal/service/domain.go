@@ -19,12 +19,12 @@ import (
 // executable Checks, and the owner's confirmation freezes it. See
 // DESIGN.md §5.2 (triangle separation: define ≠ execute ≠ judge).
 type Domain struct {
-	ID                   string `json:"id"`
-	Type                 string `json:"type"` // repo (M0); others deferred
-	Name                 string `json:"name"`
-	GitURL               string `json:"git_url"`
-	DefaultBranch        string `json:"default_branch"`
-	GitIdentity          string `json:"git_identity"`    // "name <email>" for commits
+	ID            string `json:"id"`
+	Type          string `json:"type"` // repo (M0); others deferred
+	Name          string `json:"name"`
+	GitURL        string `json:"git_url"`
+	DefaultBranch string `json:"default_branch"`
+	GitIdentity   string `json:"git_identity"` // "name <email>" for commits
 	// GitCredentials is the platform's REMOTE-OPERATION identity (decision
 	// 3-5): the token used for issue comments/close AND git push — every
 	// remote action appears under this account. Configure a dedicated
@@ -32,8 +32,8 @@ type Domain struct {
 	// render comments under the authenticating account) so the human's own
 	// identity stays clean; commits are separately authored by git_identity.
 	GitCredentials       string `json:"git_credentials"`
-	PolicyText           string `json:"policy_text"`     // NL intent (source of truth)
-	Checks               Checks `json:"checks"`          // compiled, frozen after confirmation
+	PolicyText           string `json:"policy_text"`           // NL intent (source of truth)
+	Checks               Checks `json:"checks"`                // compiled, frozen after confirmation
 	VerificationStrength string `json:"verification_strength"` // strong|medium|weak
 	MaxRunDuration       int    `json:"max_run_duration"`      // seconds per run
 	VerifyTimeout        int    `json:"verify_timeout"`        // seconds per verify command
@@ -48,7 +48,7 @@ type Domain struct {
 	// ScratchDir is the scratch domain's persistent project root on disk
 	// ('' for repo domains) — the UI shows it so the human can find the
 	// artifacts.
-	ScratchDir           string `json:"scratch_dir,omitempty"`
+	ScratchDir string `json:"scratch_dir,omitempty"`
 }
 
 // Checks is the compiled acceptance policy (DESIGN.md §5): the frozen,
@@ -121,7 +121,7 @@ func (s *DomainService) SetRunService(rs *RunService) { s.runSvc = rs }
 // (DESIGN.md §5.3): records the NL intent, enqueues a processor run on the
 // given processor agent. The daemon executes the run, reads checks.json from
 // the run's workdir, and stores the result on the domain in an UNFROZEN state
-// (checks_compiled_at stays ''); the owner's confirmation card then freezes
+// (checks_compiled_at stays ”); the owner's confirmation card then freezes
 // it via FreezeChecks. Returns the processor run.
 func (s *DomainService) CompilePolicy(ctx context.Context, domainID, policyText, processorAgentID string) (*Run, error) {
 	if strings.TrimSpace(policyText) == "" {

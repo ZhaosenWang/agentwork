@@ -138,7 +138,7 @@ func TestReconcilePendingTerminalReplaysOwnerRun(t *testing.T) {
 // TestReconcilePendingTerminalSkipsUnstartedCancelled: a run cancelled while
 // still QUEUED never executed — it has no reconcile semantics, and replaying
 // it would bump execution_attempt and enqueue a retry on a cancelled
-// sub-goal. The scan must skip it (started_at='').
+// sub-goal. The scan must skip it (started_at=”).
 func TestReconcilePendingTerminalSkipsUnstartedCancelled(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()

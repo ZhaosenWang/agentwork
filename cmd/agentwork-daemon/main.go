@@ -10,12 +10,15 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
+	"io"
+	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/proto/acpbackend"
@@ -24,6 +27,7 @@ import (
 	"github.com/eushing/agentwork/internal/server"
 	"github.com/eushing/agentwork/internal/service"
 	"github.com/eushing/agentwork/internal/store"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 func main() {
@@ -33,9 +37,21 @@ func main() {
 
 	st, err := store.Open(*dbPath)
 	if err != nil {
-		log.Fatalf("store: %v", err)
+		logging.Fatalf("store: %v", err)
 	}
 	defer st.Close()
+
+	// slog + lumberjack: the daemon's structured logger writes its compact
+	// line format (RFC3339 [LEVEL] msg — the tailer and /logs parse it) to
+	// BOTH stdout and ~/.agentwork/daemon.log (10MB size rotation, 3
+	// compressed backups). The runtime level is one atomic knob — the Web
+	// panel's PUT /logs/level — and persists in app_settings.
+	lj := &lumberjack.Logger{Filename: logging.DefaultPath(), MaxSize: 10, MaxBackups: 3, Compress: true}
+	slog.SetDefault(slog.New(logging.NewHandler(io.MultiWriter(os.Stdout, lj))))
+	if raw, err := service.NewSettingsService(st).Get(context.Background(), "logging.level"); err == nil && raw != "" {
+		logging.SetLevel(logging.ParseLevel(raw))
+		logging.Infof("logging: level restored to %s", logging.GetLevel())
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -52,7 +68,7 @@ func main() {
 	imConn.SetQueryStore(qs)
 	go func() {
 		if err := imConn.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("notify: feishu connector ended: %v", err)
+			logging.Errorf("notify: feishu connector ended: %v", err)
 		}
 	}()
 
@@ -89,12 +105,12 @@ func main() {
 	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, commentSvc, agentSvc, squadSvc, schedSvc, imConn, qs, intakeSvc)
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("daemon: %v", err)
+			logging.Errorf("daemon: %v", err)
 		}
 	}()
 
 	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc, domainSvc, imConn)
 	if err := srv.ListenAndServe(ctx, *addr); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatalf("server: %v", err)
+		logging.Fatalf("server: %v", err)
 	}
 }

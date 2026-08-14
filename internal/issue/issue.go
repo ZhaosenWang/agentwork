@@ -26,9 +26,9 @@ import (
 
 // Issue is one GitHub issue (API shape, minimal).
 type Issue struct {
-	Number int    `json:"number"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
+	Number  int    `json:"number"`
+	Title   string `json:"title"`
+	Body    string `json:"body"`
 	HTMLURL string `json:"html_url"`
 	// PullRequest is non-nil for PRs — the issues API returns them too and
 	// they must be skipped (a PR is not a work request).

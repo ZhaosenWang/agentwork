@@ -32,7 +32,9 @@ func mockGitHub(t *testing.T) (*httptest.Server, *[]string) {
 				{"id": 1, "body": "注意保留旧接口兼容", "user": map[string]any{"login": "eushing"}, "created_at": time.Now()},
 			})
 		case strings.HasSuffix(r.URL.Path, "/comments") && r.Method == http.MethodPost:
-			var cm struct{ Body string `json:"body"` }
+			var cm struct {
+				Body string `json:"body"`
+			}
 			json.NewDecoder(r.Body).Decode(&cm)
 			calls = append(calls, "BODY: "+cm.Body)
 			w.WriteHeader(http.StatusCreated)

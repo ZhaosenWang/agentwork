@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Target, Bot, Terminal, Users, Clock, Boxes, Settings } from "lucide-react";
+import { Target, Bot, Terminal, Users, Clock, Boxes, Settings, ScrollText } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
@@ -11,7 +11,8 @@ const NAV_ITEMS = [
   { href: "/runtimes", label: "Runtime", icon: Terminal },
   { href: "/squads", label: "Squad", icon: Users },
   { href: "/schedules", label: "Schedule", icon: Clock },
-  { href: "/domains", label: "项目", icon: Boxes },
+  { href: "/domains", label: "Project", icon: Boxes },
+  { href: "/logs", label: "Logs", icon: ScrollText },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

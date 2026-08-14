@@ -142,11 +142,11 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 // (the old select-default push silently dropped events AND raced the
 // close — a real panic window).
 type eventForwarder struct {
-	events  chan<- proto.Event
-	mu      sync.Mutex
-	queue   []proto.Event
-	closed  bool
-	msg     strings.Builder
+	events   chan<- proto.Event
+	mu       sync.Mutex
+	queue    []proto.Event
+	closed   bool
+	msg      strings.Builder
 	truncate int
 }
 
@@ -249,9 +249,9 @@ func toJSONString(v any) string {
 	}
 	return string(b)
 }
-func (f *eventForwarder) OnPlan(acp.Plan)                                 {}
+func (f *eventForwarder) OnPlan(acp.Plan)                                  {}
 func (f *eventForwarder) OnAvailableCommandsUpdate([]acp.AvailableCommand) {}
 func (f *eventForwarder) OnModeUpdate(acp.SessionModeId)                   {}
-func (f *eventForwarder) OnConfigOptionUpdate([]acp.SessionConfigOption)    {}
-func (f *eventForwarder) OnUsageUpdate(int, int, *acp.Cost)                 {}
-func (f *eventForwarder) OnSessionInfo(string, map[string]any)              {}
+func (f *eventForwarder) OnConfigOptionUpdate([]acp.SessionConfigOption)   {}
+func (f *eventForwarder) OnUsageUpdate(int, int, *acp.Cost)                {}
+func (f *eventForwarder) OnSessionInfo(string, map[string]any)             {}

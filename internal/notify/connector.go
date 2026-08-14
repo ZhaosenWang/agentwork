@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +20,7 @@ import (
 	"github.com/skip2/go-qrcode"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/service"
 )
 
@@ -36,10 +36,10 @@ type ConnStatus string
 
 const (
 	StatusIdle           ConnStatus = "idle"
-	StatusWaitingQR      ConnStatus = "waiting_qr"       // QR issued, awaiting scan
-	StatusWaitingMessage ConnStatus = "waiting_message"  // app created, awaiting first message to capture the receive target
+	StatusWaitingQR      ConnStatus = "waiting_qr"      // QR issued, awaiting scan
+	StatusWaitingMessage ConnStatus = "waiting_message" // app created, awaiting first message to capture the receive target
 	StatusConnected      ConnStatus = "connected"
-	StatusReconnecting   ConnStatus = "reconnecting"     // connection dropped; the reconnect loop is backing off (M4)
+	StatusReconnecting   ConnStatus = "reconnecting" // connection dropped; the reconnect loop is backing off (M4)
 	StatusFailed         ConnStatus = "failed"
 )
 
@@ -53,10 +53,10 @@ type QRInfo struct {
 // FeishuConfig is the persisted connection state (app_settings key
 // "im.feishu").
 type FeishuConfig struct {
-	AppID        string `json:"app_id"`
-	AppSecret    string `json:"app_secret"`
-	ReceiveID    string `json:"receive_id"`
-	ReceiveType  string `json:"receive_type"` // chat_id | open_id
+	AppID       string `json:"app_id"`
+	AppSecret   string `json:"app_secret"`
+	ReceiveID   string `json:"receive_id"`
+	ReceiveType string `json:"receive_type"` // chat_id | open_id
 	// OwnerOpenID is the scanned app's owner (the person who authorized the
 	// registration QR) — the platform's single user. It is the authority for
 	// M3 inbound commands and approval-card callbacks. ReceiveID is the PUSH
@@ -78,16 +78,16 @@ type SettingsStore interface {
 const settingsKey = "im.feishu"
 
 type Connector struct {
-	mu       sync.Mutex
-	status   ConnStatus
-	lastErr  string
-	qr       QRInfo
+	mu        sync.Mutex
+	status    ConnStatus
+	lastErr   string
+	qr        QRInfo
 	connectID string
-	config   FeishuConfig
+	config    FeishuConfig
 
 	store     SettingsStore
 	bus       *events.Bus
-	qs        QueryStore         // M3: card evidence + digest queries (may be nil)
+	qs        QueryStore           // M3: card evidence + digest queries (may be nil)
 	goalSvc   *service.GoalService // M3: approval-card callbacks resolve here
 	intakeSvc *IntakeService       // M3: inbound message pipeline (may be nil)
 	notify    *Notifier            // milestone pusher, armed once connected
@@ -120,12 +120,12 @@ func (c *Connector) Status() map[string]any {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return map[string]any{
-		"status":      string(c.status),
-		"receive_id":  c.config.ReceiveID,
-		"app_id":      c.config.AppID,
-		"error":       c.lastErr,
-		"qr":          c.qr,
-		"connect_id":  c.connectID,
+		"status":     string(c.status),
+		"receive_id": c.config.ReceiveID,
+		"app_id":     c.config.AppID,
+		"error":      c.lastErr,
+		"qr":         c.qr,
+		"connect_id": c.connectID,
 	}
 }
 
@@ -181,7 +181,7 @@ func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, erro
 			c.status = StatusFailed
 			c.lastErr = "registration: " + err.Error()
 			c.mu.Unlock()
-			log.Printf("notify: feishu registration failed: %v", err)
+			logging.Errorf("notify: feishu registration failed: %v", err)
 			return
 		}
 		c.mu.Lock()
@@ -214,13 +214,13 @@ func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, erro
 		// credentials only landed on captureReceive).
 		if raw, err := json.Marshal(cfg); err == nil {
 			if err := c.store.Set(context.Background(), settingsKey, string(raw)); err != nil {
-				log.Printf("notify: persist feishu app credentials: %v", err)
+				logging.Errorf("notify: persist feishu app credentials: %v", err)
 			}
 		}
 		if ownerErr != nil {
-			log.Printf("notify: feishu app created (%s), owner lookup failed (%v) — waiting for first message", result.ClientID, ownerErr)
+			logging.Infof("notify: feishu app created (%s), owner lookup failed (%v) — waiting for first message", result.ClientID, ownerErr)
 		} else {
-			log.Printf("notify: feishu connected to app owner %s", ownerOpenID)
+			logging.Infof("notify: feishu connected to app owner %s", ownerOpenID)
 		}
 		// The long connection must NOT ride on regCtx: that context carries a
 		// 10-minute registration timeout, and a cancelled context kills the
@@ -236,7 +236,7 @@ func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, erro
 func (c *Connector) cacheQR(info *registration.QRCodeInfo) {
 	png, err := qrcode.Encode(info.URL, qrcode.Medium, 256)
 	if err != nil {
-		log.Printf("notify: encode QR: %v", err)
+		logging.Errorf("notify: encode QR: %v", err)
 		return
 	}
 	c.mu.Lock()
@@ -265,11 +265,11 @@ func (c *Connector) Start(ctx context.Context) error {
 				c.status = StatusConnected
 				c.mu.Unlock()
 			}
-			log.Printf("notify: feishu config found, connecting (app %s, receive %s)", cfg.AppID, cfg.ReceiveID)
+			logging.Infof("notify: feishu config found, connecting (app %s, receive %s)", cfg.AppID, cfg.ReceiveID)
 			return c.connectWithCurrent(ctx)
 		}
 	}
-	log.Println("notify: no feishu config — connect via the Web UI (Settings → 连接飞书)")
+	logging.Infof("notify: no feishu config — connect via the Web UI (Settings → 连接飞书)")
 	<-ctx.Done()
 	return nil
 }
@@ -353,10 +353,10 @@ func (c *Connector) connectWithCurrent(ctx context.Context) error {
 			c.lastErr = "connection keeps dropping — check the Feishu app credentials and reconnect"
 			c.status = StatusFailed
 			c.mu.Unlock()
-			log.Printf("notify: feishu connection failed %d times in a row — giving up, waiting for reconnect", failures)
+			logging.Infof("notify: feishu connection failed %d times in a row — giving up, waiting for reconnect", failures)
 			return nil
 		}
-		log.Printf("notify: feishu long connection dropped (%v) — reconnecting in %s (%d/%d)", err, backoff, failures, maxReconnectFailures)
+		logging.Infof("notify: feishu long connection dropped (%v) — reconnecting in %s (%d/%d)", err, backoff, failures, maxReconnectFailures)
 		c.setStatus(StatusReconnecting)
 		select {
 		case <-time.After(backoff):
@@ -538,10 +538,10 @@ func (c *Connector) captureReceive(event *larkim.P2MessageReceiveV1) {
 	if receiveID != "" {
 		raw, _ := json.Marshal(cfg)
 		if err := c.store.Set(context.Background(), settingsKey, string(raw)); err != nil {
-			log.Printf("notify: persist feishu config: %v", err)
+			logging.Errorf("notify: persist feishu config: %v", err)
 		}
 		if !already {
-			log.Printf("notify: receive target captured (%s %s) — connected", receiveType, receiveID)
+			logging.Infof("notify: receive target captured (%s %s) — connected", receiveType, receiveID)
 		}
 	}
 
@@ -565,7 +565,9 @@ func (c *Connector) dispatchInbound(event *larkim.P2MessageReceiveV1, sender str
 		return
 	}
 	// The message text lives in a JSON content envelope {"text":"..."}.
-	var env struct{ Text string `json:"text"` }
+	var env struct {
+		Text string `json:"text"`
+	}
 	if msg.Content == nil || json.Unmarshal([]byte(*msg.Content), &env) != nil || strings.TrimSpace(env.Text) == "" {
 		return
 	}

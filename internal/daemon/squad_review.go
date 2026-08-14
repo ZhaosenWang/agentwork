@@ -3,12 +3,12 @@ package daemon
 import (
 	"context"
 	"database/sql"
-	"log"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
+	"github.com/google/uuid"
 )
 
 // ── Squad review checkpoint (platform-enforced, not agent discretion) ──
@@ -57,7 +57,7 @@ func (d *Daemon) onGoalReviewing(_ context.Context, e events.Event) {
 	// means no other run is live — the review run enqueued below claims
 	// within a dispatch tick.
 	if err := d.maybeTriggerSquadReview(d.ctx, goalID); err != nil {
-		log.Printf("daemon: squad review trigger for %s: %v", goalID, err)
+		logging.Infof("daemon: squad review trigger for %s: %v", goalID, err)
 	}
 	d.openReviewWindow(d.ctx, goalID)
 }
@@ -136,7 +136,7 @@ func (d *Daemon) maybeFireReviewReady(ctx context.Context, goalID string) {
 	if err := d.st.DB().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='review' AND status IN ('queued','running')`,
 		goalID).Scan(&pending); err != nil {
-		log.Printf("daemon: review-ready pending check %s: %v", goalID, err)
+		logging.Infof("daemon: review-ready pending check %s: %v", goalID, err)
 		return
 	}
 	if pending > 0 {
@@ -179,7 +179,7 @@ func (d *Daemon) publishReviewReady(goalID string) {
 		delete(d.reviewReadyTimers, goalID)
 	}
 	d.mu.Unlock()
-	log.Printf("daemon: review window ready for %s — notifying the human", goalID)
+	logging.Infof("daemon: review window ready for %s — notifying the human", goalID)
 	// The review_duration anchor: the human's decision window STARTS here
 	// (the reviewer's run time is not the human's decision time — the health
 	// metric must measure the latter). An invisible activity row (the
@@ -187,7 +187,7 @@ func (d *Daemon) publishReviewReady(goalID string) {
 	if _, err := d.st.DB().ExecContext(context.Background(),
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,'system','','review_ready','{}',?)`,
 		uuid.NewString(), goalID, nowStr()); err != nil {
-		log.Printf("daemon: review-ready anchor for %s: %v", goalID, err)
+		logging.Infof("daemon: review-ready anchor for %s: %v", goalID, err)
 	}
 	d.bus.Publish(context.Background(), events.Event{Topic: "goal:review_ready", Payload: map[string]any{
 		"goal_id": goalID,
@@ -275,14 +275,14 @@ func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) err
 		if err := d.st.DB().QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND role='review' AND status IN ('queued','running')`,
 			goalID, r.id).Scan(&pending); err != nil {
-			log.Printf("daemon: squad review pending check %s → %s: %v", goalID, r.id, err)
+			logging.Infof("daemon: squad review pending check %s → %s: %v", goalID, r.id, err)
 			continue
 		}
 		if pending > 0 {
 			continue
 		}
 		if err := d.enqueueSquadReview(ctx, goalID, r.id, r.name); err != nil {
-			log.Printf("daemon: squad review enqueue %s → %s: %v", goalID, r.id, err)
+			logging.Infof("daemon: squad review enqueue %s → %s: %v", goalID, r.id, err)
 		}
 	}
 	return nil
@@ -327,7 +327,7 @@ func (d *Daemon) onGoalFinished(_ context.Context, e events.Event) {
 	rows, err := d.st.DB().QueryContext(d.ctx,
 		`SELECT id FROM run WHERE goal_id=? AND status='running'`, goalID)
 	if err != nil {
-		log.Printf("daemon: cancel scan %s: %v", goalID, err)
+		logging.Infof("daemon: cancel scan %s: %v", goalID, err)
 		return
 	}
 	defer rows.Close()
@@ -339,7 +339,7 @@ func (d *Daemon) onGoalFinished(_ context.Context, e events.Event) {
 		}
 	}
 	for _, id := range ids {
-		log.Printf("daemon: goal cancelled — stopping run %s", id)
+		logging.Infof("daemon: goal cancelled — stopping run %s", id)
 		d.cancelRun(id, "stopped")
 	}
 }

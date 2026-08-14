@@ -1,9 +1,9 @@
 package ws
 
 import (
-	"log"
 	"net/http"
 
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/gorilla/websocket"
 )
 
@@ -26,7 +26,7 @@ var upgrader = websocket.Upgrader{
 func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("ws: upgrade: %v", err)
+		logging.Errorf("ws: upgrade: %v", err)
 		return
 	}
 	c := &Client{hub: hub, conn: conn, send: make(chan []byte, clientSendBuffer)}
