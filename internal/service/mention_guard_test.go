@@ -65,7 +65,8 @@ func TestMentionCycleFailsGoal(t *testing.T) {
 		`SELECT content FROM comment WHERE goal_id=? AND author_type='system' ORDER BY created_at DESC LIMIT 1`, g.ID).Scan(&sysComment); err != nil {
 		t.Fatalf("system failure comment: %v", err)
 	}
-	if !strings.Contains(sysComment, fmt.Sprintf("协作循环 %d 次", MaxMentionCycle)) {
+	// The goal is English — the comment follows its language (决策 6-18).
+	if !strings.Contains(sysComment, fmt.Sprintf("collaboration cycle reached %d", MaxMentionCycle)) {
 		t.Fatalf("failure comment should name the cycle count, got: %q", sysComment)
 	}
 }

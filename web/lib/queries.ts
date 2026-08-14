@@ -492,9 +492,26 @@ export function useGoalEvents() {
     const id = m?.goal_id;
     if (typeof id === "string" && id) {
       qc.invalidateQueries({ queryKey: qk.goal(id) });
+      qc.invalidateQueries({ queryKey: qk.goalRuns(id) });
       qc.invalidateQueries({ queryKey: qk.goalChanges(id) });
     }
   });
+  // The review window's PHASE derives from the goal's review runs (决策 6-19
+  // 延伸): claim flips awaiting_review → reviewing, terminal flips to
+  // awaiting_approval. The goal row and the runs panel refresh together so
+  // the phase badge and the approval gating follow live.
+  const invalidateRuns = (p: WSEvent["payload"]) => {
+    const m = p as Record<string, unknown> | undefined;
+    const id = m?.goal_id;
+    if (typeof id === "string" && id) {
+      qc.invalidateQueries({ queryKey: qk.goal(id) });
+      qc.invalidateQueries({ queryKey: qk.goalRuns(id) });
+      qc.invalidateQueries({ queryKey: qk.goals });
+    }
+  };
+  useWSEvent("run:claimed", invalidateRuns);
+  useWSEvent("run:enqueued", invalidateRuns);
+  useWSEvent("run:cancelled", invalidateRuns);
   // change.* events re-derive attention too, and refresh the change panel.
   useWSEvent("change.ready", invalidateGoal);
   useWSEvent("change.integrated", invalidateGoal);

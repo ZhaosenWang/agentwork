@@ -59,6 +59,31 @@ const STATUS_DOTS: Record<string, string> = {
   "dot-green": "bg-green-500",
 };
 
+// review_phase 的显示层（决策 6-19 延伸）：park 后有 reviewer 的 goal 是三阶段
+// ——待审查（run 已入队、未开跑）→ 审查中（reviewer 在跑）→ 待审批（意见齐了
+// 才轮到人）。无 reviewer 直接到待审批。
+const REVIEW_PHASES: Record<string, { label: string; cls: string; dot: string }> = {
+  awaiting_review: { label: "待审查", cls: "bg-sky-50 text-sky-700 dot-sky", dot: "bg-sky-500" },
+  reviewing: { label: "审查中", cls: "bg-amber-50 text-amber-700 dot-amber", dot: "bg-amber-500" },
+  awaiting_approval: { label: "待审批", cls: "bg-purple-50 text-purple-700 dot-purple", dot: "bg-purple-500" },
+};
+
+export function ReviewPhaseBadge({ phase, className }: { phase?: string; className?: string }) {
+  const meta = REVIEW_PHASES[phase ?? "awaiting_approval"] ?? REVIEW_PHASES.awaiting_approval;
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 px-2.5 py-0.5 text-xs font-medium rounded-full",
+        meta.cls,
+        className
+      )}
+    >
+      <span className={cn("h-1.5 w-1.5 rounded-full", meta.dot)} />
+      {meta.label}
+    </span>
+  );
+}
+
 export function Badge({ status, className }: { status: string; className?: string }) {
   const colors = STATUS_COLORS[status] ?? "bg-zinc-100 text-zinc-600 dot-zinc";
   const dot = STATUS_DOTS[colors.split(" ").find((c) => c.startsWith("dot-")) ?? "dot-zinc"] ?? "bg-zinc-400";

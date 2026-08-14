@@ -40,11 +40,15 @@ type Run struct {
 	// BaseRef/HeadRef are the Change revision refs the daemon stamps at a
 	// sub-goal run's end (merge-base of goal branch and the sub-goal branch,
 	// and the branch head SHA).
-	BaseRef          string `json:"base_ref"`
-	HeadRef          string `json:"head_ref"`
-	Attempt          int    `json:"attempt"`
-	ResultSummary    string `json:"result_summary"`
-	Evidence         string `json:"evidence"` // JSON: diff stats + verify output + summary
+	BaseRef       string `json:"base_ref"`
+	HeadRef       string `json:"head_ref"`
+	Attempt       int    `json:"attempt"`
+	ResultSummary string `json:"result_summary"`
+	Evidence      string `json:"evidence"` // JSON: diff stats + verify output + summary
+	// WakeNote is the owner-wake reason compiled in the spawn transaction
+	// (决策 6-17): the prompt reads THIS snapshot, not the mutable
+	// goal.attention — a later reconcile must not erase "why you were woken".
+	WakeNote         string `json:"wake_note,omitempty"`
 	TriggerCommentID string `json:"trigger_comment_id"`
 	IsLeaderRun      bool   `json:"is_leader_run"`
 	SquadID          string `json:"squad_id"`
@@ -136,11 +140,20 @@ func (s *RunService) hasPending(ctx context.Context, tx *sql.Tx, goalID, agentID
 // rolled-back tx must not emit). The caller publishes after its commit.
 // Note: EnqueueExistingTx (the Coordinator's path inside a goal tx) does not
 // publish — the goal layer's commitAndEmit covers goal events.
-func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID string) (*Run, *events.Event, error) {
-	role, err := s.resolveRunRole(ctx, tx, isLeader, triggerCommentID)
-	if err != nil {
-		return nil, nil, err
+func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, triggerCommentID, wakeNote, roleOverride string) (*Run, *events.Event, error) {
+	// The role is derived from the trigger comment's author UNLESS the caller
+	// stamps it explicitly (决策 6-19: the platform's review request is
+	// enqueued as role='review' even though its trigger — the parking run's
+	// report — is agent-authored).
+	role := roleOverride
+	if role == "" {
+		var derr error
+		role, derr = s.resolveRunRole(ctx, tx, isLeader, triggerCommentID)
+		if derr != nil {
+			return nil, nil, derr
+		}
 	}
+	var err error
 	// Coalesce per (goal, agent, ROLE): each role's pending run is a DISTINCT
 	// ask. A cross-role merge is a correctness bug, not a dedupe: an owner
 	// spawn merging into a pending consult swallows the WORK run and strands
@@ -164,7 +177,16 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 			// this timestamp). A RUNNING run is NOT bumped — its prompt was
 			// built at claim, before the signal existed; the signal must
 			// survive its finish.
-			_, _ = tx.ExecContext(ctx, `UPDATE run SET queued_at=? WHERE id=?`, now(), id)
+			//
+			// The wake note travels with the bump (决策 6-17): the coalesced
+			// run's prompt is built at CLAIM (not enqueue), so it must carry
+			// the LATEST signal's reason. A new note overwrites; an empty one
+			// keeps the pending run's original context.
+			if wakeNote != "" {
+				_, _ = tx.ExecContext(ctx, `UPDATE run SET queued_at=?, wake_note=? WHERE id=?`, now(), wakeNote, id)
+			} else {
+				_, _ = tx.ExecContext(ctx, `UPDATE run SET queued_at=? WHERE id=?`, now(), id)
+			}
 		}
 		ev := &events.Event{Topic: "run:coalesced", Payload: map[string]any{
 			"goal_id": goalID, "agent_id": agentID,
@@ -188,14 +210,15 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		IsLeaderRun:      isLeader,
 		SquadID:          squadID,
 		TriggerCommentID: triggerCommentID,
+		WakeNote:         wakeNote,
 		Status:           "queued",
 		QueuedAt:         ts,
 		CreatedAt:        ts,
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.Attempt, r.ResultSummary, r.TriggerCommentID, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,trigger_comment_id,wake_note,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.Attempt, r.ResultSummary, r.TriggerCommentID, r.WakeNote, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
 		return nil, nil, fmt.Errorf("insert run: %w", err)
 	}
 	ev := &events.Event{Topic: "run:enqueued", Payload: r}
@@ -257,7 +280,7 @@ func (s *RunService) EnqueueForGoalTx(ctx context.Context, tx *sql.Tx, g Goal) (
 	if err != nil {
 		return nil, nil, err
 	}
-	return s.enqueueTx(ctx, tx, g.ID, agentID, 1, isLeader, squadID, "")
+	return s.enqueueTx(ctx, tx, g.ID, agentID, 1, isLeader, squadID, "", "", "")
 }
 
 // EnqueueExisting enqueues a run on an explicit agent (used by retry and
@@ -274,6 +297,39 @@ func (s *RunService) EnqueueExisting(ctx context.Context, goalID, agentID string
 // current assignee) and does NOT cancel any in-flight run.
 func (s *RunService) EnqueueForMention(ctx context.Context, goalID, agentID, triggerCommentID string) (*Run, error) {
 	return s.enqueue(ctx, goalID, agentID, 1, false, "", triggerCommentID)
+}
+
+// EnqueueForMentionRole is EnqueueForMention with an EXPLICIT role stamp
+// (决策 6-19): the squad review request's trigger is now the parking run's
+// report comment — AGENT-authored — so resolveRunRole would derive
+// 'consult'. The review run must stay role='review' (claim gate, window
+// pending count, prompt — all keyed on role); the platform enqueues it as
+// such explicitly.
+func (s *RunService) EnqueueForMentionRole(ctx context.Context, goalID, agentID, triggerCommentID, role string) (*Run, error) {
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	r, ev, err := s.EnqueueForMentionRoleTx(ctx, tx, goalID, agentID, triggerCommentID, role)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if ev != nil {
+		s.bus.Publish(ctx, *ev)
+	}
+	return r, nil
+}
+
+// EnqueueForMentionRoleTx is the in-transaction variant (决策 6-13/6-19):
+// the review run is the PARK's successor — it is born in the park
+// transaction, so when goal:reviewing publishes, the run already EXISTS and
+// the approval card's pending-reviewer hint can never race an empty list.
+func (s *RunService) EnqueueForMentionRoleTx(ctx context.Context, tx *sql.Tx, goalID, agentID, triggerCommentID, role string) (*Run, *events.Event, error) {
+	return s.enqueueTx(ctx, tx, goalID, agentID, 1, false, "", triggerCommentID, "", role)
 }
 
 // EnqueueSubGoalRun creates a sub-goal execution run (决策 6-1/6-9): role
@@ -491,7 +547,7 @@ func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attemp
 		return nil, err
 	}
 	defer tx.Rollback()
-	r, ev, err := s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, triggerCommentID)
+	r, ev, err := s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, triggerCommentID, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -510,8 +566,8 @@ func (s *RunService) enqueue(ctx context.Context, goalID, agentID string, attemp
 // flips blocked→active and enqueues in one tx). The run event is RETURNED —
 // the caller's tx owns the publish-after-commit contract and publishes after
 // its commit (invariant 13).
-func (s *RunService) EnqueueExistingTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID string) (*Run, *events.Event, error) {
-	return s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, "")
+func (s *RunService) EnqueueExistingTx(ctx context.Context, tx *sql.Tx, goalID, agentID string, attempt int, isLeader bool, squadID, wakeNote string) (*Run, *events.Event, error) {
+	return s.enqueueTx(ctx, tx, goalID, agentID, attempt, isLeader, squadID, "", wakeNote, "")
 }
 
 // ClaimedRow is a claimed run row handed to the daemon's runTask.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -145,9 +146,30 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 		return nil, fmt.Errorf("resolve assignee label: %w", err)
 	}
 	dispatchID := newID()
-	dispatchContent := fmt.Sprintf("[@%s](mention://agent/%s) 交给你一个子任务：**%s**", label, sg.AssigneeID, sg.Title)
-	if strings.TrimSpace(sg.Description) != "" {
-		dispatchContent += "——" + sg.Description
+	// The dispatch comment's TEMPLATE follows its MATERIALS (决策 6-18): the
+	// platform wraps the leader's own words (the sub-goal title/description)
+	// — the wrapper speaks the language those words are written in. This is
+	// the ONE platform comment carrying materials; every other platform text
+	// is English. Carries only a ONE-LINE summary: the full description is
+	// the Task section of the assignee's prompt — repeating it verbatim in
+	// the feed doubles the text for every reader (决策 6-18 派发精简).
+	lead := "Assigned you a sub-task: "
+	sep := " — "
+	if isCJK(sg.Title + sg.Description) {
+		lead = "交给你一个子任务："
+		sep = "——"
+	}
+	dispatchContent := fmt.Sprintf("[@%s](mention://agent/%s) %s**%s**", label, sg.AssigneeID, lead, sg.Title)
+	summary := strings.TrimSpace(sg.Description)
+	if i := strings.IndexByte(summary, '\n'); i >= 0 {
+		summary = summary[:i]
+	}
+	summary = strings.TrimSpace(summary)
+	if r := []rune(summary); len(r) > 120 {
+		summary = string(r[:120]) + "…"
+	}
+	if summary != "" {
+		dispatchContent += sep + summary
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
@@ -797,4 +819,16 @@ func (s *GoalService) CancelSubGoal(ctx context.Context, subGoalID string) (*Sub
 		"goal_id": sg.GoalID, "sub_goal_id": sg.ID,
 	}})
 	return sg, nil
+}
+
+// isCJK is the dispatch comment's material-language check (决策 6-18): the
+// wrapper follows the language the leader wrote the work item in. Local to
+// this one platform comment — there is no global language model.
+func isCJK(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
 }

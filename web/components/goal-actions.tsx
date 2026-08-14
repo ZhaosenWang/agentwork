@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useAgents, useSquads, useAssignGoal, useCancelGoal,
   useReopenGoal, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments, useActivateGoal, useDomains } from "@/lib/queries";
-import { Button, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
+import { Button, Dialog, Field, inputCls, ConfirmDialog, ReviewPhaseBadge } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Goal } from "@/lib/types";
 
@@ -122,12 +122,20 @@ function ReviewPanel({ goal }: { goal: Goal }) {
   );
   const otherComments = recentComments.filter((c) => c.author_type !== "agent");
 
+  // 审查窗口三阶段（决策 6-19 延伸）：待审查 / 审查中 → 审批按钮不出现，
+  // 横幅点名 reviewer——审查完成（意见齐了）才轮到人审。
+  const phase = goal.review_phase || "awaiting_approval";
+  const pendingReviewers = (runs ?? []).filter(
+    (r) => r.role === "review" && (r.status === "queued" || r.status === "running")
+  );
+  const reviewerNames = pendingReviewers.map((r) => agentName(r.agent_id));
+
   return (
     <div className="rounded-2xl border border-amber-300/80 bg-amber-50/70 w-full shadow-sm shadow-amber-500/5 overflow-hidden">
       {/* 卡点原因（独立行，小字两行排） */}
       <div className="px-4 py-3 border-b border-amber-200/60 space-y-1.5">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-mono bg-amber-200 px-2 py-0.5 rounded">等待审批</span>
+          <ReviewPhaseBadge phase={phase} />
           {goal.human_iterations > 0 && (
             <span className="text-xs text-amber-700">已驳回 {goal.human_iterations} 次</span>
           )}
@@ -208,7 +216,16 @@ function ReviewPanel({ goal }: { goal: Goal }) {
         <p className="text-sm text-red-700 font-medium">⚠️ 上次合入失败（冲突/验证红）——可重新批准重试合入，或驳回让 agent 修。</p>
       )}
 
-      {!rejectForm ? (
+      {phase !== "awaiting_approval" ? (
+        <div className="flex items-center gap-2 bg-white rounded-xl border border-sky-200/80 p-3">
+          <span className="text-sm text-sky-800">
+            {phase === "reviewing" ? "🔎 审查中：" : "🔎 待审查："}
+            <span className="font-medium">{reviewerNames.join("、") || "—"}</span>
+            {phase === "awaiting_review" ? "（已入队，即将开始）" : ""}
+            ——审查完成后你可审批
+          </span>
+        </div>
+      ) : !rejectForm ? (
         <div className="flex gap-2">
           <Button
             onClick={() =>

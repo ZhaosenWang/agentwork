@@ -280,15 +280,17 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 // pointing at an AGENT-authored comment). Platform triggers (system review
 // requests) and human triggers are not agent churn. Sub-goal/verify runs are
 // EXEMPT (P2-2, 决策 6-15⑩): their trigger is the owner's dispatch comment —
-// workflow execution, not mention churn (the counter's semantic is the
-// agent↔agent consult loop; this is the current approximation, not the final
-// interaction-edge definition).
+// workflow execution, not mention churn. Review runs too (决策 6-19):
+// platform-enqueued, anchored on the parking run's agent-authored report —
+// the review round is the approval window's evidence, never churn (the
+// counter's semantic is the agent↔agent consult loop; this is the current
+// approximation, not the final interaction-edge definition).
 func (s *CommentService) MentionCycleCount(ctx context.Context, goalID string) (int, error) {
 	var n int
 	err := s.st.DB().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM run r JOIN comment c ON c.id = r.trigger_comment_id
 		 WHERE r.goal_id=? AND c.author_type='agent'
-		   AND r.role NOT IN ('subgoal','verify')`, goalID).Scan(&n)
+		   AND r.role NOT IN ('subgoal','verify','review')`, goalID).Scan(&n)
 	return n, err
 }
 
@@ -319,14 +321,18 @@ func (s *CommentService) forceMentionCycleFailed(ctx context.Context, goalID str
 	if affected, _ := res.RowsAffected(); affected == 0 {
 		return // already moved (review/reject raced) — the loop is moot
 	}
-	reason := fmt.Sprintf("agent 协作循环 %d 次（超过上限 %d）", n, MaxMentionCycle)
+	// Platform text is English (决策 6-18) — the language lives in the
+	// MATERIALS (agents' comments follow the goal's language via the
+	// LANGUAGE rule); platform notifications stay fixed.
+	reason := fmt.Sprintf("agent collaboration cycle reached %d (limit %d)", n, MaxMentionCycle)
+	comment := fmt.Sprintf("Task failed: %s. Agents kept handing the task to each other — review and reopen.", reason)
 	ts := now()
 	_, _ = s.st.DB().ExecContext(ctx,
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,'','mention_cycle_failed',?,?)`,
 		newID(), goalID, "system", `{"reason":"`+reason+`"}`, ts)
 	_, _ = s.st.DB().ExecContext(ctx,
 		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,'system','',NULL,?,?)`,
-		newID(), goalID, "任务失败："+reason+"。agent 反复互相转移任务，请检查后重开。", ts)
+		newID(), goalID, comment, ts)
 	_, _ = s.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, goalID)
 	s.bus.Publish(ctx, events.Event{Topic: "goal:finished", Payload: map[string]any{

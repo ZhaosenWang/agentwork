@@ -28,6 +28,10 @@ type fakeHost struct {
 	mu    sync.Mutex
 	terms map[string]*fakeTerm
 	next  int
+	// lastCommand/lastArgs record what the host was asked to run — the argv
+	// dedupe test asserts on them.
+	lastCommand string
+	lastArgs    []string
 }
 
 type fakeTerm struct {
@@ -49,6 +53,9 @@ func (h *fakeHost) Create(command string, args []string, env []string, cwd strin
 	if command == "" {
 		return "", errEmptyCommand
 	}
+	h.mu.Lock()
+	h.lastCommand, h.lastArgs = command, args
+	h.mu.Unlock()
 	cmd := exec.Command(command, args...)
 	cmd.Env = env
 	if cwd != "" {
@@ -184,12 +191,14 @@ func TestMCPFullClientRoundTrip(t *testing.T) {
 		t.Fatalf("read content: want %q, got %+v", "via sdk client", res.Content[0])
 	}
 
-	// Async terminal: create → poll output until exited → release.
+	// Async terminal: create → poll output until exited → release. The
+	// command is a SHELL command line (决策 4-8: /bin/sh -c on this machine)
+	// — no separate args field.
 	create, err := session.CallTool(ctx, &gmcp.CallToolParams{
 		Name: "terminal_create",
 		Arguments: map[string]any{
-			"command": "sh", "args": []any{"-c", "echo hello; exit 3"},
-			"cwd": dir,
+			"command": "echo hello; exit 3",
+			"cwd":     dir,
 		},
 	})
 	if err != nil {
@@ -386,5 +395,41 @@ func TestCollaborationPermissions(t *testing.T) {
 	var assignee string
 	if err := st.DB().QueryRowContext(ctx2, `SELECT assignee_id FROM goal WHERE id=?`, goal.ID).Scan(&assignee); err != nil || assignee != agentA.ID {
 		t.Fatalf("ownership moved by a guest (assignee=%q err=%v)", assignee, err)
+	}
+}
+
+// TestTerminalCreateShellSemantics: terminal_create's command is a SHELL
+// command line — the platform runs it via /bin/sh -c on this machine (the
+// shell is stated in the tool description, never left for the agent to
+// guess), so pipes/redirects/&& work and the exit code propagates. The
+// command/args split is gone (agents mis-split it, e.g. 'find find .').
+func TestTerminalCreateShellSemantics(t *testing.T) {
+	host := newFakeHost()
+	exec := NewExecutor(t.TempDir(), []string{"PATH=" + os.Getenv("PATH")}, host)
+	session := connect(t, HTTPHandler(exec))
+	ctx := context.Background()
+
+	// A pipeline only the shell can run — direct exec would fail.
+	res, err := session.CallTool(ctx, &gmcp.CallToolParams{
+		Name:      "terminal_create",
+		Arguments: map[string]any{"command": "echo hi | tr a-z A-Z; exit 7"},
+	})
+	if err != nil {
+		t.Fatalf("terminal_create: %v", err)
+	}
+	text := res.Content[0].(*gmcp.TextContent).Text
+	if !strings.Contains(text, "HI") {
+		t.Fatalf("the pipeline must run through the shell, got %q", text)
+	}
+	if !strings.Contains(text, `"exit_code":7`) {
+		t.Fatalf("the shell's exit code must propagate, got %q", text)
+	}
+
+	// The host was asked to run the SHELL, with the command as one -c arg.
+	host.mu.Lock()
+	cmd, args := host.lastCommand, host.lastArgs
+	host.mu.Unlock()
+	if cmd != "/bin/sh" || len(args) != 2 || args[0] != "-c" || !strings.Contains(args[1], "tr a-z A-Z") {
+		t.Fatalf("the host must run /bin/sh -c <command>, got %q %v", cmd, args)
 	}
 }

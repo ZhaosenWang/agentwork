@@ -103,7 +103,8 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		delete(d.mcpExecs, q.RunID)
 		d.mu.Unlock()
 	}()
-	prompt += worktreeGuidance(workdir)
+	// Intake runs are one-shot (no goal session) — the full contract.
+	prompt += worktreeGuidance(workdir, true)
 
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {

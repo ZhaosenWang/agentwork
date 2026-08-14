@@ -40,6 +40,12 @@ type Goal struct {
 	// Attention is the v2 derived OwnerAttention persisted by ReconcileGoal
 	// (决策 6-8): '' | integration | recovery | user_action (comma-joined).
 	Attention string `json:"attention"`
+	// ReviewPhase is the review window's DERIVED phase (决策 6-19 延伸): the
+	// platform's own judgment rendered for the Web —
+	// awaiting_review (review runs enqueued, none started) | reviewing (a
+	// review run is running) | awaiting_approval (no pending review runs —
+	// opinions are in, or no reviewer exists). '' when not in review.
+	ReviewPhase string `json:"review_phase,omitempty"`
 	// CurrentAgentID is the agent of the goal's latest running/queued run —
 	// the list card's "who is working right now" ('' = nobody in flight).
 	CurrentAgentID string `json:"current_agent_id"`
@@ -230,7 +236,7 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	// event is published after the commit (invariant 13).
 	var runEv *events.Event
 	if g.Status == "active" && (g.AssigneeType == "agent" || g.AssigneeType == "squad") {
-		_, ev, err := s.enqueueOwnerIntentTx(ctx, tx, g.ID, g.AssigneeType, g.AssigneeID, g.Status, "active")
+		_, ev, err := s.enqueueOwnerIntentTx(ctx, tx, g.ID, g.AssigneeType, g.AssigneeID, g.Status, "", "active")
 		if err != nil {
 			return nil, fmt.Errorf("enqueue first run: %w", err)
 		}
@@ -250,7 +256,11 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
 		`SELECT g.id,g.title,g.description,g.domain_id,g.assignee_type,g.assignee_id,g.status,g.handoff_note,g.review_request,g.human_iterations,g.created_by_type,g.created_by_id,g.created_at,g.source_ref,g.attention,
-		        (SELECT r.agent_id FROM run r WHERE r.goal_id = g.id AND r.status IN ('running','queued') ORDER BY r.created_at DESC LIMIT 1)
+		        (SELECT r.agent_id FROM run r WHERE r.goal_id = g.id AND r.status IN ('running','queued') ORDER BY r.created_at DESC LIMIT 1),
+		        CASE WHEN g.status != 'review' THEN ''
+		     WHEN (SELECT COUNT(*) FROM run r WHERE r.goal_id=g.id AND r.role='review' AND r.status IN ('queued','running')) = 0 THEN 'awaiting_approval'
+		     WHEN (SELECT COUNT(*) FROM run r WHERE r.goal_id=g.id AND r.role='review' AND r.status='running') > 0 THEN 'reviewing'
+		     ELSE 'awaiting_review' END
 		 FROM goal g ORDER BY g.created_at DESC`)
 	if err != nil {
 		return nil, err
@@ -260,7 +270,7 @@ func (s *GoalService) List(ctx context.Context) ([]Goal, error) {
 	for rows.Next() {
 		var g Goal
 		var domainID, currentAgent sql.NullString
-		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.SourceRef, &g.Attention, &currentAgent); err != nil {
+		if err := rows.Scan(&g.ID, &g.Title, &g.Description, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.SourceRef, &g.Attention, &currentAgent, &g.ReviewPhase); err != nil {
 			return nil, err
 		}
 		g.DomainID = domainID.String
@@ -417,9 +427,13 @@ func (s *GoalService) Get(ctx context.Context, id string) (*Goal, error) {
 	var domainID, currentAgent sql.NullString
 	err := s.st.DB().QueryRowContext(ctx,
 		`SELECT g.id,g.title,g.description,g.domain_id,g.assignee_type,g.assignee_id,g.status,g.handoff_note,g.review_request,g.human_iterations,g.created_by_type,g.created_by_id,g.created_at,g.source_ref,g.attention,
-		        (SELECT r.agent_id FROM run r WHERE r.goal_id = g.id AND r.status IN ('running','queued') ORDER BY r.created_at DESC LIMIT 1)
+		        (SELECT r.agent_id FROM run r WHERE r.goal_id = g.id AND r.status IN ('running','queued') ORDER BY r.created_at DESC LIMIT 1),
+		        CASE WHEN g.status != 'review' THEN ''
+		     WHEN (SELECT COUNT(*) FROM run r WHERE r.goal_id=g.id AND r.role='review' AND r.status IN ('queued','running')) = 0 THEN 'awaiting_approval'
+		     WHEN (SELECT COUNT(*) FROM run r WHERE r.goal_id=g.id AND r.role='review' AND r.status='running') > 0 THEN 'reviewing'
+		     ELSE 'awaiting_review' END
 		 FROM goal g WHERE g.id=?`, id).
-		Scan(&g.ID, &g.Title, &g.Description, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.SourceRef, &g.Attention, &currentAgent)
+		Scan(&g.ID, &g.Title, &g.Description, &domainID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.HandoffNote, &g.ReviewRequest, &g.HumanIterations, &g.CreatedByType, &g.CreatedByID, &g.CreatedAt, &g.SourceRef, &g.Attention, &currentAgent, &g.ReviewPhase)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -568,6 +582,14 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 				newID(), goalID, "任务停靠待审：agent 间所有权交接形成循环，请决定——批准继续（交接生效）/ 驳回（任务失败）。", now()); err != nil {
 				return nil, fmt.Errorf("insert handoff-loop comment: %w", err)
 			}
+			// The park publishes goal:reviewing like the gate park (决策 4-4:
+			// handoff_loop 停靠同样发卡 — the human MUST decide). The squad
+			// checkpoint skips it (handoff_loop prefix — no code to review);
+			// the card fires with no reviewer hint. No run_id: no run parked
+			// this goal, the handoff chain did.
+			handoffLoopEvs = append(handoffLoopEvs, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
+				"goal_id": goalID, "reason": reason,
+			}})
 		}
 	}
 	// The handoff note is the actor's words — it belongs in the comment
@@ -618,7 +640,7 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 		if err := tx.QueryRowContext(ctx, `SELECT status FROM goal WHERE id=?`, goalID).Scan(&finalStatus); err != nil {
 			return nil, fmt.Errorf("load goal status for handoff enqueue: %w", err)
 		}
-		run, ev, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, assigneeType, assigneeID, finalStatus, "active", "review")
+		run, ev, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, assigneeType, assigneeID, finalStatus, "", "active", "review")
 		if err != nil {
 			return nil, fmt.Errorf("enqueue new owner run: %w", err)
 		}
@@ -993,7 +1015,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 					// transaction — a crash can no longer lose the requester's
 					// successor run. An enqueue failure is only logged (the
 					// consult's outcome is already in the feed).
-					_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, requesterAgent, 1, false, "")
+					_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, requesterAgent, 1, false, "", "")
 					if err != nil {
 						afterCommit = append(afterCommit, func() {
 							logging.Infof("goal: consult resume enqueue for %s: %v", rc.GoalID, err)
@@ -1101,6 +1123,14 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 				newID(), rc.GoalID, "system", "", string(detail), now()); err != nil {
 				return fmt.Errorf("insert review activity: %w", err)
 			}
+			// The squad's reviewer runs are the park's SUCCESSOR (决策 6-13/
+			// 6-19): born in THIS transaction, so the goal:reviewing consumers
+			// (the approval card's pending-reviewer hint) always see them — an
+			// event-handler enqueue raced the notify handler and fired the
+			// card WITHOUT the "审查中" hint while the reviewer was starting.
+			if err := s.enqueueSquadReviewTx(ctx, tx, rc.GoalID, rc.RunID, reason); err != nil {
+				return fmt.Errorf("enqueue squad review: %w", err)
+			}
 			pendingEvents = append(pendingEvents, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
 				"goal_id": rc.GoalID, "run_id": rc.RunID, "reason": reason,
 			}})
@@ -1139,7 +1169,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			// lose the successor run. The retry events publish after the
 			// commit (invariant 13, via commitAndEmit).
 			attempt := rc.Attempt + 1
-			_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, rc.AgentID, attempt, rc.IsLeaderRun, rc.SquadID)
+			_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, rc.AgentID, attempt, rc.IsLeaderRun, rc.SquadID, "")
 			if err != nil {
 				pendingEvents = append(pendingEvents, events.Event{Topic: "goal:retry_failed", Payload: map[string]any{
 					"goal_id": rc.GoalID, "error": err.Error(),
@@ -1410,7 +1440,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		// attempt resets to 1: a reject iteration is a fresh human-directed
 		// cycle, not a machine retry — the reject count lives in
 		// goal.human_iterations (DESIGN.md §4).
-		_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "active")
+		_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "", "active")
 		if err != nil {
 			_ = tx.Rollback()
 			return nil, fmt.Errorf("enqueue after reject: %w", err)
@@ -1484,7 +1514,7 @@ func (s *GoalService) Activate(ctx context.Context, goalID string) (*Goal, error
 		Scan(&g.ID, &g.AssigneeType, &g.AssigneeID); err != nil {
 		return nil, fmt.Errorf("load goal for activate enqueue: %w", err)
 	}
-	_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "active")
+	_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "", "active")
 	if err != nil {
 		return nil, fmt.Errorf("enqueue after activate: %w", err)
 	}
@@ -1546,7 +1576,7 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal,
 	}
 	// Fresh run on the current assignee (the unified owner-run spawn, P0.5;
 	// human-assigned goals stay manual — the intent helper no-ops for them).
-	_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "active")
+	_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "", "active")
 	if err != nil {
 		return nil, fmt.Errorf("enqueue after reopen: %w", err)
 	}
@@ -1598,7 +1628,7 @@ func (s *GoalService) EnqueueOwnerRun(ctx context.Context, goalID string) (*Run,
 // (决策 2-3 revised: review freezes execution, not intent).
 // The run event is RETURNED — the caller publishes after its commit
 // (invariant 13).
-func (s *GoalService) enqueueOwnerIntentTx(ctx context.Context, tx *sql.Tx, goalID, assigneeType, assigneeID, status string, allowedStatuses ...string) (*Run, *events.Event, error) {
+func (s *GoalService) enqueueOwnerIntentTx(ctx context.Context, tx *sql.Tx, goalID, assigneeType, assigneeID, status, wakeNote string, allowedStatuses ...string) (*Run, *events.Event, error) {
 	if assigneeType != "agent" && assigneeType != "squad" {
 		return nil, nil, nil // human-assigned: manual placeholder
 	}
@@ -1627,13 +1657,15 @@ func (s *GoalService) enqueueOwnerIntentTx(ctx context.Context, tx *sql.Tx, goal
 	if agentID == "" {
 		return nil, nil, nil
 	}
-	return s.runSvc.EnqueueExistingTx(ctx, tx, goalID, agentID, 1, isLeader, squadID)
+	return s.runSvc.EnqueueExistingTx(ctx, tx, goalID, agentID, 1, isLeader, squadID, wakeNote)
 }
 
 // EnqueueOwnerRunTx is the Coordinator's active-only spawn inside a caller's
 // transaction (决策 6-4): attention spawns fire only for active goals.
-func (s *GoalService) EnqueueOwnerRunTx(ctx context.Context, tx *sql.Tx, goalID, assigneeType, assigneeID, status string) (*Run, *events.Event, error) {
-	return s.enqueueOwnerIntentTx(ctx, tx, goalID, assigneeType, assigneeID, status, "active")
+// wakeNote (决策 6-17) is the reason compiled at spawn time — the prompt's
+// "why you were woken" snapshot, immune to later attention re-derivations.
+func (s *GoalService) EnqueueOwnerRunTx(ctx context.Context, tx *sql.Tx, goalID, assigneeType, assigneeID, status, wakeNote string) (*Run, *events.Event, error) {
+	return s.enqueueOwnerIntentTx(ctx, tx, goalID, assigneeType, assigneeID, status, wakeNote, "active")
 }
 
 // ReconcileGoal is the Coordinator core (决策 6-4): events are only WAKEUP
@@ -1733,10 +1765,21 @@ func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) erro
 		}
 	}
 	if attention != "" && !lastOwnerCancelled && newestSignal > lastOwnerSpawn {
+		// The wake note (决策 6-17) is compiled HERE, in the same transaction
+		// as the spawn — the snapshot of WHY this run was woken travels on
+		// the run row. Reading goal.attention at claim time instead is a
+		// race: the wrapup predicate self-invalidates once this spawn lands
+		// (its queued_at resets the recency window), so the very events that
+		// follow the spawn (sub_goal.verified, run.terminal) re-derive the
+		// attention to '' and the woken owner loses its wake context.
+		wakeNote, err := s.compileWakeNoteTx(ctx, tx, goalID, attention)
+		if err != nil {
+			return fmt.Errorf("compile wake note: %w", err)
+		}
 		// P0-2: the spawn is born IN this transaction — the run event is
 		// published after the commit (invariant 13), so the frontend also
 		// sees Coordinator spawns (previously the event was dropped here).
-		_, runEv, err := s.EnqueueOwnerRunTx(ctx, tx, goalID, assigneeType, assigneeID, status)
+		_, runEv, err := s.EnqueueOwnerRunTx(ctx, tx, goalID, assigneeType, assigneeID, status, wakeNote)
 		if err != nil {
 			return fmt.Errorf("reconcile enqueue owner: %w", err)
 		}
@@ -1793,6 +1836,168 @@ func (s *GoalService) ReconcileAllActive(ctx context.Context) (int, error) {
 		n++
 	}
 	return n, nil
+}
+
+// enqueueSquadReviewTx enqueues the squad's reviewer runs INSIDE the park
+// transaction (决策 6-13/6-19): the review run is the park's successor — by
+// the time goal:reviewing publishes, the run already EXISTS, so the
+// approval card's pending-reviewer hint (notify reads pending review runs)
+// can never race an empty list (the live failure: the card fired at park
+// time without the "审查中" hint because the event-handler enqueue lost the
+// race against the notify handler). The trigger anchor is the parking run's
+// report comment — the completion declaration itself (决策 6-19). A
+// handoff_loop park has no code change to review — skipped (the human's
+// call is the collaboration itself).
+func (s *GoalService) enqueueSquadReviewTx(ctx context.Context, tx *sql.Tx, goalID, parkRunID, reviewReason string) error {
+	if strings.HasPrefix(reviewReason, "handoff_loop:") {
+		return nil
+	}
+	if s.runSvc == nil {
+		return nil
+	}
+	var assigneeType, assigneeID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT assignee_type, assignee_id FROM goal WHERE id=?`, goalID).Scan(&assigneeType, &assigneeID); err != nil {
+		return err
+	}
+	if assigneeType != "squad" || assigneeID == "" {
+		return nil // not squad-owned — no squad rule applies
+	}
+	// The squad's leader (a reviewer who IS the leader would review its own
+	// work — excluded, the review must come from a different member).
+	var leaderID string
+	_ = tx.QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, assigneeID).Scan(&leaderID)
+
+	// The squad's reviewers (members declared with role=reviewer). Collected
+	// BEFORE the enqueues: each enqueue writes rows, and a query cursor held
+	// open across writes breaks the single-connection in-memory test stores.
+	rows, err := tx.QueryContext(ctx,
+		`SELECT m.member_id, a.name FROM squad_member m
+		 JOIN agent a ON a.id = m.member_id
+		 WHERE m.squad_id=? AND m.member_type='agent' AND LOWER(TRIM(m.role))='reviewer'
+		 ORDER BY m.created_at`, assigneeID)
+	if err != nil {
+		return err
+	}
+	var reviewers []struct{ id, name string }
+	for rows.Next() {
+		var r struct{ id, name string }
+		if err := rows.Scan(&r.id, &r.name); err != nil {
+			rows.Close()
+			return err
+		}
+		reviewers = append(reviewers, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	// The trigger anchor (决策 6-19): the parking run's report comment — its
+	// completion declaration. Inserted earlier in THIS transaction
+	// (insertRunResultComment), so the tx query sees it; falls back to the
+	// goal's latest run report when the run left none.
+	trigger := ""
+	if parkRunID != "" {
+		_ = tx.QueryRowContext(ctx,
+			`SELECT id FROM comment WHERE goal_id=? AND run_id=? ORDER BY created_at DESC LIMIT 1`,
+			goalID, parkRunID).Scan(&trigger)
+	}
+	if trigger == "" {
+		_ = tx.QueryRowContext(ctx,
+			`SELECT c.id FROM comment c JOIN run r ON r.id = c.run_id
+			 WHERE c.goal_id=? ORDER BY r.finished_at DESC, c.created_at DESC LIMIT 1`,
+			goalID).Scan(&trigger)
+	}
+
+	for _, r := range reviewers {
+		if r.id == leaderID {
+			continue
+		}
+		// The reviewer already has a pending REVIEW request on this goal — a
+		// second enqueue would duplicate the ask (coalescing on the run row
+		// handles queued ones; the explicit check keeps the semantics local).
+		var pending int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM run WHERE goal_id=? AND agent_id=? AND role='review' AND status IN ('queued','running')`,
+			goalID, r.id).Scan(&pending); err != nil {
+			return err
+		}
+		if pending > 0 {
+			continue
+		}
+		if _, _, err := s.runSvc.EnqueueForMentionRoleTx(ctx, tx, goalID, r.id, trigger, "review"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// compileWakeNoteTx renders the derived attention bits into the owner's wake
+// note (决策 6-17) — one bullet per bit, naming the concrete sub-goals and
+// change counts. Platform text is English (决策 6-18); the sub-goal TITLES
+// carry the materials' own language. The note travels on the
+// run row as the prompt's "why you were woken" snapshot. All reads run on
+// the caller's transaction.
+func (s *GoalService) compileWakeNoteTx(ctx context.Context, tx *sql.Tx, goalID, attention string) (string, error) {
+	if attention == "" {
+		return "", nil
+	}
+	// Platform text is English (决策 6-18) — the note names the MATERIALS
+	// (sub-goal titles) verbatim; their language is the leader's own.
+	var bullets []string
+	for _, bit := range strings.Split(attention, ",") {
+		switch bit {
+		case "recovery":
+			titles, err := s.subGoalTitlesTx(ctx, tx, goalID, "failed")
+			if err != nil {
+				return "", err
+			}
+			if len(titles) == 0 {
+				continue // raced to rework — nothing to name
+			}
+			bullets = append(bullets, fmt.Sprintf("- Sub-goal(s) %q failed — decide: cancel or re-create (inspect with agentwork_get_sub_goal, cancel with agentwork_cancel_sub_goal)", strings.Join(titles, ", ")))
+		case "integration":
+			// The two faces of "integration": ready changes to merge, and
+			// no-code wrapups (verified sub-goals whose deliverable lives in
+			// the feed — 决策 6-8).
+			var ready int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM change WHERE goal_id=? AND status='ready'`, goalID).Scan(&ready); err != nil {
+				return "", err
+			}
+			if ready > 0 {
+				bullets = append(bullets, fmt.Sprintf("- %d change(s) ready to integrate — inspect with agentwork_get_change, merge each with agentwork_integrate_change", ready))
+			}
+			titles, err := s.subGoalTitlesTx(ctx, tx, goalID, "verified")
+			if err != nil {
+				return "", err
+			}
+			if len(titles) > 0 {
+				bullets = append(bullets, fmt.Sprintf("- Sub-goal(s) %q verified with no changes — the deliverable lives in the feed (its report); review the conclusion and wrap up", strings.Join(titles, ", ")))
+			}
+		}
+	}
+	return strings.Join(bullets, "\n"), nil
+}
+
+// subGoalTitlesTx loads the titles of the goal's sub-goals in the given
+// status — the wake note names work items by title (humans and agents read
+// titles; ids are system handles).
+func (s *GoalService) subGoalTitlesTx(ctx context.Context, tx *sql.Tx, goalID, status string) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT title FROM sub_goal WHERE goal_id=? AND status=? ORDER BY created_at`, goalID, status)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var titles []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		titles = append(titles, t)
+	}
+	return titles, rows.Err()
 }
 
 // deriveOwnerAttentionTx computes the v2 OwnerAttention bits (决策 6-4/6-8)

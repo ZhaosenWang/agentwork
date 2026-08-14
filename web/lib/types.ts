@@ -69,6 +69,7 @@ export interface Goal {
   source_ref: string; // M4-B: "github:owner/repo#123" (external issue source)
   current_agent_id: string; // latest running/queued run's agent ('' = none)
   attention: string; // v2 OwnerAttention：'' | integration | recovery | user_action
+  review_phase: string; // 审查窗口派生阶段：'' | awaiting_review | reviewing | awaiting_approval（决策 6-19 延伸）
 }
 
 export interface GateRule {

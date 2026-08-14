@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useGoals, useAgents, useSquads, useDomains, useCreateGoal, useGoalEvents } from "@/lib/queries";
-import { Badge, AttentionChip, Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
+import { Badge, AttentionChip, ReviewPhaseBadge, Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
 import { GoalStats } from "@/components/goal-stats";
 import type { Goal, GoalStatus } from "@/lib/types";
 
@@ -109,7 +109,11 @@ export default function GoalsPage() {
                   </h3>
                   <div className="flex items-center gap-1.5 shrink-0">
                     <AttentionChip attention={g.attention} />
-                    <Badge status={g.status} className="shrink-0" />
+                    {g.status === "review" ? (
+                      <ReviewPhaseBadge phase={g.review_phase} className="shrink-0" />
+                    ) : (
+                      <Badge status={g.status} className="shrink-0" />
+                    )}
                   </div>
                 </div>
                 {g.status === "review" && g.review_request && (

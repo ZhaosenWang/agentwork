@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -159,15 +160,23 @@ func NewServer(exec *Executor) *gmcp.Server {
 	// the turn (run maxRunDuration / idle watchdog) and the concurrent count.
 	const defaultCreateWait = 10 * time.Second
 
+	// The shell terminal_create runs commands through — resolved from the
+	// MACHINE's own OS, stated verbatim in the tool description (the agent
+	// never guesses which OS this is).
+	sh, flag := "/bin/sh", "-c"
+	if runtime.GOOS == "windows" {
+		sh, flag = "cmd.exe", "/C"
+	}
+
 	type createArgs struct {
-		Command string    `json:"command" jsonschema:"the FINAL executable to run — no shell syntax; pass sh -c \"...\" for shell semantics"`
-		Args    *[]string `json:"args,omitempty" jsonschema:"command arguments"`
-		Cwd     *string   `json:"cwd,omitempty" jsonschema:"working directory override (defaults to the workspace root)"`
-		Timeout *int64    `json:"timeout,omitempty" jsonschema:"sync-wait budget in seconds (default 10): if the command finishes within it the result is returned directly; otherwise a terminal_id comes back and you poll terminal_output. 0 = return the id immediately (pure async)"`
+		Command string  `json:"command" jsonschema:"the SHELL command line — pipes, redirects, && and quoting all work; no separate args field"`
+		Cwd     *string `json:"cwd,omitempty" jsonschema:"working directory override (defaults to the workspace root)"`
+		Timeout *int64  `json:"timeout,omitempty" jsonschema:"sync-wait budget in seconds (default 10): if the command finishes within it the result is returned directly; otherwise a terminal_id comes back and you poll terminal_output. 0 = return the id immediately (pure async)"`
 	}
 	gmcp.AddTool(srv, &gmcp.Tool{
 		Name: "terminal_create",
-		Description: "Start a command on the platform machine with the workspace as the working directory. " +
+		Description: "Start a SHELL command on the platform machine with the workspace as the working directory " +
+			"(runs via " + sh + " " + flag + " on this machine — pipes, redirects and && work). " +
 			"Waits up to the timeout budget (default 10s) for a quick result; commands that finish in time return their " +
 			"output and exit status directly (exited=true). Longer commands return a terminal_id with exited=false — " +
 			"poll terminal_output (pass the returned cursor back) until exited=true, then terminal_release. " +
@@ -176,10 +185,11 @@ func NewServer(exec *Executor) *gmcp.Server {
 		if args.Command == "" {
 			return nil, nil, errEmptyCommand
 		}
-		var argv []string
-		if args.Args != nil {
-			argv = *args.Args
-		}
+		// The command is a SHELL command line — the platform picks the shell
+		// from the machine's OS (no separate argv: agents repeatedly
+		// mis-split command/args, e.g. 'find find .', and shell syntax needs
+		// the shell anyway).
+		argv := []string{flag, args.Command}
 		cwd := exec.Worktree
 		if args.Cwd != nil && *args.Cwd != "" {
 			cwd = *args.Cwd
@@ -192,7 +202,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 				budget = time.Duration(*args.Timeout) * time.Second
 			}
 		}
-		id, err := exec.host.Create(args.Command, argv, exec.Env, cwd, 0)
+		id, err := exec.host.Create(sh, argv, exec.Env, cwd, 0)
 		if err != nil {
 			return nil, nil, err
 		}
