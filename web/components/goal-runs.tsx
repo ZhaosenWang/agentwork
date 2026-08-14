@@ -113,10 +113,15 @@ function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentNa
             </span>
           )}
           <span className="text-xs text-zinc-400 shrink-0">#{run.attempt}</span>
+          {run.status === "cancelled" && run.cancel_reason && (
+            <span className="text-[11px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600 border border-amber-100 shrink-0">
+              {cancelReasonLabel(run.cancel_reason)}
+            </span>
+          )}
           <span className="text-xs text-zinc-400 ml-auto hidden sm:block">{timeRange}</span>
           <span className="text-zinc-400 text-xs shrink-0">{open ? "▾" : "▸"}</span>
         </button>
-        {run.status === "running" && <StoppingRun goalId={goalId} runId={run.id} />}
+        {(run.status === "running" || run.status === "queued") && <StoppingRun goalId={goalId} runId={run.id} />}
       </div>
 
       {!open && run.result_summary && (
@@ -201,6 +206,21 @@ function RunMessages({ messages }: { messages: ChatMessage[] }) {
 // StoppingRun terminates a running run on human command (决策 4-12): the run
 // cancels (no attempt consumed, no auto-retry), goal state untouched — the
 // worktree keeps its state and recovery is the human's call.
+// cancelReasonLabel renders the structured cancellation cause for the runs
+// panel — a dropped intent's fate is visible at a glance.
+function cancelReasonLabel(reason: string): string {
+  switch (reason) {
+    case "idle_watchdog": return "静默超时";
+    case "handoff": return "交接终止";
+    case "stopped": return "人工停止";
+    case "timeout": return "超时";
+    case "runaway": return "失控终止";
+    case "goal_terminal": return "目标终态丢弃";
+    case "goal_cancelled": return "目标取消";
+    default: return reason;
+  }
+}
+
 function StoppingRun({ goalId, runId }: { goalId: string; runId: string }) {
   const qc = useQueryClient();
   const [stopping, setStopping] = useState(false);

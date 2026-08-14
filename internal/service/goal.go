@@ -507,6 +507,7 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 		return nil, err
 	}
 	defer tx.Rollback()
+	var handoffLoopEvs []events.Event
 
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE goal SET assignee_type=?, assignee_id=?, handoff_note=? WHERE id=?`,
@@ -599,7 +600,7 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 	// (决策 6-6: handoff only cuts the owner role). Queued-cancelled runs
 	// have no reconcile semantics (never started) — the stamp is audit.
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE run SET status='cancelled', cancel_reason='handed_off' WHERE goal_id=? AND role='owner' AND status='queued'`,
+		`UPDATE run SET status='cancelled', cancel_reason='handoff' WHERE goal_id=? AND role='owner' AND status='queued'`,
 		goalID); err != nil {
 		return nil, fmt.Errorf("cancel superseded owner runs: %w", err)
 	}
@@ -639,6 +640,9 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 	}
 	if runEv != nil {
 		s.bus.Publish(ctx, *runEv)
+	}
+	for _, ev := range handoffLoopEvs {
+		s.bus.Publish(ctx, ev)
 	}
 	// The event payload carries the FRESH row — the park above may have
 	// changed the status inside this transaction.
@@ -1161,7 +1165,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		}
 	case "cancelled":
 		// The run ended without completing or failing the goal: a timeout /
-		// watchdog cut or a handoff cut (cancel_reason='handed_off', 决策 6-6).
+		// watchdog cut or a handoff cut (cancel_reason='handoff', 决策 6-6).
 		// The goal stays exactly where it is — no goal-level event (决策 5-10);
 		// the daemon already published run:cancelled with the structured reason.
 	}
@@ -1297,7 +1301,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	duration := 0
 	var enteredAt string
 	if err := s.st.DB().QueryRowContext(ctx,
-		`SELECT created_at FROM activity_log WHERE goal_id=? AND action IN ('entered_review','requested_review','parked_review') ORDER BY created_at DESC LIMIT 1`,
+		`SELECT created_at FROM activity_log WHERE goal_id=? AND action IN ('entered_review','requested_review','parked_review','review_ready') ORDER BY created_at DESC LIMIT 1`,
 		goalID).Scan(&enteredAt); err == nil && enteredAt != "" {
 		if et, err := time.Parse(time.RFC3339Nano, enteredAt); err == nil {
 			if dt, err := time.Parse(time.RFC3339Nano, ts); err == nil {

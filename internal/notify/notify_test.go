@@ -184,3 +184,33 @@ func TestReviewReadySendsFreshWhenCardMissing(t *testing.T) {
 		t.Fatal("no card sent")
 	}
 }
+
+// TestReviewResolvedPatchesCard (Option B follow-up): a decision made on
+// the WEB never touches the card's buttons — the review_resolved event
+// patches the recorded card to its processed state.
+func TestReviewResolvedPatchesCard(t *testing.T) {
+	var patchedMsgID, patchedContent string
+	n := New("app", "secret", "chat_id", "oc_mock")
+	n.updateCardFn = func(messageID, content string) error {
+		patchedMsgID, patchedContent = messageID, content
+		return nil
+	}
+	n.mu.Lock()
+	n.approvalCards["abc123456789"] = approvalCardRec{messageID: "om_mock_message", hadPending: true}
+	n.mu.Unlock()
+	bus := events.NewBus()
+	n.Subscribe(bus)
+	bus.Publish(context.Background(), events.Event{
+		Topic: "goal:review_resolved", Payload: map[string]any{"goal_id": "abc123456789", "decision": "approve"},
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for patchedMsgID == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if patchedMsgID != "om_mock_message" {
+		t.Fatalf("the card must be patched to processed, got %q", patchedMsgID)
+	}
+	if !strings.Contains(patchedContent, "已批准") {
+		t.Fatalf("the processed card must stamp the outcome, got: %s", patchedContent)
+	}
+}

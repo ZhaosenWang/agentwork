@@ -133,6 +133,7 @@ export interface Run {
   session_id: string;
   workdir: string;
   status: RunStatus;
+  cancel_reason?: string; // structured: idle_watchdog|handoff|stopped|timeout|runaway|goal_terminal|goal_cancelled
   role: string; // owner | subgoal | consult | review | verify（决策 5-4/6-9，enqueue 时派生）
   attempt: number;
   result_summary: string;

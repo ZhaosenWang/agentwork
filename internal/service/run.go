@@ -26,6 +26,10 @@ type Run struct {
 	SessionID        string `json:"session_id"`
 	Workdir          string `json:"workdir"`
 	Status           string `json:"status"`
+	// CancelReason is the structured cancellation cause (idle_watchdog|
+	// handoff|stopped|timeout|runaway|goal_terminal|goal_cancelled) — the
+	// runs panel badges it so a dropped intent's fate is visible.
+	CancelReason     string `json:"cancel_reason,omitempty"`
 	// Role is the run's collaboration role stamped at enqueue (决策 5-4):
 	// owner|subgoal|consult|review|verify ('' for processor runs).
 	// Informational snapshot — goal authority is judged DYNAMICALLY at
@@ -762,7 +766,7 @@ func (s *RunService) ReconcilePendingTerminal(ctx context.Context) (int, error) 
 
 func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
+		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,cancel_reason,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
 		 FROM run WHERE goal_id=? ORDER BY queued_at`, goalID)
 	if err != nil {
 		return nil, err
@@ -772,7 +776,7 @@ func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	for rows.Next() {
 		var r Run
 		var leaderFlag int
-		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.SessionID, &r.Workdir, &r.Status, &r.Role, &r.Attempt, &r.ResultSummary, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.SessionID, &r.Workdir, &r.Status, &r.Role, &r.Attempt, &r.ResultSummary, &r.CancelReason, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		r.IsLeaderRun = leaderFlag != 0

@@ -670,7 +670,7 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 		// self-cancels. The stamp is the only writer besides runTask itself,
 		// so no race with finishRun.
 		if _, err := d.st.DB().ExecContext(d.ctx,
-			`UPDATE run SET status='cancelled', cancel_reason='handed_off', finished_at=? WHERE id=? AND status='running'`, nowStr(), rr.id); err != nil {
+			`UPDATE run SET status='cancelled', cancel_reason='handoff', finished_at=? WHERE id=? AND status='running'`, nowStr(), rr.id); err != nil {
 			log.Printf("daemon: handoff terminal stamp %s: %v", rr.id, err)
 		} else {
 			log.Printf("daemon: handoff stamped run %s terminal (claim→register window)", rr.id)
@@ -678,18 +678,40 @@ func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 	}
 }
 
-// StopRun terminates a running run on human command (决策 4-12): the run
-// cancels (no attempt consumed, no auto-retry — the convergence rule only
-// counts idle-watchdog stalls), the goal state is untouched, and the
-// worktree keeps its state — recovery is the human's call (re-trigger /
-// hand off / re-review), same as a timeout per 决策 2-6.
+// StopRun terminates a run on human command (决策 4-12): the run cancels
+// (no attempt consumed, no auto-retry — the convergence rule only counts
+// idle-watchdog stalls), the goal state is untouched, and the worktree
+// keeps its state — recovery is the human's call (re-trigger / hand off /
+// re-review), same as a timeout per 决策 2-6.
+//
+// A QUEUED run has no live process to cut — the platform stamps it terminal
+// directly (the cancel registry only holds running runs). This is the D-1
+// veto path: a durable intent queued during the review freeze can be
+// cancelled by the human before it ever claims.
 func (d *Daemon) StopRun(goalID, runID string) error {
-	var g string
-	if err := d.st.DB().QueryRowContext(d.ctx, `SELECT goal_id FROM run WHERE id=?`, runID).Scan(&g); err != nil {
+	var g, status string
+	if err := d.st.DB().QueryRowContext(d.ctx, `SELECT goal_id, status FROM run WHERE id=?`, runID).Scan(&g, &status); err != nil {
 		return fmt.Errorf("stop run: %v", err)
 	}
 	if g != goalID {
 		return fmt.Errorf("run %s does not belong to goal %s", runID, goalID)
+	}
+	if status == "queued" {
+		res, err := d.st.DB().ExecContext(d.ctx,
+			`UPDATE run SET status='cancelled', cancel_reason='stopped', finished_at=? WHERE id=? AND status='queued'`,
+			nowStr(), runID)
+		if err != nil {
+			return fmt.Errorf("cancel queued run: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return fmt.Errorf("run %s is no longer queued", runID)
+		}
+		log.Printf("daemon: human stopped queued run %s", runID)
+		// notify skips reason_code=stopped — the human did it, no card.
+		d.bus.Publish(d.ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
+			"run_id": runID, "goal_id": goalID, "reason": "stopped", "reason_code": "stopped",
+		}})
+		return nil
 	}
 	d.cancelRun(runID, "stopped")
 	return nil
@@ -1926,7 +1948,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			}
 		}
 		// 决策 6-6: a handoff cut keeps status='cancelled' — the structured
-		// cancel_reason ('handed_off') carries the semantics (handoff is a
+		// cancel_reason ('handoff') carries the semantics (handoff is a
 		// Goal-level event, not a run lifecycle state). Same non-retry,
 		// non-notify behavior as before.
 		//
@@ -2242,8 +2264,10 @@ func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, su
 		log.Printf("daemon: processor run %s already terminal — dropping late failure", q.RunID)
 		return
 	}
+	var domainID string
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT domain_id FROM run WHERE id=?`, q.RunID).Scan(&domainID)
 	d.bus.Publish(ctx, events.Event{Topic: "domain:compile_failed", Payload: map[string]any{
-		"run_id": q.RunID, "error": summary,
+		"run_id": q.RunID, "domain_id": domainID, "error": summary,
 	}})
 }
 
@@ -2804,6 +2828,13 @@ func (d *Daemon) reapRunawayRuns(ctx context.Context) {
 			// stays active, the human decides).
 			d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
 				"run_id": rr.id, "goal_id": rr.goalID, "reason": "runaway", "reason_code": "runaway",
+			}})
+		} else if rr.domainID != "" {
+			// A runaway COMPILE run must unstick the domain's compile panel
+			// (it waits on domain:compile_failed — the same event the normal
+			// failure path emits).
+			d.bus.Publish(ctx, events.Event{Topic: "domain:compile_failed", Payload: map[string]any{
+				"run_id": rr.id, "domain_id": rr.domainID, "error": "runaway: 编译超过 max_run_duration 被终止",
 			}})
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -179,6 +180,15 @@ func (d *Daemon) publishReviewReady(goalID string) {
 	}
 	d.mu.Unlock()
 	log.Printf("daemon: review window ready for %s — notifying the human", goalID)
+	// The review_duration anchor: the human's decision window STARTS here
+	// (the reviewer's run time is not the human's decision time — the health
+	// metric must measure the latter). An invisible activity row (the
+	// timeline renders only its known action kinds).
+	if _, err := d.st.DB().ExecContext(context.Background(),
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,'system','','review_ready','{}',?)`,
+		uuid.NewString(), goalID, nowStr()); err != nil {
+		log.Printf("daemon: review-ready anchor for %s: %v", goalID, err)
+	}
 	d.bus.Publish(context.Background(), events.Event{Topic: "goal:review_ready", Payload: map[string]any{
 		"goal_id": goalID,
 	}})
@@ -207,6 +217,17 @@ func (d *Daemon) maybeTriggerSquadReview(ctx context.Context, goalID string) err
 	}
 	if assigneeType != "squad" || assigneeID == "" {
 		return nil // not squad-owned — no squad rule applies
+	}
+	// A handoff_loop park has no code change to review — the human's call is
+	// "continue or fail the collaboration", not the diff. The approval card
+	// still fires (the park publishes goal:reviewing); the squad checkpoint
+	// skips it.
+	var reviewRequest string
+	if err := d.st.DB().QueryRowContext(ctx, `SELECT review_request FROM goal WHERE id=?`, goalID).Scan(&reviewRequest); err != nil {
+		return err
+	}
+	if strings.HasPrefix(reviewRequest, "handoff_loop:") {
+		return nil
 	}
 
 	// The squad's leader (a reviewer who IS the leader would review its own

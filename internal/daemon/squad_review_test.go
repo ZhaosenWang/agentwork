@@ -25,7 +25,9 @@ func newSquadReviewDaemon(t *testing.T) (*Daemon, *store.Store, *service.GoalSer
 	goalSvc.SetRunService(runSvc)
 	runSvc.SetGoalService(goalSvc)
 	squadSvc := service.NewSquadService(st, bus)
-	d := &Daemon{st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc, squadSvc: squadSvc}
+	d := &Daemon{st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc, squadSvc: squadSvc,
+		runCancels: make(map[string]context.CancelFunc), runCancelReasons: make(map[string]string),
+		ctx: context.Background()}
 	return d, st, goalSvc, runSvc, squadSvc
 }
 
@@ -349,5 +351,80 @@ func TestReviewWindowFallbackTimer(t *testing.T) {
 	case <-ready:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the fallback timer must fire ready for a hung reviewer")
+	}
+}
+
+// TestStopQueuedRun (D-1 veto): a queued intent — e.g. a mention queued
+// during the review freeze — can be stopped by the human before it ever
+// claims. The run stamps cancelled+stopped directly (no live process to
+// cut); notify skips reason_code=stopped.
+func TestStopQueuedRun(t *testing.T) {
+	d, st, gs, runSvc, _ := newSquadReviewDaemon(t)
+	ctx := context.Background()
+	leaderID := seedReviewAgent(t, st, "leader")
+	dom, err := service.NewDomainService(st, events.NewBus()).Create(ctx, service.Domain{Name: "d", GitURL: "https://e.com/x.git"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := gs.Create(ctx, service.Goal{Title: "g", AssigneeType: "agent", AssigneeID: leaderID, Status: "active", DomainID: dom.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := runSvc.EnqueueForGoal(ctx, *g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.StopRun(g.ID, run.ID); err != nil {
+		t.Fatalf("stop queued run: %v", err)
+	}
+	var status, reason string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT status, cancel_reason FROM run WHERE id=?`, run.ID).Scan(&status, &reason); err != nil {
+		t.Fatal(err)
+	}
+	if status != "cancelled" || reason != "stopped" {
+		t.Fatalf("queued stop must stamp cancelled+stopped, got %s/%s", status, reason)
+	}
+	// The goal state is untouched (决策 4-12: the run has no authority).
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "active" {
+		t.Fatalf("stopping a queued run must not touch the goal, got %q", after.Status)
+	}
+}
+
+// TestHandoffLoopParkFiresCardEvent: the ≥8 handoff park publishes
+// goal:reviewing (the human must decide) — while the squad checkpoint skips
+// it (no code change to review).
+func TestHandoffLoopParkFiresCardEvent(t *testing.T) {
+	d, st, gs, _, squadSvc := newSquadReviewDaemon(t)
+	ctx := context.Background()
+	goalID, _ := squadWithReviewer(t, d, st, gs, squadSvc, "reviewer")
+	// Park as the handoff-loop park does (review_request prefix is the marker).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='review', review_request='handoff_loop: 测试' WHERE id=?`, goalID); err != nil {
+		t.Fatal(err)
+	}
+	// The squad checkpoint skips handoff_loop parks — no review run.
+	if err := d.maybeTriggerSquadReview(ctx, goalID); err != nil {
+		t.Fatalf("trigger: %v", err)
+	}
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='review'`, goalID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("a handoff-loop park must not trigger squad review runs, got %d", n)
+	}
+	// The window still opens (the card fires with no hint).
+	d.openReviewWindow(ctx, goalID)
+	// And the review_ready anchor lands for the duration metric.
+	var anchor int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM activity_log WHERE goal_id=? AND action='review_ready'`, goalID).Scan(&anchor); err != nil {
+		t.Fatal(err)
+	}
+	if anchor != 1 {
+		t.Fatalf("the ready anchor must be recorded, got %d", anchor)
 	}
 }

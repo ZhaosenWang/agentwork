@@ -24,7 +24,7 @@ type SubGoal struct {
 	Description      string `json:"description"`
 	AssigneeID       string `json:"assignee_id"`
 	VerifierID       string `json:"verifier_id"` // '' = machine (domain verify commands)
-	Status           string `json:"status"`      // pending|running|done|verifying|verified|rejected|cancelled|failed
+	Status           string `json:"status"`      // running|verifying|verified|rejected|cancelled|failed（pending/done 无写入路径，见 schema.sql）
 	ExecutionAttempt int    `json:"execution_attempt"`
 	QualityIteration int    `json:"quality_iteration"`
 	CreatedAt        string `json:"created_at"`

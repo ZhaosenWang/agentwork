@@ -96,6 +96,10 @@ func (n *Notifier) Subscribe(bus *events.Bus) {
 	// replace the hint with the actual opinions.
 	bus.Subscribe("goal:reviewing", n.onGoalReviewing)
 	bus.Subscribe("goal:review_ready", n.onGoalReviewReady)
+	// A decision made on the WEB never touches the card's buttons — patch
+	// the card to its processed state from here (the button-callback path
+	// patches through the Connector with its own message id).
+	bus.Subscribe("goal:review_resolved", n.onGoalReviewResolved)
 	bus.Subscribe("goal:delivered", n.onGoalDelivered)
 	bus.Subscribe("goal:deliver_failed", n.onGoalDeliverFailed)
 	bus.Subscribe("goal:finished", n.onGoalFinished)
@@ -227,11 +231,34 @@ func (n *Notifier) onGoalReviewReady(_ context.Context, e events.Event) {
 		n.asyncSendCard(card)
 		return
 	}
-	n.mu.Lock()
-	delete(n.approvalCards, goalID)
-	n.mu.Unlock()
 	if !rec.hadPending {
-		return // the card carried no hint — nothing to replace
+		return // the card carried no hint — nothing to replace (the record stays for the resolved patch)
+	}
+	n.updateCard(rec.messageID, card)
+}
+
+// onGoalReviewResolved patches the card to its processed state when the
+// human decided on the WEB (the button path patches through the Connector).
+// The record survives the ready patch for exactly this purpose.
+func (n *Notifier) onGoalReviewResolved(_ context.Context, e events.Event) {
+	m, _ := e.Payload.(map[string]any)
+	goalID, _ := m["goal_id"].(string)
+	decision, _ := m["decision"].(string)
+	if goalID == "" || (decision != "approve" && decision != "reject" && decision != "redirect") {
+		return
+	}
+	n.mu.Lock()
+	rec, ok := n.approvalCards[goalID]
+	if ok {
+		delete(n.approvalCards, goalID)
+	}
+	n.mu.Unlock()
+	if !ok || rec.messageID == "" {
+		return // never sent / already handled — nothing to patch
+	}
+	card, err := buildProcessedCard(goalID, decision)
+	if err != nil {
+		return
 	}
 	n.updateCard(rec.messageID, card)
 }

@@ -257,7 +257,7 @@ func TestStopRunRejectsForeignRun(t *testing.T) {
 
 // TestHandoffWindowStampMarksHandedOff: a handoff landing in the
 // claim→register window (run status='running' but no registered cancel)
-// stamps the run cancelled with cancel_reason=handed_off (决策 6-6) — a handoff cut is an
+// stamps the run cancelled with cancel_reason=handoff (决策 6-6) — a handoff cut is an
 // ownership transition, the reason carries the semantics.
 func TestHandoffWindowStampMarksHandedOff(t *testing.T) {
 	ctx := context.Background()
@@ -320,7 +320,7 @@ func TestHandoffWindowStampMarksHandedOff(t *testing.T) {
 	if err := st.DB().QueryRowContext(ctx, `SELECT status, cancel_reason FROM run WHERE id='run-a'`).Scan(&status, &reason); err != nil {
 		t.Fatalf("load run: %v", err)
 	}
-	if status != "cancelled" || reason != "handed_off" {
-		t.Fatalf("window-stamped run must be cancelled + cancel_reason=handed_off, got %q / %q", status, reason)
+	if status != "cancelled" || reason != "handoff" {
+		t.Fatalf("window-stamped run must be cancelled + cancel_reason=handoff, got %q / %q", status, reason)
 	}
 }

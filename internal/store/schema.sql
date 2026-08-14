@@ -168,7 +168,7 @@ CREATE TABLE IF NOT EXISTS run (
     session_id         TEXT NOT NULL DEFAULT '',  -- protocol-returned; for history/future resume
     workdir            TEXT NOT NULL DEFAULT '',
     status             TEXT NOT NULL DEFAULT 'queued', -- queued|running|completed|failed|cancelled
-    cancel_reason      TEXT NOT NULL DEFAULT '',  -- structured: idle_watchdog|handed_off|stopped|timeout|'' (decisions don't string-match summaries)
+    cancel_reason      TEXT NOT NULL DEFAULT '',  -- structured: idle_watchdog|handoff|stopped|timeout|runaway|goal_terminal|goal_cancelled|'' (decisions don't string-match summaries)
     attempt            INTEGER NOT NULL DEFAULT 1,
     result_summary     TEXT NOT NULL DEFAULT '',
     evidence           TEXT NOT NULL DEFAULT '',   -- JSON: diff stats + verify output + agent summary
@@ -212,7 +212,7 @@ CREATE TABLE IF NOT EXISTS sub_goal (
     description       TEXT NOT NULL DEFAULT '',
     assignee_id       TEXT NOT NULL,               -- the agent executing this work item
     verifier_id       TEXT NOT NULL DEFAULT '',    -- '' = machine (domain verify commands); else agent id
-    status            TEXT NOT NULL DEFAULT 'pending', -- pending|running|done|verifying|verified|rejected|cancelled|failed
+    status            TEXT NOT NULL DEFAULT 'running', -- running|verifying|verified|rejected|cancelled|failed（pending/done 保留在枚举注释但无写入路径：CreateSubGoal 直接 running，run 完成即 verifying/verified）
     execution_attempt INTEGER NOT NULL DEFAULT 0,
     quality_iteration INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL
