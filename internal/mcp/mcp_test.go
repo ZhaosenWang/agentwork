@@ -240,6 +240,37 @@ func TestMCPFullClientRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTerminalCreatePureAsync: timeout 0 must return the id immediately
+// (exited=false) instead of dereferencing the nil cursor — a regression for
+// the panic that killed pure-async terminal_create (cursor stays nil when the
+// budget loop never runs).
+func TestTerminalCreatePureAsync(t *testing.T) {
+	h, dir := newTestHandler(t)
+	session := connect(t, h)
+	ctx := context.Background()
+
+	create, err := session.CallTool(ctx, &gmcp.CallToolParams{
+		Name: "terminal_create",
+		Arguments: map[string]any{
+			"command": "sh", "args": []any{"-c", "true"},
+			"cwd": dir, "timeout": 0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("terminal_create(timeout=0): %v", err)
+	}
+	text := create.Content[0].(*gmcp.TextContent).Text
+	if !strings.Contains(text, "terminal_id") {
+		t.Fatalf("terminal_create: want terminal_id in %q", text)
+	}
+	if !strings.Contains(text, `"exited":false`) {
+		t.Fatalf("terminal_create(timeout=0): want exited=false (pure async), got %q", text)
+	}
+	if !strings.Contains(text, `"cursor":0`) {
+		t.Fatalf("terminal_create(timeout=0): want cursor=0 (read-from-start sentinel), got %q", text)
+	}
+}
+
 // TestCollaborationTools: the collaboration tools act on the run's goal via
 // the injected services (no CLI, no HTTP hop) — the four-behavior surface
 // (决策 5-2): comment_goal lands a plain comment, consult_agent pulls in a

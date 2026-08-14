@@ -220,10 +220,12 @@ func NewServer(exec *Executor) *gmcp.Server {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
-		// Budget exhausted — the command is still running: hand back the id +
-		// everything seen so far; the agent continues via terminal_output.
+		// Budget exhausted (or timeout 0, pure async — the loop never ran and
+		// cursor is still nil): hand back the id + everything seen so far; the
+		// agent continues via terminal_output. A nil cursor derefs to 0, the
+		// buffer's "read from the start" sentinel.
 		return toolResult(map[string]any{
-			"terminal_id": string(id), "output": out.String(), "cursor": *cursor,
+			"terminal_id": string(id), "output": out.String(), "cursor": derefInt64(cursor),
 			"exited": false, "elapsed": elapsed,
 		}), nil, nil
 	})
@@ -638,6 +640,13 @@ func toolResult(v map[string]any) *gmcp.CallToolResult {
 }
 
 func derefInt(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+func derefInt64(v *int64) int64 {
 	if v == nil {
 		return 0
 	}
