@@ -1513,7 +1513,10 @@ func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) erro
 			  UNION ALL
 			  SELECT MAX(COALESCE((SELECT MAX(r3.finished_at) FROM run r3 WHERE r3.sub_goal_id = sg.id AND r3.role='subgoal'), sg.created_at))
 			  FROM sub_goal sg WHERE sg.goal_id=? AND sg.status='failed'
-			) x`, goalID, goalID).Scan(&newestSignal); err != nil {
+			  UNION ALL
+			  SELECT MAX(COALESCE((SELECT MAX(r4.finished_at) FROM run r4 WHERE r4.sub_goal_id = sg2.id AND r4.role='subgoal'), ''))
+			  FROM sub_goal sg2 WHERE sg2.goal_id=? AND sg2.status='verified'
+			) x`, goalID, goalID, goalID).Scan(&newestSignal); err != nil {
 			return fmt.Errorf("attention signal recency: %w", err)
 		}
 		if err := tx.QueryRowContext(ctx,
@@ -1597,7 +1600,23 @@ func (s *GoalService) deriveOwnerAttentionTx(ctx context.Context, tx *sql.Tx, go
 		`SELECT COUNT(*) FROM change WHERE goal_id=? AND status='ready'`, goalID).Scan(&ready); err != nil {
 		return "", fmt.Errorf("attention: changes ready: %w", err)
 	}
-	if ready > 0 {
+	// need_integration (wrap-up): a verification round completed AFTER the
+	// owner's last spawn without producing a new ready change — the no-code
+	// completion case (决策 6-8: the deliverable lives in the feed). Without
+	// this edge the owner is never woken to close the goal out (live: a goal
+	// parked active forever after its rework round verified against an
+	// already-integrated change). The spawn guard uses the same signal, so
+	// the owner waking and finishing clears it — no loop.
+	var wrapup int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sub_goal sg
+		WHERE sg.goal_id=? AND sg.status='verified'
+		  AND COALESCE((SELECT MAX(r.finished_at) FROM run r WHERE r.sub_goal_id=sg.id AND r.role='subgoal'),'')
+		    > COALESCE((SELECT MAX(r2.queued_at) FROM run r2 WHERE r2.goal_id=sg.goal_id AND r2.role='owner'),'')`,
+		goalID).Scan(&wrapup); err != nil {
+		return "", fmt.Errorf("attention: verified wrap-up: %w", err)
+	}
+	if ready > 0 || wrapup > 0 {
 		bits = append(bits, "integration")
 	}
 	return strings.Join(bits, ","), nil

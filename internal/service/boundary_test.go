@@ -576,3 +576,164 @@ func TestConsultFailureResumesRequester(t *testing.T) {
 		t.Fatalf("guest failure must leave a system comment, got %d (err %v)", n, err)
 	}
 }
+
+// TestWrapUpAttentionAfterNoChangeVerification: the colleague's dead state —
+// the rework round verified against an already-integrated change, producing
+// no new Change. The wrap-up edge must wake the owner to close the goal
+// out; once the owner runs, the signal is consumed (no re-arm loop).
+func TestWrapUpAttentionAfterNoChangeVerification(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "owner")
+	b := seedAgent(t, st, "worker")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var sgRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&sgRun); err != nil {
+		t.Fatalf("sub-goal run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, sgRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Finish(ctx, sgRun, "completed", "implemented"); err != nil {
+		t.Fatalf("finish sub-goal run: %v", err)
+	}
+	// Round 1: attention armed, owner spawned, change integrated by the owner.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile 1: %v", err)
+	}
+	var changeID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM change WHERE goal_id=? LIMIT 1`, g.ID).Scan(&changeID); err != nil {
+		t.Fatalf("change: %v", err)
+	}
+	var ownerRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND role='owner' AND status='queued' LIMIT 1`, g.ID).Scan(&ownerRun); err != nil {
+		t.Fatalf("owner run: %v", err)
+	}
+	if err := gs.MarkChangeIntegrating(ctx, changeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.MarkChangeIntegrated(ctx, changeID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the conflict round: the change conflicted at integration, the
+	// sub-goal went back to RUNNING and the owner's turn ended while the
+	// rework was in flight (the finalization guard keeps the goal active).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE sub_goal SET status='running' WHERE id=?`, sg.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Finish(ctx, ownerRun, "completed", "integrated, waiting"); err != nil {
+		t.Fatalf("finish owner: %v", err)
+	}
+	// The rework round completes and verifies against the ALREADY-INTEGRATED
+	// change (base == head → no new Change) — sub-goal verified again, the
+	// change stays integrated.
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,status,role,sub_goal_id,attempt,queued_at,started_at,finished_at,created_at)
+		 VALUES (?,?,?,'worker','completed','subgoal',?,2,?,?,?,?)`,
+		newID(), g.ID, b, sg.ID, now(), now(), now(), now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE sub_goal SET status='verified' WHERE id=?`, sg.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Reconcile (the latch edge after the rework round) — the wrap-up edge
+	// must arm attention and spawn the owner again.
+	if err := gs.ReconcileGoal(ctx, g.ID); err != nil {
+		t.Fatalf("reconcile 2: %v", err)
+	}
+	g2, _ := gs.Get(ctx, g.ID)
+	if g2.Attention == "" {
+		t.Fatalf("wrap-up attention must arm for the owner to close out, got empty")
+	}
+	var pendingOwner int
+	_ = st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE goal_id=? AND role='owner' AND status IN ('queued','running')`, g.ID).Scan(&pendingOwner)
+	if pendingOwner != 1 {
+		t.Fatalf("wrap-up must spawn the owner, got %d pending owner runs", pendingOwner)
+	}
+	// The woken owner finishes — the goal reaches its terminal judgment and
+	// the wrap-up signal is consumed (no re-arm loop).
+	var resumed string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND role='owner' AND status IN ('queued','running') LIMIT 1`, g.ID).Scan(&resumed); err != nil {
+		t.Fatalf("resumed owner run: %v", err)
+	}
+	if err := rs.Finish(ctx, resumed, "completed", "done"); err != nil {
+		t.Fatalf("finish resumed owner: %v", err)
+	}
+	g3, _ := gs.Get(ctx, g.ID)
+	if g3.Status != "done" {
+		t.Fatalf("goal must reach done after the wrap-up owner run, got %q", g3.Status)
+	}
+}
+
+// TestConflictedChangeCannotBeReIntegrated: the contract guard — a
+// CONFLICTED change refuses integrate (MarkChangeIntegrating errors and
+// MarkChangeIntegrated(true) no-ops), so an agent cannot force it through
+// without the rework revision.
+func TestConflictedChangeCannotBeReIntegrated(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "owner")
+	b := seedAgent(t, st, "worker")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: a, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work", "sub", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	var sgRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&sgRun); err != nil {
+		t.Fatalf("sub-goal run: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET base_ref='b1', head_ref='h1' WHERE id=?`, sgRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Finish(ctx, sgRun, "completed", "implemented"); err != nil {
+		t.Fatalf("finish sub-goal run: %v", err)
+	}
+	var changeID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM change WHERE goal_id=? LIMIT 1`, g.ID).Scan(&changeID); err != nil {
+		t.Fatalf("change: %v", err)
+	}
+	// Integrate → conflict.
+	if err := gs.MarkChangeIntegrating(ctx, changeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := gs.MarkChangeIntegrated(ctx, changeID, false); err != nil {
+		t.Fatal(err)
+	}
+	// Re-integrate attempts on the conflicted change are refused.
+	if err := gs.MarkChangeIntegrating(ctx, changeID); !errors.Is(err, ErrValidation) {
+		t.Fatalf("conflicted change must refuse integrating, got %v", err)
+	}
+	if err := gs.MarkChangeIntegrated(ctx, changeID, true); !errors.Is(err, ErrValidation) {
+		t.Fatalf("conflicted change must refuse force-integration, got %v", err)
+	}
+	var status string
+	_ = st.DB().QueryRowContext(ctx, `SELECT status FROM change WHERE id=?`, changeID).Scan(&status)
+	if status != "conflict" {
+		t.Fatalf("the change must stay conflicted until the rework revision, got %q", status)
+	}
+}

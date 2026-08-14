@@ -499,10 +499,17 @@ func (s *GoalService) MarkChangeIntegrated(ctx context.Context, changeID string,
 		return fmt.Errorf("load change: %w", err)
 	}
 	if success {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE change SET status='integrated' WHERE id=? AND status IN ('ready','integrating','conflict')`,
-			changeID); err != nil {
+		// Only ready/integrating may become integrated — a CONFLICTED change
+		// must first return through the rework revision (conflict → rework →
+		// ready), never be force-integrated around the loop.
+		res, err := tx.ExecContext(ctx,
+			`UPDATE change SET status='integrated' WHERE id=? AND status IN ('ready','integrating')`,
+			changeID)
+		if err != nil {
 			return fmt.Errorf("mark integrated: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return NewValidationError("the change is not integrable — a conflicted change must wait for the rework revision")
 		}
 		if err := tx.Commit(); err != nil {
 			return err
@@ -674,11 +681,20 @@ func (s *GoalService) ListChangeDetails(ctx context.Context, goalID string) ([]C
 }
 
 // MarkChangeIntegrating stamps Ready → Integrating (the integrate_change tool
-// merges next; conditional so a raced duplicate no-ops).
+// merges next). A change that is NOT ready refuses the transition loudly —
+// silently no-op'ing here let an agent re-integrate a CONFLICTED change and
+// force it through without the rework revision (live: a double integrate
+// after a conflict ended the goal's loop in a dead active state).
 func (s *GoalService) MarkChangeIntegrating(ctx context.Context, changeID string) error {
-	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE change SET status='integrating' WHERE id=? AND status='ready'`, changeID); err != nil {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE change SET status='integrating' WHERE id=? AND status='ready'`, changeID)
+	if err != nil {
 		return fmt.Errorf("mark integrating: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var status string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT status FROM change WHERE id=?`, changeID).Scan(&status)
+		return NewValidationError(fmt.Sprintf("the change is not ready (status=%s) — wait for the assignee's rework revision", status))
 	}
 	return nil
 }

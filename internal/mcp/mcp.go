@@ -503,6 +503,9 @@ func NewServer(exec *Executor) *gmcp.Server {
 		if ch.Status == "integrated" {
 			return toolResult(map[string]any{"ok": true, "status": "integrated", "note": "already integrated"}), nil, nil
 		}
+		if ch.Status == "conflict" {
+			return toolResult(map[string]any{"ok": false, "status": "conflict", "note": "the assignee is reworking this change — wait for the new Revision before integrating"}), nil, nil
+		}
 		if err := exec.goalSvc.MarkChangeIntegrating(ctx, ch.ID); err != nil {
 			return nil, nil, err
 		}
