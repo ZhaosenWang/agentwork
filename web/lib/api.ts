@@ -96,6 +96,9 @@ export interface ChatMessage {
 }
 export const listGoalRunMessages = (goalId: string, runId: string) =>
   api<ChatMessage[]>(`/goals/${goalId}/runs/${runId}/messages`);
+// Processor runs (compile/intake) have no goal — the goal-less variant.
+export const listRunMessages = (runId: string) =>
+  api<ChatMessage[]>(`/runs/${runId}/messages`);
 
 // ── Comment ──
 export const listGoalComments = (goalId: string) =>

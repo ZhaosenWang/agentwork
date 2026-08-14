@@ -8,7 +8,25 @@ import {
 } from "@/lib/queries";
 import { useWSEvent } from "@/lib/ws";
 import { Button, Dialog, Field, inputCls, PageHeader, Empty, Badge } from "@/components/ui";
-import type { Domain, Checks, Guard, GateRule } from "@/lib/types";
+import type { Domain, Checks, Guard, GateRule, Run } from "@/lib/types";
+
+// renderRunEvent turns one WS run:event (proto.Event shape) into a single
+// line for the compile progress stream.
+function renderRunEvent(ev: { type?: string; text?: string; tool?: string; input?: string; output?: string }): string {
+  const cut = (t: string, n: number) => (t.length > n ? t.slice(0, n) + "…" : t);
+  switch (ev.type) {
+    case "thought":
+      return "💭 " + cut(ev.text ?? "", 160);
+    case "message":
+      return ev.text ?? "";
+    case "tool_use":
+      return "🔧 " + (ev.tool ?? "tool") + (ev.input ? " " + cut(ev.input, 80) : "");
+    case "tool_result":
+      return "· " + cut(ev.output ?? "", 140);
+    default:
+      return cut(ev.text ?? "", 160);
+  }
+}
 
 export default function DomainsPage() {
   useGoalEvents();
@@ -61,6 +79,8 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const [policyText, setPolicyText] = useState(d.policy_text);
   const [compiling, setCompiling] = useState(false);
   const [compileError, setCompileError] = useState<string | null>(null);
+  const [compileRun, setCompileRun] = useState<Run | null>(null);
+  const [runLines, setRunLines] = useState<string[]>([]);
   // 回显域已配置的处理器 agent（域创建时选的 / 已配过的），不必每次重选
   const [processorAgent, setProcessorAgent] = useState(d.processor_agent_id);
   // 手动编辑验收策略（决策 2-8 降级路径：不依赖模型编译；冻结后也可再编辑）
@@ -141,7 +161,13 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
     // domain:compiled / domain:compile_failed event arrives below.
     compile.mutate(
       { id: d.id, policy_text: policyText, processor_agent_id: processorAgent },
-      { onError: () => setCompiling(false) }
+      {
+        onSuccess: (run) => {
+          setCompileRun(run);
+          setRunLines([]);
+        },
+        onError: () => setCompiling(false),
+      }
     );
   };
   // The compile outcome arrives asynchronously as a WS event (the run's
@@ -153,14 +179,23 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
     if ((p as { domain_id?: string })?.domain_id === d.id) {
       setCompiling(false);
       setCompileError(null);
+      setCompileRun(null);
       qc.invalidateQueries({ queryKey: qk.domain(d.id) });
     }
+  });
+  // The compile run's live stream — what the processor agent is doing right
+  // now (exploring the repo, installing deps, measuring the baseline).
+  useWSEvent("run:event", (p) => {
+    const pld = p as { run_id?: string; event?: { type?: string; text?: string; tool?: string; input?: string; output?: string } };
+    if (!compileRun || !pld.event || pld.run_id !== compileRun.id) return;
+    setRunLines((prev) => [...prev.slice(-40), renderRunEvent(pld.event!)]);
   });
   useWSEvent("domain:compile_failed", (p) => {
     const pld = p as { domain_id?: string; error?: string };
     if (pld?.domain_id === d.id) {
       setCompiling(false);
       setCompileError(pld.error ?? "编译失败（未知原因）");
+      setCompileRun(null);
     }
   });
 
@@ -327,11 +362,23 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
 
       {/* 编译进行中反馈——两种状态（首次编译 / 重新编译）共享：编译是异步
           processor run，compiling 保持到 domain:compiled / compile_failed
-          事件到达（API 返回只是 run 入队，编译本身要几分钟）。 */}
-      {compiling && (
-        <div className="flex items-center gap-2 text-xs text-amber-700">
-          <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-          正在编译验收策略——处理器 agent 正在探索仓库、安装依赖、统计基线，通常需要几分钟
+          事件到达（API 返回只是 run 入队，编译本身要几分钟）。compileRun
+          打开实时进度流——能看到处理器 agent 此刻在干什么。 */}
+      {compiling && compileRun && (
+        <div className="border-t border-gray-100 pt-2">
+          <div className="flex items-center gap-2 text-xs text-amber-700 mb-1.5">
+            <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+            正在编译验收策略（run {compileRun.id.slice(0, 8)}）——处理器 agent 正在探索仓库、安装依赖、统计基线
+          </div>
+          <div className="rounded bg-zinc-50 border border-zinc-200 p-2 max-h-44 overflow-y-auto space-y-0.5 font-mono text-[11px] text-zinc-600">
+            {runLines.length === 0 ? (
+              <span className="text-zinc-400">等待 agent 开始…</span>
+            ) : (
+              runLines.map((l, i) => (
+                <div key={i} className="whitespace-pre-wrap break-words">{l}</div>
+              ))
+            )}
+          </div>
         </div>
       )}
       {compile.isError && <p className="text-sm text-red-500">{String(compile.error)}</p>}

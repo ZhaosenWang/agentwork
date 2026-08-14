@@ -935,6 +935,15 @@ func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL, gitCred
 	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*").CombinedOutput(); err != nil {
 		return fmt.Errorf("git config remote.origin.fetch: %w: %s", err, string(out))
 	}
+	// Fetch ONCE under the new refspec — until this runs, refs/remotes/
+	// origin/* is EMPTY (the clone mirror wrote to refs/heads/*), and any
+	// path that checks out origin/<branch> before a worker-run fetch would
+	// fail "invalid reference" — the acceptance-policy compile being the
+	// usual first operation on a fresh domain (live: fixing a typo'd
+	// default_branch and recompiling "took no effect").
+	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
+		return fmt.Errorf("git fetch: %w: %s", err, string(out))
+	}
 	return nil
 }
 
@@ -1938,6 +1947,14 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		repo := domainRepoPath(domainID)
 		if defaultBranch == "" {
 			defaultBranch = "main"
+		}
+		// Fresh refs before the checkout — a corrected default_branch must
+		// take effect on the next compile, not the one after (parity with the
+		// worker path's fetch).
+		if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
+			unlock()
+			d.failProcessorRun(ctx, q, "compile fetch: "+err.Error()+": "+string(out))
+			return
 		}
 		if out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", runRowWorkdir, "origin/"+defaultBranch).CombinedOutput(); err != nil {
 			unlock()

@@ -59,6 +59,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /goals/{id}/activate", h.activateGoal)
 	mux.HandleFunc("GET /goals/{id}/runs", h.listRuns)
 	mux.HandleFunc("GET /goals/{id}/runs/{runId}/messages", h.listRunMessages)
+	mux.HandleFunc("GET /runs/{runId}/messages", h.listRunMessagesByID)
 	mux.HandleFunc("GET /goals/{id}/timeline", h.goalTimeline)
 	mux.HandleFunc("GET /goals/{id}/sub-goals", h.listSubGoals)
 	mux.HandleFunc("POST /goals/{id}/sub-goals", h.createSubGoal)
@@ -305,6 +306,14 @@ func (h *Handlers) goalTimeline(w http.ResponseWriter, r *http.Request) {
 // listRunMessages returns the run's live interaction stream — the Web run
 // detail's "what is the agent doing right now" view.
 func (h *Handlers) listRunMessages(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Run.ListMessages(r.Context(), r.PathValue("runId"))
+	writeJSON(w, out, err)
+}
+
+// listRunMessagesByID is the goal-less variant for processor runs (the
+// acceptance-policy compile, intake) — they have no goal to scope under,
+// and the compile progress panel needs their stream.
+func (h *Handlers) listRunMessagesByID(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Run.ListMessages(r.Context(), r.PathValue("runId"))
 	writeJSON(w, out, err)
 }
