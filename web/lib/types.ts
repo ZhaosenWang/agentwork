@@ -26,7 +26,9 @@ export interface McpServer {
   name: string;
   command?: string; // stdio
   args?: string[]; // stdio
+  env?: { name: string; value: string }[]; // stdio: process env
   url?: string; // http / sse
+  headers?: { name: string; value: string }[]; // http / sse: request headers
 }
 
 export interface Agent {

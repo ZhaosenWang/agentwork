@@ -139,11 +139,13 @@ export function Dialog({
   onClose,
   children,
   footer,
+  wide,
 }: {
   title: string;
   onClose: () => void;
   children: React.ReactNode;
   footer: React.ReactNode;
+  wide?: boolean; // 内容宽的表单（结构化编辑器）用 max-w-lg
 }) {
   // Esc to close.
   useEffect(() => {
@@ -170,7 +172,7 @@ export function Dialog({
       }}
     >
       <div
-        className="w-full max-w-md bg-white rounded-2xl shadow-2xl border border-zinc-200 flex flex-col max-h-[90vh] page-enter"
+        className={`w-full ${wide ? "max-w-lg" : "max-w-md"} bg-white rounded-2xl shadow-2xl border border-zinc-200 flex flex-col max-h-[90vh] page-enter`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-100">

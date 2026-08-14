@@ -11,15 +11,15 @@ export function RuntimeForm({ onClose }: { onClose: () => void }) {
   const [provider, setProvider] = useState("acp");
   const [executable, setExecutable] = useState("");
   const [endpoint, setEndpoint] = useState("");
-  const [args, setArgs] = useState("[]");
-  const [env, setEnv] = useState("{}");
+  const [args, setArgs] = useState("");
+  const [envRows, setEnvRows] = useState<{ key: string; value: string }[]>([]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    let parsedArgs: string[] = [];
-    let parsedEnv: Record<string, string> = {};
-    try { parsedArgs = JSON.parse(args || "[]"); } catch { /* keep default */ }
-    try { parsedEnv = JSON.parse(env || "{}"); } catch { /* keep default */ }
+    const parsedEnv: Record<string, string> = {};
+    for (const r of envRows) {
+      if (r.key.trim()) parsedEnv[r.key.trim()] = r.value;
+    }
     create.mutate(
       {
         name,
@@ -27,7 +27,7 @@ export function RuntimeForm({ onClose }: { onClose: () => void }) {
         provider,
         executable,
         endpoint,
-        args: parsedArgs,
+        args: args.trim() ? args.trim().split(/\s+/).filter(Boolean) : [],
         env: parsedEnv,
       },
       { onSuccess: onClose }
@@ -79,14 +79,40 @@ export function RuntimeForm({ onClose }: { onClose: () => void }) {
         )}
 
         {transport === "stdio" && (
-          <Field label="Args (JSON)" hint="传给可执行文件的参数">
-            <input value={args} onChange={(e) => setArgs(e.target.value)} className={`${inputCls} font-mono`} placeholder='["serve","--acp"]' />
+          <Field label="启动参数" hint="空格分隔，如 serve --acp">
+            <input value={args} onChange={(e) => setArgs(e.target.value)} className={`${inputCls} font-mono`} placeholder="serve --acp" />
           </Field>
         )}
 
         {transport === "stdio" && (
-          <Field label="Env (JSON)" hint="环境变量">
-            <input value={env} onChange={(e) => setEnv(e.target.value)} className={`${inputCls} font-mono`} placeholder="{}" />
+          <Field label="环境变量" hint="注入给 agent 进程">
+            <div className="space-y-2">
+              {envRows.map((r, i) => (
+                <div key={i} className="flex gap-2">
+                  <input
+                    value={r.key}
+                    onChange={(e) => setEnvRows(envRows.map((x, j) => (j === i ? { ...x, key: e.target.value } : x)))}
+                    className={`${inputCls} flex-1 font-mono`}
+                    placeholder="KEY"
+                  />
+                  <input
+                    value={r.value}
+                    onChange={(e) => setEnvRows(envRows.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))}
+                    className={`${inputCls} flex-1 font-mono`}
+                    placeholder="VALUE"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setEnvRows(envRows.filter((_, j) => j !== i))}
+                    className="text-zinc-400 hover:text-red-500 shrink-0"
+                    title="删除"
+                  >✕</button>
+                </div>
+              ))}
+              <button type="button" className="text-indigo-600 hover:text-indigo-700" onClick={() => setEnvRows([...envRows, { key: "", value: "" }])}>
+                + 添加变量
+              </button>
+            </div>
           </Field>
         )}
 
