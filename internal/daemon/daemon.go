@@ -1718,10 +1718,14 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// in the feed, not say "nothing to review" (live: the reviewer ran a
 		// code review on an introduction task and answered "no implementation
 		// changes to approve").
+		inspectLine := "Inspect the changes in the worktree (diff, tests, quality) AND the goal's comment feed (the collaboration surface). "
+		if scratchDomain {
+			inspectLine = "This is a scratch project (no git repository) — inspect the project directory's ARTIFACTS (reports and files in the goal dir and its sg/ subdirectories) AND the goal's comment feed; there is no diff to look at. "
+		}
 		prompt = "You are a reviewer. Review the current goal's outcome (squad rule: after a member implements, a reviewer reviews).\n\n" +
 			"Goal: " + title + "\n\n" +
 			"Give your opinion ONLY — do not modify any file, do not execute the task itself.\n" +
-			"Inspect the changes in the worktree (diff, tests, quality) AND the goal's comment feed (the collaboration surface). " +
+			inspectLine +
 			"If the diff is empty, the goal's deliverable lives in the feed — judge whether the goal's request was actually fulfilled there, " +
 			"and say so explicitly; never report a missing diff as the answer itself.\n" +
 			"End your turn with your opinion as the final message — the platform posts it to the feed (the approver reads it there). Do NOT post a duplicate with agentwork_comment_goal.\n" +
@@ -1992,8 +1996,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// allowed, nothing survives). A guest that committed DIRECTLY is flagged
 	// in the feed (not reverted — HEAD may carry the owner's history under
 	// it... the fresh workspace makes baseSHA==claim-HEAD, so any commit is
-	// the guest's own and only flagged for human visibility).
-	if (reviewRun || consultRun || verifyRun) && domainID != "" {
+	// the guest's own and only flagged for human visibility). Scratch
+	// read-only runs are plain-dir COPIES — there is no git to commit into,
+	// and the copy is removed by the run's cleanup anyway; the git check
+	// would only mint a false "contract violated" alarm (fatal: not a git
+	// repository).
+	if (reviewRun || consultRun || verifyRun) && domainID != "" && !scratchDomain {
 		resetGuestWorkspace(ctx, runRowWorkdir)
 		if committed := guestCommittedLog(ctx, runRowWorkdir, baseSHA); committed != "" {
 			if _, err := d.st.DB().ExecContext(ctx,

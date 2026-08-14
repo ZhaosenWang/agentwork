@@ -82,6 +82,25 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, assigneeID, "assignee agent"); err != nil {
 		return nil, err
 	}
+	// REVIEWER ONLY RULE: a squad's reviewer members review — they are never
+	// handed work items. The leader must dispatch to non-reviewer members;
+	// a misconfigured squad (every member is a reviewer) surfaces the error
+	// here instead of producing a worker who later reviews its own output
+	// (the player-referee trap).
+	var squadID string
+	_ = s.st.DB().QueryRowContext(ctx,
+		`SELECT assignee_id FROM goal WHERE id=? AND assignee_type='squad'`, goalID).Scan(&squadID)
+	if squadID != "" {
+		var reviewer int
+		if err := s.st.DB().QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM squad_member WHERE squad_id=? AND member_type='agent' AND member_id=? AND LOWER(TRIM(role))='reviewer'`,
+			squadID, assigneeID).Scan(&reviewer); err != nil {
+			return nil, fmt.Errorf("check reviewer role: %w", err)
+		}
+		if reviewer > 0 {
+			return nil, NewValidationError("the assignee is a REVIEWER of this goal's squad — reviewers only review; dispatch work to a non-reviewer member")
+		}
+	}
 	if verifierID != "" {
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, verifierID, "verifier agent"); err != nil {
 			return nil, err

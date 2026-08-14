@@ -555,3 +555,35 @@ func TestScratchSubGoalsAreNoCode(t *testing.T) {
 		t.Fatalf("the goal stays active (pending sub-goals), got %q", after.Status)
 	}
 }
+
+// TestSubGoalRejectsReviewerAssignee (REVIEWER-ONLY RULE): a squad's
+// reviewer members review — they are never handed work items. Dispatching
+// to a reviewer is rejected loudly; a non-reviewer member is fine.
+func TestSubGoalRejectsReviewerAssignee(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	leader := seedAgent(t, st, "leader")
+	reviewer := seedAgent(t, st, "reviewer")
+	worker := seedAgent(t, st, "worker")
+	squadSvc := NewSquadService(st, events.NewBus())
+	sq, err := squadSvc.Create(ctx, Squad{Name: "dev-team", LeaderID: leader})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := squadSvc.AddMember(ctx, sq.ID, "agent", reviewer, "reviewer"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := squadSvc.AddMember(ctx, sq.ID, "agent", worker, "worker"); err != nil {
+		t.Fatal(err)
+	}
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "squad", AssigneeID: sq.ID, Status: "active", DomainID: seedDomain(t, st)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.CreateSubGoal(ctx, g.ID, "拆给审查者", "工作项", reviewer, "", "agent", leader); err == nil {
+		t.Fatal("dispatching work to a reviewer must be rejected (reviewers only review)")
+	}
+	if _, err := gs.CreateSubGoal(ctx, g.ID, "拆给干活的", "工作项", worker, "", "agent", leader); err != nil {
+		t.Fatalf("dispatching to a non-reviewer member must work: %v", err)
+	}
+}

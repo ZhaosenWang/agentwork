@@ -333,6 +333,11 @@ end your turn — the platform wakes you when changes are ready
 (read-only; the platform resumes you after the answer). You do NOT
 implement the whole task yourself — members do the work; members are NOT
 auto-dispatched, you delegate explicitly.
+
+REVIEWER-ONLY RULE: members with role="reviewer" REVIEW ONLY — never
+dispatch work items to them (create_sub_goal rejects it). After your turn
+ends the platform automatically pulls the reviewers in, then the human
+approves; you never hand work to a reviewer yourself.
 `
 
 const squadParentStatusOwned = `You drive this goal's execution. When you finish your part, END your turn —
