@@ -23,6 +23,7 @@ type ReviewGoal struct {
 	RunID    string // the evidence run — recorded on the gate_decision (audit chain)
 	Evidence string // the run.evidence JSON bundle
 	Comments []string // REVIEW-role run comments — the squad review opinions (the worker's own report is evidence, not 审查意见)
+	DomainType string // repo|scratch — the approval wording branches on it (scratch has nothing to merge)
 }
 
 // GoalBrief is one goal in a digest aggregation.
@@ -56,6 +57,9 @@ type QueryStore interface {
 	// queued/running on the goal — the approval card's "审查中" hint
 	// (Option B: the human may wait for their opinions).
 	PendingReviewers(ctx context.Context, goalID string) ([]string, error)
+	// GoalDomainType resolves a goal's domain type (repo|scratch) — the
+	// processed-card wording branches on it.
+	GoalDomainType(ctx context.Context, goalID string) (string, error)
 	// GoalTitle resolves one goal's title (milestone cards carry it).
 	GoalTitle(ctx context.Context, goalID string) (string, error)
 	// GoalStatus resolves a goal by id OR id prefix (intake "状态 <id>"
@@ -82,7 +86,7 @@ func NewSQLQueryStore(st *store.Store) *SQLQueryStore {
 
 func (q *SQLQueryStore) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) {
 	rows, err := q.st.DB().QueryContext(ctx,
-		`SELECT g.id, g.title, g.review_request,
+		`SELECT g.id, g.title, g.review_request, COALESCE(d.type,''),
 		        COALESCE((SELECT r.id FROM run r WHERE r.goal_id=g.id AND r.status='completed'
 		                  ORDER BY r.finished_at DESC LIMIT 1), ''),
 		        COALESCE((SELECT r.evidence FROM run r WHERE r.goal_id=g.id AND r.status='completed'
@@ -92,7 +96,7 @@ func (q *SQLQueryStore) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) {
 		            WHERE c.goal_id=g.id AND c.author_type='agent' AND r.role='review'
 		            ORDER BY c.created_at DESC LIMIT 3
 		        )), '')
-		 FROM goal g WHERE g.status='review' ORDER BY g.created_at`)
+		 FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.status='review' ORDER BY g.created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +105,7 @@ func (q *SQLQueryStore) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) {
 	for rows.Next() {
 		var r ReviewGoal
 		var comments string
-		if err := rows.Scan(&r.GoalID, &r.Title, &r.Reason, &r.RunID, &r.Evidence, &comments); err != nil {
+		if err := rows.Scan(&r.GoalID, &r.Title, &r.Reason, &r.RunID, &r.Evidence, &comments, &r.DomainType); err != nil {
 			return nil, err
 		}
 		if comments != "" {
@@ -132,6 +136,13 @@ func (q *SQLQueryStore) PendingReviewers(ctx context.Context, goalID string) ([]
 		out = append(out, name)
 	}
 	return out, rows.Err()
+}
+
+func (q *SQLQueryStore) GoalDomainType(ctx context.Context, goalID string) (string, error) {
+	var t string
+	err := q.st.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(d.type,'') FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).Scan(&t)
+	return t, err
 }
 
 func (q *SQLQueryStore) GoalTitle(ctx context.Context, goalID string) (string, error) {

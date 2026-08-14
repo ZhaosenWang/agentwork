@@ -97,7 +97,7 @@ func TestEvidenceSummary(t *testing.T) {
 // TestBuildProcessedCard: the post-decision card stamps the outcome and
 // carries no buttons.
 func TestBuildProcessedCard(t *testing.T) {
-	raw, err := buildProcessedCard("abc123456789", "approve")
+	raw, err := buildProcessedCard("abc123456789", "approve", false)
 	if err != nil {
 		t.Fatal(err)
 	}

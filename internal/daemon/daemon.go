@@ -1433,8 +1433,26 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// DIRECTLY in it (persistent across runs — the file-state A5 model;
 		// owner single-flight makes the goal dir single-writer), read-only
 		// runs get a COPY snapshot (a torn copy is accepted for v1: report
-		// files are small and a racy read is re-readable).
-		if readOnlyRun {
+		// files are small and a racy read is re-readable). SUB-GOALS work in
+		// their own sg/<subGoalID> subdirectory under the goal dir — the
+		// deliverable IS the files there (no Change/merge machinery; the
+		// owner reviews the directory), verify runs snapshot a copy.
+		if subGoalRun || verifyRun {
+			sgDir := filepath.Join(scratchGoalDir(domainName, q.GoalID), "sg", subGoalID)
+			if verifyRun {
+				runRowWorkdir = runWorktreePath(q.RunID)
+				if err := copyDir(sgDir, runRowWorkdir); err != nil {
+					log.Printf("daemon: scratch sg snapshot for run %s: %v", q.RunID, err)
+					_ = os.MkdirAll(runRowWorkdir, 0o755)
+				}
+			} else {
+				runRowWorkdir = sgDir
+				if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
+					d.failRun(ctx, q, fmt.Sprintf("prepare scratch sg dir: %v", err))
+					return
+				}
+			}
+		} else if readOnlyRun {
 			runRowWorkdir = runWorktreePath(q.RunID)
 			if err := copyDir(scratchGoalDir(domainName, q.GoalID), runRowWorkdir); err != nil {
 				log.Printf("daemon: scratch snapshot for run %s: %v", q.RunID, err)
@@ -1694,7 +1712,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// environment facts and the collaboration contract.
 	prompt += worktreeGuidance(runRowWorkdir)
 	if scratchDomain {
-		prompt += "\n\n## Workspace contract (scratch domain)\nThis directory IS your task's persistent project directory — files you leave here survive between turns. The PARENT directory is human-maintained shared material: READ-ONLY for you. Write only inside this directory; your report (final message) is the deliverable."
+		prompt += "\n\n## Workspace contract (scratch domain)\nThis directory IS your task's persistent project directory — your artifacts (reports, notes, files) live HERE and survive between turns; the comment feed is only for coordination. Sub-goals work in their own sg/<subGoalID> subdirectories here (no code merge — the owner reviews the files directly). The PARENT directory is human-maintained shared material: READ-ONLY for you. Write only inside this directory."
 	}
 
 	// The domain's acceptance policy in NL (the "what counts as done" the
@@ -2040,7 +2058,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// revision's integration base (merge-base of the goal branch and the
 			// sub-goal branch) + the delivered head — the sub-goal layer creates
 			// Change + Revision atomically from these.
-			if subGoalRun && subGoalID != "" {
+			if subGoalRun && subGoalID != "" && !scratchDomain {
 				goalBranch := goalBranchName(q.GoalID)
 				base := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "merge-base", goalBranch, "HEAD"))
 				head := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))

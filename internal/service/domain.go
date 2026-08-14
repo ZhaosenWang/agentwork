@@ -185,7 +185,7 @@ func compilePromptScratch(d *Domain, policyText string) string {
 	var b strings.Builder
 	b.WriteString("你是 agentwork 的验收策略编译器。用户用自然语言描述了这个无仓库项目（scratch 域）的验收要求：\n\n")
 	b.WriteString(policyText)
-	b.WriteString("\n\n这个项目没有 git 仓库：任务的产出是汇报（评论区）和项目目录里的文件，没有代码 diff。请把要求编译成结构化验收策略 JSON，写入当前工作目录的 checks.json 文件（文件即结果，不要输出到 stdout）。\n\n")
+	b.WriteString("\n\n这个项目没有 git 仓库：任务的产物是项目目录里的文件（报告/笔记等），评论区只是协作面；没有代码 diff。请把要求编译成结构化验收策略 JSON，写入当前工作目录的 checks.json 文件（文件即结果，不要输出到 stdout）。\n\n")
 	b.WriteString(`checks.json 结构（无仓库域的子集）：
 {
   "setup": ["<验证环境准备命令，幂等；不需要就留空数组>", ...],

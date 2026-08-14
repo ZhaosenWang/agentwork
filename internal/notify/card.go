@@ -76,11 +76,16 @@ func buildMilestoneCard(emoji, template, title, body string) (string, error) {
 
 // buildProcessedCard replaces the approval card after a button decision: the
 // buttons are gone, the outcome is stamped (M3-1, the Message.Update path).
-func buildProcessedCard(goalID, decision string) (string, error) {
+func buildProcessedCard(goalID, decision string, scratch bool) (string, error) {
 	ok := decision == "approve"
 	header, body := "❌ 已驳回", "该卡点已驳回，goal 将带决策意见重跑。"
 	if ok {
-		header, body = "✅ 已批准", "平台正在自动合入（merge + 复验 + push）。"
+		header = "✅ 已批准"
+		if scratch {
+			body = "任务完成——按汇报验收（产物在项目目录，无合入步骤）。"
+		} else {
+			body = "平台正在自动合入（merge + 复验 + push）。"
+		}
 	}
 	card := map[string]any{
 		"config": map[string]any{"wide_screen_mode": true},

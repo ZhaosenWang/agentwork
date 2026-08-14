@@ -1212,7 +1212,7 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 	// human checkpoint is unconditional here (regardless of strength or
 	// configured gates): zero-checkpoint scratch goals must not auto-done.
 	if domainType == "scratch" {
-		return true, "merge (scratch): 交付物为汇报，必须人工审批", nil
+		return true, "merge (scratch): 交付物为项目目录里的产物，必须人工审批", nil
 	}
 	// The confirmation gate (决策 2-4/2-5): an UNFROZEN acceptance policy is
 	// no acceptance policy — nothing was run against it (the daemon skips

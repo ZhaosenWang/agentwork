@@ -39,8 +39,9 @@ import (
 // a night of uptime). token/tokenExp are guarded by mu.
 // approvalCardRec is one sent approval card's patch handle.
 type approvalCardRec struct {
-	messageID string
-	hadPending bool // the card showed a "审查中" hint — only then is the opinion patch meaningful
+	messageID  string
+	hadPending bool   // the card showed a "审查中" hint — only then is the opinion patch meaningful
+	domainType string // repo|scratch — the processed-card wording branches on it
 }
 
 type Notifier struct {
@@ -161,14 +162,14 @@ func (n *Notifier) onGoalReviewing(_ context.Context, e events.Event) {
 						pending = reviewers
 					}
 					if card, err := buildReviewCard(g, pending); err == nil {
-						n.sendApprovalCard(goalID, card, len(pending) > 0)
+						n.sendApprovalCard(goalID, card, len(pending) > 0, g.DomainType)
 						return
 					}
 				}
 			}
 		}
 	}
-	n.asyncSend(fmt.Sprintf("🔔 待审批：goal %s 等你决定\n%s\n（批准后平台自动合入）", short(goalID), reason))
+	n.asyncSend(fmt.Sprintf("🔔 待审批：goal %s 等你决定\n%s\n（批准后平台自动合入）", short(goalID), reason)) // domain type unknown without the store — repo wording is the default
 }
 
 // onGoalReviewReady patches the approval card once the review window closes:
@@ -256,7 +257,7 @@ func (n *Notifier) onGoalReviewResolved(_ context.Context, e events.Event) {
 	if !ok || rec.messageID == "" {
 		return // never sent / already handled — nothing to patch
 	}
-	card, err := buildProcessedCard(goalID, decision)
+	card, err := buildProcessedCard(goalID, decision, rec.domainType == "scratch")
 	if err != nil {
 		return
 	}
@@ -273,7 +274,7 @@ var (
 
 // sendApprovalCard sends the approval card and records its message_id for
 // the review_ready patch.
-func (n *Notifier) sendApprovalCard(goalID, cardJSON string, hadPending bool) {
+func (n *Notifier) sendApprovalCard(goalID, cardJSON string, hadPending bool, domainType string) {
 	go func() {
 		msgID, err := n.SendCard(cardJSON)
 		if err != nil {
@@ -282,7 +283,7 @@ func (n *Notifier) sendApprovalCard(goalID, cardJSON string, hadPending bool) {
 		}
 		if msgID != "" {
 			n.mu.Lock()
-			n.approvalCards[goalID] = approvalCardRec{messageID: msgID, hadPending: hadPending}
+			n.approvalCards[goalID] = approvalCardRec{messageID: msgID, hadPending: hadPending, domainType: domainType}
 			n.mu.Unlock()
 		}
 	}()
@@ -343,6 +344,11 @@ func (n *Notifier) onGoalDelivered(_ context.Context, e events.Event) {
 			}
 			body += "  \n- `" + truncate(c, 90) + "`"
 		}
+	}
+	// A scratch delivery has nothing merged — the note carries the semantics.
+	if strings.Contains(note, "无仓库交付") {
+		n.sendMilestoneCard("✅", "green", "任务完成", body)
+		return
 	}
 	n.sendMilestoneCard("✅", "blue", "已自动合入", body)
 }

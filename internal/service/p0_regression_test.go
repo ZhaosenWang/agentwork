@@ -504,10 +504,12 @@ func TestScratchGoalForcesHumanGate(t *testing.T) {
 	}
 }
 
-// TestScratchRejectsSubGoals: Change/integration is git-ref based — a
-// scratch goal cannot split.
-func TestScratchRejectsSubGoals(t *testing.T) {
-	gs, _, _, st := newTestCluster(t)
+// TestScratchSubGoalsAreNoCode: a scratch goal CAN split — each sub-goal
+// works in its own sg/<subGoalID> directory and verifies with NO Change
+// (决策 6-8's no-code sub-goal: the deliverable is the files + report, not
+// a merged Change). The wrap-up attention edge wakes the owner to review.
+func TestScratchSubGoalsAreNoCode(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	a := seedAgent(t, st, "A")
 	b := seedAgent(t, st, "B")
@@ -520,7 +522,36 @@ func TestScratchRejectsSubGoals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gs.CreateSubGoal(ctx, g.ID, "拆活", "子任务", b, "", "agent", a); err == nil {
-		t.Fatal("scratch goals must reject sub-goals")
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "拆活", "子任务", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("scratch goals must split (no-code sub-goals): %v", err)
+	}
+	// The sub-goal's run completes with no base/head refs (no git) — it
+	// verifies WITHOUT a Change.
+	var sgRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE sub_goal_id=? AND role='subgoal' LIMIT 1`, sg.ID).Scan(&sgRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.Finish(ctx, sgRun, "completed", "调研完成，产物在 sg 目录"); err != nil {
+		t.Fatalf("finish sg run: %v", err)
+	}
+	got, _ := gs.GetSubGoal(ctx, sg.ID)
+	if got.Status != "verified" {
+		t.Fatalf("the no-code sub-goal must verify, got %q", got.Status)
+	}
+	var changes int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM change WHERE sub_goal_id=?`, sg.ID).Scan(&changes); err != nil {
+		t.Fatal(err)
+	}
+	if changes != 0 {
+		t.Fatalf("a scratch sub-goal must produce NO Change, got %d", changes)
+	}
+	// The owner is woken by the wrap-up attention edge (verified sub-goal,
+	// no Change) — the finalization guard keeps the goal open meanwhile.
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "active" {
+		t.Fatalf("the goal stays active (pending sub-goals), got %q", after.Status)
 	}
 }

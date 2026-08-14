@@ -88,12 +88,13 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		d.finishDeliver(ctx, goalID, false, "deliver: goal has no domain: "+err.Error())
 		return
 	}
-	// A scratch domain has nothing to merge — the goal dir IS the deliverable
-	// (the report in the feed references it). Approval closes the loop
-	// directly; no git steps, no branch-wait (owner runs already ended — the
-	// goal parked review on the owner's completion).
+	// A scratch domain has nothing to merge — the goal's project directory
+	// (and its sg/ subdirectories) already holds the deliverable; the feed
+	// report points at it. Approval closes the loop directly; no git steps,
+	// no branch-wait (owner runs already ended — the goal parked review on
+	// the owner's completion).
 	if domainType == "scratch" {
-		d.finishDeliver(ctx, goalID, true, "无仓库交付——按汇报验收", nil)
+		d.finishDeliver(ctx, goalID, true, "无仓库交付——产物在项目目录，按汇报验收", nil)
 		return
 	}
 	// No in-flight OWNER run before the merge touches the goal branch (决策

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useAgents, useSquads, useAssignGoal, useCancelGoal,
-  useReopenGoal, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments, useActivateGoal } from "@/lib/queries";
+  useReopenGoal, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments, useActivateGoal, useDomains } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Goal } from "@/lib/types";
@@ -72,6 +72,10 @@ export function GoalActions({ goal }: { goal: Goal }) {
 // facts, not trust.
 function ReviewPanel({ goal }: { goal: Goal }) {
   const resolve = useResolveGoalReview();
+  const { data: domains } = useDomains();
+  // A scratch domain has nothing to merge — approval closes the loop
+  // directly (the deliverable is the project directory's contents).
+  const scratch = domains?.find((d) => d.id === goal.domain_id)?.type === "scratch";
   const { data: runs } = useGoalRuns(goal.id);
   const { data: comments } = useGoalComments(goal.id);
   const { data: agents } = useAgents();
@@ -193,7 +197,9 @@ function ReviewPanel({ goal }: { goal: Goal }) {
         )}
 
       {resolveOutcome === "approved" && (
-        <p className="text-sm text-emerald-700 font-medium">✅ 已批准——平台正在合入（merge + 复验 + push），完成后此卡自动关闭。</p>
+        <p className="text-sm text-emerald-700 font-medium">
+          {scratch ? "✅ 已批准——按汇报验收，任务完成。" : "✅ 已批准——平台正在合入（merge + 复验 + push），完成后此卡自动关闭。"}
+        </p>
       )}
       {resolveOutcome === "rejected" && (
         <p className="text-sm text-amber-800 font-medium">↩️ 已驳回——agent 将带你的理由重新执行。</p>
@@ -213,7 +219,11 @@ function ReviewPanel({ goal }: { goal: Goal }) {
             }
             disabled={resolve.isPending || resolveOutcome === "approved"}
           >
-            {resolve.isPending ? "处理中…" : resolveOutcome === "approved" ? "已批准，合入中…" : "批准并自动合入"}
+            {resolve.isPending
+              ? "处理中…"
+              : resolveOutcome === "approved"
+                ? (scratch ? "已批准，完成" : "已批准，合入中…")
+                : (scratch ? "批准（按汇报验收）" : "批准并自动合入")}
           </Button>
           <Button variant="outline" onClick={() => setRejectForm("reject")} disabled={resolveOutcome === "approved"}>
             驳回

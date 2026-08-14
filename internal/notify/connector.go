@@ -474,7 +474,13 @@ func (c *Connector) updateCardProcessed(messageID, goalID, decision string) {
 	if n == nil {
 		return
 	}
-	content, err := buildProcessedCard(goalID, decision)
+	scratch := false
+	if c.qs != nil {
+		if t, err := c.qs.GoalDomainType(context.Background(), goalID); err == nil {
+			scratch = t == "scratch"
+		}
+	}
+	content, err := buildProcessedCard(goalID, decision, scratch)
 	if err != nil {
 		return
 	}
