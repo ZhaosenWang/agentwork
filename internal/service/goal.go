@@ -1343,6 +1343,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		return nil, err
 	}
 	if g.Status != "review" {
+		logging.Warnf("review: goal %q decision=%s REJECTED (goal is %s, not review)", g.Title, decision, g.Status)
 		return nil, NewValidationError("goal is not in review")
 	}
 	// Duplicate-decision guard: the deliver step runs ASYNC after an approve,
@@ -1367,9 +1368,14 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 			Scan(&lastDecision)
 		if err == nil && !deliverFailed && !handoffLoopPark {
 			if decision == "approve" && lastDecision == "approve" {
+				// A human action with NO trace (no decision row, no log) is
+				// indistinguishable from a broken button — the rejected
+				// click must leave a log line with the reason.
+				logging.Warnf("review: goal %q decision=%s REJECTED (already approved — deliver in flight or its result pending)", g.Title, decision)
 				return nil, NewValidationError("goal already approved — waiting for the deliver step (or check the deliver result)")
 			}
 			if (decision == "reject" || decision == "redirect") && lastDecision == "approve" {
+				logging.Warnf("review: goal %q decision=%s REJECTED (being delivered — available after the deliver finishes or fails)", g.Title, decision)
 				return nil, NewValidationError("goal is being delivered — reject is available after the deliver finishes or fails")
 			}
 		}

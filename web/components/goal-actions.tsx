@@ -215,6 +215,9 @@ function ReviewPanel({ goal }: { goal: Goal }) {
       {resolveOutcome === "deliver_failed" && (
         <p className="text-sm text-red-700 font-medium">⚠️ 上次合入失败（冲突/验证红）——可重新批准重试合入，或驳回让 agent 修。</p>
       )}
+      {resolve.isError && (
+        <p className="text-sm text-red-600">✗ 决策未生效：{String(resolve.error)}</p>
+      )}
 
       {phase !== "awaiting_approval" ? (
         <div className="flex items-center gap-2 bg-white rounded-xl border border-sky-200/80 p-3">
