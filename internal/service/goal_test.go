@@ -65,6 +65,13 @@ func seedAgent(t *testing.T, st *store.Store, name string) string {
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}
+	// Machine-owned runtimes claim only while their machine is connected —
+	// seed the connected machine row the runtime points at, or the claim
+	// gate silently blocks every run in the test (live regression: the CLI
+	// branch moved the fixture to machine_id without seeding the machine).
+	if err := NewMachineService(st).Register(ctx, Machine{ID: "m1", Name: "m1", Hostname: "host"}, "[]"); err != nil {
+		t.Fatalf("seed machine: %v", err)
+	}
 	a, err := NewAgentService(st, events.NewBus()).Create(ctx, Agent{Name: name, RuntimeID: rt.ID, MaxConcurrent: 2})
 	if err != nil {
 		t.Fatalf("seed agent: %v", err)

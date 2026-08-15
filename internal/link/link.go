@@ -62,6 +62,9 @@ const (
 	CodeInternal     = -32603
 	// CodeAuthDenied: the register was rejected (bad/missing token).
 	CodeAuthDenied = -32001
+	// CodeForbidden: the caller is authenticated as the WRONG party — a
+	// machine reporting on a run that was dispatched to a different machine.
+	CodeForbidden = -32002
 )
 
 // RPCError is the JSON-RPC error object.
@@ -329,6 +332,11 @@ type RunFinishedParams struct {
 	RunID    string `json:"run_id"`
 	Status   string `json:"status"` // completed|failed|cancelled
 	Summary  string `json:"summary,omitempty"`
+	// Token echoes the dispatch's per-run token — the daemon swallows a
+	// report whose token doesn't match the run's CURRENT claim (a stashed
+	// report from an exec killed before a daemon restart must not cancel
+	// the re-dispatched attempt). Empty = legacy CLI, not verifiable.
+	Token    string `json:"token,omitempty"`
 	Evidence string `json:"evidence,omitempty"` // JSON bundle (scratch runs: '')
 	// Artifacts: processor runs' FILE results (checks.json etc.), uploaded
 	// from the machine — the platform reads structured side effects, never

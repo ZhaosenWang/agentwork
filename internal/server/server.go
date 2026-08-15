@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/eushing/agentwork/internal/daemon"
@@ -171,10 +172,18 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		peer := link.NewPeer(conn)
 		// The peer binds to its machine on register; on link death the
 		// daemon drops it (dispatches then fail-fast with "machine offline").
-		registeredMachineID := ""
+		// The registered id is written by the register handler and read by
+		// the report handlers (both run on link goroutines) — atomic, never
+		// a plain variable. Unregister passes the PEER too: a stale dying
+		// connection must not evict the machine's live replacement.
+		var registeredMachineID atomic.Value // string
+		machineID := func() string {
+			v, _ := registeredMachineID.Load().(string)
+			return v
+		}
 		defer func() {
-			if registeredMachineID != "" {
-				s.d.UnregisterMachinePeer(registeredMachineID)
+			if id := machineID(); id != "" {
+				s.d.UnregisterMachinePeer(id, peer)
 			}
 		}()
 		peer.Handle(link.MethodMachineRegister, func(ctx context.Context, params json.RawMessage) (any, *link.RPCError) {
@@ -193,7 +202,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			// Bind the live peer: dispatched runs for this machine's
 			// runtimes flow over THIS link.
 			s.d.RegisterMachinePeer(p.MachineID, peer)
-			registeredMachineID = p.MachineID
+			registeredMachineID.Store(p.MachineID)
 			// Full skills sync (Phase 4): offline edits land on reconnect.
 			go s.d.PushMachineSkills(context.Background(), p.MachineID)
 			logging.Infof("connect: machine %q (%s) registered, %d agent CLI(s) probed", p.Name, p.Hostname, len(p.CLIs))
@@ -204,21 +213,33 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			if err := json.Unmarshal(raw, &p); err != nil || p.RunID == "" {
 				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "run_id is required"}
 			}
-			return nil, s.d.IngestRunClaimed(ctx, p)
+			id := machineID()
+			if id == "" {
+				return nil, &link.RPCError{Code: link.CodeForbidden, Message: "register first"}
+			}
+			return nil, s.d.IngestRunClaimed(ctx, id, p)
 		})
 		peer.Handle(link.MethodRunEventBatch, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 			var p link.RunEventBatchParams
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "invalid event batch"}
 			}
-			return nil, s.d.IngestRunEvents(ctx, p)
+			id := machineID()
+			if id == "" {
+				return nil, &link.RPCError{Code: link.CodeForbidden, Message: "register first"}
+			}
+			return nil, s.d.IngestRunEvents(ctx, id, p)
 		})
 		peer.Handle(link.MethodRunFinished, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 			var p link.RunFinishedParams
 			if err := json.Unmarshal(raw, &p); err != nil {
 				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "invalid finish report"}
 			}
-			return nil, s.d.IngestRunFinished(ctx, p)
+			id := machineID()
+			if id == "" {
+				return nil, &link.RPCError{Code: link.CodeForbidden, Message: "register first"}
+			}
+			return nil, s.d.IngestRunFinished(ctx, id, p)
 		})
 		peer.Handle(link.MethodMachineHeartbeat, func(ctx context.Context, params json.RawMessage) (any, *link.RPCError) {
 			var p link.HeartbeatParams

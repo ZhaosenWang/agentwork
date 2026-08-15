@@ -238,7 +238,7 @@ loop:
 	}
 	// Processor runs upload their FILE results (the platform reads
 	// structured side effects, never agent stdout).
-	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output}
+	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output, Token: p.Token}
 	if p.Proc && status == "completed" {
 		finishParams.Artifacts = map[string]string{}
 		for _, f := range p.ArtifactFiles {
@@ -253,9 +253,12 @@ loop:
 // finish uploads run.finished — the daemon runs Finish + reconcile. If the
 // link is down at this exact moment, the report is STASHED to disk and
 // flushed on the next successful register (a lost terminal report would
-// leave the run hanging 'running' until the daemon restarts).
+// leave the run hanging 'running' until the daemon restarts). The report
+// echoes the dispatch's per-run TOKEN: the daemon swallows stale reports
+// (an exec killed before a daemon restart must not cancel the attempt the
+// daemon re-dispatched after recovery).
 func (e *executor) finish(p link.RunDispatchParams, status, summary string) {
-	report := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: summary}
+	report := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: summary, Token: p.Token}
 	if err := callRPC(e.peer, link.MethodRunFinished, report, nil, 30*time.Second); err == nil {
 		return
 	}

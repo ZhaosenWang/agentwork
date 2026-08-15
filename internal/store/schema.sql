@@ -193,6 +193,10 @@ CREATE TABLE IF NOT EXISTS run (
     prompt             TEXT NOT NULL DEFAULT '',  -- platform-internal runs only (processor): the compile/processing instruction
     session_id         TEXT NOT NULL DEFAULT '',  -- protocol-returned; for history/future resume
     workdir            TEXT NOT NULL DEFAULT '',
+    -- CLI 分支: the machine this run was dispatched to — stamped at dispatch,
+    -- the anchor every /connect report (claimed/events/finished) is checked
+    -- against. '' = never dispatched.
+    machine_id         TEXT NOT NULL DEFAULT '',
     status             TEXT NOT NULL DEFAULT 'queued', -- queued|running|completed|failed|cancelled
     cancel_reason      TEXT NOT NULL DEFAULT '',  -- structured: idle_watchdog|handoff|stopped|timeout|runaway|goal_terminal|goal_cancelled|'' (decisions don't string-match summaries)
     attempt            INTEGER NOT NULL DEFAULT 1,

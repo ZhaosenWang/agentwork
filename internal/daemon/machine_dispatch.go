@@ -22,21 +22,33 @@ import (
 // uploads, and the watchdog for dispatched runs.
 
 // RegisterMachinePeer binds a machine's live /connect peer (the server
-// calls this after a successful machine.register).
+// calls this after a successful machine.register). A stale connection for
+// the same machine is displaced: the CLI reconnects with the SAME
+// machine_id, and without this the old link's deferred unregister would
+// later evict the NEW peer (identity-checked below) while its lingering
+// frames double-report.
 func (d *Daemon) RegisterMachinePeer(machineID string, p *link.Peer) {
 	d.machineMu.Lock()
 	defer d.machineMu.Unlock()
 	if d.machinePeers == nil {
 		d.machinePeers = map[string]*link.Peer{}
 	}
+	if old, ok := d.machinePeers[machineID]; ok && old != p {
+		old.Close() // stale link — its unregister will no-op (peer identity)
+	}
 	d.machinePeers[machineID] = p
 }
 
-// UnregisterMachinePeer drops a machine's peer (its link died).
-func (d *Daemon) UnregisterMachinePeer(machineID string) {
+// UnregisterMachinePeer drops a machine's peer — ONLY if it is still the
+// registered one. The peer identity check keeps a dying stale connection
+// from evicting the live replacement (the same machine_id reconnecting
+// while the old link is still draining).
+func (d *Daemon) UnregisterMachinePeer(machineID string, p *link.Peer) {
 	d.machineMu.Lock()
 	defer d.machineMu.Unlock()
-	delete(d.machinePeers, machineID)
+	if cur, ok := d.machinePeers[machineID]; ok && cur == p {
+		delete(d.machinePeers, machineID)
+	}
 }
 
 // MachinePeer returns the machine's live link peer (nil = offline).
@@ -57,6 +69,13 @@ func (d *Daemon) dispatchToMachine(ctx context.Context, q *service.ClaimedRow, p
 		d.failRun(ctx, q, fmt.Sprintf("machine offline — the machine must run `agentwork connect` (machine %s)", machineID))
 		return
 	}
+	// Stamp the ownership anchor BEFORE the wire send: every /connect report
+	// (claimed/events/finished) is checked against run.machine_id — no other
+	// machine can complete or pollute this run.
+	if _, err := d.st.DB().ExecContext(ctx,
+		`UPDATE run SET machine_id=? WHERE id=? AND status='running'`, machineID, q.RunID); err != nil {
+		logging.Infof("dispatch: stamp machine %s on run %s: %v", machineID, q.RunID, err)
+	}
 	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	var res link.RunDispatchResult
@@ -70,6 +89,7 @@ func (d *Daemon) dispatchToMachine(ctx context.Context, q *service.ClaimedRow, p
 	}
 	d.machineLastEventMu.Lock()
 	d.machineLastEvent[q.RunID] = time.Now()
+	d.machineRunMachine[q.RunID] = machineID
 	d.machineLastEventMu.Unlock()
 	go d.runMachineWatchdog(q.RunID, machineID)
 	logging.Infof("dispatch: run %s → machine %s (role=%s, attempt=%d)", q.RunID, machineID, p.Role, q.Attempt)
@@ -77,13 +97,21 @@ func (d *Daemon) dispatchToMachine(ctx context.Context, q *service.ClaimedRow, p
 
 // IngestRunClaimed — the machine's run.claimed ack: publish the bus event
 // (the frontend's queued→running flip and the review window's "审查中"
-// state hang on it).
-func (d *Daemon) IngestRunClaimed(ctx context.Context, p link.RunClaimedParams) *link.RPCError {
-	var goalID, agentID string
+// state hang on it). `mid` is the reporting machine: only the run's own
+// machine may ack it, and only while the run is still running.
+func (d *Daemon) IngestRunClaimed(ctx context.Context, mid string, p link.RunClaimedParams) *link.RPCError {
+	var goalID, agentID, machineID, status string
 	var attempt int
 	if err := d.st.DB().QueryRowContext(ctx,
-		`SELECT goal_id, agent_id, attempt FROM run WHERE id=?`, p.RunID).Scan(&goalID, &agentID, &attempt); err != nil {
+		`SELECT goal_id, agent_id, attempt, machine_id, status FROM run WHERE id=?`,
+		p.RunID).Scan(&goalID, &agentID, &attempt, &machineID, &status); err != nil {
 		return &link.RPCError{Code: link.CodeInternal, Message: "unknown run"}
+	}
+	if machineID != "" && machineID != mid {
+		return &link.RPCError{Code: link.CodeForbidden, Message: "not this machine's run"}
+	}
+	if status != "running" {
+		return nil // late ack from a stale exec — the run is already decided
 	}
 	d.bus.Publish(ctx, events.Event{Topic: "run:claimed", Payload: map[string]any{
 		"run_id": p.RunID, "goal_id": goalID, "agent_id": agentID,
@@ -96,10 +124,35 @@ func (d *Daemon) IngestRunClaimed(ctx context.Context, p link.RunClaimedParams) 
 // IngestRunEvents persists a batch of stream events — the machine's
 // per-run seq, contiguous within the batch — exactly like the local
 // executor's persistEvent, refreshes the watchdog's activity stamp, and
-// broadcasts run:event for the live panels.
-func (d *Daemon) IngestRunEvents(ctx context.Context, p link.RunEventBatchParams) *link.RPCError {
+// broadcasts run:event for the live panels. `mid` is the reporting
+// machine; batches from any other machine are rejected, and batches for a
+// run that is no longer running (a stale exec flushing after a daemon
+// restart re-queued it) are dropped.
+func (d *Daemon) IngestRunEvents(ctx context.Context, mid string, p link.RunEventBatchParams) *link.RPCError {
 	if p.RunID == "" || len(p.Events) == 0 {
 		return nil
+	}
+	// Ownership: the dispatch-time map entry (fast path). Missing = daemon
+	// restarted since dispatch — re-derive from the run row and cache.
+	d.machineLastEventMu.Lock()
+	expect, seen := d.machineRunMachine[p.RunID]
+	d.machineLastEventMu.Unlock()
+	if !seen {
+		var rm, status string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT machine_id, status FROM run WHERE id=?`, p.RunID).Scan(&rm, &status); err != nil {
+			return &link.RPCError{Code: link.CodeInvalidParams, Message: "unknown run"}
+		}
+		if status != "running" {
+			return nil // stale batch — the run was re-queued for another dispatch
+		}
+		expect = rm
+		d.machineLastEventMu.Lock()
+		d.machineRunMachine[p.RunID] = rm
+		d.machineLastEventMu.Unlock()
+	}
+	if expect == "" || expect != mid {
+		return &link.RPCError{Code: link.CodeForbidden, Message: "not this machine's run"}
 	}
 	// Gap detection: the daemon expects contiguous seq per run. A gap means
 	// frames were lost (link degradation) — logged; the transcript refill
@@ -131,15 +184,35 @@ func (d *Daemon) IngestRunEvents(ctx context.Context, p link.RunEventBatchParams
 // run gets its gate evaluation (the daemon computes, the goal layer
 // judges — the same division as the local path): the machine's transferred
 // branch is adopted and diffed, and the fired gates land on the run row.
-func (d *Daemon) IngestRunFinished(ctx context.Context, p link.RunFinishedParams) *link.RPCError {
+//
+// The report is validated three ways: it must come from the run's OWN
+// machine (run.machine_id), carry the run's CURRENT per-run token (a
+// stashed report from an exec killed before a daemon restart must not
+// finish the re-dispatched attempt), and the run must still be running.
+func (d *Daemon) IngestRunFinished(ctx context.Context, mid string, p link.RunFinishedParams) *link.RPCError {
 	if p.RunID == "" {
 		return &link.RPCError{Code: link.CodeInvalidParams, Message: "run_id is required"}
 	}
+	var status, token, machineID, kind, runType, domainID string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT status, token, machine_id, run_kind, run_type, domain_id FROM run WHERE id=?`,
+		p.RunID).Scan(&status, &token, &machineID, &kind, &runType, &domainID); err != nil {
+		return &link.RPCError{Code: link.CodeInvalidParams, Message: "unknown run"}
+	}
+	if machineID != "" && machineID != mid {
+		return &link.RPCError{Code: link.CodeForbidden, Message: "not this machine's run"}
+	}
+	if status != "running" {
+		logging.Infof("machine: run %s: late terminal report (%s) dropped — run is %s", p.RunID, p.Status, status)
+		return nil
+	}
+	if p.Token != "" && p.Token != token {
+		logging.Infof("machine: run %s: stale terminal report dropped (token mismatch — the run was re-claimed)", p.RunID)
+		return nil
+	}
 	// Processor runs (goal-less) complete through their artifact paths,
 	// not the goal reconcile.
-	var kind, runType, domainID string
-	if err := d.st.DB().QueryRowContext(ctx,
-		`SELECT run_kind, run_type, domain_id FROM run WHERE id=?`, p.RunID).Scan(&kind, &runType, &domainID); err == nil && kind == "processor" {
+	if kind == "processor" {
 		return d.ingestProcessorFinished(ctx, p, runType, domainID)
 	}
 	if p.Status == "completed" {
@@ -156,6 +229,7 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, p link.RunFinishedParams
 	d.machineLastEventMu.Lock()
 	delete(d.machineLastSeq, p.RunID)
 	delete(d.machineLastEvent, p.RunID)
+	delete(d.machineRunMachine, p.RunID)
 	d.machineLastEventMu.Unlock()
 	if err := d.runSvc.Finish(ctx, p.RunID, p.Status, p.Summary); err != nil && !errors.Is(err, service.ErrRunAlreadyTerminal) {
 		logging.Infof("machine: finish run %s: %v", p.RunID, err)
@@ -166,7 +240,8 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, p link.RunFinishedParams
 }
 
 // ingestProcessorFinished completes a machine-dispatched processor run
-// from its uploaded artifacts (checks.json / intake.json etc.).
+// from its uploaded artifacts (checks.json / intake.json etc.). The
+// caller already validated ownership, token, and status.
 func (d *Daemon) ingestProcessorFinished(ctx context.Context, p link.RunFinishedParams, runType, domainID string) *link.RPCError {
 	d.flushRunMessages(ctx, p.RunID)
 	q := &service.ClaimedRow{RunID: p.RunID}
@@ -189,11 +264,16 @@ func (d *Daemon) ingestProcessorFinished(ctx context.Context, p link.RunFinished
 // runMachineWatchdog supervises a dispatched run: no events for idleWindow
 // or a total duration beyond maxRunDuration cancels it via the machine
 // link (the local executor's watchdog semantics, re-applied across the
-// wire).
+// wire). The cancel is a REQUEST, not a stamp: after firing it keeps
+// ticking, and if the machine has not reported the terminal state within
+// a grace period (dead link, or an executor that ignores run.cancel) it
+// stamps cancelled locally — the run must never hang 'running' on an
+// unresponsive machine.
 func (d *Daemon) runMachineWatchdog(runID, machineID string) {
 	tick := time.NewTicker(idleWindow / 2)
 	defer tick.Stop()
 	start := time.Now()
+	cancelSent := time.Time{}
 	for {
 		<-tick.C
 		// Terminal? The run's state is the truth — the watchdog dies when
@@ -216,16 +296,20 @@ func (d *Daemon) runMachineWatchdog(runID, machineID string) {
 		if !fired {
 			continue
 		}
-		logging.Infof("machine: watchdog firing for run %s (%s)", runID, reason)
-		if peer := d.MachinePeer(machineID); peer != nil {
-			_ = peer.Notify(context.Background(), link.MethodRunCancel, link.RunCancelParams{RunID: runID, Reason: reason})
+		if cancelSent.IsZero() {
+			logging.Infof("machine: watchdog firing for run %s (%s)", runID, reason)
+			if peer := d.MachinePeer(machineID); peer != nil {
+				_ = peer.Notify(context.Background(), link.MethodRunCancel, link.RunCancelParams{RunID: runID, Reason: reason})
+			}
+			cancelSent = time.Now()
+			continue
 		}
-		// The machine reports the terminal state via run.finished; if the
-		// link is dead, stamp locally so the run cannot hang forever.
-		if d.MachinePeer(machineID) == nil {
-			_ = d.runSvc.Finish(context.Background(), runID, "cancelled", "machine offline — watchdog cancelled")
+		// Cancel sent but no terminal report: grace, then stamp locally.
+		if time.Since(cancelSent) > 2*time.Minute {
+			logging.Infof("machine: watchdog stamping run %s cancelled locally (machine unresponsive after cancel)", runID)
+			_ = d.runSvc.Finish(context.Background(), runID, "cancelled", "watchdog cancelled (machine unresponsive)")
+			return
 		}
-		return
 	}
 }
 

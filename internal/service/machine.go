@@ -35,10 +35,23 @@ func NewMachineService(st *store.Store) *MachineService {
 }
 
 // Register upserts the machine (same machine_id across reconnects) and
-// marks it connected with the fresh probe report.
+// marks it connected with the fresh probe report. Machine names are UNIQUE:
+// runtime rows are keyed by "<cli>@<name>" (UpsertProbeRuntimes), so a
+// second machine registering the same name would silently steal the first
+// machine's runtime rows and reroute its runs — reject with a pointer to
+// --name instead. Re-registering under its own name is fine.
 func (s *MachineService) Register(ctx context.Context, m Machine, probedCLIsJSON string) error {
 	if m.ID == "" {
 		return NewValidationError("machine_id is required")
+	}
+	if m.Name == "" {
+		return NewValidationError("name is required")
+	}
+	var holder string
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT id FROM machine WHERE name=? AND id != ?`, m.Name, m.ID).Scan(&holder); err == nil {
+		return NewValidationError(fmt.Sprintf(
+			"machine name %q is already registered by machine %s — pass --name to choose a unique one", m.Name, holder))
 	}
 	ts := now()
 	if _, err := s.st.DB().ExecContext(ctx,

@@ -37,6 +37,17 @@ func TestMachineRegistry(t *testing.T) {
 		t.Fatalf("re-register must upsert, got %+v", list)
 	}
 
+	// A DIFFERENT machine must not take an existing name: runtime rows are
+	// keyed "<cli>@<name>", so a silent takeover would reroute the first
+	// machine's runs.
+	if err := svc.Register(ctx, Machine{ID: "m2", Name: "dev2", Hostname: "host2"}, "[]"); err == nil {
+		t.Fatalf("duplicate machine name must be rejected")
+	}
+	// The same machine may keep its own name on re-register (no-op check).
+	if err := svc.Register(ctx, Machine{ID: "m1", Name: "dev2", Hostname: "host1"}, "[]"); err != nil {
+		t.Fatalf("same machine re-register under its own name: %v", err)
+	}
+
 	// A FRESH machine must NOT be swept (the timezone-comparison regression:
 	// a local-zone cutoff made every connected machine look stale and the
 	// sweep flapped offline every tick while heartbeats re-marked it).

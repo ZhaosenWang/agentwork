@@ -170,6 +170,7 @@ type Daemon struct {
 	machineLastEventMu sync.Mutex
 	machineLastSeq     map[string]int64
 	machineLastEvent   map[string]time.Time
+	machineRunMachine  map[string]string // runID → the machine it was dispatched to (ownership anchor for report ingestion)
 }
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.
@@ -205,6 +206,7 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		reviewReadyFired:  make(map[string]bool),
 		machinePeers:      make(map[string]*link.Peer),
 		machineLastSeq:    make(map[string]int64),
+		machineRunMachine: make(map[string]string),
 		machineLastEvent:  make(map[string]time.Time),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
