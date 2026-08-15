@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useRef, useCallback } from "react";
 import { useGoalRuns, useGoalRunMessages, useAgents } from "@/lib/queries";
 import { useQueryClient } from "@tanstack/react-query";
 import { stopRun } from "@/lib/api";
@@ -10,6 +10,31 @@ import { Markdown } from "@/components/markdown";
 import type { Run } from "@/lib/types";
 import type { ChatMessage } from "@/lib/api";
 
+// useThrottled returns a throttled wrapper (leading + trailing edge): at
+// most one call per window, and a call landing inside an open window is
+// delivered when it closes. Used to tame the per-token run:event storm —
+// the live stream panel refetches at most once per second.
+function useThrottled(fn: () => void, ms: number) {
+  const fnRef = useRef(fn);
+  fnRef.current = fn;
+  const last = useRef(0);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  return useCallback(() => {
+    const now = Date.now();
+    if (timer.current) return; // trailing edge already scheduled
+    if (now - last.current >= ms) {
+      last.current = now;
+      fnRef.current();
+      return;
+    }
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      last.current = Date.now();
+      fnRef.current();
+    }, ms - (now - last.current));
+  }, [ms]);
+}
+
 export function GoalRuns({ goalId }: { goalId: string }) {
   const { data: runs, isLoading, refetch } = useGoalRuns(goalId);
   const { data: agents } = useAgents();
@@ -18,15 +43,25 @@ export function GoalRuns({ goalId }: { goalId: string }) {
   // Agent id → name (the runs table reads who is working, not a hex id).
   const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
 
-  // Refresh on run events — the TERMINAL events matter most for the stop
-  // button: the stop request only fires the cancel; the run flips terminal
-  // when the backend reports back, and without these subscriptions the card
-  // stays "running" forever after a stop click (the immediate invalidation
-  // refetches while the run is still winding down).
-  useWSEvent("run:enqueued", () => refetch());
-  useWSEvent("run:event", () => refetch());
-  useWSEvent("run:cancelled", () => refetch());
-  useWSEvent("run.terminal", () => refetch());
+  // Refresh on run LIFECYCLE events only (enqueued/claimed/cancelled/
+  // terminal) — the TERMINAL events matter most for the stop button: the
+  // stop request only fires the cancel; the run flips terminal when the
+  // backend reports back, and without these subscriptions the card stays
+  // "running" forever after a stop click (the immediate invalidation
+  // refetches while the run is still winding down). run:event is
+  // deliberately NOT subscribed: it is a per-token broadcast for every
+  // run on the platform, and the list rows show nothing that changes per
+  // stream event — subscribing refetched the whole list dozens of times
+  // per second while any agent worked (the live stream panel below
+  // refreshes itself per open run). Events are global — only refetch for
+  // THIS goal.
+  const refetchIfOwn = (p: { goal_id?: string }) => {
+    if (p?.goal_id === goalId) refetch();
+  };
+  useWSEvent("run:enqueued", refetchIfOwn);
+  useWSEvent("run:claimed", refetchIfOwn);
+  useWSEvent("run:cancelled", refetchIfOwn);
+  useWSEvent("run.terminal", refetchIfOwn);
 
   const activeRuns = useMemo(() => runs?.filter((r) => r.status === "queued" || r.status === "running") ?? [], [runs]);
   const pastRuns = useMemo(
@@ -94,8 +129,15 @@ function RunTable({ runs, goalId, agentName }: { runs: Run[]; goalId: string; ag
 function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentName: (id: string) => string }) {
   const [open, setOpen] = useState(false);
   const { data: messages, refetch } = useGoalRunMessages(goalId, run.id);
-  useWSEvent("run:event", () => {
-    if (open) refetch();
+  // The live stream refreshes on run:event — but that broadcast is
+  // PER-TOKEN for every run on the platform: filter to THIS run and
+  // throttle (the persisted rows are aggregated, so adjacent events
+  // rarely change anything — 1/s keeps the panel fresh without the storm).
+  const throttledRefetch = useThrottled(() => refetch(), 1000);
+  useWSEvent("run:event", (p) => {
+    if (!open) return;
+    if ((p as { run_id?: string })?.run_id !== run.id) return;
+    throttledRefetch();
   });
 
   const timeRange = [

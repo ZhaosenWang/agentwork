@@ -168,14 +168,16 @@ export function GoalTimeline({ goalId, goalStatus }: { goalId: string; goalStatu
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
 
-  useWSEvent("run:enqueued", () =>
-    qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) })
-  );
+  useWSEvent("run:enqueued", (p) => {
+    if ((p as { goal_id?: string })?.goal_id === goalId)
+      qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) });
+  });
   // queued→running: the review window must flip from "等你审批" to
   // "审查中" the moment the reviewer's run is claimed.
-  useWSEvent("run:claimed", () =>
-    qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) })
-  );
+  useWSEvent("run:claimed", (p) => {
+    if ((p as { goal_id?: string })?.goal_id === goalId)
+      qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) });
+  });
 
   if (!items || items.length === 0) return null;
 
@@ -544,8 +546,14 @@ function RunDetail({ goalId, runId, agentName }: {
 export function GoalStatusBar({ goalId, goalStatus }: { goalId: string; goalStatus: string }) {
   const { items, active, agentName, nowMs } = useFlow(goalId, goalStatus);
   const qc = useQueryClient();
-  useWSEvent("run:enqueued", () => qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) }));
-  useWSEvent("run:claimed", () => qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) }));
+  useWSEvent("run:enqueued", (p) => {
+    if ((p as { goal_id?: string })?.goal_id === goalId)
+      qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) });
+  });
+  useWSEvent("run:claimed", (p) => {
+    if ((p as { goal_id?: string })?.goal_id === goalId)
+      qc.invalidateQueries({ queryKey: qk.goalTimeline(goalId) });
+  });
 
   if (active) return <ActiveBadge active={active} agentName={agentName} nowMs={nowMs} goalStatus={goalStatus} />;
   const meta: Record<string, { icon: string; text: string; cls: string }> = {
