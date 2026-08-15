@@ -37,7 +37,7 @@ cron/Web  goal→run→   (域策略      (仲裁事务内)  review    合入/me
 
 | 渠道 | 机制 | 幂等 / 防重 |
 |---|---|---|
-| cron（schedule） | 模板 → 到点克隆 goal + 入队 | `uq(schedule_id, planned_at)` 一次触发一条 |
+| cron（schedule） | 模板 → 到点克隆 goal + 入队 | `uq(schedule_id, planned_at)` 一次触发一条；**错过即错过**（2026-08 修订：daemon 停机跨过窗口不重放——补跑会把过期的重复任务灌进队列（实测停机 3 小时 → 3 个同模板 goal 5 秒连发），跳过到下一个未来触发点；窗口内迟到 ≤1min（tick 滞后/重启骑线）仍正常触发 |
 | Web | 建 goal / 指派 / 评论 mention | — |
 | Issue（github / gitcode） | **轮询（默认 30s）+ webhook 双通道** → `CreateGoalForIssue` | `source_ref` 唯一约束——webhook 与轮询并发竞争时冲突被当作幂等结果；deliver 成功后 close + 结构化 commit 链接评论 |
 | IM 入站（飞书） | 文本消息 → processor run（intake）解析意图 → 执行动作 | 消息 ID 去重；多域任务草稿澄清（10min 过期） |

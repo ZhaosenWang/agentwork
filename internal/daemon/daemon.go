@@ -3081,6 +3081,8 @@ func (d *Daemon) runBudgetSeconds(ctx context.Context, goalID, domainID string) 
 
 // dispatchSchedules fires every enabled schedule whose next_run_at is due,
 // cloning a fresh goal + run. Idempotent via uq_schedule_run_planned.
+// Occurrences missed while the daemon was down are SKIPPED, not replayed
+// (cron semantics — a miss is a miss; see skipMissedOccurrences).
 func (d *Daemon) dispatchSchedules(ctx context.Context) {
 	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
 	rows, err := d.st.DB().QueryContext(ctx,
@@ -3102,7 +3104,54 @@ func (d *Daemon) dispatchSchedules(ctx context.Context) {
 	}
 	rows.Close()
 	for _, r := range due {
+		planned, err := time.Parse(time.RFC3339Nano, r.NextRunAt)
+		if err == nil && time.Since(planned) > scheduleMissGrace {
+			if n, err := d.skipMissedOccurrences(ctx, r); err != nil {
+				logging.Infof("daemon: schedule %s skip missed: %v", r.ScheduleID, err)
+			} else if n > 0 {
+				logging.Infof("daemon: schedule %s skipped %d overdue occurrence(s) (daemon was down) — no replay, resuming at the next future occurrence", r.ScheduleID, n)
+			}
+			continue
+		}
 		d.fireSchedule(ctx, r)
+	}
+}
+
+// scheduleMissGrace is how late a due firing may be before it counts as
+// MISSED rather than mere tick lag: the tick runs every 5s, and a restart
+// straddling the fire minute costs tens of seconds — within a minute the
+// occurrence still fires. Beyond it the daemon was down across the window.
+const scheduleMissGrace = time.Minute
+
+// skipMissedOccurrences advances a schedule past its missed windows WITHOUT
+// firing: replaying stacked overdue occurrences floods the queue with
+// identical stale work items (live: a multi-hour downtime produced three
+// "南京当前温度" goals five seconds apart). The schedule resumes at its
+// next FUTURE occurrence. Returns how many occurrences were passed over.
+func (d *Daemon) skipMissedOccurrences(ctx context.Context, r scheduleDueRow) (int, error) {
+	anchor, err := time.Parse(time.RFC3339Nano, r.NextRunAt)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now().UTC()
+	skipped := 0
+	for {
+		next, err := service.ComputeNextRun(r.CronExpression, r.Timezone, anchor)
+		if err != nil {
+			return skipped, err
+		}
+		if next.After(now) {
+			if skipped > 0 {
+				if _, err := d.st.DB().ExecContext(ctx,
+					`UPDATE schedule SET next_run_at=?, last_run_at=? WHERE id=?`,
+					next.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), r.ScheduleID); err != nil {
+					logging.Infof("daemon: schedule %s skip advance: %v", r.ScheduleID, err)
+				}
+			}
+			return skipped, nil
+		}
+		skipped++
+		anchor = next
 	}
 }
 

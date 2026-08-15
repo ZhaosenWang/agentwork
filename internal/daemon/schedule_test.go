@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/service"
@@ -161,5 +162,86 @@ func TestFireScheduleAtomicBirth(t *testing.T) {
 		`SELECT COUNT(*) FROM run WHERE goal_id IN (SELECT goal_id FROM schedule_run WHERE schedule_id=?)`,
 		sched.ID).Scan(&runs); err != nil || runs != 1 {
 		t.Fatalf("duplicate firing must not enqueue a second run, got %d (err %v)", runs, err)
+	}
+}
+
+// TestScheduleMissedOccurrencesSkipped covers the cron miss semantics: a
+// schedule whose window passed while the daemon was down is advanced to its
+// next FUTURE occurrence WITHOUT firing — replaying stacked overdue fires
+// flooded the queue with identical stale goals (live: a multi-hour downtime
+// produced three "南京当前温度" goals five seconds apart).
+func TestScheduleMissedOccurrencesSkipped(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	bus := events.NewBus()
+
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	if err != nil {
+		t.Fatalf("runtime: %v", err)
+	}
+	agent, err := service.NewAgentService(st, bus).Create(ctx, service.Agent{Name: "maintainer", RuntimeID: rt.ID})
+	if err != nil {
+		t.Fatalf("agent: %v", err)
+	}
+	domain, err := service.NewDomainService(st, bus).Create(ctx, service.Domain{Name: "d", GitURL: "https://example.com/d.git"})
+	if err != nil {
+		t.Fatalf("domain: %v", err)
+	}
+	sched, err := service.NewScheduleService(st, bus).Create(ctx, service.Schedule{
+		Name: "s", TitleTemplate: "t", Description: "d",
+		AssigneeType: "agent", AssigneeID: agent.ID, DomainID: domain.ID,
+		CronExpression: "50 * * * *", Timezone: "UTC",
+	})
+	if err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+	// The daemon was "down" across several windows: next_run_at sits three
+	// hours in the past.
+	past := time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(ctx, `UPDATE schedule SET next_run_at=? WHERE id=?`, past, sched.ID); err != nil {
+		t.Fatalf("age schedule: %v", err)
+	}
+	goalSvc := service.NewGoalService(st, bus)
+	runSvc := service.NewRunService(st, bus)
+	goalSvc.SetRunService(runSvc)
+	runSvc.SetGoalService(goalSvc)
+	d := &Daemon{st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc}
+
+	d.dispatchSchedules(ctx)
+
+	// No replay: zero goals, zero firings for the missed windows.
+	var goals, firings int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM goal WHERE created_by_id=?`, sched.ID).Scan(&goals); err != nil || goals != 0 {
+		t.Fatalf("missed occurrences must not fire, got %d goal(s) (err %v)", goals, err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schedule_run WHERE schedule_id=?`, sched.ID).Scan(&firings); err != nil || firings != 0 {
+		t.Fatalf("missed occurrences must not fire, got %d firing(s) (err %v)", firings, err)
+	}
+	// The schedule resumed at its next FUTURE occurrence.
+	var nextStr string
+	if err := st.DB().QueryRowContext(ctx, `SELECT next_run_at FROM schedule WHERE id=?`, sched.ID).Scan(&nextStr); err != nil {
+		t.Fatalf("read next_run_at: %v", err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextStr)
+	if err != nil || !next.After(time.Now().UTC()) {
+		t.Fatalf("next_run_at must be in the future, got %q (err %v)", nextStr, err)
+	}
+
+	// A due firing within the grace window still fires normally (tick lag,
+	// not a miss).
+	justNow := time.Now().UTC().Add(-3 * time.Second).Format(time.RFC3339Nano)
+	if _, err := st.DB().ExecContext(ctx, `UPDATE schedule SET next_run_at=? WHERE id=?`, justNow, sched.ID); err != nil {
+		t.Fatalf("un-age schedule: %v", err)
+	}
+	d.dispatchSchedules(ctx)
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schedule_run WHERE schedule_id=?`, sched.ID).Scan(&firings); err != nil || firings != 1 {
+		t.Fatalf("within-grace firing must fire, got %d firing(s) (err %v)", firings, err)
 	}
 }
