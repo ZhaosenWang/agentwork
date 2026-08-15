@@ -139,11 +139,31 @@ func (h *Handlers) deleteRuntime(w http.ResponseWriter, r *http.Request) {
 
 // ── agent ──
 
+// createAgentRequest is the POST /agents body: an Agent plus an optional
+// inline runtime spec. When runtime_id is empty and Runtime is set, the
+// handler get-or-creates the runtime from the spec (acp ws form) before
+// binding the agent — the no-runtime-entry-point path.
+type createAgentRequest struct {
+	service.Agent
+	Runtime *service.Runtime `json:"runtime,omitempty"`
+}
+
 func (h *Handlers) createAgent(w http.ResponseWriter, r *http.Request) {
-	var a service.Agent
-	if err := json.NewDecoder(r.Body).Decode(&a); err != nil {
+	var req createAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	a := req.Agent
+	// Backward compatible: an explicit runtime_id wins. Only fall back to the
+	// inline runtime spec when no runtime_id was given.
+	if a.RuntimeID == "" && req.Runtime != nil {
+		rt, err := h.Runtime.GetOrCreate(r.Context(), *req.Runtime)
+		if err != nil {
+			writeJSON(w, nil, err)
+			return
+		}
+		a.RuntimeID = rt.ID
 	}
 	out, err := h.Agent.Create(r.Context(), a)
 	writeJSON(w, out, err)

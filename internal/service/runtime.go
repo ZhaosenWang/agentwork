@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/eushing/agentwork/internal/store"
 )
@@ -118,6 +119,68 @@ func (s *RuntimeService) Get(ctx context.Context, id string) (*Runtime, error) {
 	_ = json.Unmarshal([]byte(argsJSON), &r.Args)
 	_ = json.Unmarshal([]byte(envJSON), &r.Env)
 	return &r, nil
+}
+
+// GetByEndpoint returns the runtime bound to the given ws/tcp endpoint, or
+// ErrNotFound. The endpoint is the identity of a remote (ws/tcp) runtime, so
+// this is the dedup lookup behind GetOrCreate.
+func (s *RuntimeService) GetByEndpoint(ctx context.Context, endpoint string) (*Runtime, error) {
+	var r Runtime
+	var argsJSON, envJSON string
+	err := s.st.DB().QueryRowContext(ctx,
+		`SELECT id,name,transport,provider,executable,args,endpoint,env,agentwork_url,created_at FROM runtime WHERE endpoint=? LIMIT 1`, endpoint).
+		Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.AgentworkURL, &r.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = json.Unmarshal([]byte(argsJSON), &r.Args)
+	_ = json.Unmarshal([]byte(envJSON), &r.Env)
+	return &r, nil
+}
+
+// GetOrCreate returns the runtime bound to r.Endpoint, creating it (with
+// ws/acp defaults) if none exists. Dedup key is the endpoint — the identity of
+// an "acp ws" runtime, so selecting the same ws address repeatedly never
+// inserts a second row. It backs POST /agents when the caller has no runtime
+// entry point and passes the ws address inline.
+func (s *RuntimeService) GetOrCreate(ctx context.Context, r Runtime) (*Runtime, error) {
+	if r.Endpoint == "" {
+		return nil, NewValidationError("runtime.endpoint is required")
+	}
+	if r.Transport == "" {
+		r.Transport = "ws"
+	}
+	if r.Provider == "" {
+		r.Provider = "acp"
+	}
+	if r.Name == "" {
+		r.Name = deriveRuntimeName(r.Endpoint)
+	}
+	existing, err := s.GetByEndpoint(ctx, r.Endpoint)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	return s.Create(ctx, r)
+}
+
+// deriveRuntimeName builds a display name from a ws endpoint when the caller
+// doesn't supply one: strip the scheme and any trailing slash so
+// "ws://127.0.0.1:8787/" becomes "127.0.0.1:8787".
+func deriveRuntimeName(endpoint string) string {
+	name := endpoint
+	name = strings.TrimPrefix(name, "wss://")
+	name = strings.TrimPrefix(name, "ws://")
+	name = strings.TrimSuffix(name, "/")
+	if name == "" {
+		return endpoint
+	}
+	return name
 }
 
 func (s *RuntimeService) Delete(ctx context.Context, id string) error {
