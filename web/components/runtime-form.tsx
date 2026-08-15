@@ -11,6 +11,7 @@ export function RuntimeForm({ onClose }: { onClose: () => void }) {
   const [provider, setProvider] = useState("acp");
   const [executable, setExecutable] = useState("");
   const [endpoint, setEndpoint] = useState("");
+  const [agentworkURL, setAgentworkURL] = useState("");
   const [args, setArgs] = useState("");
   const [envRows, setEnvRows] = useState<{ key: string; value: string }[]>([]);
 
@@ -27,6 +28,7 @@ export function RuntimeForm({ onClose }: { onClose: () => void }) {
         provider,
         executable,
         endpoint,
+        agentwork_url: agentworkURL.trim(),
         args: args.trim() ? args.trim().split(/\s+/).filter(Boolean) : [],
         env: parsedEnv,
       },
@@ -77,6 +79,10 @@ export function RuntimeForm({ onClose }: { onClose: () => void }) {
             <input value={endpoint} onChange={(e) => setEndpoint(e.target.value)} className={inputCls} placeholder={transport === "ws" ? "ws://host:port" : "host:port"} required />
           </Field>
         )}
+
+        <Field label="Agentwork 地址" hint="平台对外广告的地址（远程 agent 需要公网可达；留空 = http://127.0.0.1:7373）">
+          <input value={agentworkURL} onChange={(e) => setAgentworkURL(e.target.value)} className={inputCls} placeholder="http://127.0.0.1:7373（默认）" />
+        </Field>
 
         {transport === "stdio" && (
           <Field label="启动参数" hint="空格分隔，如 serve --acp">

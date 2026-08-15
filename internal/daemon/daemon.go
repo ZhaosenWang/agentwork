@@ -1502,12 +1502,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 	var title, desc, handoff, domainID, gitURL, defaultBranch, domainType, domainName, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
-	var agentName, agentDesc, triggerAuthorName string
+	var agentName, agentDesc, triggerAuthorName, runtimeAgentworkURL string
 	var triggerAuthor, triggerCommentID, triggerCommentContent, runRole, subGoalID, wakeNote, wakeAnchorID string
 	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, COALESCE(d.type,''), COALESCE(d.name,''), a.system_prompt, a.name, COALESCE(a.description,''),
-		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent, d.max_run_duration,
+		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, COALESCE(r.agentwork_url,''), a.max_concurrent, d.max_run_duration,
 		        g.source_ref, d.git_credentials,
 		        r2.trigger_comment_id, COALESCE(c.author_type, ''), COALESCE(c.content, ''), COALESCE(ca.name,''), r2.role, r2.sub_goal_id, r2.wake_note, COALESCE(r2.wake_anchor,'')
 		 FROM run r2
@@ -1518,7 +1518,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 LEFT JOIN agent ca ON ca.id = c.author_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &agentName, &agentDesc, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &triggerAuthorName, &runRole, &subGoalID, &wakeNote, &wakeAnchorID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &agentName, &agentDesc, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &runtimeAgentworkURL, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &triggerAuthorName, &runRole, &subGoalID, &wakeNote, &wakeAnchorID)
 	// Claim visibility: which run, which agent, which role — the panel's
 	// answer to "who is doing what right now". The TITLE travels with the
 	// id: ids are for the system, humans read titles.
@@ -1588,16 +1588,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	for k, v := range agentEnv {
 		taskEnv = append(taskEnv, k+"="+v)
 	}
-	addr := d.addr
-	if addr == "" {
-		addr = defaultListenAddr
-	}
-	_, port, err := net.SplitHostPort(addr)
+	serverURL, err := d.advertisedBaseURL(ctx, runtimeAgentworkURL)
 	if err != nil {
-		d.failRun(ctx, q, fmt.Sprintf("parse listen addr %q: %v", addr, err))
+		d.failRun(ctx, q, err.Error())
 		return
 	}
-	serverURL := "http://" + net.JoinHostPort("127.0.0.1", port)
 	taskEnv = append(taskEnv,
 		"AGENTWORK_SERVER_URL="+serverURL,
 		"AGENTWORK_GOAL_ID="+q.GoalID, // product-plane id (CLI comments/handoff)
@@ -2323,12 +2318,12 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 
-	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
+	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, procAgentworkURL string
 	var maxConcurrent int
 	err = d.st.DB().QueryRowContext(ctx,
-		`SELECT a.system_prompt, r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent
+		`SELECT a.system_prompt, r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, COALESCE(r.agentwork_url,''), a.max_concurrent
 		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`, agentID).
-		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent)
+		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &procAgentworkURL, &maxConcurrent)
 	if err != nil {
 		d.failProcessorRun(ctx, q, "load agent runtime: "+err.Error())
 		return
@@ -2407,16 +2402,11 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	// The processor agent is not a goal worker: no AGENTWORK_GOAL_ID/RUN_ID
 	// injection (it should not call back into the platform), just the server
 	// URL and its own identity for orientation.
-	addr := d.addr
-	if addr == "" {
-		addr = defaultListenAddr
-	}
-	_, port, err := net.SplitHostPort(addr)
+	serverURL, err := d.advertisedBaseURL(ctx, procAgentworkURL)
 	if err != nil {
-		d.failProcessorRun(ctx, q, "parse listen addr: "+err.Error())
+		d.failProcessorRun(ctx, q, err.Error())
 		return
 	}
-	serverURL := "http://" + net.JoinHostPort("127.0.0.1", port)
 	taskEnv = append(taskEnv, "AGENTWORK_SERVER_URL="+serverURL)
 
 	conn, err := runtime.Open(ctx, runtime.Spec{
@@ -2626,6 +2616,33 @@ Your worktree lives on the PLATFORM machine — it is not your environment:
 - Commands that touch the worktree run through the platform's execution channel (agentwork_terminal_create or terminal/*), on the platform machine, with the worktree as their working directory
 - Verification, review and delivery read only what you wrote through these channels
 `, workdir)
+}
+
+// advertisedBaseURL is the base URL the platform advertises to agents: the
+// workspace MCP server (/mcp/<id>) and the CLI callback endpoint live under
+// it. A remote agent (ws/tcp runtime) cannot reach 127.0.0.1, so the owner
+// can point it at the daemon's public address via the app_settings key
+// platform.advertise_url (e.g. "https://agentwork.example.com"). Unset =
+// http://127.0.0.1:<listen port>. No dedicated UI — the settings API and IM
+// already read/write app_settings keys.
+func (d *Daemon) advertisedBaseURL(ctx context.Context, runtimeURL string) (string, error) {
+	if s := strings.TrimSpace(runtimeURL); s != "" {
+		return strings.TrimRight(s, "/"), nil
+	}
+	var raw string
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key='platform.advertise_url'`).Scan(&raw)
+	if s := strings.TrimSpace(raw); s != "" {
+		return strings.TrimRight(s, "/"), nil
+	}
+	addr := d.addr
+	if addr == "" {
+		addr = defaultListenAddr
+	}
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("parse listen addr %q: %w", addr, err)
+	}
+	return "http://" + net.JoinHostPort("127.0.0.1", port), nil
 }
 
 // nowStr is the daemon-side UTC timestamp helper (service.now is private).

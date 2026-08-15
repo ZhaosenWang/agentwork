@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS runtime (
     args        TEXT NOT NULL DEFAULT '[]',    -- stdio: JSON array; ws/tcp: '[]'
     endpoint    TEXT NOT NULL DEFAULT '',      -- ws/tcp: "ws://host:port" or "host:port"; stdio: ''
     env         TEXT NOT NULL DEFAULT '{}',    -- JSON object of runtime env (stdio only)
+    agentwork_url TEXT NOT NULL DEFAULT '',    -- advertised platform base URL for THIS runtime (remote agents need the daemon's public address); '' = http://127.0.0.1:<listen port>
     created_at  TEXT NOT NULL                  -- RFC3339
 );
 

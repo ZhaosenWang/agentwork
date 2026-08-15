@@ -23,7 +23,11 @@ type Runtime struct {
 	Args       []string          `json:"args"`
 	Endpoint   string            `json:"endpoint"`
 	Env        map[string]string `json:"env"`
-	CreatedAt  string            `json:"created_at"`
+	// AgentworkURL is the advertised platform base URL for THIS runtime
+	// (remote agents need the daemon's public address); '' = the platform
+	// default (http://127.0.0.1:<listen port>).
+	AgentworkURL string `json:"agentwork_url"`
+	CreatedAt    string `json:"created_at"`
 }
 
 func validProvider(p string) bool {
@@ -70,8 +74,8 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 	argsJSON, _ := json.Marshal(r.Args)
 	envJSON, _ := json.Marshal(r.Env)
 	_, err := s.st.DB().ExecContext(ctx,
-		`INSERT INTO runtime (id,name,transport,provider,executable,args,endpoint,env,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Name, r.Transport, r.Provider, r.Executable, string(argsJSON), r.Endpoint, string(envJSON), r.CreatedAt)
+		`INSERT INTO runtime (id,name,transport,provider,executable,args,endpoint,env,agentwork_url,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Name, r.Transport, r.Provider, r.Executable, string(argsJSON), r.Endpoint, string(envJSON), r.AgentworkURL, r.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert runtime: %w", err)
 	}
@@ -80,7 +84,7 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 
 func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,transport,provider,executable,args,endpoint,env,created_at FROM runtime ORDER BY created_at`)
+		`SELECT id,name,transport,provider,executable,args,endpoint,env,agentwork_url,created_at FROM runtime ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +93,7 @@ func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	for rows.Next() {
 		var r Runtime
 		var argsJSON, envJSON string
-		if err := rows.Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.AgentworkURL, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(argsJSON), &r.Args)
@@ -103,8 +107,8 @@ func (s *RuntimeService) Get(ctx context.Context, id string) (*Runtime, error) {
 	var r Runtime
 	var argsJSON, envJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,transport,provider,executable,args,endpoint,env,created_at FROM runtime WHERE id=?`, id).
-		Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.CreatedAt)
+		`SELECT id,name,transport,provider,executable,args,endpoint,env,agentwork_url,created_at FROM runtime WHERE id=?`, id).
+		Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.AgentworkURL, &r.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

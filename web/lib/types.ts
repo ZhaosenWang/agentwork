@@ -9,6 +9,7 @@ export interface Runtime {
   args: string[];
   endpoint: string;
   env: Record<string, string>;
+  agentwork_url: string; // advertised platform base URL for this runtime; '' = http://127.0.0.1:<port>
   created_at: string;
 }
 

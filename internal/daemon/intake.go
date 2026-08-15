@@ -17,7 +17,6 @@ import (
 	"github.com/eushing/agentwork/internal/proto"
 	"github.com/eushing/agentwork/internal/runtime"
 	"github.com/eushing/agentwork/internal/service"
-	"net"
 )
 
 // runIntakeTask executes an inbound-message parse run (M3-4): the parser
@@ -44,12 +43,12 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 	// full path so the write_file path argument is unambiguous.
 	prompt += fmt.Sprintf("\n\n产物文件绝对路径：%s\n（用 agentwork_write_file 的 path 参数写入此绝对路径；不要猜测工作目录，不要用 shell 重定向）\n",
 		filepath.Join(workdir, "intake.json"))
-	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON string
+	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, intakeAgentworkURL string
 	var maxConcurrent int
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT a.system_prompt, r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, a.max_concurrent
+		`SELECT a.system_prompt, r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, COALESCE(r.agentwork_url,''), a.max_concurrent
 		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`, agentID).
-		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &maxConcurrent)
+		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &intakeAgentworkURL, &maxConcurrent)
 	if err != nil {
 		d.failIntakeRun(ctx, q, "load agent runtime: "+err.Error())
 		return
@@ -83,16 +82,11 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 	// never lands (a live failure, same as compile before its fix). The
 	// intake branch was missed when the shared processor path was fixed;
 	// give it the environment + MCP workspace + Workspace contract too.
-	addr := d.addr
-	if addr == "" {
-		addr = defaultListenAddr
-	}
-	_, port, err := net.SplitHostPort(addr)
+	serverURL, err := d.advertisedBaseURL(ctx, intakeAgentworkURL)
 	if err != nil {
-		d.failIntakeRun(ctx, q, "parse listen addr: "+err.Error())
+		d.failIntakeRun(ctx, q, err.Error())
 		return
 	}
-	serverURL := "http://" + net.JoinHostPort("127.0.0.1", port)
 	env := newRunEnvironment(q.RunID, "", q.AgentID, workdir, serverURL)
 	defer env.tm.cleanup()
 	d.mu.Lock()
