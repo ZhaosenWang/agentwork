@@ -107,11 +107,18 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// never race it. The approve/reject guard keeps the goal in review while
 	// deliver runs, so the wait cannot be invalidated by a concurrent decision.
 	waitDeadline := time.Now().Add(deliverWaitForRuns)
+	waitLogged := false
 	for {
 		var running int
 		if err := d.st.DB().QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='running' AND role='owner'`, goalID).Scan(&running); err == nil && running == 0 {
 			break
+		}
+		if !waitLogged {
+			// The deliver wait is a 卡点 (up to 5 minutes): the merge is
+			// held — say so, and say what holds it.
+			logging.Infof("deliver: goal %q waiting for %d running owner run(s) before merge", goalTitle, running)
+			waitLogged = true
 		}
 		if time.Now().After(waitDeadline) {
 			d.finishDeliver(ctx, goalID, false, "deliver: 等待运行中的 owner run 结束超时（5 分钟），请稍后再次批准")

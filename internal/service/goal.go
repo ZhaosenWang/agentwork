@@ -582,6 +582,7 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 				newID(), goalID, "任务停靠待审：agent 间所有权交接形成循环，请决定——批准继续（交接生效）/ 驳回（任务失败）。", now()); err != nil {
 				return nil, fmt.Errorf("insert handoff-loop comment: %w", err)
 			}
+			logging.Infof("review: goal %q parked (handoff loop: %d handoffs — human must decide)", g.Title, handoffs)
 			// The park publishes goal:reviewing like the gate park (决策 4-4:
 			// handoff_loop 停靠同样发卡 — the human MUST decide). The squad
 			// checkpoint skips it (handoff_loop prefix — no code to review);
@@ -982,8 +983,8 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 
 	var g Goal
 	err = tx.QueryRowContext(ctx,
-		`SELECT id,assignee_type,assignee_id,status FROM goal WHERE id=?`, rc.GoalID).
-		Scan(&g.ID, &g.AssigneeType, &g.AssigneeID, &g.Status)
+		`SELECT id,assignee_type,assignee_id,status,title FROM goal WHERE id=?`, rc.GoalID).
+		Scan(&g.ID, &g.AssigneeType, &g.AssigneeID, &g.Status, &g.Title)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // goal vanished; nothing to reconcile
 	}
@@ -1121,6 +1122,11 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			return fmt.Errorf("count pending consults: %w", err)
 		}
 		if pendingSG > 0 || pendingChanges > 0 || pendingConsults > 0 {
+			// A WAIT is open: the run ended but the goal holds active until
+			// the pending work lands — log the hold (otherwise a finished
+			// run with no advancement looks like a hang).
+			logging.Infof("goal: %q run %s done but finalization guard holds (sub-goals=%d changes=%d consults=%d) — no gate yet",
+				g.Title, rc.RunID, pendingSG, pendingChanges, pendingConsults)
 			break // stay active — the attention loop owns the next step
 		}
 		// A completed run that passed machine verification has reached the
@@ -1168,6 +1174,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			if err := s.enqueueSquadReviewTx(ctx, tx, rc.GoalID, rc.RunID, reason); err != nil {
 				return fmt.Errorf("enqueue squad review: %w", err)
 			}
+			logging.Infof("review: goal %q parked (gate hit: %q)", g.Title, trimLog(reason, 80))
 			pendingEvents = append(pendingEvents, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
 				"goal_id": rc.GoalID, "run_id": rc.RunID, "reason": reason,
 			}})
@@ -1398,6 +1405,14 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		newID(), goalID, runID, rule, decision, reason, "human", ts, duration); err != nil {
 		return nil, fmt.Errorf("insert gate_decision: %w", err)
 	}
+	// The decision is what CLOSES the review wait (approve → deliver,
+	// reject → agent re-runs) — the checkpoint's resolution must be in the
+	// log, not just the gate_decision row.
+	reasonSuffix := ""
+	if reason != "" {
+		reasonSuffix = fmt.Sprintf(" (reason=%q)", trimLog(reason, 60))
+	}
+	logging.Infof("review: goal %q decision=%s by human%s", g.Title, decision, reasonSuffix)
 	// The decision's reason is the human's words — the comment feed is where
 	// the agent's next run reads recent human comments, so the reject reason
 	// must be there (not only in gate_decision / handoff_note).
@@ -1664,6 +1679,11 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason, triggerComment
 	if runEv != nil {
 		s.bus.Publish(ctx, *runEv)
 	}
+	trigger := "manual"
+	if triggerCommentID != "" {
+		trigger = "trigger comment " + triggerCommentID
+	}
+	logging.Infof("goal: %q reopened (%s)", g.Title, trigger)
 	return s.Get(ctx, goalID)
 }
 
@@ -1988,6 +2008,7 @@ func (s *GoalService) enqueueSquadReviewTx(ctx context.Context, tx *sql.Tx, goal
 			goalID).Scan(&trigger)
 	}
 
+	enqueued := 0
 	for _, r := range reviewers {
 		if r.id == leaderID {
 			continue
@@ -2007,6 +2028,12 @@ func (s *GoalService) enqueueSquadReviewTx(ctx context.Context, tx *sql.Tx, goal
 		if _, _, err := s.runSvc.EnqueueForMentionRoleTx(ctx, tx, goalID, r.id, trigger, "review"); err != nil {
 			return err
 		}
+		enqueued++
+	}
+	if enqueued > 0 {
+		// The review wait's START — the card's "审查中" state and the
+		// window-close both hang on these runs.
+		logging.Infof("review: enqueued %d review run(s) for goal %s", enqueued, goalID)
 	}
 	return nil
 }

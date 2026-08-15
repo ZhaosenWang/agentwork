@@ -257,6 +257,8 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 				// A bad/unknown agent UUID → drop, don't fail the whole comment.
 				continue
 			}
+			logging.Infof("comment: mention dispatch goal=%q (%s) → consult run %s agent=%s (trigger comment %s)",
+				g.Title, c.GoalID, r.ID, m.ID, c.ID)
 			// Consult chain (决策 5-8): record the request — requester run /
 			// target / trigger comment / guest run — so the platform can
 			// auto-resume the requester once the guest answers.

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/logging"
@@ -15,6 +16,29 @@ import (
 // NO authority over goal status: on a terminal status the daemon calls
 // GoalService.ReconcileOnRunEnd, which is the sole path that advances a goal.
 // See DESIGN.md §9.
+
+// goalTitleForLog resolves a goal's title for log lines — ids are system
+// handles, humans read logs. '' when the goal is gone (or processor runs).
+func (s *RunService) goalTitleForLog(ctx context.Context, goalID string) string {
+	if goalID == "" {
+		return ""
+	}
+	var t string
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT title FROM goal WHERE id=?`, goalID).Scan(&t); err != nil {
+		return ""
+	}
+	return t
+}
+
+// trimLog caps a string for a log line (summaries and wake notes are full
+// sentences; the log keeps the opening, the feed carries the rest).
+func trimLog(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
 type Run struct {
 	ID        string `json:"id"`
 	GoalID    string `json:"goal_id"`
@@ -194,6 +218,11 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		ev := &events.Event{Topic: "run:coalesced", Payload: map[string]any{
 			"goal_id": goalID, "agent_id": agentID,
 		}}
+		// goal ID only — this runs INSIDE the caller's transaction, and a
+		// pool-side title lookup would deadlock single-connection stores
+		// (:memory: tests). The daemon's claimed line carries the title.
+		logging.Infof("run: coalesced %s goal=%s role=%s agent=%s (already %s)",
+			id, goalID, role, agentID, pstatus)
 		return &Run{ID: id, GoalID: goalID, AgentID: agentID}, ev, nil
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -225,6 +254,18 @@ func (s *RunService) enqueueTx(ctx context.Context, tx *sql.Tx, goalID, agentID 
 		r.ID, r.GoalID, r.AgentID, "worker", "", "", "", "", r.Status, r.Role, r.Attempt, r.ResultSummary, r.TriggerCommentID, r.WakeNote, r.WakeAnchor, leaderFlag, r.SquadID, r.QueuedAt, r.StartedAt, r.FinishedAt, r.CreatedAt); err != nil {
 		return nil, nil, fmt.Errorf("insert run: %w", err)
 	}
+	// Every queued run is a potential WAIT (a run nobody claims is invisible
+	// otherwise): the enqueue line is the scheduling ledger — goal, role,
+	// agent, attempt, and for owner spawns the WAKE REASON (wake_note).
+	// goal ID only — this runs INSIDE the caller's transaction, and a
+	// pool-side title lookup would deadlock single-connection stores
+	// (:memory: tests). The daemon's claimed line carries the title.
+	wake := ""
+	if r.WakeNote != "" {
+		wake = fmt.Sprintf(" wake=%q", trimLog(r.WakeNote, 60))
+	}
+	logging.Infof("run: enqueued %s goal=%s role=%s agent=%s attempt=%d%s",
+		r.ID, r.GoalID, r.Role, r.AgentID, r.Attempt, wake)
 	ev := &events.Event{Topic: "run:enqueued", Payload: r}
 	return &r, ev, nil
 }
@@ -733,6 +774,14 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 		}
 		return err
 	}
+	// The terminal event of the scheduling ledger — a run ending is what
+	// closes (or opens) every wait: reviewer windows, deliver, retries.
+	sum := ""
+	if rc.Summary != "" {
+		sum = fmt.Sprintf(" summary=%q", trimLog(rc.Summary, 80))
+	}
+	logging.Infof("run: finished %s goal=%q (%s) role=%s status=%s attempt=%d%s",
+		runID, s.goalTitleForLog(ctx, rc.GoalID), rc.GoalID, rc.Role, rc.Status, rc.Attempt, sum)
 	// run.terminal is the Coordinator's wakeup hint (决策 6-4, P2-5): the
 	// latch's second edge — "owner run terminal → Reconcile" — subscribes here.
 	// Published AFTER the reconcile committed (invariant 13).

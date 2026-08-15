@@ -11,6 +11,16 @@ import type { LogLine } from "@/lib/types";
 // system, the panel renders them as TITLE links.
 const goalIDRe = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi;
 
+// tsShort renders the timestamp compactly and FIXED-WIDTH (MM-DD HH:mm:ss)
+// so the column stays aligned line to line — the full RFC3339 value is on
+// the hover title.
+function tsShort(ts: string): string {
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return ts;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 // renderText splits a log line on goal uuids and renders known goals as
 // titled links (unknown ids stay as the bare id).
 function renderText(text: string, goalById: Map<string, string>) {
@@ -34,11 +44,14 @@ function renderText(text: string, goalById: Map<string, string>) {
 
 const LEVELS = ["debug", "info", "warn", "error"] as const;
 
+// The log list sits on a DARK panel (bg-zinc-950) — these are dark-theme
+// text colors. The previous light-theme set (info = zinc-700 on near-black)
+// made the most common lines nearly invisible.
 const LEVEL_STYLE: Record<string, string> = {
-  debug: "text-zinc-400",
-  info: "text-zinc-700",
-  warn: "text-amber-600",
-  error: "text-red-600 font-medium",
+  debug: "text-zinc-500",
+  info: "text-zinc-200",
+  warn: "text-amber-400",
+  error: "text-red-400 font-medium",
 };
 
 const LEVEL_DOT: Record<string, string> = {
@@ -215,9 +228,9 @@ export default function LogsPage() {
         {visible.length === 0 && !loading && <p className="text-zinc-500 py-4 text-center">暂无日志</p>}
         {visible.map((l, i) => (
           <div key={i} className="flex gap-2 hover:bg-zinc-900/60 rounded px-1">
-            <span className={`shrink-0 mt-1.5 h-1.5 w-1.5 rounded-full ${LEVEL_DOT[l.level] ?? LEVEL_DOT.info}`} />
-            <span className="shrink-0 text-zinc-500">{l.ts ? new Date(l.ts).toLocaleString("zh-CN") : ""}</span>
-            <span className={`break-all whitespace-pre-wrap ${LEVEL_STYLE[l.level] ?? LEVEL_STYLE.info}`}>{renderText(l.text, goalById)}</span>
+            <span className={`shrink-0 mt-[7px] h-1.5 w-1.5 rounded-full ${LEVEL_DOT[l.level] ?? LEVEL_DOT.info}`} />
+            <span className="shrink-0 text-zinc-500 tabular-nums" title={l.ts}>{l.ts ? tsShort(l.ts) : ""}</span>
+            <span className={`whitespace-pre-wrap break-words ${LEVEL_STYLE[l.level] ?? LEVEL_STYLE.info}`}>{renderText(l.text, goalById)}</span>
           </div>
         ))}
       </div>

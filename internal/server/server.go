@@ -158,13 +158,29 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			http.Error(w, "no active run with this id", http.StatusNotFound)
 			return
 		}
-		// Method + status logged: the agent's handshake is
-		// initialize → tools/list → tools/call — a silent handshake break
-		// (e.g. the tools/list step) is otherwise invisible (live: a retry
-		// run got 4 requests then never called a tool again).
 		sw := &statusWriter{ResponseWriter: w}
 		mcp.HTTPHandler(exec).ServeHTTP(sw, r)
-		logging.Infof("mcp: %s /mcp/%s -> %d", r.Method, r.PathValue("runID"), sw.status)
+		status := sw.status
+		if status == 0 {
+			status = http.StatusOK // WriteHeader never ran — Go's implicit 200
+		}
+		// Per-tool-call noise at DEBUG only — an agent working makes dozens
+		// of these, and the run's message stream is the info-level truth for
+		// what it is doing. The debug line carries the FULL URL the agent
+		// actually hit (host + path — which advertised address the runtime
+		// reached is exactly what remote-agent debugging needs), the run,
+		// and the goal (the FULL goal uuid renders as a titled link in the
+		// web log panel) so the handshake sequence
+		// initialize → tools/list → tools/call stays traceable.
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		runID := exec.RunID
+		if len(runID) > 8 {
+			runID = runID[:8]
+		}
+		logging.Debugf("mcp: %s %s://%s%s run=%s goal=%s -> %d", r.Method, scheme, r.Host, r.URL.Path, runID, exec.GoalID, status)
 	}
 	mux.HandleFunc("POST /mcp/{runID}", serveMCP)
 	mux.HandleFunc("GET /mcp/{runID}", serveMCP)

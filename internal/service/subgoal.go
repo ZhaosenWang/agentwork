@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/logging"
 )
 
 // SubGoal is a work item split off a goal (v2 model, 决策 6-1) — NOT a child
@@ -181,6 +182,7 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	logging.Infof("sub-goal: created %q (goal %s) → assignee=%s verifier=%s", sg.Title, sg.GoalID, sg.AssigneeID, sg.VerifierID)
 	s.bus.Publish(ctx, events.Event{Topic: "sub_goal.created", Payload: map[string]any{
 		"goal_id": goalID, "sub_goal_id": sg.ID,
 	}})
@@ -484,6 +486,9 @@ func (s *GoalService) VerifySubGoal(ctx context.Context, runID, verdict, summary
 		newID(), sg.GoalID, sg.ID, runID, verdict, summary, evidence, now()); err != nil {
 		return fmt.Errorf("insert verification_result: %w", err)
 	}
+	// The verdict closes the sub-goal's verify wait (passed → owner
+	// integration; rejected → assignee rework round).
+	logging.Infof("sub-goal: %s verdict=%s by verifier run %s (summary=%q)", sg.ID, verdict, runID, trimLog(summary, 60))
 
 	var evs []events.Event
 	if verdict == "passed" {
