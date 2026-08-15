@@ -1,10 +1,15 @@
 package acpbackend
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -190,4 +195,75 @@ func TestSessionBackendSerializesWakes(t *testing.T) {
 		t.Fatalf("serialized second wake: %v", res2.Status)
 	}
 	_ = time.Since(start)
+}
+
+// TestSessionTransportCloseSurfacesError: a transport-level failure (agent
+// process crash / connection drop) during a prompt must:
+//  1. Surface the read error in the run output (not just "transport closed").
+//  2. Call conn.Close before reading stderr (so stdio stderr is complete).
+func TestSessionTransportCloseSurfacesError(t *testing.T) {
+	cr, sw := io.Pipe() // client reads ← mini agent writes
+	sr, cw := io.Pipe() // mini agent reads ← client writes
+
+	var closeCalled atomic.Bool
+	conn := proto.Conn{
+		R: cr, W: cw,
+		Close: func() error { closeCalled.Store(true); return nil },
+	}
+
+	// Mini agent: respond to initialize + session/new, then on session/prompt
+	// close the write pipe with an error to simulate a transport drop.
+	go func() {
+		defer cw.Close()
+		sc := bufio.NewScanner(sr)
+		sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+		for sc.Scan() {
+			var msg struct {
+				ID     json.RawMessage `json:"id,omitempty"`
+				Method string          `json:"method,omitempty"`
+			}
+			if json.Unmarshal(sc.Bytes(), &msg) != nil {
+				continue
+			}
+			switch msg.Method {
+			case "initialize":
+				line := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}}`, msg.ID)
+				_, _ = sw.Write([]byte(line + "\n"))
+			case "session/new":
+				line := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess-1"}}`, msg.ID)
+				_, _ = sw.Write([]byte(line + "\n"))
+			case "session/prompt":
+				_ = sw.CloseWithError(errors.New("connection reset by peer"))
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = cr.Close()
+		_ = sr.Close()
+	})
+
+	s, err := New().OpenSession(context.Background(), proto.SessionSpec{Conn: conn, Cwd: "/tmp"})
+	if err != nil {
+		t.Fatalf("open session: %v", err)
+	}
+
+	run, err := s.Prompt(context.Background(), "crash test")
+	if err != nil {
+		t.Fatalf("prompt: %v", err)
+	}
+	res := <-run.Result
+
+	if res.Status != proto.StatusFailed {
+		t.Fatalf("expected failed, got %v (err %v)", res.Status, res.Err)
+	}
+	if !strings.Contains(res.Output, "transport closed") {
+		t.Fatalf("output should mention transport closed, got: %s", res.Output)
+	}
+	if !strings.Contains(res.Output, "connection reset by peer") {
+		t.Fatalf("output should contain the read error, got: %s", res.Output)
+	}
+	if !closeCalled.Load() {
+		t.Fatalf("conn.Close should be called on transport failure")
+	}
 }

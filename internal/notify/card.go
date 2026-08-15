@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/eushing/agentwork/internal/card"
+	"github.com/eushing/agentwork/internal/card/feishu"
 )
 
-// Card construction (M3): Feishu interactive cards (JSON 2.0). Cards are the
+// Card construction (M3): Feishu interactive cards (schema 2.0). Cards are the
 // M3 upgrade over text pushes — the approval card carries the evidence and
 // approve/reject buttons whose callbacks arrive over the long connection
 // (card.action.trigger). The card content is emitted as a JSON string; the
@@ -21,11 +24,15 @@ import (
 // working, the card names them and tells the human they MAY wait; the
 // review_ready patch rebuilds this card with the pending set empty, so the
 // hint is replaced by the actual 审查意见.
+//
+// Schema 2.0 is built directly (not via feishu.BuildCard) because the card
+// carries custom elements: a markdown body and a column_set button row —
+// more than the neutral Card model's single body + optional approval section.
 func buildReviewCard(g ReviewGoal, pendingReviewers []string) (string, error) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "**%s**  \n`goal %s`", g.Title, short(g.GoalID))
+	fmt.Fprintf(&b, "**%s**", g.Title)
 	if g.Reason != "" {
-		b.WriteString("\n卡点：" + g.Reason)
+		b.WriteString("\n**卡点**：" + g.Reason)
 	}
 	if ev := evidenceSummary(g.Evidence); ev != "" {
 		b.WriteString("\n\n" + ev)
@@ -34,44 +41,68 @@ func buildReviewCard(g ReviewGoal, pendingReviewers []string) (string, error) {
 		b.WriteString("\n\n🔎 审查中：" + strings.Join(pendingReviewers, "、") + "——可等待他们的意见后再决定")
 	}
 	// The squad review opinions — the approval decision reads the review,
-	// not just the worker's claim.
+	// not just the worker's claim. A reviewer that dumped an evidence-style
+	// JSON blob as its final message gets its agent field extracted and
+	// rendered as markdown (the raw JSON in a > quote was unreadable).
 	if len(g.Comments) > 0 {
 		b.WriteString("\n\n**审查意见**")
 		for _, c := range g.Comments {
-			b.WriteString("\n> " + c)
+			b.WriteString("\n" + renderReviewComment(c))
 		}
 	}
-	card := map[string]any{
-		"config": map[string]any{"wide_screen_mode": true},
-		"header": map[string]any{"template": "orange", "title": map[string]any{
-			"tag": "plain_text", "content": "🔔 待审批"}},
-		"elements": []any{
-			map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": b.String()}},
-			map[string]any{"tag": "hr"},
-			map[string]any{"tag": "input", "name": "reject_reason", "placeholder": "驳回理由（选填，驳回时建议填写）"},
-			map[string]any{"tag": "action", "actions": []any{
-				cardButton("✅ 批准", "primary", map[string]any{"action": "approve", "goal_id": g.GoalID, "run_id": g.RunID}),
-				cardButton("❌ 驳回", "danger", map[string]any{"action": "reject", "goal_id": g.GoalID, "run_id": g.RunID}),
-			}},
+	reviewCard := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{"update_multi": true},
+		"header": map[string]any{
+			"template": "orange",
+			"title":    map[string]any{"tag": "plain_text", "content": "🔔 待审批"},
+		},
+		"body": map[string]any{
+			"direction": "vertical",
+			"elements": []map[string]any{
+			{"tag": "markdown", "content": b.String()},
+			{"tag": "hr"},
+			reviewButtonRow(g.GoalID, g.RunID),
+			},
 		},
 	}
-	raw, err := json.Marshal(card)
+	raw, err := json.Marshal(reviewCard)
 	return string(raw), err
+}
+
+// reviewButtonRow builds the column_set element containing the two approval
+// buttons (批准 / 驳回). Button values carry {action, goal_id, run_id} so
+// onCardAction can correlate the click to the goal + evidence run.
+func reviewButtonRow(goalID, runID string) map[string]any {
+	btn := func(label, action, btnType string) map[string]any {
+		return map[string]any{
+			"tag":   "button",
+			"text":  map[string]any{"tag": "plain_text", "content": label},
+			"type":  btnType,
+			"width": "default",
+			"name":  action,
+			"value": map[string]any{"action": action, "goal_id": goalID, "run_id": runID},
+		}
+	}
+	return map[string]any{
+		"tag":                "column_set",
+		"flex_mode":          "flow",
+		"horizontal_spacing": "8px",
+		"columns": []map[string]any{
+			{"tag": "column", "width": "auto", "elements": []map[string]any{btn("✅ 批准", "approve", "primary_filled")}},
+			{"tag": "column", "width": "auto", "elements": []map[string]any{btn("❌ 驳回", "reject", "danger_filled")}},
+		},
+	}
 }
 
 // buildMilestoneCard is the generic milestone card (M3-2): a colored header
 // (done green / failed red / merged blue) + title + body markdown.
 func buildMilestoneCard(emoji, template, title, body string) (string, error) {
-	card := map[string]any{
-		"config": map[string]any{"wide_screen_mode": true},
-		"header": map[string]any{"template": template, "title": map[string]any{
-			"tag": "plain_text", "content": emoji + " " + title}},
-		"elements": []any{
-			map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": body}},
-		},
-	}
-	raw, err := json.Marshal(card)
-	return string(raw), err
+	return feishu.BuildCard(&card.Card{
+		Header:  card.CardHeader{Title: emoji + " " + title},
+		Content: body,
+		Color:   card.CardColor(template),
+	})
 }
 
 // buildProcessedCard replaces the approval card after a button decision: the
@@ -87,30 +118,20 @@ func buildProcessedCard(goalID, decision string, scratch bool) (string, error) {
 			body = "平台正在自动合入（merge + 复验 + push）。"
 		}
 	}
-	card := map[string]any{
-		"config": map[string]any{"wide_screen_mode": true},
-		"header": map[string]any{"template": map[bool]string{true: "green", false: "red"}[ok],
-			"title": map[string]any{"tag": "plain_text", "content": header}},
-		"elements": []any{
-			map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": body + "  \n`goal " + short(goalID) + "`"}},
-		},
+	template := card.CardColorRed
+	if ok {
+		template = card.CardColorGreen
 	}
-	raw, err := json.Marshal(card)
-	return string(raw), err
-}
-
-func cardButton(text, typ string, value map[string]any) map[string]any {
-	return map[string]any{
-		"tag":   "button",
-		"text":  map[string]any{"tag": "plain_text", "content": text},
-		"type":  typ,
-		"value": value,
-	}
+	return feishu.BuildCard(&card.Card{
+		Header:  card.CardHeader{Title: header},
+		Content: body + "  \n`goal " + short(goalID) + "`",
+		Color:   template,
+	})
 }
 
 // evidenceSummary renders the run.evidence JSON bundle into the approval
-// card's markdown body: diff stat + verify outcome + agent summary. Unknown
-// shapes degrade to an empty string (the card then shows only the gate
+// card's markdown body: diff stat + verify outcome + guards + agent summary.
+// Unknown shapes degrade to an empty string (the card then shows only the gate
 // reason — never a broken card).
 func evidenceSummary(raw string) string {
 	if strings.TrimSpace(raw) == "" {
@@ -120,6 +141,7 @@ func evidenceSummary(raw string) string {
 		DiffStat string   `json:"diff_stat"`
 		Changed  []string `json:"changed"`
 		Verify   string   `json:"verify"`
+		Guards   string   `json:"guards"`
 		Agent    string   `json:"agent"`
 	}
 	if err := json.Unmarshal([]byte(raw), &ev); err != nil {
@@ -154,10 +176,72 @@ func evidenceSummary(raw string) string {
 			parts = append(parts, "结果："+tail)
 		}
 	}
-	if a := strings.TrimSpace(ev.Agent); a != "" {
-		// The agent's report is markdown (lark_md renders it); a longer slice
-		// keeps the approval decision on the actual work, not a teaser.
-		parts = append(parts, "agent："+truncate(a, 800))
+	if g := strings.TrimSpace(ev.Guards); g != "" {
+		parts = append(parts, "约束："+truncate(g, 200))
 	}
-	return strings.Join(parts, "  \n")
+	// The agent's report is markdown (lark_md renders it). It gets its own
+	// paragraph (separated by \n\n from the objective evidence above) so the
+	// card visually distinguishes "machine-verified facts" from "agent's
+	// self-report". truncateParagraphs cuts on paragraph boundaries (\n\n)
+	// so bullet lists and code blocks are not split mid-way (a byte-level
+	// cut left broken markdown that rendered as raw text).
+	var agentSection string
+	if a := strings.TrimSpace(ev.Agent); a != "" {
+		agentSection = "\n\n—— agent 自述 ——\n" + truncateParagraphs(a, 1200)
+	}
+	return strings.Join(parts, "  \n") + agentSection
+}
+
+// truncateParagraphs truncates s to at most maxBytes, cutting on paragraph
+// boundaries (\n\n) so markdown structures (bullet lists, code blocks) stay
+// intact. A single paragraph exceeding maxBytes falls back to a byte-level
+// cut. The result gets a "…" suffix when truncation occurred.
+func truncateParagraphs(s string, maxBytes int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= maxBytes {
+		return s
+	}
+	paras := strings.Split(s, "\n\n")
+	var b strings.Builder
+	for _, p := range paras {
+		if b.Len()+len(p) > maxBytes {
+			break
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(p)
+	}
+	if b.Len() == 0 {
+		// Single paragraph larger than maxBytes — rune-level cut avoids
+		// splitting a multi-byte UTF-8 character (Chinese is 3 bytes/char).
+		runes := []rune(s)
+		if len(runes) > maxBytes {
+			runes = runes[:maxBytes]
+		}
+		b.WriteString(string(runes))
+	}
+	return b.String() + "\n\n…"
+}
+
+// renderReviewComment renders one reviewer comment for the approval card's
+// 审查意见 section. A reviewer agent may dump an evidence-style JSON blob
+// ({"agent":"…","diff_stat":"…",…}) as its final message — the raw JSON in
+// a > quote was unreadable. When the comment parses as evidence JSON with a
+// non-empty agent field, the agent text is extracted and rendered as markdown
+// (paragraph-truncated). Plain-text comments keep the > quote.
+func renderReviewComment(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var ev struct {
+		Agent string `json:"agent"`
+	}
+	if json.Unmarshal([]byte(raw), &ev) == nil {
+		if a := strings.TrimSpace(ev.Agent); a != "" {
+			return truncateParagraphs(a, 1200)
+		}
+	}
+	return "> " + raw
 }

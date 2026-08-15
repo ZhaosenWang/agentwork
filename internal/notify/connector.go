@@ -427,15 +427,7 @@ func (c *Connector) onCardAction(ctx context.Context, event *callback.CardAction
 			Type: "error", Content: "平台未就绪（goalSvc 未接线）",
 		}}, nil
 	}
-	// The reject-reason input's value arrives in form_value (the input's name
-	// is reject_reason, set in buildReviewCard).
-	reason := ""
-	if r, ok := act.FormValue["reject_reason"]; ok {
-		if s, ok := r.(string); ok {
-			reason = s
-		}
-	}
-	if _, err := c.goalSvc.ResolveReview(ctx, goalID, runID, decision, reason); err != nil {
+	if _, err := c.goalSvc.ResolveReview(ctx, goalID, runID, decision, ""); err != nil {
 		// The validator's message is developer-oriented; the toast must be
 		// human-oriented (the most common case: a duplicate click while the
 		// async deliver runs — the card still shows buttons until the update
@@ -562,6 +554,12 @@ func (c *Connector) dispatchInbound(event *larkim.P2MessageReceiveV1, sender str
 	}
 	msg := event.Event.Message
 	if msg.MessageType == nil || *msg.MessageType != "text" {
+		// Rich text (post: bold/links/@), image, voice, file… are not parsed
+		// — tell the owner instead of silently dropping (a dropped message
+		// looks like a dead bot).
+		if n := c.notifier(); n != nil {
+			n.asyncSend("⚠️ 暂时不支持富文本消息，请用纯文字重新发送")
+		}
 		return
 	}
 	// The message text lives in a JSON content envelope {"text":"..."}.
@@ -583,11 +581,6 @@ func (c *Connector) dispatchInbound(event *larkim.P2MessageReceiveV1, sender str
 	isP2P := msg.ChatType != nil && *msg.ChatType == "p2p"
 	if !isP2P && !containsMention(msg) {
 		return
-	}
-	// Immediate acknowledgement — the parse run may queue behind a busy
-	// worker agent.
-	if n := c.notifier(); n != nil {
-		n.asyncSend("⏳ 收到，正在解析你的消息…")
 	}
 	if c.intakeSvc == nil {
 		if n := c.notifier(); n != nil {

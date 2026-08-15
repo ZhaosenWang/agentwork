@@ -13,8 +13,9 @@ import (
 )
 
 // TestBuildReviewCard: the approval card carries the gate reason, the
-// evidence summary, the reject-reason input, and approve/reject buttons
-// whose values carry {action, goal_id, run_id}.
+// evidence summary, and approve/reject buttons whose values carry
+// {action, goal_id, run_id}. Schema 2.0: body.elements with markdown
+// and column_set button row (no input — removed).
 func TestBuildReviewCard(t *testing.T) {
 	raw, err := buildReviewCard(ReviewGoal{
 		GoalID:   "abc123456789",
@@ -26,46 +27,59 @@ func TestBuildReviewCard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build card: %v", err)
 	}
-	var card struct {
+	var c struct {
+		Schema string `json:"schema"`
 		Header struct {
 			Title struct {
 				Content string `json:"content"`
 			} `json:"title"`
 		} `json:"header"`
-		Elements []json.RawMessage `json:"elements"`
+		Body struct {
+			Elements []json.RawMessage `json:"elements"`
+		} `json:"body"`
 	}
-	if err := json.Unmarshal([]byte(raw), &card); err != nil {
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
 		t.Fatalf("card must be valid JSON: %v\n%s", err, raw)
 	}
-	if !strings.Contains(card.Header.Title.Content, "待审批") {
-		t.Fatalf("card header must announce the checkpoint, got %q", card.Header.Title.Content)
+	if c.Schema != "2.0" {
+		t.Fatalf("expected schema 2.0, got %q", c.Schema)
 	}
-	var actions []map[string]any
-	var hasInput bool
-	for _, el := range card.Elements {
+	if !strings.Contains(c.Header.Title.Content, "待审批") {
+		t.Fatalf("card header must announce the checkpoint, got %q", c.Header.Title.Content)
+	}
+	var buttonRow map[string]any
+	var hasInput, hasMarkdown bool
+	for _, el := range c.Body.Elements {
 		var e map[string]any
 		if err := json.Unmarshal(el, &e); err != nil {
 			continue
 		}
-		if e["tag"] == "input" {
+		switch e["tag"] {
+		case "input":
 			hasInput = true
+		case "markdown":
+			hasMarkdown = true
+		case "column_set":
+			buttonRow = e
 		}
-		if e["tag"] == "action" {
-			actions = append(actions, e)
-		}
 	}
-	if !hasInput {
-		t.Fatal("card must carry the reject-reason input")
+	if !hasMarkdown {
+		t.Fatal("card body must have a markdown element")
 	}
-	if len(actions) != 1 {
-		t.Fatalf("expected one action element, got %d", len(actions))
+	if hasInput {
+		t.Fatal("card must NOT carry an input element (removed — the send button had no effect)")
 	}
-	btns, _ := actions[0]["actions"].([]any)
-	if len(btns) != 2 {
-		t.Fatalf("expected 2 buttons, got %d", len(btns))
+	if buttonRow == nil {
+		t.Fatal("card must carry a column_set button row")
 	}
-	for _, b := range btns {
-		btn := b.(map[string]any)
+	cols, _ := buttonRow["columns"].([]any)
+	if len(cols) != 2 {
+		t.Fatalf("expected 2 button columns, got %d", len(cols))
+	}
+	for _, col := range cols {
+		colMap := col.(map[string]any)
+		elements, _ := colMap["elements"].([]any)
+		btn := elements[0].(map[string]any)
 		value, _ := btn["value"].(map[string]any)
 		if value["goal_id"] != "abc123456789" || value["run_id"] != "r123456789" {
 			t.Fatalf("button value must carry goal_id + run_id: %v", value)
@@ -86,6 +100,9 @@ func TestEvidenceSummary(t *testing.T) {
 	if !strings.Contains(s, "1 file changed") || !strings.Contains(s, "go test") {
 		t.Fatalf("evidence summary incomplete: %s", s)
 	}
+	if !strings.Contains(s, "agent 自述") {
+		t.Fatalf("agent section header missing: %s", s)
+	}
 	if evidenceSummary("not json") != "" {
 		t.Fatal("bad evidence must degrade to empty")
 	}
@@ -94,12 +111,106 @@ func TestEvidenceSummary(t *testing.T) {
 	}
 }
 
+// TestEvidenceSummaryGuards: the guards field renders when present.
+func TestEvidenceSummaryGuards(t *testing.T) {
+	s := evidenceSummary(`{"diff_stat":"","changed":["a.go"],"guards":"no_todo: ok","agent":"done"}`)
+	if !strings.Contains(s, "约束：no_todo: ok") {
+		t.Fatalf("guards must render: %s", s)
+	}
+}
+
+// TestEvidenceSummaryAgentTruncation: a long multi-paragraph agent report is
+// cut on a paragraph boundary (\n\n), not mid-bullet — the truncated output
+// ends with "…" and contains no broken bullet fragments.
+func TestEvidenceSummaryAgentTruncation(t *testing.T) {
+	// Each paragraph ~300 bytes; 6 paragraphs = ~1800 bytes, over the 1200 cap.
+	long := strings.Repeat("这是第一段很长的 agent 报告内容用来测试段落截断逻辑。", 8) + "\n\n" +
+		"第二段：简短。\n\n" +
+		"- bullet 1\n- bullet 2\n- bullet 3\n\n" +
+		strings.Repeat("第四段也很长用来确保累积超限。", 20) + "\n\n" +
+		"第五段不应该出现。"
+	s := evidenceSummary(`{"diff_stat":"1 file","agent":` + jsonQuote(long) + `}`)
+	if !strings.Contains(s, "…") {
+		t.Fatalf("truncated agent must end with …: %s", s)
+	}
+	if strings.Contains(s, "第五段") {
+		t.Fatalf("content past the cap must not appear: %s", s)
+	}
+	// The bullet list paragraph must be intact (all 3 bullets) or absent —
+	// never a partial cut mid-list.
+	if strings.Contains(s, "bullet 1") && !strings.Contains(s, "bullet 3") {
+		t.Fatalf("bullet list was split mid-way: %s", s)
+	}
+}
+
+// jsonQuote escapes a string into a JSON string literal (for test fixtures).
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// TestRenderReviewComment: a JSON evidence blob is parsed and its agent field
+// rendered as markdown; a plain-text comment keeps the > quote.
+func TestRenderReviewComment(t *testing.T) {
+	// JSON with agent field — extracted, no > quote, no raw JSON.
+	jsonComment := `{"agent":"所有编码步骤完成，Go 测试通过。\n\n后端改动：\n- goal.go 新增 filter","diff_stat":"12 files","changed":["a.go"]}`
+	got := renderReviewComment(jsonComment)
+	if strings.HasPrefix(got, ">") {
+		t.Fatalf("JSON comment with agent must not be quoted: %s", got)
+	}
+	if !strings.Contains(got, "所有编码步骤完成") {
+		t.Fatalf("agent text must be extracted: %s", got)
+	}
+	if strings.Contains(got, "diff_stat") {
+		t.Fatalf("raw JSON fields must not leak: %s", got)
+	}
+
+	// JSON without agent field — falls back to quote.
+	got = renderReviewComment(`{"diff_stat":"12 files"}`)
+	if !strings.HasPrefix(got, ">") {
+		t.Fatalf("JSON without agent must fall back to quote: %s", got)
+	}
+
+	// Plain text — quoted as before.
+	got = renderReviewComment("实现合理，可以批准。")
+	if got != "> 实现合理，可以批准。" {
+		t.Fatalf("plain text must be quoted: %s", got)
+	}
+
+	// Empty — empty.
+	if renderReviewComment("") != "" {
+		t.Fatal("empty comment must return empty")
+	}
+
+	// Long agent text — truncated on paragraph boundary.
+	long := strings.Repeat("这是很长的一段审查意见内容。", 80)
+	got = renderReviewComment(`{"agent":` + jsonQuote(long) + `}`)
+	if !strings.Contains(got, "…") {
+		t.Fatalf("long agent text must be truncated: %s", got[:50])
+	}
+}
+
 // TestBuildProcessedCard: the post-decision card stamps the outcome and
-// carries no buttons.
+// carries no buttons. Schema 2.0 structure.
 func TestBuildProcessedCard(t *testing.T) {
 	raw, err := buildProcessedCard("abc123456789", "approve", false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var c struct {
+		Schema string `json:"schema"`
+		Header struct {
+			Template string `json:"template"`
+		} `json:"header"`
+	}
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if c.Schema != "2.0" {
+		t.Fatalf("expected schema 2.0, got %q", c.Schema)
+	}
+	if c.Header.Template != "green" {
+		t.Fatalf("approved card should be green, got %q", c.Header.Template)
 	}
 	if !strings.Contains(raw, "已批准") {
 		t.Fatalf("processed card must stamp the decision: %s", raw)
@@ -154,6 +265,15 @@ func TestBuildDigestCard(t *testing.T) {
 	raw, err := BuildDigestCard(ctx, qs, dayStart.Add(-24*time.Hour), dayStart, now)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var c struct {
+		Schema string `json:"schema"`
+	}
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if c.Schema != "2.0" {
+		t.Fatalf("expected schema 2.0, got %q", c.Schema)
 	}
 	if !strings.Contains(raw, "待审任务") || !strings.Contains(raw, "昨日完成") {
 		t.Fatalf("digest must carry pending + completed: %s", raw)

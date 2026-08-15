@@ -2,10 +2,12 @@ package notify
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/eushing/agentwork/internal/card"
+	"github.com/eushing/agentwork/internal/card/feishu"
 )
 
 // Daily digest (M3-3): the morning summary card — pending approvals +
@@ -61,19 +63,12 @@ func BuildDigestCard(ctx context.Context, qs QueryStore, since, until time.Time,
 			fmt.Fprintf(&body, "- %s\n", t)
 		}
 	}
-	card := map[string]any{
-		"config": map[string]any{"wide_screen_mode": true},
-		"header": map[string]any{"template": "blue", "title": map[string]any{
-			"tag": "plain_text", "content": "📋 每日摘要 " + now.Format("01-02")}},
-		"elements": []any{
-			map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": body.String()}},
-			map[string]any{"tag": "note", "elements": []any{
-				map[string]any{"tag": "plain_text", "content": "agentwork · 点开 Web 审批队列处理卡点"},
-			}},
-		},
-	}
-	raw, err := json.Marshal(card)
-	return string(raw), err
+	return feishu.BuildCard(&card.Card{
+		Header:  card.CardHeader{Title: "📋 每日摘要 " + now.Format("01-02")},
+		Content: body.String(),
+		Footer:  "agentwork · 点开 Web 审批队列处理卡点",
+		Color:   card.CardColorBlue,
+	})
 }
 
 // firstLine keeps the card compact: a multi-line reason (reject notes can
