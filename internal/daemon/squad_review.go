@@ -178,10 +178,8 @@ func (d *Daemon) onGoalFinished(_ context.Context, e events.Event) {
 	if !ok {
 		return
 	}
-	// A terminal goal has no more wakes — its sessions are done (决策 6-21).
-	if goalID, _ := m["goal_id"].(string); goalID != "" {
-		d.closeGoalSessions(goalID)
-	}
+	// A terminal goal has no more wakes (决策 6-21 — sessions retired with
+	// the local execution path, CLI 分支).
 	status, _ := m["status"].(string)
 	if status != "cancelled" {
 		return

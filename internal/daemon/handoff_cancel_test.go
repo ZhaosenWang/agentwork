@@ -45,7 +45,7 @@ func TestHandoffCancelsOldOwnerRun(t *testing.T) {
 	})
 	waitHandled := func() { <-handled }
 
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestHandoffToHumanCancelsAllRuns(t *testing.T) {
 		close(handled)
 	})
 
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestCancelStopsRunningRun(t *testing.T) {
 		close(handled)
 	})
 
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestHandoffWindowStampMarksHandedOff(t *testing.T) {
 		close(handled)
 	})
 
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}

@@ -135,6 +135,13 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, p link.RunFinishedParams
 	if p.RunID == "" {
 		return &link.RPCError{Code: link.CodeInvalidParams, Message: "run_id is required"}
 	}
+	// Processor runs (goal-less) complete through their artifact paths,
+	// not the goal reconcile.
+	var kind, runType, domainID string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT run_kind, run_type, domain_id FROM run WHERE id=?`, p.RunID).Scan(&kind, &runType, &domainID); err == nil && kind == "processor" {
+		return d.ingestProcessorFinished(ctx, p, runType, domainID)
+	}
 	if p.Status == "completed" {
 		// The platform verifies (invariant 9 — the worker never verifies
 		// its own work): setup+verify+guards run on the adopted branch,
@@ -155,6 +162,27 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, p link.RunFinishedParams
 		return &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
 	}
 	logging.Infof("machine: run %s finished (%s)", p.RunID, p.Status)
+	return nil
+}
+
+// ingestProcessorFinished completes a machine-dispatched processor run
+// from its uploaded artifacts (checks.json / intake.json etc.).
+func (d *Daemon) ingestProcessorFinished(ctx context.Context, p link.RunFinishedParams, runType, domainID string) *link.RPCError {
+	d.flushRunMessages(ctx, p.RunID)
+	q := &service.ClaimedRow{RunID: p.RunID}
+	if p.Status != "completed" {
+		if runType == "intake" {
+			d.failIntakeRun(ctx, q, p.Summary)
+		} else {
+			d.failProcessorRun(ctx, q, p.Summary)
+		}
+		return nil
+	}
+	if runType == "intake" {
+		d.ingestIntakeArtifact(ctx, q, p.Artifacts["intake.json"])
+		return nil
+	}
+	d.storeProcessorArtifacts(ctx, q, domainID, p.Artifacts, p.Summary)
 	return nil
 }
 

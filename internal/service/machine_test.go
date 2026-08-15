@@ -83,7 +83,7 @@ func TestMachineRegistry(t *testing.T) {
 }
 
 // TestUpsertProbeRuntimes covers the Phase 2 runtime provisioning: a probed
-// CLI becomes an agentwork-transport runtime row owned by the machine; a
+// CLI becomes a machine-owned runtime row; a
 // re-register refreshes it instead of duplicating.
 func TestUpsertProbeRuntimes(t *testing.T) {
 	st := newTestStore(t)
@@ -100,7 +100,7 @@ func TestUpsertProbeRuntimes(t *testing.T) {
 		t.Fatalf("expected 1 runtime, got %d (err %v)", len(all), err)
 	}
 	r := all[0]
-	if r.Name != "claude@dev" || r.Transport != "agentwork" || r.MachineID != "m1" {
+	if r.Name != "claude@dev" || r.MachineID != "m1" {
 		t.Fatalf("probe runtime mismatch: %+v", r)
 	}
 	if len(r.Args) != 2 || r.Args[0] != "claude" || r.Args[1] != "--acp" {

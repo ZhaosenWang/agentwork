@@ -673,9 +673,9 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 		   JOIN runtime rt ON rt.id = a.runtime_id
 		   LEFT JOIN goal g ON g.id = r.goal_id
 		   WHERE r.status='queued' AND r.agent_id IN (`+placeholders+`)
-		     AND (rt.transport != 'agentwork'              -- machine-owned runtimes claim only while
-		          OR EXISTS (SELECT 1 FROM machine m       -- their machine is online (CLI 分支 Phase 2)
-		              WHERE m.id = rt.machine_id AND m.status='connected'))
+		     AND (rt.machine_id = '' OR EXISTS (         -- machine-owned runtimes claim only while
+		          SELECT 1 FROM machine m                 -- their machine is online (CLI 分支)
+		          WHERE m.id = rt.machine_id AND m.status='connected'))
 		     AND (g.id IS NULL                              -- processor runs have no goal
 		          OR g.status = 'active'
 		          OR (g.status = 'review' AND r.role = 'review'))

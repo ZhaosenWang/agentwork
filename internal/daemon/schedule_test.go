@@ -26,7 +26,7 @@ func TestFireScheduleGoalInsert(t *testing.T) {
 	bus := events.NewBus()
 
 	// Seed: runtime + agent + domain (mirrors the m0/m1 scripts).
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("runtime: %v", err)
 	}
@@ -102,7 +102,7 @@ func TestFireScheduleAtomicBirth(t *testing.T) {
 	ctx := context.Background()
 	bus := events.NewBus()
 
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("runtime: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestScheduleMissedOccurrencesSkipped(t *testing.T) {
 	ctx := context.Background()
 	bus := events.NewBus()
 
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("runtime: %v", err)
 	}

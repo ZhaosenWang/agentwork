@@ -23,13 +23,16 @@ import (
 // payload is a complete readonly snapshot.
 type executor struct {
 	peer *link.Peer
+	// serverURL is the platform address THIS machine dialed (connect
+	// --server / default) — the same address the agent's CLI callbacks use.
+	serverURL string
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc // runID → turn cancel
 }
 
-func newExecutor(peer *link.Peer) *executor {
-	return &executor{peer: peer, cancels: map[string]context.CancelFunc{}}
+func newExecutor(peer *link.Peer, serverURL string) *executor {
+	return &executor{peer: peer, serverURL: serverURL, cancels: map[string]context.CancelFunc{}}
 }
 
 // shutdown cancels every in-flight run (the link died — the platform will
@@ -80,13 +83,46 @@ func (e *executor) execute(p link.RunDispatchParams) {
 		cancel()
 	}()
 
-	// Workdir: scratch domains derive the local directory layout (mirrors
-	// the daemon's); git domains get a worktree on the goal branch — and
-	// the completed run's changes are committed + pushed as agentwork/
-	// <branch> (中转, Phase 3).
+	// Workdir: processor runs get the proc dir (compile-on-repo = a
+	// detached worktree of origin/<default>); scratch domains derive the
+	// local directory layout (mirrors the daemon's); git domains get a
+	// worktree on the goal branch — and the completed run's changes are
+	// committed + pushed as agentwork/<branch> (中转, Phase 3).
 	var workdir, repo, branch string
 	var cleanupGit func()
-	if p.Scratch {
+	if p.Proc {
+		workdir = machineProcWorkdir(p.RunID)
+		if p.Scratch {
+			if err := os.MkdirAll(workdir, 0o755); err != nil {
+				e.finish(p, "failed", fmt.Sprintf("workdir: %v", err))
+				return
+			}
+		} else {
+			var err error
+			repo, err = ensureBareRepo(ctx, p)
+			if err != nil {
+				e.finish(p, "failed", fmt.Sprintf("git: %v", err))
+				return
+			}
+			def := p.DefaultBranch
+			if def == "" {
+				def = "main"
+			}
+			if out, err := runGit(ctx, repo, "worktree", "add", "--force", "--detach", workdir, "origin/"+def); err != nil {
+				e.finish(p, "failed", fmt.Sprintf("worktree add: %v: %s", err, out))
+				return
+			}
+			defer func() {
+				_, _ = runGit(context.Background(), repo, "worktree", "remove", "--force", workdir)
+			}()
+		}
+		// The artifact's ABSOLUTE paths — the proc dir is opaque to the
+		// agent (it once guessed a path and the artifact never landed).
+		if len(p.ArtifactFiles) > 0 {
+			p.Prompt += fmt.Sprintf("\n\nThe artifact files' ABSOLUTE directory: %s\n(Write %s there with your file tools; do NOT guess the working directory.)\n",
+				workdir, strings.Join(p.ArtifactFiles, ", "))
+		}
+	} else if p.Scratch {
 		var err error
 		workdir, err = scratchWorkdir(p)
 		if err != nil {
@@ -105,7 +141,10 @@ func (e *executor) execute(p link.RunDispatchParams) {
 
 	// The agent's persona (pushed via config.push) rides AGENTS.md in the
 	// workdir — the runtime loads it natively.
-	pushedProfile := syncAgentProfile(p.AgentID, workdir)
+	pushedProfile := ""
+	if !p.Proc {
+		pushedProfile = syncAgentProfile(p.AgentID, workdir)
+	}
 
 	conn, err := runtime.Open(ctx, runtime.Spec{
 		Transport:  "stdio",
@@ -191,13 +230,24 @@ loop:
 	case proto.StatusCancelled:
 		status = "cancelled"
 	}
-	if status == "completed" && !p.Scratch {
+	if status == "completed" && !p.Scratch && !p.Proc {
 		if err := commitAndPush(context.Background(), p, workdir, repo, branch, p.RunID, pushedProfile); err != nil {
 			e.finish(p, "failed", "commit/push: "+err.Error())
 			return
 		}
 	}
-	e.finish(p, status, result.Output)
+	// Processor runs upload their FILE results (the platform reads
+	// structured side effects, never agent stdout).
+	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output}
+	if p.Proc && status == "completed" {
+		finishParams.Artifacts = map[string]string{}
+		for _, f := range p.ArtifactFiles {
+			if b, err := os.ReadFile(filepath.Join(workdir, f)); err == nil {
+				finishParams.Artifacts[f] = string(b)
+			}
+		}
+	}
+	_ = callRPC(e.peer, link.MethodRunFinished, finishParams, nil, 30*time.Second)
 }
 
 // finish uploads run.finished — the daemon runs Finish + reconcile. If the
@@ -304,6 +354,12 @@ func syncAgentProfile(agentID, workdir string) string {
 	return content
 }
 
+// machineProcWorkdir is where a processor run works on the machine.
+func machineProcWorkdir(runID string) string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".agentwork", "runs", "proc", runID)
+}
+
 // scratchWorkdir derives the local workdir for a scratch-domain run
 // (mirrors the daemon's layout: runs/scratch/<domain>/goals/<goalID>,
 // sub-goals under sg/<subGoalID>).
@@ -335,7 +391,7 @@ func (e *executor) buildEnv(p link.RunDispatchParams, workdir string) []string {
 		env = append(env, "PATH="+shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	}
 	env = append(env,
-		"AGENTWORK_SERVER_URL="+p.ServerURL,
+		"AGENTWORK_SERVER_URL="+e.serverURL,
 		"AGENTWORK_GOAL_ID="+p.GoalID,
 		"AGENTWORK_RUN_ID="+p.RunID,
 		"AGENTWORK_AGENT_ID="+p.AgentID,

@@ -26,7 +26,7 @@ func newTestHandlers(t *testing.T) (*Handlers, *store.Store, string) {
 	bus := events.NewBus()
 	gs := service.NewGoalService(st, bus)
 
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt-test", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt-test", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}

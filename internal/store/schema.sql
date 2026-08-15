@@ -67,29 +67,21 @@ CREATE TABLE IF NOT EXISTS machine (
     created_at   TEXT NOT NULL
 );
 
--- A runtime is a launch spec: how to connect to a protocol-speaking agent.
--- Pure configuration; no capabilities of its own.
--- transport=stdio → daemon spawns executable+args (subprocess).
--- transport=ws|tcp → daemon dials endpoint (remote service; no spawn).
--- transport=agentwork → the run is dispatched to the registered machine
---   (runtime.machine_id) over its /connect link; the machine's agentwork
---   spawns the CLI there (acp_spawn in args). CLI 分支 Phase 2.
--- provider selects which backend speaks the agent's wire protocol:
---   acp → JSON-RPC 2.0 (internal/proto/acp)
---   jsonl → single-direction JSONL stream (claude/opencode style)
---   jsonrpc → bidirectional JSON-RPC 2.0 (codex app-server style)
+-- A runtime is the launch spec of one probed agent CLI on one registered
+-- machine (CLI 分支): id + machine + how the machine spawns it (args =
+-- acp_spawn) + env + the advertised platform URL. The local-transport
+-- concepts (transport/provider/executable/endpoint) are RETIRED — the
+-- daemon never opens a transport; every run dispatches over the machine's
+-- /connect link. The wire protocol is the MACHINE's implementation detail
+-- (always ACP today; a future a2a backend would live in the machine's
+-- executor, not as a platform column).
 CREATE TABLE IF NOT EXISTS runtime (
-    id          TEXT PRIMARY KEY,
-    name        TEXT NOT NULL UNIQUE,
-    transport   TEXT NOT NULL DEFAULT 'stdio', -- stdio|ws|tcp
-    provider    TEXT NOT NULL DEFAULT 'acp',   -- acp|jsonl|jsonrpc → which backend
-    executable  TEXT NOT NULL DEFAULT '',      -- stdio: "/path/to/cli"; ws/tcp: ''
-    args        TEXT NOT NULL DEFAULT '[]',    -- stdio: JSON array; ws/tcp: '[]'
-    endpoint    TEXT NOT NULL DEFAULT '',      -- ws/tcp: "ws://host:port" or "host:port"; stdio: ''
-    env         TEXT NOT NULL DEFAULT '{}',    -- JSON object of runtime env (stdio only)
-    agentwork_url TEXT NOT NULL DEFAULT '',    -- advertised platform base URL for THIS runtime (remote agents need the daemon's public address); '' = http://127.0.0.1:<listen port>
-    machine_id     TEXT NOT NULL DEFAULT '',    -- transport=agentwork: the registered machine that executes this runtime's runs
-    created_at  TEXT NOT NULL                  -- RFC3339
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,        -- <cli>@<machine> (probe-generated)
+    machine_id    TEXT NOT NULL DEFAULT '',    -- the registered machine that executes this runtime's runs
+    args          TEXT NOT NULL DEFAULT '[]',  -- acp_spawn: how the machine starts the CLI
+    env           TEXT NOT NULL DEFAULT '{}',  -- runtime env (layered over the machine env at spawn)
+    created_at    TEXT NOT NULL                -- RFC3339
 );
 
 -- An agent is a runtime + a persona. Creating an agent does NOT launch a

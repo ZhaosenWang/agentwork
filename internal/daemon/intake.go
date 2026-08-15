@@ -9,13 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/eushing/agentwork/internal/acp"
-	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/link"
 	"github.com/eushing/agentwork/internal/logging"
-	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
-	"github.com/eushing/agentwork/internal/proto"
-	"github.com/eushing/agentwork/internal/runtime"
 	"github.com/eushing/agentwork/internal/service"
 )
 
@@ -43,12 +39,12 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 	// full path so the write_file path argument is unambiguous.
 	prompt += fmt.Sprintf("\n\n产物文件绝对路径：%s\n（用 agentwork_write_file 的 path 参数写入此绝对路径；不要猜测工作目录，不要用 shell 重定向）\n",
 		filepath.Join(workdir, "intake.json"))
-	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, intakeAgentworkURL string
+	var argsJSON, rtEnvJSON, intakeMachineID string
 	var maxConcurrent int
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT a.system_prompt, r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, COALESCE(r.agentwork_url,''), a.max_concurrent
+		`SELECT r.args, r.env, COALESCE(r.machine_id,''), a.max_concurrent
 		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`, agentID).
-		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &intakeAgentworkURL, &maxConcurrent)
+		Scan(&argsJSON, &rtEnvJSON, &intakeMachineID, &maxConcurrent)
 	if err != nil {
 		d.failIntakeRun(ctx, q, "load agent runtime: "+err.Error())
 		return
@@ -60,93 +56,37 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 	var rtEnv map[string]string
 	_ = json.Unmarshal([]byte(rtEnvJSON), &rtEnv)
 	agentEnv, _ := d.loadAgentEnv(ctx, agentID)
-	taskEnv := os.Environ()
-	for k, v := range agentEnv {
-		taskEnv = append(taskEnv, k+"="+v)
-	}
 
-	conn, err := runtime.Open(ctx, runtime.Spec{
-		Transport: transport, Executable: execPath, Args: args, Endpoint: endpoint, Env: rtEnv,
-		Cwd: workdir, // the parser's scratch dir — see Spec.Cwd
-	}, taskEnv)
-	if err != nil {
-		d.failIntakeRun(ctx, q, "open transport: "+err.Error())
-		return
-	}
-	defer conn.Close()
-
-	// Unified execution model (DESIGN.md 决策 4-8), same as worker and
-	// compile runs: WITHOUT the client handler the ACP handshake declares no
-	// fs/terminal capabilities and the parser's local write tools are
-	// rejected ("agent→client RPC not configured") — the intake.json artifact
-	// never lands (a live failure, same as compile before its fix). The
-	// intake branch was missed when the shared processor path was fixed;
-	// give it the environment + MCP workspace + Workspace contract too.
-	serverURL, err := d.advertisedBaseURL(ctx, intakeAgentworkURL)
-	if err != nil {
-		d.failIntakeRun(ctx, q, err.Error())
-		return
-	}
-	env := newRunEnvironment(q.RunID, "", q.AgentID, workdir, serverURL, q.Token)
-	defer env.tm.cleanup()
-	d.mu.Lock()
-	d.mcpExecs[q.RunID] = mcp.NewExecutor(workdir, env.runEnv(nil), env.tm)
-	d.mu.Unlock()
-	defer func() {
-		d.mu.Lock()
-		delete(d.mcpExecs, q.RunID)
-		d.mu.Unlock()
-	}()
-	// Intake runs are one-shot (no goal session) — the full contract.
-	prompt += worktreeGuidance(workdir)
-
-	backend, err := d.protoReg.Get(provider)
-	if err != nil {
-		d.failIntakeRun(ctx, q, "provider "+provider+": "+err.Error())
-		return
-	}
-	// Intake runs get the same total-time budget as worker/compile runs (the
-	// runaway reaper's DB backstop also applies, but the in-process timeout
-	// is the first line) — a hung parser must not sit 'running' unbounded.
-	promptCtx, promptCancel := context.WithTimeout(ctx, time.Duration(defaultMaxRunDurationSeconds)*time.Second)
-	defer promptCancel()
-	run, err := backend.Execute(promptCtx, proto.ExecuteSpec{
-		Conn:          conn,
-		Cwd:           workdir,
-		Prompt:        prompt,
-		ClientHandler: env,
-		McpServers: []acp.McpServer{{
-			Type: "http", Name: "agentwork", URL: serverURL + "/mcp/" + q.RunID,
-		}},
-	})
-	if err != nil {
-		d.failIntakeRun(ctx, q, "execute: "+err.Error())
-		return
-	}
-	for ev := range run.Events {
-		d.persistEvent(ctx, q.RunID, ev)
-		d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
-			"run_id": q.RunID, "event": ev,
-		}})
-	}
-	result, ok := <-run.Result
-	if !ok {
-		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
-	}
-	d.flushRunMessages(ctx, q.RunID)
-	if result.Status != proto.StatusCompleted {
-		d.failIntakeRun(ctx, q, result.Output)
+	// CLI 分支 Phase 2: machine-owned intake runtimes dispatch (same shape
+	// as the compile processor — scratch proc dir + intake.json artifact).
+	if intakeMachineID != "" {
+		dispatchEnv := map[string]string{}
+		for k, v := range rtEnv {
+			dispatchEnv[k] = v
+		}
+		for k, v := range agentEnv {
+			dispatchEnv[k] = v
+		}
+		d.dispatchToMachine(ctx, q, link.RunDispatchParams{
+			RunID: q.RunID, AgentID: q.AgentID, Attempt: q.Attempt, Token: q.Token,
+			Prompt: prompt, Proc: true, Scratch: true,
+			ArtifactFiles: []string{"intake.json"},
+			ACPSpawn: args, Env: dispatchEnv,
+		}, intakeMachineID)
 		return
 	}
 
-	// Read the parsed action (file = structured side effect).
-	raw, err := os.ReadFile(filepath.Join(workdir, "intake.json"))
-	if err != nil {
-		d.failIntakeRun(ctx, q, "read intake.json: "+err.Error())
-		return
-	}
+	// Legacy transports have no executor anymore (the unified model
+	// dispatches everything to machines).
+	d.failIntakeRun(ctx, q, "this runtime has no machine — run `agentwork connect` and point the agent at a machine-owned runtime")
+}
+
+// ingestIntakeArtifact completes an intake run from its FILE artifact
+// (intake.json) — the shared path for local execution and the machine-
+// dispatched upload (CLI 分支 Phase 2).
+func (d *Daemon) ingestIntakeArtifact(ctx context.Context, q *service.ClaimedRow, artifactContent string) {
 	var parsed intakeAction
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	if err := json.Unmarshal([]byte(artifactContent), &parsed); err != nil {
 		d.failIntakeRun(ctx, q, "parse intake.json: "+err.Error())
 		return
 	}

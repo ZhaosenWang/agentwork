@@ -4,7 +4,6 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -17,7 +16,6 @@ import (
 	"github.com/eushing/agentwork/internal/issue"
 	"github.com/eushing/agentwork/internal/link"
 	"github.com/eushing/agentwork/internal/logging"
-	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/server/handler"
 	"github.com/eushing/agentwork/internal/server/ws"
@@ -396,6 +394,93 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			return map[string]any{"ok": true}, nil
 		})
 
+		peer.Handle(link.MethodSubGoalGet, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			if _, rpcErr := resolve(raw); rpcErr != nil {
+				return nil, rpcErr
+			}
+			var p link.SubGoalGetParams
+			if err := json.Unmarshal(raw, &p); err != nil || p.SubGoalID == "" {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "sub_goal_id is required"}
+			}
+			sg, err := s.goalSvc.GetSubGoal(ctx, p.SubGoalID)
+			if err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			return sg, nil
+		})
+
+		peer.Handle(link.MethodSubGoalVerifications, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			if _, rpcErr := resolve(raw); rpcErr != nil {
+				return nil, rpcErr
+			}
+			var p link.SubGoalVerificationsParams
+			if err := json.Unmarshal(raw, &p); err != nil || p.SubGoalID == "" {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "sub_goal_id is required"}
+			}
+			out, err := s.goalSvc.ListVerificationResults(ctx, p.SubGoalID)
+			if err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			return out, nil
+		})
+
+		peer.Handle(link.MethodChangeList, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			id, rpcErr := resolve(raw)
+			if rpcErr != nil {
+				return nil, rpcErr
+			}
+			out, err := s.goalSvc.ListChangeDetails(ctx, id.GoalID)
+			if err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			return out, nil
+		})
+
+		peer.Handle(link.MethodChangeIntegrateBegin, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			id, rpcErr := resolve(raw)
+			if rpcErr != nil {
+				return nil, rpcErr
+			}
+			var p link.ChangeIntegrateBeginParams
+			if err := json.Unmarshal(raw, &p); err != nil || p.ChangeID == "" {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "change_id is required"}
+			}
+			ch, err := s.goalSvc.GetChange(ctx, p.ChangeID)
+			if err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			if ch.GoalID != id.GoalID {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "the change does not belong to this goal"}
+			}
+			if ch.Status == "integrated" {
+				return link.ChangeIntegrateResult{OK: true, Status: "integrated", Note: "already integrated"}, nil
+			}
+			if ch.Status == "conflict" {
+				return link.ChangeIntegrateResult{OK: false, Status: "conflict", Note: "the assignee is reworking this change — wait for the new Revision before integrating"}, nil
+			}
+			if err := s.goalSvc.MarkChangeIntegrating(ctx, ch.ID); err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			return link.ChangeIntegrateResult{OK: true, Status: "integrating", HeadRef: ch.HeadRef}, nil
+		})
+
+		peer.Handle(link.MethodChangeIntegrateFinish, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			if _, rpcErr := resolve(raw); rpcErr != nil {
+				return nil, rpcErr
+			}
+			var p link.ChangeIntegrateFinishParams
+			if err := json.Unmarshal(raw, &p); err != nil || p.ChangeID == "" {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "change_id is required"}
+			}
+			if err := s.goalSvc.MarkChangeIntegrated(ctx, p.ChangeID, p.OK); err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			if p.OK {
+				return link.ChangeIntegrateResult{OK: true, Status: "integrated"}, nil
+			}
+			return link.ChangeIntegrateResult{OK: false, Status: "conflict", Note: "change marked conflicted — the sub-goal assignee has been woken to rework", Output: p.Output}, nil
+		})
+
 		peer.Handle(link.MethodGoalWait, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 			id, rpcErr := resolve(raw)
 			if rpcErr != nil {
@@ -444,45 +529,6 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			}
 		}
 	}()
-	// Workspace MCP server per run (DESIGN.md 决策 4-8): the run's executor
-	// is registered in the daemon while the run is active; the agent reaches
-	// it at /mcp/{runID} (the URL is advertised in session/new mcpServers).
-	// streamable HTTP: POST for JSON-RPC, GET for the SSE event stream —
-	// opencode subscribes with a GET after initialize; without the GET route
-	// it gets 405 and never registers the MCP tools (a live run proved it:
-	// three POSTs arrived, the GET was missing, no tools appeared).
-	serveMCP := func(w http.ResponseWriter, r *http.Request) {
-		exec := s.d.MCPExecutor(r.PathValue("runID"))
-		if exec == nil {
-			http.Error(w, "no active run with this id", http.StatusNotFound)
-			return
-		}
-		sw := &statusWriter{ResponseWriter: w}
-		mcp.HTTPHandler(exec).ServeHTTP(sw, r)
-		status := sw.status
-		if status == 0 {
-			status = http.StatusOK // WriteHeader never ran — Go's implicit 200
-		}
-		// Per-tool-call noise at DEBUG only — an agent working makes dozens
-		// of these, and the run's message stream is the info-level truth for
-		// what it is doing. The debug line carries the FULL URL the agent
-		// actually hit (host + path — which advertised address the runtime
-		// reached is exactly what remote-agent debugging needs), the run,
-		// and the goal (the FULL goal uuid renders as a titled link in the
-		// web log panel) so the handshake sequence
-		// initialize → tools/list → tools/call stays traceable.
-		scheme := "http"
-		if r.TLS != nil {
-			scheme = "https"
-		}
-		runID := exec.RunID
-		if len(runID) > 8 {
-			runID = runID[:8]
-		}
-		logging.Debugf("mcp: %s %s://%s%s run=%s goal=%s -> %d", r.Method, scheme, r.Host, r.URL.Path, runID, exec.GoalID, status)
-	}
-	mux.HandleFunc("POST /mcp/{runID}", serveMCP)
-	mux.HandleFunc("GET /mcp/{runID}", serveMCP)
 	// Human-initiated run stop (决策 4-12): terminates the running run (no
 	// attempt consumed, no auto-retry), goal state untouched — recovery is
 	// the human's call.
@@ -492,23 +538,6 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
-	})
-	// Runtime connectivity check: opens the transport + does the protocol
-	// handshake without executing a task, so the owner can verify a runtime
-	// is usable right after creating it — instead of discovering a bad config
-	// in a failed run after assigning a goal.
-	mux.HandleFunc("POST /runtimes/{id}/test", func(w http.ResponseWriter, r *http.Request) {
-		out, err := s.d.TestRuntime(r.Context(), r.PathValue("id"))
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				http.Error(w, "runtime not found", http.StatusNotFound)
-			} else {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-			}
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(out)
 	})
 	// The domain git check tests UNSAVED form values (create/edit dialogs),
 	// so it carries the config in the body rather than a domain id.

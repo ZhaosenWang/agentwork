@@ -54,6 +54,10 @@ func main() {
 		squadCmd(serverURL, os.Args[2:])
 	case "stats":
 		statsCmd(serverURL, os.Args[2:])
+	case "subgoal":
+		subgoalCmd(os.Args[2:])
+	case "change":
+		changeCmd(os.Args[2:])
 	case "issue":
 		issueCmd(serverURL, goalID, os.Args[2:])
 	case "-h", "--help", "help":
@@ -121,6 +125,15 @@ Subcommands:
                                              human to decide (behavior gate)
   agent list                                 list all agents (JSON)
   squad list                                 list all squads (JSON)
+  subgoal list|get <id>|create --title T --assignee A [--description D] [--verifier V]
+                                             list/create/read work items (the owner splits)
+  subgoal cancel <id>                        cancel a work item
+  subgoal verify <id> --verdict passed|rejected [--summary S] [--evidence E]
+                                             the verifier's verdict
+  subgoal verifications <id>                 a work item's verification rounds
+  change list                                the goal's changes (ready/integrating/…)
+  change integrate <id>                      merge a change into THIS worktree locally;
+                                             conflict → the assignee is woken to rework
   stats                                      goal/run status statistics (JSON): goal totals
                                              + counts per status (backlog/active/blocked/done/
                                              failed/cancelled) and run totals + counts per status

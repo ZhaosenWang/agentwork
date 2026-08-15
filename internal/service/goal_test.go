@@ -61,7 +61,7 @@ func seedDomain(t *testing.T, st *store.Store) string {
 func seedAgent(t *testing.T, st *store.Store, name string) string {
 	t.Helper()
 	ctx := context.Background()
-	rt, err := NewRuntimeService(st).Create(ctx, Runtime{Name: "rt-" + name, Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := NewRuntimeService(st).Create(ctx, Runtime{Name: "rt-" + name, MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}

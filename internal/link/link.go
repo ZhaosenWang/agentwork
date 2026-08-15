@@ -41,6 +41,11 @@ const (
 	MethodSubGoalCreate = "subgoal.create"
 	MethodSubGoalCancel = "subgoal.cancel"
 	MethodSubGoalVerify = "subgoal.verify"
+	MethodSubGoalGet    = "subgoal.get"
+	MethodSubGoalVerifications = "subgoal.verifications"
+	MethodChangeList    = "change.list"
+	MethodChangeIntegrateBegin  = "change.integrate_begin"
+	MethodChangeIntegrateFinish = "change.integrate_finish"
 	MethodGoalWait     = "goal.wait"
 	MethodGoalStats    = "goal.stats"
 
@@ -160,6 +165,43 @@ type SubGoalCancelParams struct {
 	SubGoalID string `json:"sub_goal_id"`
 }
 
+// SubGoalGetParams loads one sub-goal (resume-index expansion).
+type SubGoalGetParams struct {
+	RPCToken
+	SubGoalID string `json:"sub_goal_id"`
+}
+
+// SubGoalVerificationsParams lists a sub-goal's verification rounds.
+type SubGoalVerificationsParams struct {
+	RPCToken
+	SubGoalID string `json:"sub_goal_id"`
+}
+
+// ChangeIntegrateBeginParams starts an integration: the daemon validates
+// and marks the change integrating, returning the head ref — the CLI then
+// merges it LOCALLY (its cwd is the worktree) and reports back.
+type ChangeIntegrateBeginParams struct {
+	RPCToken
+	ChangeID string `json:"change_id"`
+}
+
+// ChangeIntegrateResult is the begin/finish response.
+type ChangeIntegrateResult struct {
+	OK      bool   `json:"ok"`
+	Status  string `json:"status"` // ready|integrating|integrated|conflict
+	HeadRef string `json:"head_ref,omitempty"`
+	Note    string `json:"note,omitempty"`
+	Output  string `json:"output,omitempty"` // the merge's stderr on conflict
+}
+
+// ChangeIntegrateFinishParams reports the local merge outcome.
+type ChangeIntegrateFinishParams struct {
+	RPCToken
+	ChangeID string `json:"change_id"`
+	OK       bool   `json:"ok"`
+	Output   string `json:"output,omitempty"`
+}
+
 // GoalWaitParams blocks the CLI until the goal's sub-goals settle
 // (the owner's wait tool — returns current children states).
 type GoalWaitParams struct {
@@ -182,6 +224,13 @@ type RunDispatchParams struct {
 	Token     string `json:"token"` // per-run credential → AGENTWORK_TOKEN env
 	Prompt    string `json:"prompt"` // fixed block + wake line, fully assembled
 
+	// Processor runs (goal-less, platform-internal): the machine works in
+	// its proc dir (compile-on-repo gets a detached worktree of
+	// origin/<default>; scratch/intake a plain directory) and uploads the
+	// artifact files with run.finished.
+	Proc         bool     `json:"proc,omitempty"`
+	ArtifactFiles []string `json:"artifact_files,omitempty"`
+
 	// Worktree spec: scratch domains derive the local directory layout;
 	// git (repo) domains carry the clone config — the machine clones the
 	// bare repo, checks out the goal branch, commits, and pushes the
@@ -197,7 +246,6 @@ type RunDispatchParams struct {
 	// Runtime spawn config (from the machine-owned runtime row).
 	ACPSpawn []string          `json:"acp_spawn"`          // argv of the ACP stdio server
 	Env      map[string]string `json:"env,omitempty"`      // runtime env + agent env (merged daemon-side)
-	ServerURL string           `json:"server_url"`          // AGENTWORK_SERVER_URL for the CLI's /rpc
 }
 
 // RunDispatchResult is the run.dispatch ack — the machine accepts or
@@ -282,6 +330,10 @@ type RunFinishedParams struct {
 	Status   string `json:"status"` // completed|failed|cancelled
 	Summary  string `json:"summary,omitempty"`
 	Evidence string `json:"evidence,omitempty"` // JSON bundle (scratch runs: '')
+	// Artifacts: processor runs' FILE results (checks.json etc.), uploaded
+	// from the machine — the platform reads structured side effects, never
+	// agent stdout (决策 5.3/§9).
+	Artifacts map[string]string `json:"artifacts,omitempty"`
 }
 
 // rpcMarshal marshals params, normalizing empty slices so they reach the

@@ -45,7 +45,7 @@ func seedReviewAgent(t *testing.T, st *store.Store, name string) string {
 	t.Helper()
 	ctx := context.Background()
 	bus := events.NewBus()
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt-" + name, Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt-" + name, MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}

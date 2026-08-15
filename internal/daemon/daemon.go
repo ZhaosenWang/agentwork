@@ -20,8 +20,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,10 +36,8 @@ import (
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/gitutil"
 	"github.com/eushing/agentwork/internal/issue"
-	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/proto"
-	"github.com/eushing/agentwork/internal/runtime"
 	"github.com/eushing/agentwork/internal/service"
 	"github.com/eushing/agentwork/internal/store"
 	"github.com/google/uuid"
@@ -139,7 +135,6 @@ type Daemon struct {
 	domainLocks map[string]*domainLock  // per-domain git lock (fetch + deliver)
 	// sessionPool is the persistent (agent, goal) session pool (决策 6-21).
 	// Its own mutex (sessionMu) guards it — see session_pool.go.
-	sessionPool map[string]*liveSession
 	msgBuffers  map[string]*msgBuffer // runID → aggregated text row (persistEvent)
 	// runCancels maps runID → the run's prompt cancel (registered by runTask,
 	// used to terminate a running run when its goal changes hands — a handed
@@ -163,10 +158,6 @@ type Daemon struct {
 	reviewReadyTimers map[string]*time.Timer
 	reviewReadyFired  map[string]bool
 	// mcpExecs maps runID → the run's workspace MCP executor (DESIGN.md
-	// 决策 4-8: agents that don't delegate tools to client RPCs get the
-	// workspace through an MCP server advertised at session/new). Guarded
-	// by mu.
-	mcpExecs map[string]*mcp.Executor
 	stopped  bool
 	ctx      context.Context
 
@@ -208,7 +199,6 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		issueCloser:       issue.NewCloser(st),
 		workers:           make(map[string]*agentWorker),
 		msgBuffers:        make(map[string]*msgBuffer),
-		mcpExecs:          make(map[string]*mcp.Executor),
 		runCancels:        make(map[string]context.CancelFunc),
 		runCancelReasons:  make(map[string]string),
 		reviewReadyTimers: make(map[string]*time.Timer),
@@ -286,7 +276,6 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 // Run starts the dispatch loop. Blocks until ctx is cancelled.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.ctx = ctx
-	defer d.closeAllSessions() // sessions are in-memory — shutdown tears them down
 	d.recoverWorkers(ctx)
 	d.sweepDeliverWorktrees(ctx)
 	d.sweepRunWorktrees(ctx)
@@ -514,12 +503,6 @@ func (d *Daemon) Poller() *issue.Poller { return d.issuePoll }
 
 // MCPExecutor returns the workspace MCP executor for a run (nil if the run
 // is not active). The server's /mcp/{runID} route resolves through this.
-func (d *Daemon) MCPExecutor(runID string) *mcp.Executor {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.mcpExecs[runID]
-}
-
 // imNotifier returns the live milestone pusher (nil before the long
 // connection is up — digest and intake replies then no-op).
 func (d *Daemon) imNotifier() *notify.Notifier {
@@ -629,9 +612,6 @@ func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
 	if !ok {
 		return
 	}
-	if goalID, _ := m["goal_id"].(string); goalID != "" {
-		d.closeGoalSessions(goalID)
-	}
 	ids, _ := m["run_ids"].([]string)
 	for _, id := range ids {
 		logging.Infof("daemon: goal deleted — stopping run %s", id)
@@ -715,11 +695,6 @@ func (d *Daemon) onSubGoalCancelled(_ context.Context, e events.Event) {
 func (d *Daemon) onGoalAssigned(_ context.Context, e events.Event) {
 	// Handoff (决策 6-21): the old owner's session holds the goal branch's
 	// single checkout — close it so the new owner's session can take it.
-	if m, ok := e.Payload.(map[string]any); ok {
-		if goalID, _ := m["goal_id"].(string); goalID != "" {
-			d.closeOwnerSession(goalID)
-		}
-	}
 	g, ok := e.Payload.(*service.Goal)
 	if !ok {
 		return
@@ -1576,7 +1551,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// pipeline — they produce opinions, not work, and the platform's
 	// verification judges work (决策 5-3/6-5). Declared early: the scratch
 	// workdir branch below needs it.
-	readOnlyRun := consultRun || reviewRun || verifyRun
 	if err != nil {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
@@ -1609,7 +1583,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, "run's goal has no domain — cannot allocate a worktree")
 		return
 	}
-	scratchDomain := domainType == "scratch"
 	// Parse runtime args + env.
 	var args []string
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
@@ -1620,23 +1593,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	_ = json.Unmarshal([]byte(rtEnvJSON), &rtEnv)
 	agentEnv, _ := d.loadAgentEnv(ctx, q.AgentID)
 
-	// Build the task environment: inherit parent, layer agent env, inject
-	// agentwork-cli context so the agent can call back into the server.
-	taskEnv := os.Environ()
-	for k, v := range agentEnv {
-		taskEnv = append(taskEnv, k+"="+v)
-	}
-	serverURL, err := d.advertisedBaseURL(ctx, runtimeAgentworkURL)
-	if err != nil {
-		d.failRun(ctx, q, err.Error())
-		return
-	}
-	taskEnv = append(taskEnv,
-		"AGENTWORK_SERVER_URL="+serverURL,
-		"AGENTWORK_GOAL_ID="+q.GoalID, // product-plane id (CLI comments/handoff)
-		"AGENTWORK_RUN_ID="+q.RunID,   // execution-plane id
-		"AGENTWORK_AGENT_ID="+q.AgentID,
-	)
 	// M4-B: issue-sourced goals carry the issue identity so the agent can
 	// reply via `agentwork-cli issue comment` (the platform owns the token);
 	// the LIVE issue comments are fetched at run start and injected into the
@@ -1654,12 +1610,6 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 				}
 			}
 		}
-	}
-	if issueRepo != "" {
-		taskEnv = append(taskEnv,
-			"AGENTWORK_ISSUE_REPO="+issueRepo,
-			"AGENTWORK_ISSUE_NUMBER="+issueNumber,
-		)
 	}
 
 		var issueSection string
@@ -1685,13 +1635,17 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// machine — assemble the SAME engineered prompt and dispatch it over
 	// the link. This goroutine's job ends at the ack; the run's lifecycle
 	// continues via the machine's claimed/event/finished uploads.
-	if transport == "agentwork" {
+	if runtimeMachineID != "" {
 		dispatchEnv := map[string]string{}
 		for k, v := range rtEnv {
 			dispatchEnv[k] = v
 		}
 		for k, v := range agentEnv {
 			dispatchEnv[k] = v
+		}
+		if issueRepo != "" {
+			dispatchEnv["AGENTWORK_ISSUE_REPO"] = issueRepo
+			dispatchEnv["AGENTWORK_ISSUE_NUMBER"] = issueNumber
 		}
 		machinePrompt := d.assemblePrompt(ctx, q, promptInputs{
 			agentName: agentName, agentDesc: agentDesc, systemPrompt: systemPrompt, runRole: runRole,
@@ -1708,564 +1662,15 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			Scratch: domainType == "scratch", DomainName: domainName,
 			DomainID: domainID, GitURL: gitURL, GitCredentials: gitCredentials,
 			DefaultBranch: defaultBranch, GitIdentity: gitIdentity,
-			ACPSpawn: args, Env: dispatchEnv, ServerURL: serverURL,
+			ACPSpawn: args, Env: dispatchEnv,
 		}, runtimeMachineID)
 		return
 	}
 
-	// Persistent session (决策 6-21): owner/review/consult runs of an ACP
-	// runtime ride the (agent, goal) session — ONE process + ONE ACP session
-	// across wakes. The session owns its worktree (owner: the goal branch's
-	// checkout; guests: a detached snapshot refreshed per wake); per-run
-	// worktrees stay for sub-goal/verify and non-ACP runtimes.
-	sessionRun := sessionCapable(provider)
-	var ls *liveSession
-	sessionIsNew := false
-	if sessionRun {
-		var err error
-		ls, sessionIsNew, err = d.acquireSession(ctx, q.RunID, q.GoalID, q.AgentID, provider, runRole, subGoalID,
-			scratchDomain, domainName, domainID, gitURL, gitCredentials, defaultBranch, serverURL,
-			transport, execPath, endpoint, args, rtEnv, taskEnv, q.Token)
-		if err != nil {
-			d.failRun(ctx, q, fmt.Sprintf("session: %v", err))
-			return
-		}
-	}
-	var runRowWorkdir string
-	if sessionRun {
-		runRowWorkdir = ls.workdir // the session owns the worktree
-	} else if scratchDomain {
-		// A scratch goal's project directory IS the branch: owner runs work
-		// DIRECTLY in it (persistent across runs — the file-state A5 model;
-		// owner single-flight makes the goal dir single-writer), read-only
-		// runs get a COPY snapshot (a torn copy is accepted for v1: report
-		// files are small and a racy read is re-readable). SUB-GOALS work in
-		// their own sg/<subGoalID> subdirectory under the goal dir — the
-		// deliverable IS the files there (no Change/merge machinery; the
-		// owner reviews the directory), verify runs snapshot a copy.
-		if subGoalRun || verifyRun {
-			sgDir := filepath.Join(scratchGoalDir(domainName, q.GoalID), "sg", subGoalID)
-			if verifyRun {
-				runRowWorkdir = runWorktreePath(q.RunID)
-				if err := copyDir(sgDir, runRowWorkdir); err != nil {
-					logging.Infof("daemon: scratch sg snapshot for run %s: %v", q.RunID, err)
-					_ = os.MkdirAll(runRowWorkdir, 0o755)
-				}
-			} else {
-				runRowWorkdir = sgDir
-				if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
-					d.failRun(ctx, q, fmt.Sprintf("prepare scratch sg dir: %v", err))
-					return
-				}
-			}
-		} else if readOnlyRun {
-			runRowWorkdir = runWorktreePath(q.RunID)
-			if err := copyDir(scratchGoalDir(domainName, q.GoalID), runRowWorkdir); err != nil {
-				logging.Infof("daemon: scratch snapshot for run %s: %v", q.RunID, err)
-				_ = os.MkdirAll(runRowWorkdir, 0o755)
-			}
-		} else {
-			runRowWorkdir = scratchGoalDir(domainName, q.GoalID)
-			if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
-				d.failRun(ctx, q, fmt.Sprintf("prepare scratch dir: %v", err))
-				return
-			}
-		}
-	} else {
-		runRowWorkdir, err = d.ensureRunWorktreeFor(ctx, q.RunID, domainID, q.GoalID, subGoalID, runRole, gitURL, gitCredentials, defaultBranch)
-		if err != nil {
-			d.failRun(ctx, q, fmt.Sprintf("prepare workdir: %v", err))
-			return
-		}
-	}
-	// Release the workspace when the run ends — git allows ONE checkout per
-	// branch, and the goal/sub-goal branch is shared by every run of that
-	// goal: the NEXT run cannot create its worktree while this one holds it
-	// (the E2E hit "a branch named ... already exists" on the woken owner).
-	// The worktree is EPHEMERAL — durable state lives in the commits; crash
-	// leftovers are swept at startup (sweepRunWorktrees). Scratch: the owner
-	// dir PERSISTS (it is the durable state); only the read-only copy goes.
-	// SESSIONS (决策 6-21) exempt: the session worktree lives across the
-	// session's wakes and is released on eviction (handoff/terminal/exit).
-	defer func() {
-		if sessionRun {
-			return
-		}
-		if scratchDomain {
-			if readOnlyRun {
-				_ = os.RemoveAll(runRowWorkdir)
-			}
-			return
-		}
-		unlock := d.lockDomain(domainID)
-		if out, err := exec.CommandContext(context.Background(), "git", "-C", domainRepoPath(domainID), "worktree", "remove", "--force", runRowWorkdir).CombinedOutput(); err != nil {
-			logging.Infof("daemon: release worktree %s: %v %s", q.RunID, err, out)
-		}
-		unlock()
-	}()
-
-	// Environment readiness BEFORE the agent starts (决策 3-1, the setup half):
-	// the acceptance policy's setup commands (dependency installs) prepare the
-	// verification environment — but the agent needs the SAME environment to
-	// self-verify while working (a pytest it cannot import is a blind run).
-	// Run setup up front (idempotent; the verification stage re-runs it to
-	// guarantee the judging environment is fresh). A failed setup here is an
-	// environment failure — the run fails with that attribution, the retry
-	// chain applies as usual.
-	checks, timeout, baseline, checksFrozen := d.loadDomainChecks(ctx, domainID)
-	if checksFrozen && len(checks.Setup) > 0 && !readOnlyRun {
-		setupReport, ok := runSetupOnly(ctx, runRowWorkdir, checks, timeout)
-		if !ok {
-			d.finishRun(ctx, q, "failed", "environment setup failed:\n"+setupReport)
-			return
-		}
-	}
-
-	// The run's diff baseline: guards and evidence measure this run's changes
-	// as baseSHA..HEAD (the agent may commit itself, and the daemon commits
-	// leftover work at run end — both land in HEAD). Scratch domains have no
-	// git — every git-derived judgment (guards, gates, diff evidence) degrades
-	// to empty; the deliverable is the report.
-	baseSHA := ""
-	if !scratchDomain {
-		baseSHA = strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
-	}
-
-	// AGENTWORK.md is RETIRED (决策 6-22): its content (system_prompt, squad
-	// instructions, roster) rides the fixed context block in the prompt — the
-	// per-run "read AGENTWORK.md first" tool round-trip is gone with it.
-
-	// Execution-environment proxy (DESIGN.md 决策 4-8): EVERY run gets the
-	// same execution model — the worktree lives on the client side and is
-	// reached through the ACP fs/terminal capabilities the client declares
-	// in the handshake. stdio and remote agents are treated identically:
-	// one mechanism, one behaviour, and the handler path is exercised by
-	// every run's traffic instead of only remote ones. (A stdio agent whose
-	// local tools operate on its cwd — the worktree — is unaffected: same
-	// directory, same result.) Leftover terminals are killed
-	// unconditionally at session close (defer).
-	var env *runEnvironment
-	var mcpExec *mcp.Executor
-	if sessionRun {
-		// The session's OWN handler + workspace MCP server (决策 6-21),
-		// re-pointed at this wake's run and worktree. Registered under the
-		// session key at creation; the URL was advertised at session/new.
-		env = ls.env
-		env.setRun(q.RunID, runRowWorkdir, q.Token)
-		mcpExec = ls.mcpExec
-		mcpExec.SetWorktree(runRowWorkdir)
-		mcpExec.SetCollaboration(q.GoalID, q.AgentID, q.RunID, d.commentSvc, d.goalSvc, d.runSvc, d.agentSvc, d.squadSvc)
-	} else {
-		env = newRunEnvironment(q.RunID, q.GoalID, q.AgentID, runRowWorkdir, serverURL, q.Token)
-		// Workspace MCP server (DESIGN.md 决策 4-8): every run advertises its
-		// workspace as an MCP server over HTTP at session/new — agents that do
-		// not delegate tools to client fs/terminal RPCs (opencode's tools are
-		// local by design) still get read_file/write_file/run_command bound to
-		// THIS run's worktree + environment. Registered for the run's
-		// lifetime; the /mcp/{runID} route resolves it.
-		mcpExec = mcp.NewExecutor(runRowWorkdir, env.runEnv(nil), env.tm)
-		mcpExec.SetCollaboration(q.GoalID, q.AgentID, q.RunID, d.commentSvc, d.goalSvc, d.runSvc, d.agentSvc, d.squadSvc)
-		d.mu.Lock()
-		d.mcpExecs[q.RunID] = mcpExec
-		d.mu.Unlock()
-		defer func() {
-			d.mu.Lock()
-			delete(d.mcpExecs, q.RunID)
-			d.mu.Unlock()
-		}()
-	}
-	defer env.tm.cleanup()
-
-	// Open the transport (stdio/ws/tcp); the backend speaks the protocol.
-	spec := runtime.Spec{
-		Transport:  transport,
-		Executable: execPath,
-		Args:       args,
-		Endpoint:   endpoint,
-		Env:        rtEnv,
-		Cwd:        runRowWorkdir, // the goal's worktree — see Spec.Cwd
-	}
-	var conn proto.Conn
-	if !sessionRun {
-		var err error
-		conn, err = runtime.Open(ctx, spec, taskEnv)
-		if err != nil {
-			d.failRun(ctx, q, fmt.Sprintf("open transport: %v", err))
-			return
-		}
-	}
-
-	// Prompt the run: title + description + handoff/wakeup note, plus the
-	// issue comments fetched at run start (M4-B: the issue is the
-	// human-agent dialogue channel — the agent starts with the latest
-	// conversation, nothing stored).
-	// A REVIEW run (triggered by the platform's system review-request
-	// comment) must NOT receive the goal's task description — it would
-	// execute the task instead of reviewing it (a live failure: the opencode
-	// reviewer re-created the file the leader had just written). Its prompt
-	// is the review instruction only; the worktree, the comment feed
-	// (injected below) and the workspace guidance give it everything else.
-	// The engineered context (决策 6-22): the FIXED BLOCK (session-fresh) +
-	// the WAKE LINE (every turn). The comment feed is PULLED via
-	// agentwork_get_comments, never injected wholesale — the wake line
-	// carries the triggering words, the feed is the shared context.
-	var prompt string
-	_ = prompt
-	prompt = d.assemblePrompt(ctx, q, promptInputs{
-		agentName: agentName, agentDesc: agentDesc, systemPrompt: systemPrompt, runRole: runRole,
-		goalTitle: goalTitle, policyText: policyText, domainType: domainType, domainName: domainName,
-		triggerCommentID: triggerCommentID, triggerAuthor: triggerAuthor, triggerAuthorName: triggerAuthorName,
-		triggerCommentContent: triggerCommentContent, title: title, desc: desc, handoff: handoff,
-		wakeNote: wakeNote, wakeAnchorID: wakeAnchorID, issueSection: issueSection, subGoalID: subGoalID,
-		consultRun: consultRun, reviewRun: reviewRun, verifyRun: verifyRun, subGoalRun: subGoalRun,
-	}, false, sessionRun, sessionIsNew, runRowWorkdir)
-	backend, err := d.protoReg.Get(provider)
-	if err != nil {
-		if !sessionRun {
-			conn.Close()
-		}
-		d.failRun(ctx, q, fmt.Sprintf("provider %q: %v", provider, err))
-		return
-	}
-	// maxRunDuration (DESIGN.md §4, decision 2-6): the run's total time
-	// budget, independent of activity — a run stuck in a tool loop must not
-	// burn forever. The idle watchdog (silence) and this (total time) are
-	// complementary cancellers of the same promptCtx. On timeout the backend
-	// reports StatusCancelled; the run is cancelled WITHOUT consuming attempt
-	// credit, the goal stays active, and the human is notified (M1 notify).
-	if maxRunDuration <= 0 {
-		maxRunDuration = 7200 // default 2h
-	}
-	var lastActivity atomic.Int64
-	lastActivity.Store(time.Now().UnixNano())
-	var inFlightTools atomic.Int32
-	promptCtx, promptCancel := context.WithTimeout(ctx, time.Duration(maxRunDuration)*time.Second)
-	defer promptCancel()
-	// Register the run's cancel so a handoff can cut it (goal:assigned →
-	// onGoalAssigned); unregister when the run finishes. The same cancel the
-	// idle watchdog fires.
-	d.mu.Lock()
-	d.runCancels[q.RunID] = promptCancel
-	delete(d.runCancelReasons, q.RunID) // fresh run — no stale reason
-	d.mu.Unlock()
-	defer func() {
-		d.mu.Lock()
-		delete(d.runCancels, q.RunID)
-		delete(d.runCancelReasons, q.RunID)
-		d.mu.Unlock()
-	}()
-	// Post-register self-check: a handoff that landed in the claim→register
-	// window stamped this run terminal in the DB (onGoalAssigned found no
-	// registered cancel to cut). Honor the stamp — self-cancel so the new
-	// owner's run claims immediately instead of waiting out this one. The
-	// stamp is the only concurrent writer of status besides finishRun, and
-	// finishRun runs after this check, so there is no race.
-	var registeredStatus, stampedReason string
-	_ = d.st.DB().QueryRowContext(ctx, `SELECT status, cancel_reason FROM run WHERE id=?`, q.RunID).Scan(&registeredStatus, &stampedReason)
-	if registeredStatus != "running" {
-		// The stamp is the authority — carry ITS reason through the
-		// cancellation branch (a handoff stamp reports handoff; a human
-		// stop stamp reports stopped), not a hardcoded guess.
-		if stampedReason == "" {
-			stampedReason = "handoff"
-		}
-		logging.Infof("daemon: run %s terminal-stamped before registration — self-cancelling (%s)", q.RunID, stampedReason)
-		d.mu.Lock()
-		d.runCancelReasons[q.RunID] = stampedReason
-		d.mu.Unlock()
-		promptCancel()
-	}
-	go d.runIdleWatchdog(promptCtx, &lastActivity, &inFlightTools, promptCancel, q.RunID, env.tm.activeCount)
-
-	var run *proto.Run
-	if sessionRun {
-		// The wake rides the SESSION (决策 6-21): one prompt on the live
-		// session — no transport open, no session/new.
-		run, err = ls.sess.Prompt(promptCtx, prompt)
-	} else {
-		run, err = backend.Execute(promptCtx, proto.ExecuteSpec{
-			Conn:          conn,
-			Cwd:           runRowWorkdir,
-			Prompt:        prompt,
-			ClientHandler: env,
-			// The platform's workspace server first, then the agent's own
-			// configured MCP servers (its specialty tools) — both advertised at
-			// session/new, both live in the agent's tool registry.
-			McpServers: append([]acp.McpServer{{
-				Type: "http",
-				Name: "agentwork",
-				URL:  serverURL + "/mcp/" + q.RunID,
-			}}, d.extraMcpServers(ctx, q.AgentID)...),
-		})
-	}
-	if err != nil {
-		if !sessionRun {
-			conn.Close()
-		}
-		d.failRun(ctx, q, fmt.Sprintf("execute: %v", err))
-		return
-	}
-
-	// Record workdir once the session is live (best-effort; the backend may not
-	// return a session id until Result).
-	_ = d.runSvc.MarkSession(ctx, q.RunID, "", runRowWorkdir)
-
-	for ev := range run.Events {
-		lastActivity.Store(time.Now().UnixNano())
-		d.persistEvent(ctx, q.RunID, ev)
-		d.trackToolInflight(&inFlightTools, ev)
-		d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
-			"run_id": q.RunID, "event": ev,
-		}})
-	}
-
-	result, ok := <-run.Result
-	if !sessionRun {
-		conn.Close()
-	}
-	if !ok {
-		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
-	}
-	if !sessionRun && conn.Stderr != nil {
-		// The agent's own stderr (stdio transport) — MCP connect failures
-		// print here ("acp: MCP connect ... failed") and were silently
-		// dropped when the run failed for another reason (live: the retry
-		// run's missing workspace tools left no trace).
-		if b, err := io.ReadAll(conn.Stderr); err == nil && len(b) > 0 {
-			logging.Infof("daemon: agent stderr for run %s:\n%s", q.RunID, strings.TrimSpace(string(b)))
-		}
-	}
-	if sessionRun {
-		// Park the session. A FAILED turn with a transport-level error means
-		// the session died (process crash) — evict so the next wake starts
-		// fresh. Cancelled (our cancel via session/cancel) keeps it alive.
-		if result.Status == proto.StatusFailed && result.Err != nil {
-			d.evictSessionKey(ls.key)
-		} else {
-			sessionMu.Lock()
-			ls.lastRunEndedAt = nowStr()
-			sessionMu.Unlock()
-		}
-	}
-	// The event stream is done — flush the aggregated text buffer so the last
-	// message of the turn is persisted (persistEvent aggregates per-role).
-	d.flushRunMessages(ctx, q.RunID)
-
-	// Consult/review read-only enforcement (决策 6-2/6-7): the run's workspace
-	// started CLEAN (fresh worktree from a ref) — whatever the outcome, reset
-	// it to HEAD and clean untracked files (domain read-only: ephemeral writes
-	// allowed, nothing survives). A guest that committed DIRECTLY is flagged
-	// in the feed (not reverted — HEAD may carry the owner's history under
-	// it... the fresh workspace makes baseSHA==claim-HEAD, so any commit is
-	// the guest's own and only flagged for human visibility). Scratch
-	// read-only runs are plain-dir COPIES — there is no git to commit into,
-	// and the copy is removed by the run's cleanup anyway; the git check
-	// would only mint a false "contract violated" alarm (fatal: not a git
-	// repository).
-	if (reviewRun || consultRun || verifyRun) && domainID != "" && !scratchDomain {
-		resetGuestWorkspace(ctx, runRowWorkdir)
-		if committed := guestCommittedLog(ctx, runRowWorkdir, baseSHA); committed != "" {
-			// Platform text is English (决策 6-18) — the MATERIALS (the commit
-			// log below) carry their own language.
-			if _, err := d.st.DB().ExecContext(ctx,
-				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,'system','',NULL,?,?,?)`,
-				uuid.NewString(), q.GoalID, "⚠️ A read-only run committed changes directly (consult/review contract violated) — they stay on the goal branch and are visible before delivery:\n```\n"+committed+"\n```", nowStr(), q.RunID); err != nil {
-				logging.Infof("daemon: guest commit warning for run %s: %v", q.RunID, err)
-			}
-		}
-	}
-
-	switch result.Status {
-	case proto.StatusCompleted:
-		// The handoff/wakeup note is consumed by the goal layer (ReconcileOnRunEnd
-		// clears it only after confirming this run owns the goal and the goal
-		// promotes to done). The daemon must NOT clear it here: on a handoff this
-		// run no longer owns the goal, and clearing would wipe the new owner's
-		// note (see P2 in the bug review).
-		_ = d.runSvc.MarkSession(ctx, q.RunID, result.SessionID, runRowWorkdir)
-
-		// The run's REPORT is its last assistant message — the agent's final
-		// summary (what it did + how it verified), NOT the full transcript
-		// (which opens with the agent's thinking). The approval card, the
-		// comment feed, and the deliver note all read this; a transcript
-		// opening made Feishu's approval card show "I'm the worker agent…"
-		// instead of the work. Falls back to the backend output.
-		var report string
-		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT content FROM chat_message WHERE run_id=? AND role='assistant' AND content != '' ORDER BY created_at DESC LIMIT 1`,
-			q.RunID).Scan(&report); err != nil || strings.TrimSpace(report) == "" {
-			report = result.Output
-		}
-
-		if domainID != "" {
-			// Make the agent's work durable on the goal branch (the agent is
-			// guided to commit; the daemon guarantees it — deliver merges the
-			// branch, and uncommitted work would deliver nothing). The
-			// domain's declared excludes (checks.excludes, compiled + owner-
-			// confirmed) keep dependency dirs out of the branch.
-			// GUEST and REVIEW runs are exempt (决策 5-3): their product is
-			// opinion/information, not code — nothing of theirs merges into
-			// the goal branch; window changes were already discarded above.
-			if !reviewRun && !consultRun && !verifyRun && !scratchDomain {
-				if err := commitRunChanges(ctx, runRowWorkdir, d.domainGitIdentity(ctx, domainID), checks.Excludes); err != nil {
-					d.finishRun(ctx, q, "failed", "commit run changes: "+err.Error())
-					return
-				}
-			}
-			// Machine verification (DESIGN.md §4/§5 (§9 invariant 14)): the
-			// domain's verify commands run BEFORE the run is finished. A red
-			// verify ends the run failed → retry chain. The goal layer only
-			// ever sees 'completed' runs that passed.
-			//
-			// An UNFROZEN policy (checks_compiled_at empty — the owner never
-			// confirmed the compiled checks) runs NOTHING: no setup/verify/
-			// guards against an unconfirmed definition, and no gate evaluation
-			// (the goal layer forces the human checkpoint instead). Evidence
-			// still carries the diff + agent summary for that checkpoint.
-			verifyReport, guardReport := "", ""
-			if checksFrozen && !readOnlyRun {
-				verifyReport, ok, policyIssue := runVerification(ctx, runRowWorkdir, checks, timeout)
-				if !ok {
-					// Objective policy defect (POSIX exit 127 — missing command /
-					// script)? Flag it once — the owner fixes the policy instead
-					// of the agent burning retries against an impossible check.
-					if policyIssue {
-						d.annotatePolicyIssue(ctx, q.GoalID)
-					}
-					d.finishRun(ctx, q, "failed", "verification failed:\n"+verifyReport)
-					return
-				}
-				// Structural guards on the diff (DESIGN.md §5.1), measured as
-				// baseSHA..HEAD — the run's own changes. git status would be empty
-				// here: the daemon just committed the agent's work (and the agent
-				// may have committed itself), so the worktree is clean. Scratch
-				// domains have no diff — guards are repo-only.
-				if !scratchDomain {
-					guardReport, ok = checkGuards(ctx, runRowWorkdir, baseSHA, checks, baseline)
-					if !ok {
-						d.finishRun(ctx, q, "failed", "guards failed:\n"+guardReport)
-						return
-					}
-				}
-				// Gate evaluation (M2 rule engine): merge always fires; diff_*
-				// fire on the run's changed paths. The fired gates are recorded on
-				// the run row — the goal layer reads them in the reconcile
-				// transaction (the daemon computes, the goal layer judges).
-				// SUB-GOAL runs skip gates (决策 6-1): their work item has no
-				// human checkpoint — verification is machine (or the optional
-				// agent verifier, 决策 6-5), the human gates stay goal-level.
-				if !subGoalRun && !verifyRun && !scratchDomain {
-					gatesHit := evalGates(ctx, runRowWorkdir, baseSHA, checks)
-					if len(gatesHit) > 0 {
-						gatesJSON, _ := json.Marshal(gatesHit)
-						if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET gates_hit=? WHERE id=?`, string(gatesJSON), q.RunID); err != nil {
-							logging.Infof("daemon: record gates_hit for run %s: %v", q.RunID, err)
-						}
-					}
-				}
-			}
-			// Sub-goal runs stamp the Change revision refs (决策 6-3): the
-			// revision's integration base (merge-base of the goal branch and the
-			// sub-goal branch) + the delivered head — the sub-goal layer creates
-			// Change + Revision atomically from these.
-			if subGoalRun && subGoalID != "" && !scratchDomain {
-				goalBranch := goalBranchName(q.GoalID)
-				base := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "merge-base", goalBranch, "HEAD"))
-				head := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
-				if _, err := d.st.DB().ExecContext(ctx,
-					`UPDATE run SET base_ref=?, head_ref=? WHERE id=?`, base, head, q.RunID); err != nil {
-					logging.Infof("daemon: stamp change refs for run %s: %v", q.RunID, err)
-				}
-			}
-			// Evidence bundle for the approval card (decision 2-3).
-			ev := buildEvidence(ctx, runRowWorkdir, baseSHA, report, verifyReport, guardReport)
-			if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET evidence=? WHERE id=?`, ev, q.RunID); err != nil {
-				logging.Infof("daemon: store evidence for run %s: %v", q.RunID, err)
-			}
-		}
-		// A follow-up round with ZERO changes returns the goal to done
-		// (决策 4-1 修订): the human's comment was answered in the feed —
-		// nothing to merge, nothing new to approve. The signal is STRUCTURAL:
-		// a HUMAN-authored trigger comment (the reopen stamped it on the run)
-		// + zero git changes. Re-parking popped the approval card again (the
-		// live failure: a Q&A round re-entered review). The promote is
-		// conditional and happens BEFORE finishRunOK so the reconcile's park
-		// UPDATE (status NOT IN done) finds nothing to park.
-		if triggerAuthor == "human" && !scratchDomain && !readOnlyRun {
-			head := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
-			if head == strings.TrimSpace(baseSHA) {
-				if ok, err := d.goalSvc.CompleteFollowUp(ctx, q.GoalID); err != nil {
-					logging.Infof("daemon: complete follow-up for %s: %v", q.GoalID, err)
-				} else if ok {
-					logging.Infof("daemon: follow-up run %s produced no changes — goal %s back to done", q.RunID, q.GoalID)
-				}
-			}
-		}
-		d.finishRunOK(ctx, q, report)
-	case proto.StatusCancelled:
-		// decision 2-6 + the "stuck active with no run" hole: a cancelled run
-		// does NOT fail the goal, and does NOT consume attempt credit — the
-		// requeue keeps the SAME attempt (a timeout is not a machine failure).
-		// The convergence rule is separate: only the FIRST cancellation gets an
-		// automatic retry; a second consecutive stall is systemic (the agent
-		// keeps hanging) and surfaces to the owner instead of looping.
-		// Only IDLE-WATCHDOG cancellations count toward the convergence rule —
-		// the worktree-dirty park, handoff cuts, approval cuts, and human
-		// cancels also mark runs cancelled (without the watchdog summary) and
-		// must not consume the single automatic retry.
-		// Structured cancellation reason (no string-matching semantics): the
-		// code is stamped on the run row + carried in the event; the summary
-		// text is display only.
-		code := d.takeCancelReason(q.RunID)
-		if code == "" {
-			code = "timeout" // maxRunDuration deadline — no retry (决策 2-6)
-		}
-		display := map[string]string{
-			"idle_watchdog": "idle watchdog",
-			"handoff":       "handoff",
-			"stopped":       "stopped", // human-initiated (StopRun / Cancel)
-			"timeout":       "timeout",
-			"runaway":       "runaway", // the reaper terminalized the run (P1, 决策 6-15⑦)
-		}[code]
-		summary := display + ": " + result.Output
-		// P0-5: the reason stamp is conditional — a run the reaper (or the
-		// handoff window stamp) already terminalized keeps THEIR reason; this
-		// late cancellation is not the run's terminal truth.
-		if _, err := d.st.DB().ExecContext(ctx,
-			`UPDATE run SET cancel_reason=? WHERE id=? AND status='running'`, code, q.RunID); err != nil {
-			logging.Infof("daemon: stamp cancel_reason %s: %v", q.RunID, err)
-		}
-		var priorCancelled int
-		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM run WHERE goal_id=? AND status='cancelled' AND cancel_reason='idle_watchdog'`, q.GoalID).Scan(&priorCancelled)
-		if priorCancelled == 0 && code == "idle_watchdog" {
-			var isLeader int
-			var squadID string
-			_ = d.st.DB().QueryRowContext(ctx, `SELECT is_leader_run, squad_id FROM run WHERE id=?`, q.RunID).Scan(&isLeader, &squadID)
-			if err := d.runSvc.EnqueueExisting(ctx, q.GoalID, q.AgentID, q.Attempt, isLeader != 0, squadID); err != nil {
-				logging.Infof("daemon: requeue cancelled run %s: %v", q.RunID, err)
-			}
-		}
-		// 决策 6-6: a handoff cut keeps status='cancelled' — the structured
-		// cancel_reason ('handoff') carries the semantics (handoff is a
-		// Goal-level event, not a run lifecycle state). Same non-retry,
-		// non-notify behavior as before.
-		//
-		// P0-5: the terminal event publishes ONLY when this writer's stamp
-		// won — a reaper-terminalized run publishes its own run:cancelled
-		// (from reapRunawayRuns); republishing here would double the notify
-		// card.
-		if d.finishRun(ctx, q, "cancelled", summary) {
-			// Surface the stall so the notify layer can tell the owner a task
-			// stalled (cancelled runs leave the goal active with no pending
-			// run — the human decides, per decision 2-6).
-			d.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
-				"run_id": q.RunID, "goal_id": q.GoalID, "reason": summary, "reason_code": code,
-			}})
-		}
-	case proto.StatusFailed, proto.StatusAborted:
-		d.finishRun(ctx, q, "failed", result.Output)
-	}
+	// The unified execution model (CLI 分支): every run dispatches to its
+	// machine over the /connect link. Legacy transports have no executor
+	// anymore — fail with a pointer instead of pretending to run.
+	d.failRun(ctx, q, fmt.Sprintf("legacy runtime transport %q is no longer executed locally — run `agentwork connect` and point the agent at a machine-owned runtime", transport))
 }
 
 // runProcessorTask executes a platform-internal processor run: opens the
@@ -2296,259 +1701,118 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 
-	var systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, procAgentworkURL string
+	var argsJSON, rtEnvJSON, procMachineID string
 	var maxConcurrent int
 	err = d.st.DB().QueryRowContext(ctx,
-		`SELECT a.system_prompt, r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, COALESCE(r.agentwork_url,''), a.max_concurrent
+		`SELECT r.args, r.env, COALESCE(r.machine_id,''), a.max_concurrent
 		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`, agentID).
-		Scan(&systemPrompt, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &procAgentworkURL, &maxConcurrent)
+		Scan(&argsJSON, &rtEnvJSON, &procMachineID, &maxConcurrent)
 	if err != nil {
 		d.failProcessorRun(ctx, q, "load agent runtime: "+err.Error())
 		return
 	}
 	d.ensureWorker(agentID, maxConcurrent)
 
-	// Workdir: compile runs work ON THE REAL REPO — a worktree of the domain's
-	// shared bare repo, so the processor compiles against what the repo
-	// actually is, not a guess from an empty scratch dir (the regression: an
-	// empty dir produced "pip install -r requirements.txt" for a zero-
-	// dependency repo and every verification failed). Intake runs keep the
-	// scratch dir (no repo involved).
-	runRowWorkdir := filepath.Join(runsRoot(), "proc", q.RunID)
-	if runType == "compile" {
-		var gitURL, gitCredentials, defaultBranch, domainType string
+	// CLI 分支 Phase 2: machine-owned processor runtimes dispatch — the
+	// machine works the proc dir (repo compile: a detached worktree of
+	// origin/<default>) and uploads the artifact files with run.finished.
+	if procMachineID != "" {
+		var dType, gitURL, gitCredentials, defaultBranch string
 		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT git_url, git_credentials, default_branch, COALESCE(type,'') FROM domain WHERE id=?`, domainID).
-			Scan(&gitURL, &gitCredentials, &defaultBranch, &domainType)
-		// A scratch domain has no repo for the compile agent to inspect —
-		// it compiles from the policy text alone in its proc dir (the
-		// compile prompt carries the scratch variant).
-		if domainType != "scratch" && gitURL == "" {
-			d.failProcessorRun(ctx, q, "compile run: domain has no git_url")
-			return
+			`SELECT COALESCE(type,''), git_url, git_credentials, default_branch FROM domain WHERE id=?`, domainID).
+			Scan(&dType, &gitURL, &gitCredentials, &defaultBranch)
+		var args []string
+		_ = json.Unmarshal([]byte(argsJSON), &args)
+		var rtEnv map[string]string
+		_ = json.Unmarshal([]byte(rtEnvJSON), &rtEnv)
+		agentEnv, _ := d.loadAgentEnv(ctx, agentID)
+		dispatchEnv := map[string]string{}
+		for k, v := range rtEnv {
+			dispatchEnv[k] = v
 		}
-		if domainType == "scratch" {
-			if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
-				d.failProcessorRun(ctx, q, "mkdir compile workdir: "+err.Error())
-				return
-			}
-		} else {
-			unlock := d.lockDomain(domainID)
-			if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
-				unlock()
-				d.failProcessorRun(ctx, q, "prepare compile repo: "+err.Error())
-				return
-			}
-			repo := domainRepoPath(domainID)
-			if defaultBranch == "" {
-				defaultBranch = "main"
-			}
-			// Fresh refs before the checkout — a corrected default_branch must
-			// take effect on the next compile, not the one after (parity with the
-			// worker path's fetch).
-			if out, err := exec.CommandContext(ctx, "git", "-C", repo, "fetch", "origin").CombinedOutput(); err != nil {
-				unlock()
-				d.failProcessorRun(ctx, q, "compile fetch: "+err.Error()+": "+string(out))
-				return
-			}
-			if out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", runRowWorkdir, "origin/"+defaultBranch).CombinedOutput(); err != nil {
-				unlock()
-				d.failProcessorRun(ctx, q, "compile worktree add: "+err.Error()+": "+string(out))
-				return
-			}
-			unlock()
-			defer func() {
-				unlock := d.lockDomain(domainID)
-				_, _ = exec.CommandContext(context.Background(), "git", "-C", repo, "worktree", "remove", "--force", runRowWorkdir).CombinedOutput()
-				unlock()
-			}()
+		for k, v := range agentEnv {
+			dispatchEnv[k] = v
 		}
-	} else if err := os.MkdirAll(runRowWorkdir, 0o755); err != nil {
-		d.failProcessorRun(ctx, q, "mkdir workdir: "+err.Error())
+		d.dispatchToMachine(ctx, q, link.RunDispatchParams{
+			RunID: q.RunID, AgentID: q.AgentID, Attempt: q.Attempt, Token: q.Token,
+			Prompt: prompt, Proc: true, Scratch: dType == "scratch",
+			ArtifactFiles: []string{"checks.json", "strength.txt", "metrics.json"},
+			DomainID: domainID, GitURL: gitURL, GitCredentials: gitCredentials, DefaultBranch: defaultBranch,
+			ACPSpawn: args, Env: dispatchEnv,
+		}, procMachineID)
 		return
 	}
 
-	var args []string
-	_ = json.Unmarshal([]byte(argsJSON), &args)
-	var rtEnv map[string]string
-	_ = json.Unmarshal([]byte(rtEnvJSON), &rtEnv)
-	agentEnv, _ := d.loadAgentEnv(ctx, agentID)
-	taskEnv := os.Environ()
-	for k, v := range agentEnv {
-		taskEnv = append(taskEnv, k+"="+v)
+	// Legacy transports have no executor anymore (the unified model
+	// dispatches everything to machines).
+	d.failProcessorRun(ctx, q, "this runtime has no machine — run `agentwork connect` and point the agent at a machine-owned runtime")
+}
+
+// storeProcessorArtifacts completes a compile run from its FILE artifacts
+// (checks.json + strength.txt + metrics.json) — the shared path for the
+// local execution and the machine-dispatched upload (CLI 分支 Phase 2).
+// The platform reads structured side effects, never agent stdout.
+func (d *Daemon) storeProcessorArtifacts(ctx context.Context, q *service.ClaimedRow, domainID string, files map[string]string, summary string) {
+	if files == nil {
+		files = map[string]string{}
 	}
-	// The processor agent is not a goal worker: no AGENTWORK_GOAL_ID/RUN_ID
-	// injection (it should not call back into the platform), just the server
-	// URL and its own identity for orientation.
-	serverURL, err := d.advertisedBaseURL(ctx, procAgentworkURL)
-	if err != nil {
-		d.failProcessorRun(ctx, q, err.Error())
+	raw, ok := files["checks.json"]
+	if !ok || strings.TrimSpace(raw) == "" {
+		d.failProcessorRun(ctx, q, "checks.json: artifact missing — the compile agent did not produce it")
 		return
 	}
-	taskEnv = append(taskEnv, "AGENTWORK_SERVER_URL="+serverURL)
-
-	conn, err := runtime.Open(ctx, runtime.Spec{
-		Transport: transport, Executable: execPath, Args: args, Endpoint: endpoint, Env: rtEnv,
-		Cwd: runRowWorkdir, // the processor's scratch dir — see Spec.Cwd
-	}, taskEnv)
-	if err != nil {
-		d.failProcessorRun(ctx, q, "open transport: "+err.Error())
+	var checks service.Checks
+	if err := json.Unmarshal([]byte(raw), &checks); err != nil {
+		d.failProcessorRun(ctx, q, "parse checks.json: "+err.Error())
 		return
 	}
-	defer conn.Close()
-
-	// Unified execution model (DESIGN.md 决策 4-8): a processor run gets the
-	// same client execution environment + MCP workspace server + Workspace
-	// contract as a worker run. Without the client handler the ACP handshake
-	// declares no fs/terminal capabilities and the processor agent's
-	// write/shell tools are rejected ("agent→client RPC not configured") —
-	// the compile run cannot land its checks.json artifact (a live failure).
-	env := newRunEnvironment(q.RunID, "", q.AgentID, runRowWorkdir, serverURL, q.Token)
-	defer env.tm.cleanup()
-	d.mu.Lock()
-	mcpExec := mcp.NewExecutor(runRowWorkdir, env.runEnv(nil), env.tm)
-	mcpExec.SetCollaboration(q.GoalID, q.AgentID, q.RunID, d.commentSvc, d.goalSvc, d.runSvc, d.agentSvc, d.squadSvc)
-	d.mcpExecs[q.RunID] = mcpExec
-	d.mu.Unlock()
-	defer func() {
-		d.mu.Lock()
-		delete(d.mcpExecs, q.RunID)
-		d.mu.Unlock()
-	}()
-	// Processor runs are one-shot (no goal session) — the full contract.
-	prompt += worktreeGuidance(runRowWorkdir)
-	// The artifact's ABSOLUTE path: a processor's scratch dir is opaque to the
-	// agent — told to "write intake.json in the current directory", it guessed
-	// (a write_file call missing its path argument, then a raw shell heredoc
-	// that terminal_create cannot execute — the command must be an
-	// executable). State the file's full path so write_file's required path
-	// argument is unambiguous.
-	prompt += fmt.Sprintf("\n\nThe artifact file's ABSOLUTE path: %s\n(Write to this exact path with agentwork_write_file's path argument; do NOT guess the working directory, do NOT use shell redirection.)\n",
-		filepath.Join(runRowWorkdir, "intake.json"))
-
-	backend, err := d.protoReg.Get(provider)
-	if err != nil {
-		d.failProcessorRun(ctx, q, "provider "+provider+": "+err.Error())
+	if len(checks.Verify) == 0 && len(checks.Guards) == 0 {
+		d.failProcessorRun(ctx, q, "checks.json: no verify or guards produced")
 		return
 	}
-	// Time bounds, same as worker runs (a compile agent stuck on a slow pip
-	// index was running UNBOUNDED — no maxRunDuration, no idle watchdog, so
-	// the run sat "running" forever and the page showed 编译中… indefinitely;
-	// a live 15+ minute hang on pypi.org). The domain's max_run_duration is
-	// the budget (default 2h); the idle watchdog cuts silent stalls, and the
-	// terminal manager's activeCount widens its window like a worker run.
-	maxRunDuration := 7200
-	if domainID != "" {
-		var d2 int
-		_ = d.st.DB().QueryRowContext(ctx, `SELECT max_run_duration FROM domain WHERE id=?`, domainID).Scan(&d2)
-		if d2 > 0 {
-			maxRunDuration = d2
+	strength := "medium"
+	if sraw, ok := files["strength.txt"]; ok {
+		if v := strings.TrimSpace(sraw); v == "strong" || v == "medium" || v == "weak" {
+			strength = v
 		}
 	}
-	var lastActivity atomic.Int64
-	lastActivity.Store(time.Now().UnixNano())
-	var inFlightTools atomic.Int32
-	procCtx, procCancel := context.WithTimeout(ctx, time.Duration(maxRunDuration)*time.Second)
-	defer procCancel()
-	go d.runIdleWatchdog(procCtx, &lastActivity, &inFlightTools, procCancel, q.RunID, env.tm.activeCount)
-
-	run, err := backend.Execute(procCtx, proto.ExecuteSpec{
-		Conn:          conn,
-		Cwd:           runRowWorkdir,
-		Prompt:        prompt,
-		ClientHandler: env,
-		McpServers: append([]acp.McpServer{{
-			Type: "http", Name: "agentwork", URL: serverURL + "/mcp/" + q.RunID,
-		}}, d.extraMcpServers(ctx, q.AgentID)...),
-	})
-	if err != nil {
-		d.failProcessorRun(ctx, q, "execute: "+err.Error())
+	checksJSON, _ := json.Marshal(checks)
+	// The compiled policy ALWAYS lands (a fresh compile cycle replaces the
+	// previous one wholesale — DESIGN.md §5.3), and resets the freeze
+	// stamp: the domain returns to the pending-confirmation state so the
+	// owner's confirmation card reappears with the NEW product.
+	//
+	// The evolution-metrics baseline (decision 2-15) is recorded alongside
+	// (metrics.json — test count / coverage the processor measured at
+	// compile time). Only the FIRST compile stamps the baseline.
+	baseline := "{}"
+	if raw, ok := files["metrics.json"]; ok {
+		var m struct {
+			TestCount int     `json:"test_count"`
+			Coverage  float64 `json:"coverage"`
+		}
+		if json.Unmarshal([]byte(raw), &m) == nil && (m.TestCount > 0 || m.Coverage > 0) {
+			b, _ := json.Marshal(map[string]any{"test_count": m.TestCount, "coverage": m.Coverage})
+			baseline = string(b)
+		}
+	}
+	if _, err := d.st.DB().ExecContext(ctx,
+		`UPDATE domain SET checks=?, verification_strength=?, checks_compiled_at='',
+		        metrics_baseline=CASE WHEN metrics_baseline='{}' OR metrics_baseline='' THEN ? ELSE metrics_baseline END
+		 WHERE id=?`,
+		string(checksJSON), strength, baseline, domainID); err != nil {
+		d.failProcessorRun(ctx, q, "store compiled checks: "+err.Error())
 		return
 	}
-	for ev := range run.Events {
-		lastActivity.Store(time.Now().UnixNano())
-		d.persistEvent(ctx, q.RunID, ev)
-		d.trackToolInflight(&inFlightTools, ev)
-		d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
-			"run_id": q.RunID, "event": ev,
-		}})
+	if _, err := d.st.DB().ExecContext(ctx,
+		`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
+		summary, nowStr(), q.RunID); err != nil {
+		logging.Infof("daemon: finish processor run %s: %v", q.RunID, err)
 	}
-	result, ok := <-run.Result
-	if !ok {
-		result = proto.Result{Status: proto.StatusFailed, Output: "backend closed result channel"}
-	}
-	d.flushRunMessages(ctx, q.RunID)
-	switch result.Status {
-	case proto.StatusCompleted:
-		// Read the compiled policy from the run workdir (file = structured
-		// side effect), validate, and store on the domain unfrozen.
-		checksPath := filepath.Join(runRowWorkdir, "checks.json")
-		raw, err := os.ReadFile(checksPath)
-		if err != nil {
-			d.failProcessorRun(ctx, q, "read checks.json: "+err.Error())
-			return
-		}
-		var checks service.Checks
-		if err := json.Unmarshal(raw, &checks); err != nil {
-			d.failProcessorRun(ctx, q, "parse checks.json: "+err.Error())
-			return
-		}
-		if len(checks.Verify) == 0 && len(checks.Guards) == 0 {
-			d.failProcessorRun(ctx, q, "checks.json: no verify or guards produced")
-			return
-		}
-		strength := "medium"
-		if sraw, err := os.ReadFile(filepath.Join(runRowWorkdir, "strength.txt")); err == nil {
-			if v := strings.TrimSpace(string(sraw)); v == "strong" || v == "medium" || v == "weak" {
-				strength = v
-			}
-		}
-		checksJSON, _ := json.Marshal(checks)
-		// The compiled policy ALWAYS lands (a fresh compile cycle replaces
-		// the previous one wholesale — DESIGN.md §5.3), and resets the
-		// freeze stamp: the domain returns to the pending-confirmation state
-		// so the owner's confirmation card reappears with the NEW product.
-		// (Regression: the old UPDATE was gated on checks_compiled_at='',
-		// which made a recompile AFTER freezing a silent no-op — the new
-		// product was discarded and runs kept verifying with the old policy.)
-		//
-		// The evolution-metrics baseline (decision 2-15) is recorded alongside
-		// (metrics.json — test count / coverage the processor measured at
-		// compile time). Only the FIRST compile stamps the baseline: later
-		// recompiles refresh the policy, not the evolution baseline.
-		baseline := "{}"
-		if raw, err := os.ReadFile(filepath.Join(runRowWorkdir, "metrics.json")); err == nil {
-			var m struct {
-				TestCount int     `json:"test_count"`
-				Coverage  float64 `json:"coverage"`
-			}
-			if json.Unmarshal(raw, &m) == nil && (m.TestCount > 0 || m.Coverage > 0) {
-				b, _ := json.Marshal(map[string]any{"test_count": m.TestCount, "coverage": m.Coverage})
-				baseline = string(b)
-			}
-		}
-		if _, err := d.st.DB().ExecContext(ctx,
-			`UPDATE domain SET checks=?, verification_strength=?, checks_compiled_at='',
-			        metrics_baseline=CASE WHEN metrics_baseline='{}' OR metrics_baseline='' THEN ? ELSE metrics_baseline END
-			 WHERE id=?`,
-			string(checksJSON), strength, baseline, domainID); err != nil {
-			d.failProcessorRun(ctx, q, "store compiled checks: "+err.Error())
-			return
-		}
-		if _, err := d.st.DB().ExecContext(ctx,
-			`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
-			result.Output, nowStr(), q.RunID); err != nil {
-			logging.Infof("daemon: finish processor run %s: %v", q.RunID, err)
-		}
-		d.bus.Publish(ctx, events.Event{Topic: "domain:compiled", Payload: map[string]any{
-			"domain_id": domainID, "run_id": q.RunID,
-		}})
-		logging.Infof("daemon: domain %s acceptance policy compiled (strength=%s)", domainID, strength)
-	case proto.StatusCancelled:
-		d.failProcessorRun(ctx, q, "idle watchdog: "+result.Output)
-	case proto.StatusFailed, proto.StatusAborted:
-		d.failProcessorRun(ctx, q, result.Output)
-	}
+	d.bus.Publish(ctx, events.Event{Topic: "domain:compiled", Payload: map[string]any{
+		"domain_id": domainID, "run_id": q.RunID,
+	}})
+	logging.Infof("daemon: domain %s acceptance policy compiled (strength=%s)", domainID, strength)
 }
 
 // failProcessorRun marks a processor run failed and notifies the frontend that
@@ -2596,32 +1860,6 @@ Your worktree lives on the PLATFORM machine — it is not your environment:
 `, workdir)
 }
 
-// advertisedBaseURL is the base URL the platform advertises to agents: the
-// workspace MCP server (/mcp/<id>) and the CLI callback endpoint live under
-// it. A remote agent (ws/tcp runtime) cannot reach 127.0.0.1, so the owner
-// can point it at the daemon's public address via the app_settings key
-// platform.advertise_url (e.g. "https://agentwork.example.com"). Unset =
-// http://127.0.0.1:<listen port>. No dedicated UI — the settings API and IM
-// already read/write app_settings keys.
-func (d *Daemon) advertisedBaseURL(ctx context.Context, runtimeURL string) (string, error) {
-	if s := strings.TrimSpace(runtimeURL); s != "" {
-		return strings.TrimRight(s, "/"), nil
-	}
-	var raw string
-	_ = d.st.DB().QueryRowContext(ctx, `SELECT value FROM app_settings WHERE key='platform.advertise_url'`).Scan(&raw)
-	if s := strings.TrimSpace(raw); s != "" {
-		return strings.TrimRight(s, "/"), nil
-	}
-	addr := d.addr
-	if addr == "" {
-		addr = defaultListenAddr
-	}
-	_, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", fmt.Errorf("parse listen addr %q: %w", addr, err)
-	}
-	return "http://" + net.JoinHostPort("127.0.0.1", port), nil
-}
 
 // nowStr is the daemon-side UTC timestamp helper (service.now is private).
 func nowStr() string { return time.Now().UTC().Format(time.RFC3339Nano) }

@@ -24,7 +24,7 @@ func seedCtx(t *testing.T) (*Daemon, *store.Store, string, string) {
 	}
 	t.Cleanup(func() { st.Close() })
 	d := &Daemon{st: st}
-	rt, err := service.NewRuntimeService(st).Create(context.Background(), service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(context.Background(), service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatal(err)
 	}

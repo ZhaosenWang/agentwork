@@ -133,11 +133,11 @@ func (s *MachineService) UpsertProbeRuntimes(ctx context.Context, machineID, mac
 		argsJSON, _ := json.Marshal(c.ACPSpawn)
 		name := c.Name + "@" + machineName
 		if _, err := s.st.DB().ExecContext(ctx,
-			`INSERT INTO runtime (id,name,transport,provider,executable,args,endpoint,env,agentwork_url,machine_id,created_at)
-			 VALUES (?,?,'agentwork','acp','',?, '', '{}', '', ?, ?)
+			`INSERT INTO runtime (id,name,machine_id,args,env,created_at)
+			 VALUES (?,?,?,?,'{}',?)
 			 ON CONFLICT(name) DO UPDATE SET
-			   transport='agentwork', provider='acp', args=excluded.args, machine_id=excluded.machine_id`,
-			newID(), name, string(argsJSON), machineID, now()); err != nil {
+			   args=excluded.args, machine_id=excluded.machine_id`,
+			newID(), name, machineID, string(argsJSON), now()); err != nil {
 			return fmt.Errorf("upsert probe runtime %s: %w", name, err)
 		}
 	}

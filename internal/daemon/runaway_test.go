@@ -36,7 +36,7 @@ func TestReapRunawayRun(t *testing.T) {
 		ctx:              context.Background(),
 	}
 
-	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", Transport: "stdio", Provider: "acp", Executable: "/bin/true"})
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
 	if err != nil {
 		t.Fatalf("seed runtime: %v", err)
 	}

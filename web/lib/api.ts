@@ -1,4 +1,4 @@
-import type { Runtime, RuntimeTestResult, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem } from "./types";
+import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem } from "./types";
 
 // 默认走同源 /backend/*（Next rewrites 转发到本机 daemon 7373）——反代出
 // 去时浏览器无需直连 daemon。本地直连场景可显式设置 NEXT_PUBLIC_API_URL。
@@ -31,8 +31,6 @@ export const createRuntime = (body: Omit<Runtime, "id" | "created_at">) =>
   api<Runtime>("/runtimes", { method: "POST", body: JSON.stringify(body) });
 export const deleteRuntime = (id: string) =>
   api<void>(`/runtimes/${id}`, { method: "DELETE" });
-export const testRuntime = (id: string) =>
-  api<RuntimeTestResult>(`/runtimes/${id}/test`, { method: "POST" });
 
 // ── Agent ──
 export const listAgents = () => api<Agent[]>("/agents");

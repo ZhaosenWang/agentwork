@@ -32,21 +32,10 @@ export interface Machine {
 export interface Runtime {
   id: string;
   name: string;
-  transport: string; // stdio | ws | tcp
-  provider: string;  // acp | jsonl | jsonrpc
-  executable: string;
-  args: string[];
-  endpoint: string;
+  machine_id: string; // the registered machine that executes this runtime's runs
+  args: string[]; // acp_spawn — how the machine starts the CLI
   env: Record<string, string>;
-  agentwork_url: string; // advertised platform base URL for this runtime; '' = http://127.0.0.1:<port>
   created_at: string;
-}
-
-export interface RuntimeTestResult {
-  ok: boolean;
-  error?: string;
-  latency_ms: number;
-  details?: string;
 }
 
 // McpServer mirrors acp.McpServer: an extra MCP server the agent's runs

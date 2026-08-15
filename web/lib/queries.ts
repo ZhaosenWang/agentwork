@@ -5,7 +5,6 @@ import {
   listRuntimes,
   createRuntime,
   deleteRuntime,
-  testRuntime,
   listMachines,
   listSkills,
   createSkill,
@@ -138,9 +137,6 @@ export function useDeleteRuntime() {
     mutationFn: deleteRuntime,
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.runtimes }),
   });
-}
-export function useTestRuntime() {
-  return useMutation({ mutationFn: testRuntime });
 }
 
 // ── Agent hooks ──

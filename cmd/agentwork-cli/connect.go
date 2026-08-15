@@ -122,7 +122,7 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	// Phase 2: the machine executes dispatched runs over THIS link — wire
 	// the executor's handlers, and cancel everything in flight when the
 	// link dies (the platform reclaims them via RecoverStuckRunning).
-	exec := newExecutor(peer)
+	exec := newExecutor(peer, st.Server)
 	defer exec.shutdown()
 	peer.Handle(link.MethodRunDispatch, exec.handleDispatch)
 	peer.Handle(link.MethodRunCancel, exec.handleCancel)
