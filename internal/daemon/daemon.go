@@ -1848,6 +1848,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// anchor (comment id) is the get_comments(after=) handle.
 	var wakeWho, wakeAnchor, wakeContent string
 	switch {
+	case runRole == "owner" && triggerCommentID != "" && triggerAuthor == "human":
+		// A comment-triggered reopen (决策 4-1 修订): the human's follow-up
+		// comment IS this turn's ask — same mention shape as a consult.
+		wakeWho = "the user"
+		wakeAnchor = triggerCommentID
+		wakeContent = "> " + triggerCommentContent
 	case consultRun:
 		wakeWho = triggerAuthorName
 		if wakeWho == "" {
@@ -2202,6 +2208,24 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			ev := buildEvidence(ctx, runRowWorkdir, baseSHA, report, verifyReport, guardReport)
 			if _, err := d.st.DB().ExecContext(ctx, `UPDATE run SET evidence=? WHERE id=?`, ev, q.RunID); err != nil {
 				logging.Infof("daemon: store evidence for run %s: %v", q.RunID, err)
+			}
+		}
+		// A follow-up round with ZERO changes returns the goal to done
+		// (决策 4-1 修订): the human's comment was answered in the feed —
+		// nothing to merge, nothing new to approve. The signal is STRUCTURAL:
+		// a HUMAN-authored trigger comment (the reopen stamped it on the run)
+		// + zero git changes. Re-parking popped the approval card again (the
+		// live failure: a Q&A round re-entered review). The promote is
+		// conditional and happens BEFORE finishRunOK so the reconcile's park
+		// UPDATE (status NOT IN done) finds nothing to park.
+		if triggerAuthor == "human" && !scratchDomain && !readOnlyRun {
+			head := strings.TrimSpace(mustGitRun(ctx, runRowWorkdir, "rev-parse", "HEAD"))
+			if head == strings.TrimSpace(baseSHA) {
+				if ok, err := d.goalSvc.CompleteFollowUp(ctx, q.GoalID); err != nil {
+					logging.Infof("daemon: complete follow-up for %s: %v", q.GoalID, err)
+				} else if ok {
+					logging.Infof("daemon: follow-up run %s produced no changes — goal %s back to done", q.RunID, q.GoalID)
+				}
 			}
 		}
 		d.finishRunOK(ctx, q, report)

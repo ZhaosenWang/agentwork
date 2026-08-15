@@ -263,7 +263,7 @@ func (h *Handlers) reopenGoal(w http.ResponseWriter, r *http.Request) {
 		Reason string `json:"reason"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	out, err := h.Goal.Reopen(r.Context(), r.PathValue("id"), body.Reason)
+	out, err := h.Goal.Reopen(r.Context(), r.PathValue("id"), body.Reason, "")
 	writeJSON(w, out, err)
 }
 

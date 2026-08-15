@@ -1570,7 +1570,40 @@ func (s *GoalService) Activate(ctx context.Context, goalID string) (*Goal, error
 // reopen-and-comment): back to active with the reason as handoff_note, and a
 // fresh run on the current assignee (attempt resets — a reopen is a new
 // human-directed cycle, like a reject).
-func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal, error) {
+// CompleteFollowUp closes a follow-up round that produced NO changes
+// (决策 4-1 修订): the human's comment was answered in the feed — nothing to
+// merge, nothing new to approve — so the goal returns to done instead of
+// re-parking in review. The DAEMON calls this only when its structural
+// judgment holds (run has a HUMAN-authored trigger comment + zero changes);
+// the transition itself is a plain conditional on status='active'.
+func (s *GoalService) CompleteFollowUp(ctx context.Context, goalID string) (bool, error) {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='done', handoff_note='', review_request='' WHERE id=? AND status='active'`,
+		goalID)
+	if err != nil {
+		return false, fmt.Errorf("complete follow-up: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n == 0 {
+		return false, nil
+	}
+	_, _ = s.st.DB().ExecContext(ctx,
+		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'follow_up_completed','{}',?)`,
+		newID(), goalID, "system", "", now())
+	return true, nil
+}
+
+// Reopen returns a terminal goal to active with a fresh owner run. When the
+// reopen came from a human COMMENT (决策 4-1), triggerCommentID names that
+// comment — the spawn carries it as the run's trigger with an EXPLICIT
+// owner role (the human-authored trigger would derive 'consult'). The
+// trigger is the STRUCTURAL marker of a follow-up run: its presence (not
+// any handoff-note string) lets the daemon distinguish "the human asked a
+// follow-up" from first-time work.
+func (s *GoalService) Reopen(ctx context.Context, goalID, reason, triggerCommentID string) (*Goal, error) {
 	g, err := s.Get(ctx, goalID)
 	if err != nil {
 		return nil, err
@@ -1601,9 +1634,10 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal,
 		newID(), goalID, "human", "", "{}", now()); err != nil {
 		return nil, fmt.Errorf("insert activity: %w", err)
 	}
-	// The reopen reason is the human's words — land it in the comment feed
-	// so the conversation stays complete (and the next run's prompt injects
-	// it via the recent-human-comments mechanism).
+	// A non-empty reason (the explicit Reopen button's words) lands in the
+	// feed. The comment-triggered reopen passes NO reason — the human's
+	// comment itself is already the reason (and the run's trigger); a
+	// duplicate "重开：…" comment was feed noise.
 	if reason != "" {
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,'',NULL,?,?)`,
@@ -1612,10 +1646,17 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason string) (*Goal,
 		}
 	}
 	// Fresh run on the current assignee (the unified owner-run spawn, P0.5;
-	// human-assigned goals stay manual — the intent helper no-ops for them).
-	_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "", "", "active")
-	if err != nil {
-		return nil, fmt.Errorf("enqueue after reopen: %w", err)
+	// human-assigned goals stay manual). A comment-triggered reopen stamps
+	// the run with the comment as its trigger + an explicit owner role —
+	// the follow-up marker the daemon reads structurally.
+	var runEv *events.Event
+	if agentID, isLeader, squadID, err := s.runSvc.resolveLeaderTx(ctx, tx, g.AssigneeType, g.AssigneeID); err != nil {
+		return nil, fmt.Errorf("resolve assignee after reopen: %w", err)
+	} else if agentID != "" {
+		_, runEv, err = s.runSvc.enqueueTx(ctx, tx, goalID, agentID, 1, isLeader, squadID, triggerCommentID, "", "", "owner")
+		if err != nil {
+			return nil, fmt.Errorf("enqueue after reopen: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

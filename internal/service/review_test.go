@@ -428,7 +428,7 @@ func TestReopenReasonInFeed(t *testing.T) {
 	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='failed' WHERE id=?`, g.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := gs.Reopen(ctx, g.ID, "重试一下"); err != nil {
+	if _, err := gs.Reopen(ctx, g.ID, "重试一下", ""); err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
 	comments, _ := cs.List(ctx, g.ID)

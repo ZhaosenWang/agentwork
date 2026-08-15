@@ -250,7 +250,7 @@ func TestReopenFailedGoal(t *testing.T) {
 	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='failed' WHERE id=?`, g.ID); err != nil {
 		t.Fatal(err)
 	}
-	got, err := gs.Reopen(ctx, g.ID, "重试一下")
+	got, err := gs.Reopen(ctx, g.ID, "重试一下", "")
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -262,7 +262,7 @@ func TestReopenFailedGoal(t *testing.T) {
 		t.Fatalf("reopen must enqueue a fresh run at attempt 1, got %+v", runs)
 	}
 	// Done goals cannot be reopened.
-	if _, err := gs.Reopen(ctx, g.ID, "x"); err == nil {
+	if _, err := gs.Reopen(ctx, g.ID, "x", ""); err == nil {
 		t.Fatal("active goal must not be reopenable")
 	}
 }
@@ -366,5 +366,72 @@ func TestDeleteCarriesRunningRunIDs(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("goal:deleted event never arrived")
+	}
+}
+
+// TestCommentReopenStampsTriggerAndOwnerRole (决策 4-1 修订): a
+// comment-triggered reopen's run carries the comment as its trigger with an
+// EXPLICIT owner role — the structural follow-up marker (a human-authored
+// trigger would derive 'consult'; the marker lets the daemon distinguish
+// follow-ups without any string matching).
+func TestCommentReopenStampsTriggerAndOwnerRole(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	owner := seedAgent(t, st, "owner")
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "do it", AssigneeType: "agent", AssigneeID: owner, Status: "active", DomainID: seedDomain(t, st)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Terminate (dropping the create-time queued run — the terminal
+	// transition does this in production; the reopen must not coalesce into
+	// a stale pending run), then reopen via a human comment.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='done' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='cancelled', cancel_reason='goal_terminal' WHERE goal_id=? AND status='queued'`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.Reopen(ctx, g.ID, "", "cmt-1"); err != nil {
+		t.Fatal(err)
+	}
+	var role, trigger string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT role, trigger_comment_id FROM run WHERE goal_id=? AND status='queued' ORDER BY queued_at DESC LIMIT 1`, g.ID).Scan(&role, &trigger); err != nil {
+		t.Fatal(err)
+	}
+	if role != "owner" {
+		t.Fatalf("the reopened run must be an owner run, got %q", role)
+	}
+	if trigger != "cmt-1" {
+		t.Fatalf("the reopened run must carry the comment as its trigger, got %q", trigger)
+	}
+	// No duplicate "重开：" comment — the human's comment itself is the
+	// reason and the trigger.
+	var dup int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND content LIKE '重开：%'`, g.ID).Scan(&dup); err != nil {
+		t.Fatal(err)
+	}
+	if dup != 0 {
+		t.Fatalf("a comment-triggered reopen must not duplicate the reason, got %d", dup)
+	}
+	// CompleteFollowUp: the plain conditional promote (called by the daemon
+	// when the follow-up produced no changes).
+	after, _ := gs.Get(ctx, g.ID)
+	if after.Status != "active" {
+		t.Fatalf("reopen must activate the goal, got %q", after.Status)
+	}
+	ok, err := gs.CompleteFollowUp(ctx, g.ID)
+	if err != nil || !ok {
+		t.Fatalf("CompleteFollowUp: ok=%v err=%v", ok, err)
+	}
+	after, _ = gs.Get(ctx, g.ID)
+	if after.Status != "done" {
+		t.Fatalf("a zero-change follow-up must return the goal to done, got %q", after.Status)
+	}
+	// A second call is a no-op (already done).
+	if ok, _ := gs.CompleteFollowUp(ctx, g.ID); ok {
+		t.Fatal("a done goal must not be re-promoted")
 	}
 }

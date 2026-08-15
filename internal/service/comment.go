@@ -204,10 +204,15 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 			break
 		}
 	}
+	reopened := false
 	if isTerminal && c.AuthorType == "human" && hasActionMention {
-		if _, err := s.goalSvc.Reopen(ctx, c.GoalID, "评论触发重开："+c.Content); err == nil {
+		if _, err := s.goalSvc.Reopen(ctx, c.GoalID, "", c.ID); err == nil {
 			// Reopened → the goal is active now; the mention dispatch below
-			// proceeds against the fresh state.
+			// proceeds against the fresh state. The reopen's OWNER run already
+			// carries THIS comment as its trigger (决策 4-1 修订) — a mention
+			// to the assignee must not dispatch a second, consult-shaped run
+			// on top of it.
+			reopened = true
 			if g2, err := s.goalSvc.Get(ctx, c.GoalID); err == nil {
 				g = g2
 			}
@@ -233,6 +238,9 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 		agentCanConsult = owns
 	}
 	for _, m := range ParseMentions(c.Content) {
+		if reopened && g.AssigneeType == m.Type && g.AssigneeID == m.ID {
+			continue // the reopen's owner run answers THIS comment already
+		}
 		switch m.Type {
 		case "agent":
 			if s.runSvc == nil || !agentCanConsult {
