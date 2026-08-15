@@ -54,7 +54,14 @@ func (b *Backend) OpenSession(ctx context.Context, spec proto.SessionSpec) (prot
 		conn.Close()
 		return nil, err
 	}
-	newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{Cwd: spec.Cwd, McpServers: spec.McpServers})
+	newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{
+		Cwd:        spec.Cwd,
+		McpServers: spec.McpServers,
+		// The ACP convention for naming the client: _meta._channel lets the
+		// agent's runtime identify WHERE a session came from (a multi-tenant
+		// openagent can route/group platform sessions by it).
+		Meta: map[string]any{"_channel": "agentwork"},
+	})
 	if err != nil {
 		conn.Close()
 		return nil, err
