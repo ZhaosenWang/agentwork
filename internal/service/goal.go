@@ -896,6 +896,25 @@ func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) 
 	if rc.Status != "completed" || strings.TrimSpace(rc.Summary) == "" {
 		return "", nil
 	}
+	// Dispatch-only turns leave NO flat report (决策 4-6/6-22 revised): an
+	// owner run that CREATED sub-goals and was triggered by nothing (no
+	// trigger comment — it is neither a mention nor a reply) produced only
+	// the dispatches, which the platform already announced as dispatch
+	// comments. Posting its report is a bare announcement — the feed noise
+	// the live runs showed ("已派发子任务给 coder…" flat, next to the
+	// dispatch comment itself). The human still sees the run in the run
+	// detail; the approval card carries the evidence. Sub-goal/consult/
+	// review reports are threaded replies to their triggers and stay.
+	if rc.TriggerCommentID == "" {
+		var created int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM sub_goal sg
+			WHERE sg.goal_id=? AND sg.created_at >= (SELECT COALESCE(started_at, created_at) FROM run WHERE id=?)
+			  AND sg.created_at <= (SELECT COALESCE(finished_at, created_at) FROM run WHERE id=?)`,
+			rc.GoalID, rc.RunID, rc.RunID).Scan(&created); err == nil && created > 0 {
+			return "", nil
+		}
+	}
 	id := newID()
 	var parentID any
 	if rc.TriggerCommentID != "" {

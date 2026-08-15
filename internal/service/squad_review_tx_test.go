@@ -311,3 +311,67 @@ func TestReviewPhaseDerivation(t *testing.T) {
 		t.Fatalf("terminal review runs → awaiting_approval, got %q", p)
 	}
 }
+
+// TestDispatchOnlyRunLeavesNoReport (决策 4-6/6-22 修订): an owner run whose
+// only action was dispatching sub-goals (no trigger comment — neither a
+// mention nor a reply) leaves NO flat report in the feed. The dispatch
+// comments already announced the delegation; the flat "已派发…" report was
+// the feed noise the live runs showed.
+func TestDispatchOnlyRunLeavesNoReport(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	owner := seedAgent(t, st, "owner")
+	worker := seedAgent(t, st, "worker")
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "do it", AssigneeType: "agent", AssigneeID: owner, Status: "active", DomainID: seedDomain(t, st)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The owner run is LIVE first (claimed)…
+	var ownerRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND role='owner' LIMIT 1`, g.ID).Scan(&ownerRun); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='running', started_at=? WHERE id=?`, now(), ownerRun); err != nil {
+		t.Fatal(err)
+	}
+	// …then it dispatches during its run window…
+	if _, err := gs.CreateSubGoal(ctx, g.ID, "审计用例", "补齐测试", worker, "", "agent", owner); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='completed', finished_at=? WHERE id=?`, now(), ownerRun); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	report, err := insertRunResultComment(ctx, tx, goalRunContext{
+		RunID: ownerRun, GoalID: g.ID, AgentID: owner, Role: "owner", Status: "completed",
+		Summary: "已派发子任务给 coder。",
+	})
+	if err == nil {
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report != "" {
+		t.Fatalf("a dispatch-only owner run must leave no flat report, got %q", report)
+	}
+	// The dispatch comment itself is still there (the platform's announce);
+	// the owner's bare report text must NOT appear anywhere.
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment WHERE goal_id=? AND content LIKE '%已派发子任务给 coder%'`, g.ID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("the dispatch-only owner report must not land in the feed, got %d", n)
+	}
+}
