@@ -67,6 +67,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		Domain:   s.domainSvc,
 		Settings: settingsSvc,
 		IM:       s.imConn,
+		Daemon:   s.d,
 		// M4-B: the real-time issue triggers (github + gitcode) share the
 		// poller's create path (source_ref idempotency makes webhook + poll
 		// racing safe). The shared secret lives in app_settings
@@ -193,6 +194,21 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out)
+	})
+	// The domain git check tests UNSAVED form values (create/edit dialogs),
+	// so it carries the config in the body rather than a domain id.
+	mux.HandleFunc("POST /domains/test", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			GitURL         string `json:"git_url"`
+			DefaultBranch  string `json:"default_branch"`
+			GitCredentials string `json:"git_credentials"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(s.d.TestDomainGit(r.Context(), body.GitURL, body.DefaultBranch, body.GitCredentials))
 	})
 	h.Mount(mux)
 

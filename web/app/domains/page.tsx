@@ -6,14 +6,57 @@ import {
   useDomains, useDomain, useAgents, useSquads, useCreateDomain, useUpdateDomain, useCompileDomainPolicy,
   useDomainCompileRun, useFreezeDomainChecks, useGoalEvents, useGateStats, qk,
 } from "@/lib/queries";
-import { listRunMessages } from "@/lib/api";
+import { listRunMessages, testDomainGit } from "@/lib/api";
 import { useWSEvent } from "@/lib/ws";
 import { Button, Dialog, Field, inputCls, PageHeader, Empty, Badge } from "@/components/ui";
-import type { Domain, Checks, Guard, GateRule, Run } from "@/lib/types";
+import type { Domain, DomainGitTestResult, Checks, Guard, GateRule, Run } from "@/lib/types";
 
 // cutLine truncates one backfilled line for the compile progress box.
 function cutLine(t: string): string {
   return t.length > 160 ? t.slice(0, 160) + "…" : t;
+}
+
+// GitTestButton probes UNSAVED form values (决策 6-24): repo URL + branch +
+// token read permission via `git ls-remote` on the daemon — a misconfigured
+// domain used to surface as a failed first run (clone/fetch error) instead.
+// onResult reports the outcome to the owning dialog (the create dialog
+// gates its submit on it).
+function GitTestButton({ gitUrl, defaultBranch, gitCredentials, onResult }: { gitUrl: string; defaultBranch: string; gitCredentials: string; onResult?: (r: DomainGitTestResult) => void }) {
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<DomainGitTestResult | null>(null);
+  const run = async () => {
+    setTesting(true);
+    setResult(null);
+    try {
+      const r = await testDomainGit({ git_url: gitUrl.trim(), default_branch: defaultBranch.trim(), git_credentials: gitCredentials });
+      setResult(r);
+      onResult?.(r);
+    } catch (e) {
+      const r: DomainGitTestResult = { ok: false, branch_exists: false, error: String(e), latency_ms: 0 };
+      setResult(r);
+      onResult?.(r);
+    } finally {
+      setTesting(false);
+    }
+  };
+  return (
+    <div className="flex items-center gap-2 flex-wrap">
+      <Button type="button" variant="outline" onClick={run} disabled={testing || !gitUrl.trim()}>
+        {testing ? "测试中…" : "测试连接"}
+      </Button>
+      {result && (
+        <span className={`text-xs ${result.ok && result.branch_exists ? "text-emerald-700" : "text-red-600"}`}>
+          {result.ok
+            ? (result.refs?.length ?? 0) === 0
+              ? "✗ 仓库可达，但没有任何分支（空仓库？）"
+              : result.branch_exists
+                ? `✓ 仓库可达，分支 ${result.resolved_branch} 存在`
+                : `✗ 仓库可达，但分支 ${result.resolved_branch} 不存在（远端: ${result.refs?.join(", ") || "无"}）`
+            : `✗ ${result.error}`}
+        </span>
+      )}
+    </div>
+  );
 }
 
 // renderRunEvent turns one WS run:event (proto.Event shape) into a single
@@ -673,6 +716,15 @@ function EditDomainDialog({ domain, onClose }: { domain: Domain; onClose: () => 
   const [issueAssigneeType, setIssueAssigneeType] = useState(domain.issue_assignee_type || "agent");
   const [issueAssignee, setIssueAssignee] = useState(domain.issue_assignee);
   const [issueProvider, setIssueProvider] = useState(domain.issue_provider || "github");
+  // 决策 6-24 延伸：编辑不能绕过创建门槛——git 配置动过就必须重测通过
+  // 才能保存（后端同样强制）；没动 git 配置时不拦（仓库已失效仍可改
+  // issue 处理方等无关字段）。git 字段一改，旧结果失效。
+  const [gitTestPassed, setGitTestPassed] = useState<boolean | null>(null);
+  const gitDirty =
+    gitUrl !== domain.git_url ||
+    defaultBranch !== (domain.default_branch || "main") ||
+    gitCredentials !== domain.git_credentials;
+  const gitGateBlocks = gitDirty && gitTestPassed !== true;
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -701,7 +753,7 @@ function EditDomainDialog({ domain, onClose }: { domain: Domain; onClose: () => 
       footer={
         <>
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button type="submit" form="edit-domain-form" disabled={update.isPending || !gitUrl.trim()}>
+          <Button type="submit" form="edit-domain-form" disabled={update.isPending || !gitUrl.trim() || gitGateBlocks}>
             {update.isPending ? "保存中…" : "保存"}
           </Button>
         </>
@@ -709,19 +761,23 @@ function EditDomainDialog({ domain, onClose }: { domain: Domain; onClose: () => 
     >
       <form id="edit-domain-form" onSubmit={handleSubmit} className="space-y-4">
         <Field label="Git 仓库地址">
-          <input value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} className={inputCls} required />
+          <input value={gitUrl} onChange={(e) => { setGitUrl(e.target.value); setGitTestPassed(null); }} className={inputCls} required />
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="默认分支">
-            <input value={defaultBranch} onChange={(e) => setDefaultBranch(e.target.value)} className={inputCls} />
+            <input value={defaultBranch} onChange={(e) => { setDefaultBranch(e.target.value); setGitTestPassed(null); }} className={inputCls} />
           </Field>
           <Field label="Git 身份（commit 作者）">
             <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
           </Field>
         </div>
         <Field label="平台令牌（git_credentials，远程操作身份）">
-          <input value={gitCredentials} onChange={(e) => setGitCredentials(e.target.value)} className={inputCls} type="password" placeholder="bot 账号的 token" />
+          <input value={gitCredentials} onChange={(e) => { setGitCredentials(e.target.value); setGitTestPassed(null); }} className={inputCls} type="password" placeholder="bot 账号的 token" />
         </Field>
+        <GitTestButton gitUrl={gitUrl} defaultBranch={defaultBranch} gitCredentials={gitCredentials} onResult={(r) => setGitTestPassed(r.ok && r.branch_exists)} />
+        {gitGateBlocks && (
+          <p className="text-xs text-amber-600">⚠ git 配置已改动，需重新通过「测试连接」才能保存</p>
+        )}
         <Field label="Issue 追踪（M4-B）" hint="open issue 自动变成任务，处理完自动 close">
           <input value={issueRepo} onChange={(e) => setIssueRepo(e.target.value)} className={inputCls} placeholder="owner/repo" />
           <div className="mt-2 flex gap-2 items-center">
@@ -776,6 +832,9 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const [issueProvider, setIssueProvider] = useState("github");
   const [gitCredentials, setGitCredentials] = useState("");
   const [gitIdentity, setGitIdentity] = useState("");
+  // 决策 6-24 延伸：repo 域必须通过「测试连接」才能创建（后端同样强制，
+  // 这里是前端门槛）。git 字段一改，之前的测试结果即失效——必须重测。
+  const [gitTestPassed, setGitTestPassed] = useState<boolean | null>(null);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -799,7 +858,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
       footer={
         <>
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button type="submit" form="create-domain-form" disabled={create.isPending || !name.trim() || (domainType === "repo" && !gitUrl.trim())}>
+          <Button type="submit" form="create-domain-form" disabled={create.isPending || !name.trim() || (domainType === "repo" && (!gitUrl.trim() || gitTestPassed !== true))}>
             {create.isPending ? "创建中…" : "创建"}
           </Button>
         </>
@@ -826,7 +885,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
         </Field>
         {domainType === "repo" && (
         <Field label="Git 仓库地址" hint="agentwork 会 clone 它作为共享仓库，每个 Goal 一个独立 worktree">
-          <input value={gitUrl} onChange={(e) => setGitUrl(e.target.value)} className={inputCls} placeholder="https://github.com/you/repo.git" required />
+          <input value={gitUrl} onChange={(e) => { setGitUrl(e.target.value); setGitTestPassed(null); }} className={inputCls} placeholder="https://github.com/you/repo.git" required />
         </Field>
         )}
         {domainType === "repo" && (
@@ -880,8 +939,12 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
           </div>
         </Field>
         <Field label="平台操作 token（git_credentials）" hint="bot 账号 token（决策 3-5）：issue 评论/close + git push 都以此身份出现。权限需覆盖：仓库读写（Contents）+ issues 读写。GitHub 用 fine-grained PAT 只授权本仓库；GitCode 用 token-classic">
-          <input value={gitCredentials} onChange={(e) => setGitCredentials(e.target.value)} className={inputCls} placeholder="GitHub PAT 或 GitCode token（bot 账号，需仓库+issue 读写）" type="password" />
+          <input value={gitCredentials} onChange={(e) => { setGitCredentials(e.target.value); setGitTestPassed(null); }} className={inputCls} placeholder="GitHub PAT 或 GitCode token（bot 账号，需仓库+issue 读写）" type="password" />
         </Field>
+        <GitTestButton gitUrl={gitUrl} defaultBranch="" gitCredentials={gitCredentials} onResult={(r) => setGitTestPassed(r.ok && r.branch_exists)} />
+        {gitTestPassed !== true && (
+          <p className="text-xs text-amber-600">⚠ 需先通过「测试连接」才能创建（后端同样强制）</p>
+        )}
         </>
         )}
         {create.isError && <p className="text-sm text-red-500">{String(create.error)}</p>}

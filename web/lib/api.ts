@@ -179,6 +179,10 @@ export const compileDomainPolicy = (
 // refresh (决策 6-23).
 export const getDomainCompileRun = (id: string) =>
   api<Run | null>(`/domains/${id}/compile-run`);
+// The config-time git probe (决策 6-24): tests UNSAVED form values — repo
+// URL, branch, token read permission — via `git ls-remote` on the daemon.
+export const testDomainGit = (body: { git_url: string; default_branch: string; git_credentials: string }) =>
+  api<import("./types").DomainGitTestResult>(`/domains/test`, { method: "POST", body: JSON.stringify(body) });
 export const freezeDomainChecks = (
   id: string,
   body: { checks: Checks; verification_strength: string }

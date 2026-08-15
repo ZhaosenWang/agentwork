@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/issue"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/service"
@@ -33,6 +34,11 @@ type Handlers struct {
 	// provider ("github" | "gitcode"); absent = that provider's webhook
 	// disabled (polling still covers intake).
 	IssueWebhooks map[string]*issue.WebhookHandler
+	// Daemon backs the git-side checks the CRUD layer cannot do itself
+	// (决策 6-24: the domain git test runs git ls-remote — the daemon owns
+	// git exec). nil = the check is skipped (tests construct handlers
+	// without it).
+	Daemon *daemon.Daemon
 }
 
 func (h *Handlers) Mount(mux *http.ServeMux) {
@@ -437,6 +443,31 @@ func (h *Handlers) createDomain(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	// 决策 6-24 延伸：repo 域必须通过 git 连接测试才能创建——仓库/分支/token
+	// 在配置期验证，而不是留给第一次 run 的 clone/fetch 失败。scratch 无
+	// git_url 跳过；URL 留空交给 Create 自己的校验（报错更准确）。这是
+	// 与「测试连接」按钮同一个探针（幂等只读）。
+	if d.Type != "scratch" && d.GitURL != "" && h.Daemon != nil {
+		res := h.Daemon.TestDomainGit(r.Context(), d.GitURL, d.DefaultBranch, d.GitCredentials)
+		if !res.OK {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("git 连接测试失败：%s", res.Error))
+			return
+		}
+		if !res.BranchExists {
+			if len(res.Refs) == 0 {
+				writeErr(w, http.StatusBadRequest, errors.New("仓库为空（无任何分支），无法作为项目仓库"))
+			} else {
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("分支 %q 在仓库中不存在（远端分支：%s）", res.ResolvedBranch, strings.Join(res.Refs, ", ")))
+			}
+			return
+		}
+		// 测试解析的真相落到 domain 上：body 没传分支时（创建表单无分支
+		// 字段），存远端真实 HEAD——run 建分支和交付 push 都用它。否则
+		// master 仓会存 "main"，第一次 run 从 origin/main 建分支失败。
+		if d.DefaultBranch == "" {
+			d.DefaultBranch = res.ResolvedBranch
+		}
+	}
 	out, err := h.Domain.Create(r.Context(), d)
 	writeJSON(w, out, err)
 }
@@ -462,6 +493,35 @@ func (h *Handlers) updateDomain(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	// 决策 6-24 延伸：创建门槛不能被编辑绕过——git 配置（URL/分支/token）
+	// 有变化时用同一个探针验证新值；没动 git 配置则跳过（仓库已失效时
+	// 仍允许改 issue 处理方这类无关字段）。
+	if h.Daemon != nil {
+		if old, err := h.Domain.Get(r.Context(), r.PathValue("id")); err == nil {
+			gitChanged := old.GitURL != d.GitURL ||
+				old.DefaultBranch != d.DefaultBranch ||
+				old.GitCredentials != d.GitCredentials
+			if gitChanged && d.GitURL != "" {
+				res := h.Daemon.TestDomainGit(r.Context(), d.GitURL, d.DefaultBranch, d.GitCredentials)
+				if !res.OK {
+					writeErr(w, http.StatusBadRequest, fmt.Errorf("git 连接测试失败：%s", res.Error))
+					return
+				}
+				if !res.BranchExists {
+					if len(res.Refs) == 0 {
+						writeErr(w, http.StatusBadRequest, errors.New("仓库为空（无任何分支），无法作为项目仓库"))
+					} else {
+						writeErr(w, http.StatusBadRequest, fmt.Errorf("分支 %q 在仓库中不存在（远端分支：%s）", res.ResolvedBranch, strings.Join(res.Refs, ", ")))
+					}
+					return
+				}
+				// 分支留空（表单没填）时写回远端真实 HEAD，同 create。
+				if d.DefaultBranch == "" {
+					d.DefaultBranch = res.ResolvedBranch
+				}
+			}
+		}
 	}
 	out, err := h.Domain.Update(r.Context(), r.PathValue("id"), d)
 	writeJSON(w, out, err)

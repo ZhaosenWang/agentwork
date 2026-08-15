@@ -126,6 +126,18 @@ export interface Domain {
 
 export type RunStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
+// DomainGitTestResult is the outcome of POST /domains/test (决策 6-24):
+// the config-time git probe — repo URL + branch + token read permission,
+// verified BEFORE the first run instead of failing it.
+export interface DomainGitTestResult {
+  ok: boolean;
+  branch_exists: boolean;
+  resolved_branch?: string; // the branch checked (configured, or the remote's HEAD default)
+  refs?: string[];
+  error?: string;
+  latency_ms: number;
+}
+
 export interface Run {
   id: string;
   goal_id: string;
