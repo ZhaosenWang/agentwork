@@ -177,6 +177,7 @@ CREATE TABLE IF NOT EXISTS run (
     squad_id           TEXT NOT NULL DEFAULT '',  -- the squad a leader run belongs to
     role               TEXT NOT NULL DEFAULT 'owner', -- owner|subgoal|consult|review|verify ('' for processor runs); informational snapshot, authority stays dynamic at reconcile
     wake_note          TEXT NOT NULL DEFAULT '',  -- owner spawns: WHY this run was woken, compiled in the spawn transaction (决策 6-17) — the prompt reads the run row, not the mutable goal.attention
+    wake_anchor        TEXT NOT NULL DEFAULT '',  -- the comment the wake refers to (决策 6-22: the get_comments(after=) handle; '' = no comment anchor)
     sub_goal_id        TEXT NOT NULL DEFAULT '',  -- v2 (决策 6-9): the sub-goal this run executes (1:N with sub_goal; '' for goal-level runs)
     base_ref           TEXT NOT NULL DEFAULT '',  -- subgoal runs: merge-base(goal branch, sub-goal branch) at run end — the Change revision's integration base
     head_ref           TEXT NOT NULL DEFAULT '',  -- subgoal runs: the branch head SHA the Change revision delivers

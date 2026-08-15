@@ -104,7 +104,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		d.mu.Unlock()
 	}()
 	// Intake runs are one-shot (no goal session) — the full contract.
-	prompt += worktreeGuidance(workdir, true)
+	prompt += worktreeGuidance(workdir)
 
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {

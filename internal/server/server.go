@@ -37,6 +37,18 @@ type Server struct {
 	imConn     *notify.Connector
 }
 
+// statusWriter captures the response status for request logging (the MCP
+// handshake's health is only visible through which requests return what).
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 func New(st *store.Store, bus *events.Bus, d *daemon.Daemon, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, domainSvc *service.DomainService, imConn *notify.Connector) *Server {
 	return &Server{st: st, bus: bus, d: d, hub: ws.NewHub(bus), goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, squadSvc: squadSvc, schedSvc: schedSvc, domainSvc: domainSvc, imConn: imConn}
 }
@@ -145,8 +157,13 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			http.Error(w, "no active run with this id", http.StatusNotFound)
 			return
 		}
-		logging.Infof("mcp: request on run %s", r.PathValue("runID"))
-		mcp.HTTPHandler(exec).ServeHTTP(w, r)
+		// Method + status logged: the agent's handshake is
+		// initialize → tools/list → tools/call — a silent handshake break
+		// (e.g. the tools/list step) is otherwise invisible (live: a retry
+		// run got 4 requests then never called a tool again).
+		sw := &statusWriter{ResponseWriter: w}
+		mcp.HTTPHandler(exec).ServeHTTP(sw, r)
+		logging.Infof("mcp: %s /mcp/%s -> %d", r.Method, r.PathValue("runID"), sw.status)
 	}
 	mux.HandleFunc("POST /mcp/{runID}", serveMCP)
 	mux.HandleFunc("GET /mcp/{runID}", serveMCP)

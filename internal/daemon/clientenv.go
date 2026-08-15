@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/eushing/agentwork/internal/acp"
 )
@@ -31,9 +32,14 @@ import (
 // moment.
 type runEnvironment struct {
 	runID, goalID, agentID string
-	workdir                string // the run's per-run worktree, runs/<runID> (default terminal cwd)
 	serverURL              string // AGENTWORK_SERVER_URL for the CLI
 	tm                     *terminalManager
+
+	// workdir + runID are MUTABLE on a session-scoped handler (决策 6-21):
+	// the session's env answers client RPCs across consecutive wakes, each
+	// with its own run and worktree. Guarded by mu.
+	mu      sync.RWMutex
+	workdir string // the current wake's worktree (default terminal cwd)
 }
 
 // newRunEnvironment builds the per-run handler.
@@ -48,6 +54,13 @@ func newRunEnvironment(runID, goalID, agentID, workdir, serverURL string) *runEn
 	}
 }
 
+// setRun binds the handler to the current wake's run + worktree (决策 6-21).
+func (e *runEnvironment) setRun(runID, workdir string) {
+	e.mu.Lock()
+	e.runID, e.workdir = runID, workdir
+	e.mu.Unlock()
+}
+
 // runEnv builds the environment for spawned commands: platform base +
 // agent-requested env + run context injected last (authoritative).
 func (e *runEnvironment) runEnv(agentEnv []acp.EnvVariable) []string {
@@ -56,9 +69,12 @@ func (e *runEnvironment) runEnv(agentEnv []acp.EnvVariable) []string {
 		env = append(env, kv.Name+"="+kv.Value)
 	}
 	// Run context — last wins over anything the agent passes.
+	e.mu.RLock()
+	runID := e.runID
+	e.mu.RUnlock()
 	env = append(env,
 		"AGENTWORK_GOAL_ID="+e.goalID,
-		"AGENTWORK_RUN_ID="+e.runID,
+		"AGENTWORK_RUN_ID="+runID,
 		"AGENTWORK_AGENT_ID="+e.agentID,
 		"AGENTWORK_SERVER_URL="+e.serverURL,
 	)
@@ -118,7 +134,9 @@ func deref(p *int, def int) int {
 // ── terminal ──
 
 func (e *runEnvironment) HandleCreateTerminal(ctx context.Context, req acp.CreateTerminalRequest) (*acp.CreateTerminalResponse, error) {
+	e.mu.RLock()
 	cwd := e.workdir
+	e.mu.RUnlock()
 	if req.Cwd != nil && *req.Cwd != "" {
 		cwd = *req.Cwd
 	}

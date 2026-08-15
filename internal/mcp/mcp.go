@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	gmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -53,7 +54,11 @@ type TerminalHost interface {
 // filesystem basis and the run environment for commands. The daemon builds
 // one per run and registers it under the run id.
 type Executor struct {
-	// Worktree is the run's worktree root — the execution directory.
+	// Worktree is the run's worktree root — the execution directory. Guarded
+	// by mu: a session-scoped executor (决策 6-21) swaps its worktree between
+	// wakes while MCP requests from the just-ended turn may still be in
+	// flight.
+	mu       sync.RWMutex
 	Worktree string
 	// Env is the command environment (platform base + run context, PATH
 	// prepended with the agentwork-cli dir).
@@ -79,6 +84,22 @@ type Executor struct {
 // NewExecutor binds an Executor to one run's workspace + terminal pool.
 func NewExecutor(workdir string, env []string, host TerminalHost) *Executor {
 	return &Executor{Worktree: workdir, Env: env, host: host}
+}
+
+// SetWorktree swaps the executor's execution directory (决策 6-21: a
+// session-scoped executor serves consecutive wakes of one (agent, goal)
+// pair, each with its own worktree).
+func (e *Executor) SetWorktree(dir string) {
+	e.mu.Lock()
+	e.Worktree = dir
+	e.mu.Unlock()
+}
+
+// Workdir returns the current execution directory.
+func (e *Executor) Workdir() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.Worktree
 }
 
 // SetCollaboration wires the services the collaboration tools need.
@@ -190,7 +211,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 		// mis-split command/args, e.g. 'find find .', and shell syntax needs
 		// the shell anyway).
 		argv := []string{flag, args.Command}
-		cwd := exec.Worktree
+		cwd := exec.Workdir()
 		if args.Cwd != nil && *args.Cwd != "" {
 			cwd = *args.Cwd
 		}
@@ -303,7 +324,7 @@ func NewServer(exec *Executor) *gmcp.Server {
 	}
 	gmcp.AddTool(srv, &gmcp.Tool{
 		Name:        "get_comments",
-		Description: "Read the goal's comment feed (READ-ONLY): pull NEW comments during a long run — your prompt snapshot is fixed at claim, this is the live view. Pass the last comment id you saw as `after` for incremental reads; `limit` caps the batch.",
+		Description: "Read the goal's comment feed (READ-ONLY): the feed is the SHARED context — pull it before acting when you lack background. Returns comments with their ids and authors. Pass the last comment id you saw as `after` for incremental reads; if you do NOT remember what you have seen in this session, pull WITHOUT `after` (full feed) — never guess an `after`. `limit` caps the batch.",
 	}, func(ctx context.Context, req *gmcp.CallToolRequest, args getCommentsArgs) (*gmcp.CallToolResult, any, error) {
 		if exec.commentSvc == nil {
 			return nil, nil, errors.New("collaboration not wired for this run")
@@ -550,12 +571,12 @@ func NewServer(exec *Executor) *gmcp.Server {
 		// The deterministic merge runs in THIS run's worktree (the owner's
 		// workspace — the change head is a ref in the shared bare repo, so no
 		// fetch is needed).
-		cmd := execCommand(ctx, exec.Worktree, "git", "merge", "--no-ff", ch.HeadRef, "-m", "Integrate "+ch.ID)
+		cmd := execCommand(ctx, exec.Workdir(), "git", "merge", "--no-ff", ch.HeadRef, "-m", "Integrate "+ch.ID)
 		out, mergeErr := cmd.CombinedOutput()
 		if mergeErr != nil {
 			// Conflict: abort the merge in the worktree, record the Change
 			// conflict — the assignee gets woken to rework on a new base.
-			_ = execCommand(ctx, exec.Worktree, "git", "merge", "--abort").Run()
+			_ = execCommand(ctx, exec.Workdir(), "git", "merge", "--abort").Run()
 			if err := exec.goalSvc.MarkChangeIntegrated(ctx, ch.ID, false); err != nil {
 				return nil, nil, err
 			}

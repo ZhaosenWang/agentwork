@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -146,30 +145,29 @@ func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, descript
 		return nil, fmt.Errorf("resolve assignee label: %w", err)
 	}
 	dispatchID := newID()
-	// The dispatch comment's TEMPLATE follows its MATERIALS (决策 6-18): the
-	// platform wraps the leader's own words (the sub-goal title/description)
-	// — the wrapper speaks the language those words are written in. This is
-	// the ONE platform comment carrying materials; every other platform text
-	// is English. Carries only a ONE-LINE summary: the full description is
-	// the Task section of the assignee's prompt — repeating it verbatim in
-	// the feed doubles the text for every reader (决策 6-18 派发精简).
-	lead := "Assigned you a sub-task: "
-	sep := " — "
-	if isCJK(sg.Title + sg.Description) {
-		lead = "交给你一个子任务："
-		sep = "——"
-	}
-	dispatchContent := fmt.Sprintf("[@%s](mention://agent/%s) %s**%s**", label, sg.AssigneeID, lead, sg.Title)
+	// The dispatch comment is PURE MATERIALS (决策 6-18, 2026-08 修订):
+	// the leader's own words — mention + title + one-line summary. No
+	// platform template, no language branch (the work-item wake line carries
+	// the agent's task; the comment serves the human feed + the causal
+	// anchor). The full description is the assignee's prompt — repeating it
+	// in the feed doubles the text for every reader.
+	dispatchContent := fmt.Sprintf("[@%s](mention://agent/%s) **%s**", label, sg.AssigneeID, sg.Title)
 	summary := strings.TrimSpace(sg.Description)
 	if i := strings.IndexByte(summary, '\n'); i >= 0 {
 		summary = summary[:i]
 	}
 	summary = strings.TrimSpace(summary)
 	if r := []rune(summary); len(r) > 120 {
-		summary = string(r[:120]) + "…"
+		// Cut at a word boundary, not mid-word (a live mid-sentence "…"
+		// stayed in every replayed history as a broken fragment).
+		cut := string(r[:120])
+		if i := strings.LastIndexAny(cut, "，。；、,.；: "); i > 60 {
+			cut = cut[:i]
+		}
+		summary = cut + "…"
 	}
 	if summary != "" {
-		dispatchContent += sep + summary
+		dispatchContent += " — " + summary
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
@@ -819,16 +817,4 @@ func (s *GoalService) CancelSubGoal(ctx context.Context, subGoalID string) (*Sub
 		"goal_id": sg.GoalID, "sub_goal_id": sg.ID,
 	}})
 	return sg, nil
-}
-
-// isCJK is the dispatch comment's material-language check (决策 6-18): the
-// wrapper follows the language the leader wrote the work item in. Local to
-// this one platform comment — there is no global language model.
-func isCJK(s string) bool {
-	for _, r := range s {
-		if unicode.Is(unicode.Han, r) {
-			return true
-		}
-	}
-	return false
 }

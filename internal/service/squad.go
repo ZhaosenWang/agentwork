@@ -340,10 +340,11 @@ ends the platform automatically pulls the reviewers in, then the human
 approves; you never hand work to a reviewer yourself.
 
 FINAL MESSAGE = your run report: your final message is posted to the feed
-verbatim when your turn ends. If this turn only dispatched sub-goals, keep
-it MINIMAL (e.g. one line of plan context at most) — the platform already
-wrote the dispatch comments, so do NOT repeat the delegation, and never
-write agent IDs into it (the feed is read by humans).
+verbatim when your turn ends. If this turn only dispatched sub-goals, end
+with AT MOST one short sentence, e.g. "派发完成，等待变更。" — the platform
+already wrote the dispatch comments, so do NOT repeat the delegation, do
+NOT recap the plan, and NEVER write ids (goal/sub-goal/agent/squad ids are
+system handles — humans cannot use them and read the feed as prose).
 `
 
 const squadParentStatusOwned = `You drive this goal's execution. When you finish your part, END your turn —

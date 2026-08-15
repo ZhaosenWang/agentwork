@@ -41,7 +41,15 @@ func commitRunChanges(ctx context.Context, workdir, identity string, excludes []
 	if strings.TrimSpace(status) == "" {
 		return nil // clean — nothing to commit
 	}
-	args := []string{"add", "-A", "--", ".", ":(exclude)AGENTWORK.md"}
+	args := []string{"add", "-A", "--", "."}
+	// AGENTWORK.md is the platform's own namespace — exclude it UNLESS the
+	// repo's .gitignore already ignores it. An explicit :(exclude) pathspec
+	// naming a git-ignored file makes git exit 1 ("paths are ignored ... use
+	// -f" — live: the coder's run failed at commit once the repo's .gitignore
+	// gained AGENTWORK.md; the add itself would silently skip it anyway).
+	if _, err := gitRun(ctx, workdir, "check-ignore", "-q", "AGENTWORK.md"); err != nil {
+		args = append(args, ":(exclude)AGENTWORK.md")
+	}
 	for _, e := range excludes {
 		args = append(args, ":(exclude)"+e)
 	}

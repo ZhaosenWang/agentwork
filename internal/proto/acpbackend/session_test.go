@@ -1,0 +1,193 @@
+package acpbackend
+
+import (
+	"context"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/eushing/agentwork/internal/acp"
+	"github.com/eushing/agentwork/internal/proto"
+)
+
+// ── Session backend (决策 6-21): one ACP session, many prompts ──
+
+// fakeAgent is a minimal in-memory ACP agent: it answers each prompt with a
+// canned message and records what it was asked.
+type fakeAgent struct {
+	mu        sync.Mutex
+	prompts   []string
+	sessionID acp.SessionId
+}
+
+func (f *fakeAgent) OnInitialize(ctx context.Context, req acp.InitializeRequest) (*acp.InitializeResponse, error) {
+	return &acp.InitializeResponse{ProtocolVersion: 1, AgentCapabilities: acp.AgentCapabilities{LoadSession: true}}, nil
+}
+func (f *fakeAgent) OnNewSession(ctx context.Context, req acp.NewSessionRequest) (*acp.NewSessionResponse, error) {
+	f.sessionID = "sess-1"
+	return &acp.NewSessionResponse{SessionID: f.sessionID}, nil
+}
+func (f *fakeAgent) OnLoadSession(ctx context.Context, req acp.LoadSessionRequest, s acp.SessionEventSender) (*acp.LoadSessionResponse, error) {
+	return &acp.LoadSessionResponse{}, nil
+}
+func (f *fakeAgent) OnResumeSession(ctx context.Context, req acp.ResumeSessionRequest) (*acp.ResumeSessionResponse, error) {
+	return &acp.ResumeSessionResponse{}, nil
+}
+func (f *fakeAgent) OnCloseSession(ctx context.Context, req acp.CloseSessionRequest) (*acp.CloseSessionResponse, error) {
+	return &acp.CloseSessionResponse{}, nil
+}
+func (f *fakeAgent) OnDeleteSession(ctx context.Context, req acp.DeleteSessionRequest) (*acp.DeleteSessionResponse, error) {
+	return &acp.DeleteSessionResponse{}, nil
+}
+func (f *fakeAgent) OnListSessions(ctx context.Context, req acp.ListSessionsRequest) (*acp.ListSessionsResponse, error) {
+	return &acp.ListSessionsResponse{}, nil
+}
+func (f *fakeAgent) OnSetSessionMode(ctx context.Context, req acp.SetSessionModeRequest) (*acp.SetSessionModeResponse, error) {
+	return &acp.SetSessionModeResponse{}, nil
+}
+func (f *fakeAgent) OnSetSessionConfigOption(ctx context.Context, req acp.SetSessionConfigOptionRequest) (*acp.SetSessionConfigOptionResponse, error) {
+	return &acp.SetSessionConfigOptionResponse{}, nil
+}
+func (f *fakeAgent) OnPrompt(ctx context.Context, req acp.PromptRequest, s acp.SessionEventSender) (*acp.PromptResponse, error) {
+	f.mu.Lock()
+	f.prompts = append(f.prompts, textOf(req.Prompt))
+	f.mu.Unlock()
+	if err := s.SendAgentMessage("answer: " + textOf(req.Prompt)); err != nil {
+		return nil, err
+	}
+	return &acp.PromptResponse{StopReason: "end_turn"}, nil
+}
+func (f *fakeAgent) OnLogout(ctx context.Context, req acp.LogoutRequest) (*acp.LogoutResponse, error) {
+	return &acp.LogoutResponse{}, nil
+}
+func (f *fakeAgent) OnCancel(ctx context.Context, sid acp.SessionId) error { return nil }
+func (f *fakeAgent) OnAuthenticate(ctx context.Context, req acp.AuthenticateRequest) (*acp.AuthenticateResponse, error) {
+	return &acp.AuthenticateResponse{}, nil
+}
+
+func textOf(blocks []acp.ContentBlock) string {
+	var b strings.Builder
+	for _, blk := range blocks {
+		b.WriteString(blk.Text)
+	}
+	return b.String()
+}
+
+// openTestSession wires the backend against the in-memory agent over pipes.
+func openTestSession(t *testing.T, f *fakeAgent) proto.Session {
+	t.Helper()
+	cr, sw := io.Pipe() // client reads ← server writes
+	sr, cw := io.Pipe() // server reads ← client writes
+	srv := acp.NewServer("fake-agent", "1", f)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.RunTransport(ctx, sw, sr)
+	}()
+	t.Cleanup(func() { cancel(); _ = cw.Close(); _ = cr.Close(); <-done })
+	conn := proto.Conn{R: cr, W: cw, Close: func() error { cancel(); return nil }}
+	s, err := New().OpenSession(context.Background(), proto.SessionSpec{Conn: conn, Cwd: "/tmp"})
+	if err != nil {
+		t.Fatalf("open session: %v", err)
+	}
+	return s
+}
+
+// TestSessionBackendMultiPrompt: ONE session serves MANY prompts — the core
+// of 决策 6-21 (no per-run process, no per-run session/new).
+func TestSessionBackendMultiPrompt(t *testing.T) {
+	f := &fakeAgent{}
+	s := openTestSession(t, f)
+	ctx := context.Background()
+
+	run1, err := s.Prompt(ctx, "first wake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res1 := <-run1.Result
+	if res1.Status != proto.StatusCompleted {
+		t.Fatalf("first wake: %v (err %v)", res1.Status, res1.Err)
+	}
+	if !strings.Contains(res1.Output, "first wake") {
+		t.Fatalf("first wake output: %q", res1.Output)
+	}
+
+	run2, err := s.Prompt(ctx, "second wake")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2 := <-run2.Result
+	if res2.Status != proto.StatusCompleted || !strings.Contains(res2.Output, "second wake") {
+		t.Fatalf("second wake: %v %q (err %v)", res2.Status, res2.Output, res2.Err)
+	}
+
+	f.mu.Lock()
+	n := len(f.prompts)
+	f.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("the fake agent must see BOTH prompts on one session, got %d", n)
+	}
+}
+
+// TestSessionBackendCancelKeepsSession: cancel interrupts the in-flight
+// prompt; the SESSION survives and serves the next wake (决策 6-21 cancel
+// semantics — a cancelled run is not a dead session).
+func TestSessionBackendCancelKeepsSession(t *testing.T) {
+	f := &fakeAgent{}
+	s := openTestSession(t, f)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	run1, err := s.Prompt(ctx, "will be cancelled")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel() // the platform cancels this wake
+	res1 := <-run1.Result
+	if res1.Status != proto.StatusCancelled {
+		t.Fatalf("a cancelled wake reports cancelled, got %v (err %v)", res1.Status, res1.Err)
+	}
+
+	// The SESSION is alive — the next wake completes normally.
+	run2, err := s.Prompt(context.Background(), "after cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2 := <-run2.Result
+	if res2.Status != proto.StatusCompleted {
+		t.Fatalf("the session must survive a cancelled wake, got %v (err %v)", res2.Status, res2.Err)
+	}
+}
+
+// TestSessionBackendSerializesWakes: two concurrent prompts serialize — the
+// second completes after the first (one session = one in-flight turn).
+func TestSessionBackendSerializesWakes(t *testing.T) {
+	f := &fakeAgent{}
+	s := openTestSession(t, f)
+	ctx := context.Background()
+
+	run1, err := s.Prompt(ctx, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done1 := make(chan struct{})
+	go func() { <-run1.Result; close(done1) }()
+
+	start := time.Now()
+	run2, err := s.Prompt(ctx, "two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2 := <-run2.Result
+	select {
+	case <-done1:
+	case <-time.After(2 * time.Second):
+		t.Fatal("wake one must have finished first")
+	}
+	if res2.Status != proto.StatusCompleted {
+		t.Fatalf("serialized second wake: %v", res2.Status)
+	}
+	_ = time.Since(start)
+}

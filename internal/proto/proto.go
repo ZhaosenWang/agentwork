@@ -121,6 +121,38 @@ type Backend interface {
 	Execute(ctx context.Context, spec ExecuteSpec) (*Run, error)
 }
 
+// Session is a PERSISTENT protocol session (决策 6-21): the transport and the
+// protocol session stay alive across the turns of one (agent, goal) pair.
+// Each Prompt is one turn — its events and result channels close when the
+// turn ends, while the underlying session survives for the next wake.
+type Session interface {
+	// Prompt runs one turn on the live session. ctx cancellation cancels
+	// THIS turn (session/cancel on ACP) — the session survives. Prompts are
+	// serialized: a concurrent wake blocks until the in-flight turn ends.
+	Prompt(ctx context.Context, prompt string) (*Run, error)
+	// Cancel interrupts the in-flight turn if any.
+	Cancel(ctx context.Context) error
+	// Close tears the session down (protocol close + transport close +
+	// process cleanup).
+	Close() error
+}
+
+// SessionSpec is what a SessionBackend needs to open one persistent session.
+type SessionSpec struct {
+	Conn          Conn
+	Cwd           string
+	ClientHandler acp.ClientRequestHandler
+	McpServers    []acp.McpServer
+}
+
+// SessionBackend speaks a session-capable wire protocol. ACP MUST support
+// this (决策 6-21 — no capability detection: a runtime without ACP sessions
+// is not in scope). Backends without sessions (jsonl/jsonrpc) simply don't
+// implement it and keep the per-run Execute path.
+type SessionBackend interface {
+	OpenSession(ctx context.Context, spec SessionSpec) (Session, error)
+}
+
 // Registry maps a provider name to its Backend. The daemon looks up by
 // runtime.provider.
 type Registry struct {
