@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os/exec"
 	"strings"
 	"time"
@@ -48,8 +50,20 @@ func (d *Daemon) TestDomainGit(ctx context.Context, gitURL, defaultBranch, crede
 	out, err := exec.CommandContext(ctx, "git", "ls-remote", "--heads", url).CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
+		switch {
+		case errors.Is(ctx.Err(), context.DeadlineExceeded):
+			// The probe hit its bound — git was killed and usually wrote
+			// nothing; "signal: killed" would tell the owner nothing.
+			msg = fmt.Sprintf("connection timed out after %s", domainGitTestTimeout)
+		case msg == "":
+			// No stderr at all: the bare exit code is the only fact left —
+			// say so instead of emitting a bare "exit status 128".
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				msg = fmt.Sprintf("git ls-remote failed (exit %d, no output)", exitErr.ExitCode())
+			} else {
+				msg = err.Error()
+			}
 		}
 		res.Error = sanitizeURL(msg)
 		return res

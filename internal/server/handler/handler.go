@@ -450,14 +450,14 @@ func (h *Handlers) createDomain(w http.ResponseWriter, r *http.Request) {
 	if d.Type != "scratch" && d.GitURL != "" && h.Daemon != nil {
 		res := h.Daemon.TestDomainGit(r.Context(), d.GitURL, d.DefaultBranch, d.GitCredentials)
 		if !res.OK {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("git 连接测试失败：%s", res.Error))
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("git connection test failed: %s", res.Error))
 			return
 		}
 		if !res.BranchExists {
 			if len(res.Refs) == 0 {
-				writeErr(w, http.StatusBadRequest, errors.New("仓库为空（无任何分支），无法作为项目仓库"))
+				writeErr(w, http.StatusBadRequest, errors.New("repository is empty (no branches) — cannot be used as a project repo"))
 			} else {
-				writeErr(w, http.StatusBadRequest, fmt.Errorf("分支 %q 在仓库中不存在（远端分支：%s）", res.ResolvedBranch, strings.Join(res.Refs, ", ")))
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("branch %q does not exist on the repository (remote branches: %s)", res.ResolvedBranch, strings.Join(res.Refs, ", ")))
 			}
 			return
 		}
@@ -505,14 +505,14 @@ func (h *Handlers) updateDomain(w http.ResponseWriter, r *http.Request) {
 			if gitChanged && d.GitURL != "" {
 				res := h.Daemon.TestDomainGit(r.Context(), d.GitURL, d.DefaultBranch, d.GitCredentials)
 				if !res.OK {
-					writeErr(w, http.StatusBadRequest, fmt.Errorf("git 连接测试失败：%s", res.Error))
+					writeErr(w, http.StatusBadRequest, fmt.Errorf("git connection test failed: %s", res.Error))
 					return
 				}
 				if !res.BranchExists {
 					if len(res.Refs) == 0 {
-						writeErr(w, http.StatusBadRequest, errors.New("仓库为空（无任何分支），无法作为项目仓库"))
+						writeErr(w, http.StatusBadRequest, errors.New("repository is empty (no branches) — cannot be used as a project repo"))
 					} else {
-						writeErr(w, http.StatusBadRequest, fmt.Errorf("分支 %q 在仓库中不存在（远端分支：%s）", res.ResolvedBranch, strings.Join(res.Refs, ", ")))
+						writeErr(w, http.StatusBadRequest, fmt.Errorf("branch %q does not exist on the repository (remote branches: %s)", res.ResolvedBranch, strings.Join(res.Refs, ", ")))
 					}
 					return
 				}
