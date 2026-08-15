@@ -110,8 +110,8 @@ Subcommands:
                                              + counts per status (backlog/active/blocked/done/
                                              failed/cancelled) and run totals + counts per status
                                              (queued/running/completed/failed/cancelled)
-  issue comment --text T                     reply to the GitHub issue behind the current
-                                             goal (the platform owns the token; only for
+  issue comment --text T                     reply to the issue behind the current goal
+                                             (the platform owns the token; only for
                                              issue-sourced goals, M4-B)
 
 Environment (injected by daemon):
