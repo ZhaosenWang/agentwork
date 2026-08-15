@@ -223,7 +223,7 @@ func (p *Poller) CreateGoalForIssue(ctx context.Context, domainID, assigneeID, a
 	if title == "" {
 		title = fmt.Sprintf("Issue #%d", iss.Number)
 	}
-	desc := fmt.Sprintf("来自 GitHub issue #%d：%s\n%s", iss.Number, iss.Title, truncate(iss.Body, 1500))
+	desc := fmt.Sprintf("来自 %s issue #%d：%s\n%s", providerLabel(provider), iss.Number, iss.Title, truncate(iss.Body, 1500))
 	_, err := p.goalSvc.Create(ctx, service.Goal{
 		Title:         title,
 		Description:   desc,
@@ -255,6 +255,20 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// providerLabel maps a provider id to its human-facing platform name, so the
+// goal's description names the real source ("GitHub" | "GitCode") instead of
+// always saying GitHub.
+func providerLabel(provider string) string {
+	switch provider {
+	case "gitcode":
+		return "GitCode"
+	case "", "github":
+		return "GitHub"
+	default:
+		return provider
+	}
 }
 
 // ── Closer: delivered goal → close its issue ──

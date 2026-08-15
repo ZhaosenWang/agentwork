@@ -311,6 +311,20 @@ func TestGitCodeClient(t *testing.T) {
 	}
 }
 
+// TestProviderLabel: the goal description must name the real source, not
+// always GitHub (a gitcode issue was mislabeled "来自 GitHub issue #1").
+func TestProviderLabel(t *testing.T) {
+	if got := providerLabel("github"); got != "GitHub" {
+		t.Fatalf("github -> %q", got)
+	}
+	if got := providerLabel(""); got != "GitHub" {
+		t.Fatalf("empty -> %q", got)
+	}
+	if got := providerLabel("gitcode"); got != "GitCode" {
+		t.Fatalf("gitcode -> %q", got)
+	}
+}
+
 // TestGitCodeWebhookTokenMode: gitcode password mode verifies via the
 // X-GitCode-Token header; signature mode via X-GitCode-Signature-256.
 func TestGitCodeWebhookTokenMode(t *testing.T) {
