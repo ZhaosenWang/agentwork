@@ -1,14 +1,20 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   useDomains, useDomain, useAgents, useSquads, useCreateDomain, useUpdateDomain, useCompileDomainPolicy,
-  useFreezeDomainChecks, useGoalEvents, useGateStats, qk,
+  useDomainCompileRun, useFreezeDomainChecks, useGoalEvents, useGateStats, qk,
 } from "@/lib/queries";
+import { listRunMessages } from "@/lib/api";
 import { useWSEvent } from "@/lib/ws";
 import { Button, Dialog, Field, inputCls, PageHeader, Empty, Badge } from "@/components/ui";
 import type { Domain, Checks, Guard, GateRule, Run } from "@/lib/types";
+
+// cutLine truncates one backfilled line for the compile progress box.
+function cutLine(t: string): string {
+  return t.length > 160 ? t.slice(0, 160) + "…" : t;
+}
 
 // renderRunEvent turns one WS run:event (proto.Event shape) into a single
 // line for the compile progress stream.
@@ -75,6 +81,8 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const compile = useCompileDomainPolicy();
   const freeze = useFreezeDomainChecks();
   const { data: agents } = useAgents();
+  // 决策 6-23: 该域最新的 compile processor run——刷新恢复的真相源
+  const { data: latestCompile } = useDomainCompileRun(d.id);
   const [showEdit, setShowEdit] = useState(false);
   const [policyText, setPolicyText] = useState(d.policy_text);
   const [compiling, setCompiling] = useState(false);
@@ -154,6 +162,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const startCompile = () => {
     if (!policyText.trim() || !processorAgent) return;
     setCompiling(true);
+    setCompileError(null);
     // Compilation is an ASYNC processor run (explores the repo, installs
     // deps, measures the baseline — minutes, not the API round-trip).
     // onSuccess must NOT clear compiling: the API returning only means the
@@ -198,6 +207,32 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
       setCompileRun(null);
     }
   });
+  // 决策 6-23: 刷新恢复。compiling/compileRun 是组件 state，刷新即丢——但
+  // 后端持久化了 compile run，mount 时查回最新一条：queued/running → 恢复
+  // 横幅（WS 是全局广播、按 run_id 过滤，实时流自动续上）+ content 回填；
+  // failed → 恢复失败提示（顺带修"刷新后看不到编译失败"）；completed →
+  // 不显示（domain 查询本身带出编译产物/确认卡）。startCompile 在会话内
+  // 直接置 state，不动这个查询，互不干扰。
+  useEffect(() => {
+    if (!latestCompile) return;
+    if (latestCompile.status === "queued" || latestCompile.status === "running") {
+      setCompiling(true);
+      setCompileRun(latestCompile);
+      // 回填进度框历史：只取 content（跳过 thought/reasoning 与 tool 行）
+      listRunMessages(latestCompile.id)
+        .then((msgs) =>
+          setRunLines(
+            msgs
+              .filter((m) => m.role === "assistant" && m.content.trim() !== "")
+              .slice(-20)
+              .map((m) => cutLine(m.content.trim()))
+          )
+        )
+        .catch(() => {});
+    } else if (latestCompile.status === "failed") {
+      setCompileError((prev) => prev ?? (latestCompile.result_summary || "编译失败（未知原因）"));
+    }
+  }, [latestCompile]);
 
   return (
     <div className="rounded-lg border border-gray-200 p-4 space-y-3">
@@ -371,12 +406,13 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
       {/* 编译进行中反馈——两种状态（首次编译 / 重新编译）共享：编译是异步
           processor run，compiling 保持到 domain:compiled / compile_failed
           事件到达（API 返回只是 run 入队，编译本身要几分钟）。compileRun
-          打开实时进度流——能看到处理器 agent 此刻在干什么。 */}
+          打开实时进度流——能看到处理器 agent 此刻在干什么。刷新后由
+          useDomainCompileRun 恢复（决策 6-23）。 */}
       {compiling && compileRun && (
         <div className="border-t border-gray-100 pt-2">
-          <div className="flex items-center gap-2 text-xs text-amber-700 mb-1.5">
+          <div className="flex items-center gap-2 text-xs text-amber-700 mb-1.5" title={compileRun.id}>
             <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-            正在编译验收策略（run {compileRun.id.slice(0, 8)}）——处理器 agent 正在探索仓库、安装依赖、统计基线
+            {agents?.find((a) => a.id === compileRun.agent_id)?.name ?? compileRun.agent_id.slice(0, 8)} 正在探索项目、统计基线，请稍等......
           </div>
           <div className="rounded bg-zinc-50 border border-zinc-200 p-2 max-h-44 overflow-y-auto space-y-0.5 font-mono text-[11px] text-zinc-600">
             {runLines.length === 0 ? (

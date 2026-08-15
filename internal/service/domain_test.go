@@ -62,6 +62,69 @@ func TestCompilePolicyEnqueuesProcessorRun(t *testing.T) {
 	}
 }
 
+// TestLatestCompileRun covers the compile panel's refresh-restore query
+// (决策 6-23): no run → null; active run → returned as-is; after the run
+// goes terminal a newer compile wins — the panel branches on status.
+func TestLatestCompileRun(t *testing.T) {
+	st := newTestStore(t)
+	bus := events.NewBus()
+	domainSvc := NewDomainService(st, bus)
+	runSvc := NewRunService(st, bus)
+	domainSvc.SetRunService(runSvc)
+	runSvc.SetGoalService(NewGoalService(st, bus)) // Finish reconciles; goal-less processor runs no-op there
+	ctx := context.Background()
+
+	// Never compiled → null, no error.
+	got, err := runSvc.LatestCompileRun(ctx, "nope")
+	if err != nil || got != nil {
+		t.Fatalf("expected (nil, nil) for unknown domain, got (%+v, %v)", got, err)
+	}
+
+	d, err := domainSvc.Create(ctx, Domain{Name: "aw", GitURL: "https://example.com/aw.git"})
+	if err != nil {
+		t.Fatalf("create domain: %v", err)
+	}
+	procAgentID := seedAgent(t, st, "processor")
+	run, err := domainSvc.CompilePolicy(ctx, d.ID, "测试必须通过", procAgentID)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	// Active run is returned with its real row (status queued).
+	latest, err := runSvc.LatestCompileRun(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("latest: %v", err)
+	}
+	if latest == nil || latest.ID != run.ID || latest.Status != "queued" || latest.AgentID != procAgentID {
+		t.Fatalf("expected the queued compile run, got %+v", latest)
+	}
+
+	// Terminal run: the failure (and its summary) survives for the panel.
+	if err := runSvc.Finish(ctx, run.ID, "failed", "依赖安装失败"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	latest, err = runSvc.LatestCompileRun(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("latest after finish: %v", err)
+	}
+	if latest == nil || latest.Status != "failed" || latest.ResultSummary != "依赖安装失败" {
+		t.Fatalf("expected the failed run with summary, got %+v", latest)
+	}
+
+	// A newer compile wins over the terminal one.
+	run2, err := domainSvc.CompilePolicy(ctx, d.ID, "新的要求", procAgentID)
+	if err != nil {
+		t.Fatalf("compile again: %v", err)
+	}
+	latest, err = runSvc.LatestCompileRun(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("latest after recompile: %v", err)
+	}
+	if latest == nil || latest.ID != run2.ID {
+		t.Fatalf("expected the newest run %s, got %+v", run2.ID, latest)
+	}
+}
+
 // TestDomainCRUDAndFreeze covers the domain lifecycle: create with defaults,
 // read back, and freeze the compiled acceptance policy (the owner-confirmed
 // step that keeps the "define" role with the human — DESIGN.md §5.3).

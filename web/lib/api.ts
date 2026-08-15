@@ -174,6 +174,11 @@ export const compileDomainPolicy = (
   id: string,
   body: { policy_text: string; processor_agent_id: string }
 ) => api<Run>(`/domains/${id}/compile`, { method: "POST", body: JSON.stringify(body) });
+// The domain's latest compile processor run (null when never compiled) —
+// the compile panel restores its in-flight banner from this after a page
+// refresh (决策 6-23).
+export const getDomainCompileRun = (id: string) =>
+  api<Run | null>(`/domains/${id}/compile-run`);
 export const freezeDomainChecks = (
   id: string,
   body: { checks: Checks; verification_strength: string }

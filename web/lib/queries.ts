@@ -46,6 +46,7 @@ import {
   updateDomain,
   deleteDomain,
   compileDomainPolicy,
+  getDomainCompileRun,
   freezeDomainChecks,
   getImStatus,
   connectFeishu,
@@ -76,6 +77,7 @@ export const qk = {
   schedules: ["schedules"] as const,
   domains: ["domains"] as const,
   domain: (id: string) => ["domains", id] as const,
+  domainCompileRun: (id: string) => ["domains", id, "compile-run"] as const,
   im: ["im"] as const,
   platformSettings: ["platform-settings"] as const,
   gateStats: ["gate-stats"] as const,
@@ -350,6 +352,15 @@ export function useDomains() {
 }
 export function useDomain(id: string) {
   return useQuery({ queryKey: qk.domain(id), queryFn: () => getDomain(id), enabled: !!id });
+}
+// Latest compile processor run for a domain (决策 6-23): the compile panel's
+// refresh-restore source of truth.
+export function useDomainCompileRun(id: string) {
+  return useQuery({
+    queryKey: qk.domainCompileRun(id),
+    queryFn: () => getDomainCompileRun(id),
+    enabled: !!id,
+  });
 }
 export function useCreateDomain() {
   const qc = useQueryClient();

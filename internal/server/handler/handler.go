@@ -90,6 +90,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /domains/{id}", h.deleteDomain)
 	mux.HandleFunc("POST /domains/{id}/checks", h.freezeDomainChecks)
 	mux.HandleFunc("POST /domains/{id}/compile", h.compileDomainPolicy)
+	mux.HandleFunc("GET /domains/{id}/compile-run", h.compileRunStatus)
 
 	mux.HandleFunc("GET /gate-decisions/stats", h.gateStats)
 
@@ -479,6 +480,14 @@ func (h *Handlers) compileDomainPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := h.Domain.CompilePolicy(r.Context(), r.PathValue("id"), body.PolicyText, body.ProcessorAgentID)
+	writeJSON(w, out, err)
+}
+
+// compileRunStatus returns the domain's latest compile processor run (决策
+// 6-23) — the compile panel restores its in-flight banner from this after a
+// page refresh. null when the domain has never compiled.
+func (h *Handlers) compileRunStatus(w http.ResponseWriter, r *http.Request) {
+	out, err := h.Run.LatestCompileRun(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)
 }
 

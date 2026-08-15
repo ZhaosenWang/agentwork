@@ -844,6 +844,29 @@ func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	return out, rows.Err()
 }
 
+// LatestCompileRun returns the domain's most recent compile processor run
+// (决策 6-23): the compile panel restores its in-flight state from this
+// after a page refresh — queued/running means still compiling, failed
+// shows the failure, completed needs no banner (the domain query itself
+// carries the compiled checks). (nil, nil) when the domain has never
+// compiled.
+func (s *RunService) LatestCompileRun(ctx context.Context, domainID string) (*Run, error) {
+	row := s.st.DB().QueryRowContext(ctx,
+		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,cancel_reason,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
+		 FROM run WHERE run_kind='processor' AND run_type='compile' AND domain_id=? ORDER BY created_at DESC LIMIT 1`,
+		domainID)
+	var r Run
+	var leaderFlag int
+	if err := row.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.SessionID, &r.Workdir, &r.Status, &r.Role, &r.Attempt, &r.ResultSummary, &r.CancelReason, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	r.IsLeaderRun = leaderFlag != 0
+	return &r, nil
+}
+
 // RunMessage is one row of a run's interaction stream (chat_message) — the
 // Web run detail's "what is the agent doing right now" view.
 type RunMessage struct {
