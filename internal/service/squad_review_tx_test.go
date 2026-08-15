@@ -375,3 +375,62 @@ func TestDispatchOnlyRunLeavesNoReport(t *testing.T) {
 		t.Fatalf("the dispatch-only owner report must not land in the feed, got %d", n)
 	}
 }
+
+// TestWakeReportThreadsToAnchor (决策 6-22): an attention-woken owner's
+// report has no trigger comment — it threads to the run's wake_anchor (the
+// sub-goal report that woke it), keeping the feed as mentions + replies
+// (no flat self-talk; live: the PM's integration report sat flat).
+func TestWakeReportThreadsToAnchor(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	owner := seedAgent(t, st, "owner")
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "do it", AssigneeType: "agent", AssigneeID: owner, Status: "active", DomainID: seedDomain(t, st)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The anchor: the sub-goal report that woke the owner.
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES ('sg-report','`+g.ID+`','agent','`+owner+`',NULL,'完成。42/42',?)`, now()); err != nil {
+		t.Fatal(err)
+	}
+	var wakeRun string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM run WHERE goal_id=? AND role='owner' LIMIT 1`, g.ID).Scan(&wakeRun); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='running', started_at=?, wake_anchor='sg-report' WHERE id=?`, now(), wakeRun); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='completed', finished_at=? WHERE id=?`, now(), wakeRun); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	id, err := insertRunResultComment(ctx, tx, goalRunContext{
+		RunID: wakeRun, GoalID: g.ID, AgentID: owner, Role: "owner", Status: "completed",
+		Summary: "五子棋测试已补齐并集成。",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var parent, root string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COALESCE(parent_id,'') FROM comment WHERE id=?`, id).Scan(&parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT id FROM comment WHERE goal_id=? ORDER BY created_at ASC LIMIT 1`, g.ID).Scan(&root); err != nil {
+		t.Fatal(err)
+	}
+	if parent != root {
+		t.Fatalf("the completion declaration must reply to the goal's ROOT comment, got %q want %q", parent, root)
+	}
+}

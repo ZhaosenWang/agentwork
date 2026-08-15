@@ -919,6 +919,24 @@ func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) 
 	var parentID any
 	if rc.TriggerCommentID != "" {
 		parentID = rc.TriggerCommentID
+	} else {
+		// No trigger comment (an attention-woken owner): the report is the
+		// COMPLETION DECLARATION — it replies to the goal's ROOT comment
+		// (the creation words that started the goal, usually the human's
+		// first mention). A plain reply, never a mention: mentioning the
+		// reviewer would dispatch a consult that collides with the
+		// platform's review machinery, and mentioning the human would imply
+		// a consult the approval card already answers. Fallbacks: the wake
+		// anchor (the sub-goal report that woke the run), then flat.
+		var root string
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM comment WHERE goal_id=? ORDER BY created_at ASC LIMIT 1`, rc.GoalID).Scan(&root); err == nil && root != "" {
+			parentID = root
+		} else if rc.RunID != "" {
+			var anchor string
+			if err := tx.QueryRowContext(ctx, `SELECT wake_anchor FROM run WHERE id=?`, rc.RunID).Scan(&anchor); err == nil && anchor != "" {
+				parentID = anchor
+			}
+		}
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,?,?,?,?)`,
