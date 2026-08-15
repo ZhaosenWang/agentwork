@@ -84,12 +84,14 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			// run never finishes (a live zombie: an agent that stalled
 			// connecting to the advertised MCP server left its run
 			// 'running' indefinitely after the idle watchdog fired).
+			_ = conn.Close()
 			close(events)
 			results <- proto.Result{Status: proto.StatusFailed, Output: proto.AppendStderr("initialize: "+err.Error(), conn.Stderr), Err: err}
 			return
 		}
 		newResp, err := sess.NewSession(ctx, acp.NewSessionRequest{Cwd: spec.Cwd, McpServers: spec.McpServers})
 		if err != nil {
+			_ = conn.Close()
 			close(events)
 			results <- proto.Result{Status: proto.StatusFailed, Output: proto.AppendStderr("new session: "+err.Error(), conn.Stderr), Err: err}
 			return
@@ -112,6 +114,12 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			status := proto.StatusFailed
 			if ctx.Err() != nil {
 				status = proto.StatusCancelled
+			}
+			// Close the transport first on failure so the subprocess joins
+			// (cmd.Wait) and its stderr buffer is complete before
+			// AppendStderr reads it — same race fix as the session path.
+			if status == proto.StatusFailed {
+				_ = conn.Close()
 			}
 			results <- proto.Result{Status: status, Output: proto.AppendStderr("prompt: "+err.Error(), conn.Stderr), Err: err, SessionID: string(newResp.SessionID)}
 			return

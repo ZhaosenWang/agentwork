@@ -127,6 +127,15 @@ func (s *session) Prompt(ctx context.Context, prompt string) (*proto.Run, error)
 			if ctx.Err() != nil {
 				status = proto.StatusCancelled
 			}
+			// A transport-level failure (process crash / connection drop)
+			// means the session is dead. Close the transport FIRST so the
+			// subprocess joins (cmd.Wait) and its stderr buffer is complete
+			// before AppendStderr reads it — otherwise the race drops the
+			// crash reason (a live stdio crash left no stderr in the output).
+			// Idempotent: the daemon's eviction calls Close again.
+			if status == proto.StatusFailed {
+				_ = s.conn.Close()
+			}
 			results <- proto.Result{Status: status, Output: proto.AppendStderr("prompt: "+err.Error(), s.conn.Stderr), Err: err, SessionID: s.sessionID}
 			return
 		}

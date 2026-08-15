@@ -585,7 +585,16 @@ func (s *Session) startReader() {
 	// hanging forever. Without this, a subprocess that exits before replying
 	// (e.g. bad args) leaves the task stuck in "running" until the idle
 	// watchdog fires minutes later.
-	s.failPending(fmt.Errorf("acp: transport closed (agent exited without responding)"))
+	//
+	// Surface the scanner's read error (if any) so a ws/tcp connection drop
+	// reports the actual cause (websocket close code, TCP reset, …) instead
+	// of a bare "transport closed" — a live remote-agent failure left no
+	// diagnostic in the run output.
+	if readErr := sc.Err(); readErr != nil {
+		s.failPending(fmt.Errorf("acp: transport closed: %v (agent exited without responding)", readErr))
+	} else {
+		s.failPending(fmt.Errorf("acp: transport closed (agent exited without responding)"))
+	}
 }
 
 // failPending delivers a terminal error to all in-flight RPC calls. Called

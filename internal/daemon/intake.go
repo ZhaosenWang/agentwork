@@ -277,7 +277,7 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 	if d.intakeSvc != nil {
 		_ = d.intakeSvc.ClearDraft(ctx)
 	}
-	return fmt.Sprintf("✅ 已创建任务：**%s**（`goal %s`），agent 开始执行", created.Title, shortID(created.ID))
+	return fmt.Sprintf("✅ 已创建任务：%s（goal %s），agent 开始执行", created.Title, shortID(created.ID))
 }
 
 // intakeDomainList lists the available domains for the clarification ask.
@@ -318,7 +318,7 @@ func (d *Daemon) intakeReviewList(ctx context.Context) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔔 待审批（%d 个）：\n", len(goals))
 	for _, g := range goals {
-		fmt.Fprintf(&b, "- **%s**（`%s`）\n  %s\n", g.Title, shortID(g.GoalID), firstLineIn(g.Reason))
+		fmt.Fprintf(&b, "- %s（%s）\n  %s\n", g.Title, shortID(g.GoalID), firstLineIn(g.Reason))
 	}
 	b.WriteString("\n在飞书里点对应卡片的按钮，或打开 Web 审批队列处理。")
 	return b.String()
@@ -338,7 +338,7 @@ func (d *Daemon) intakeGoalStatus(ctx context.Context, id string) string {
 		return "查询失败：找不到该任务（" + err.Error() + "）"
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "📌 **%s**（`%s`）\n状态：%s", v.Title, shortID(v.GoalID), v.Status)
+	fmt.Fprintf(&b, "📌 %s（%s）\n状态：%s", v.Title, shortID(v.GoalID), v.Status)
 	if v.ReviewRequest != "" {
 		b.WriteString("\n待审：" + v.ReviewRequest)
 	}
@@ -394,7 +394,7 @@ func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) 
 			next = t.Local().Format("01-02 15:04")
 		}
 	}
-	return fmt.Sprintf("✅ 已创建定时任务：**%s**（`%s`），下次执行 %s（本地时间）", s.Name, s.CronExpression, next)
+	return fmt.Sprintf("✅ 已创建定时任务：%s（%s），下次执行 %s（本地时间）", s.Name, s.CronExpression, next)
 }
 
 // intakeScheduleList answers "查看定时任务" with the enabled schedules.
@@ -415,7 +415,7 @@ func (d *Daemon) intakeScheduleList(ctx context.Context) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "📅 启用的定时任务（%d 个）：\n", len(enabled))
 	for _, s := range enabled {
-		fmt.Fprintf(&b, "- **%s**（`%s`）\n", s.Name, s.CronExpression)
+		fmt.Fprintf(&b, "- %s（%s）\n", s.Name, s.CronExpression)
 		if s.Description != "" {
 			b.WriteString("  " + firstLineIn(s.Description) + "\n")
 		}
@@ -448,7 +448,7 @@ func (d *Daemon) intakeScheduleStop(ctx context.Context, parsed intakeAction) st
 	if _, err := d.schedSvc.SetEnabled(ctx, target.ID, false); err != nil {
 		return "停用失败：" + err.Error()
 	}
-	return fmt.Sprintf("⏹ 已停用定时任务：**%s**（%s）", target.Name, target.CronExpression)
+	return fmt.Sprintf("⏹ 已停用定时任务：%s（%s）", target.Name, target.CronExpression)
 }
 
 func shortID(id string) string {
