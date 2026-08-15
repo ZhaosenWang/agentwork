@@ -87,7 +87,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		d.failIntakeRun(ctx, q, err.Error())
 		return
 	}
-	env := newRunEnvironment(q.RunID, "", q.AgentID, workdir, serverURL)
+	env := newRunEnvironment(q.RunID, "", q.AgentID, workdir, serverURL, q.Token)
 	defer env.tm.cleanup()
 	d.mu.Lock()
 	d.mcpExecs[q.RunID] = mcp.NewExecutor(workdir, env.runEnv(nil), env.tm)

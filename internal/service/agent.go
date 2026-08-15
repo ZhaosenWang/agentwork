@@ -29,6 +29,9 @@ type Agent struct {
 	// database, an external ACP agent via an MCP bridge, ...). Type speaks
 	// acp.McpServer (type stdio|http|sse, name, url or command/args).
 	McpServers    []acp.McpServer `json:"mcp_servers"`
+	// Skills are the platform-managed skill ids selected for this agent
+	// (CLI 分支 Phase 4) — pushed to the agent's machine via config.push.
+	Skills        []string        `json:"skills"`
 	MaxConcurrent int             `json:"max_concurrent"`
 	CreatedAt     string          `json:"created_at"`
 }
@@ -64,14 +67,18 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 	if a.McpServers == nil {
 		a.McpServers = []acp.McpServer{}
 	}
+	if a.Skills == nil {
+		a.Skills = []string{}
+	}
 	a.ID = newID()
 	a.CreatedAt = now()
 	envJSON, _ := json.Marshal(a.Env)
 	mcpJSON, _ := json.Marshal(a.McpServers)
+	skillsJSON, _ := json.Marshal(a.Skills)
 	_, err = s.st.DB().ExecContext(ctx,
-		`INSERT INTO agent (id,name,description,runtime_id,system_prompt,model,env,mcp_servers,max_concurrent,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, string(envJSON), string(mcpJSON), a.MaxConcurrent, a.CreatedAt)
+		`INSERT INTO agent (id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, string(envJSON), string(mcpJSON), skillsJSON, a.MaxConcurrent, a.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert agent: %w", err)
 	}
@@ -97,9 +104,10 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 	}
 	envJSON, _ := json.Marshal(a.Env)
 	mcpJSON, _ := json.Marshal(a.McpServers)
+	skillsJSON, _ := json.Marshal(a.Skills)
 	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE agent SET name=?, description=?, system_prompt=?, max_concurrent=?, env=?, mcp_servers=? WHERE id=?`,
-		a.Name, a.Description, a.SystemPrompt, a.MaxConcurrent, string(envJSON), string(mcpJSON), id); err != nil {
+		`UPDATE agent SET name=?, description=?, system_prompt=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
+		a.Name, a.Description, a.SystemPrompt, a.MaxConcurrent, string(envJSON), string(mcpJSON), string(skillsJSON), id); err != nil {
 		return nil, fmt.Errorf("update agent: %w", err)
 	}
 	return s.Get(ctx, id)
@@ -107,7 +115,7 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,max_concurrent,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
 		 FROM agent ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -116,12 +124,13 @@ func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	out := []Agent{}
 	for rows.Next() {
 		var a Agent
-		var envJSON, mcpJSON string
-		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &a.MaxConcurrent, &a.CreatedAt); err != nil {
+		var envJSON, mcpJSON, skillsJSON string
+		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(envJSON), &a.Env)
 		_ = json.Unmarshal([]byte(mcpJSON), &a.McpServers)
+		_ = json.Unmarshal([]byte(skillsJSON), &a.Skills)
 		out = append(out, a)
 	}
 	return out, rows.Err()
@@ -129,11 +138,11 @@ func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 
 func (s *AgentService) Get(ctx context.Context, id string) (*Agent, error) {
 	var a Agent
-	var envJSON, mcpJSON string
+	var envJSON, mcpJSON, skillsJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,max_concurrent,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
 		 FROM agent WHERE id=?`, id).
-		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &a.MaxConcurrent, &a.CreatedAt)
+		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -142,6 +151,7 @@ func (s *AgentService) Get(ctx context.Context, id string) (*Agent, error) {
 	}
 	_ = json.Unmarshal([]byte(envJSON), &a.Env)
 	_ = json.Unmarshal([]byte(mcpJSON), &a.McpServers)
+	_ = json.Unmarshal([]byte(skillsJSON), &a.Skills)
 	return &a, nil
 }
 

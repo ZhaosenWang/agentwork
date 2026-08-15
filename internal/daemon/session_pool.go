@@ -121,7 +121,7 @@ func wakeTargetFor(role, subGoalID string) wakeTarget {
 // target switches the checkout (the process and MCP server stay).
 func (d *Daemon) acquireSession(ctx context.Context, runID, goalID, agentID, provider, role, subGoalID string,
 	scratch bool, domainName, domainID, gitURL, gitCredentials, defaultBranch, serverURL string,
-	transport, execPath, endpoint string, args []string, rtEnv map[string]string, taskEnv []string) (*liveSession, bool, error) {
+	transport, execPath, endpoint string, args []string, rtEnv map[string]string, taskEnv []string, token string) (*liveSession, bool, error) {
 
 	key := sessionKey(agentID, goalID)
 	target := wakeTargetFor(role, subGoalID)
@@ -163,7 +163,7 @@ func (d *Daemon) acquireSession(ctx context.Context, runID, goalID, agentID, pro
 
 	// The session-scoped execution environment: ONE client RPC handler + ONE
 	// workspace MCP server for the session's whole life.
-	env := newRunEnvironment(runID, goalID, agentID, workdir, serverURL)
+	env := newRunEnvironment(runID, goalID, agentID, workdir, serverURL, token)
 	mcpExec := mcp.NewExecutor(workdir, env.runEnv(nil), env.tm)
 	mcpExec.SetCollaboration(goalID, agentID, runID, d.commentSvc, d.goalSvc, d.runSvc, d.agentSvc, d.squadSvc)
 	mcpID := uuid.NewString()

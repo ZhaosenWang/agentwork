@@ -15,6 +15,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/eushing/agentwork/internal/link"
 )
 
 const (
@@ -38,6 +40,12 @@ func main() {
 	agentID := os.Getenv("AGENTWORK_AGENT_ID")
 
 	switch os.Args[1] {
+	case "connect":
+		connectCmd(os.Args[2:])
+		return
+	case "status":
+		statusCmd(os.Args[2:])
+		return
 	case "goal":
 		goalCmd(serverURL, goalID, agentID, os.Args[2:])
 	case "agent":
@@ -92,8 +100,15 @@ func issueCmd(serverURL, goalID string, args []string) {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `agentwork-cli — agent-side tool (called by agents during task execution)
+and remote-machine sidecar (register this host to agentwork-daemon).
 
 Subcommands:
+  connect [--server URL] [--token T] [--name N]
+                                             connect this machine to agentwork-daemon (default
+                                             127.0.0.1:7373, no auth), probe its agent CLIs and
+                                             register them; heartbeats until interrupted
+  status                                     show the persisted connection state (machine id,
+                                             server, last heartbeat, probed agent CLIs)
   goal list [--limit N] [--status S] [--json]  list goals (JSON — the default format; --json requests
                                              it explicitly); --limit caps to N most recent (default all);
                                              --status keeps only goals whose status equals S (exact match)
@@ -137,6 +152,8 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 		goalCreate(serverURL, goalID, agentID, args[1:])
 	case "comment":
 		goalComment(serverURL, goalID, args[1:])
+	case "comments":
+		goalComments(serverURL, goalID, args[1:])
 	case "wait":
 		goalWait(serverURL, goalID, args[1:])
 	default:
@@ -257,31 +274,56 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 	post(serverURL+"/goals", body)
 }
 
+// goalComment posts a comment on the run's goal via /rpc — the per-run
+// token (env AGENTWORK_TOKEN) is the identity; the daemon resolves it to
+// the run's goal and agent.
 func goalComment(serverURL, goalID string, args []string) {
 	fs := flag.NewFlagSet("goal comment", flag.ExitOnError)
-	role := fs.String("role", "agent", "author role (agent|human|system)")
 	text := fs.String("text", "", "comment text (required; may contain a structured mention)")
+	parent := fs.String("parent", "", "parent comment id (optional — replies thread under it)")
 	fs.Parse(args)
 	if *text == "" {
 		fail("--text is required")
 	}
-	if goalID == "" {
-		fail("AGENTWORK_GOAL_ID not set")
+	var res struct {
+		ID string `json:"id"`
 	}
-	body := map[string]string{
-		"author_type": *role,
-		"author_id":   os.Getenv("AGENTWORK_AGENT_ID"),
-		"content":     *text,
-		"run_id":      os.Getenv("AGENTWORK_RUN_ID"),
+	if err := rpcCall(link.MethodGoalComment, link.GoalCommentParams{
+		RPCToken: rpcToken(),
+		Text:     *text,
+		ParentID: *parent,
+	}, &res); err != nil {
+		fail("%v", err)
 	}
-	post(serverURL+"/goals/"+goalID+"/comments", body)
+	rpcPrintJSON(res)
 }
 
-func goalWait(serverURL, goalID string, args []string) {
-	if goalID == "" {
-		fail("AGENTWORK_GOAL_ID not set")
+// goalComments pulls the run's goal comment feed via /rpc — the shared
+// context. --after reads incrementally from the last seen comment id.
+func goalComments(serverURL, goalID string, args []string) {
+	fs := flag.NewFlagSet("goal comments", flag.ExitOnError)
+	after := fs.String("after", "", "only comments after this id (incremental read)")
+	limit := fs.Int("limit", 50, "max comments to return")
+	fs.Parse(args)
+	var out []map[string]any
+	if err := rpcCall(link.MethodGoalComments, link.GoalCommentsParams{
+		RPCToken: rpcToken(),
+		After:    *after,
+		Limit:    *limit,
+	}, &out); err != nil {
+		fail("%v", err)
 	}
-	postNoBody(serverURL+"/goals/"+goalID+"/wait", nil)
+	rpcPrintJSON(out)
+}
+
+// goalWait parks until the goal's sub-goals settle (or the server-side
+// timeout) via /rpc, then prints their states.
+func goalWait(serverURL, goalID string, args []string) {
+	var states []map[string]any
+	if err := rpcCall(link.MethodGoalWait, link.GoalWaitParams{RPCToken: rpcToken()}, &states); err != nil {
+		fail("%v", err)
+	}
+	rpcPrintJSON(states)
 }
 
 

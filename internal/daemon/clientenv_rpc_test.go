@@ -18,7 +18,7 @@ import (
 // the JSON-RPC layer, proving SetClientRequestHandler wiring end to end.
 func TestClientRPCWiring(t *testing.T) {
 	dir := t.TempDir()
-	env := newRunEnvironment("run-1", "goal-1", "agent-1", dir, "http://127.0.0.1:7373")
+	env := newRunEnvironment("run-1", "goal-1", "agent-1", dir, "http://127.0.0.1:7373", "tok-1")
 	t.Cleanup(env.tm.cleanup)
 
 	path := filepath.Join(dir, "a.txt")

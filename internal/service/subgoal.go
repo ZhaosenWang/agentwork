@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/logging"
@@ -822,4 +823,38 @@ func (s *GoalService) CancelSubGoal(ctx context.Context, subGoalID string) (*Sub
 		"goal_id": sg.GoalID, "sub_goal_id": sg.ID,
 	}})
 	return sg, nil
+}
+
+// waitChildrenTimeout bounds `goal wait` — the owner parks until its
+// dispatched work settles, never forever.
+const waitChildrenTimeout = 10 * time.Minute
+
+// WaitChildren blocks until the goal's sub-goals settle (none pending —
+// the same predicate as the finalization guard: only verified/failed/
+// cancelled are terminal) or the wait times out, and returns the
+// children's current states. The owner's `goal wait` tool: the agent
+// parks here instead of guessing whether its dispatches landed.
+func (s *GoalService) WaitChildren(ctx context.Context, goalID string) ([]SubGoal, error) {
+	deadline := time.Now().Add(waitChildrenTimeout)
+	for {
+		all, err := s.ListSubGoals(ctx, goalID)
+		if err != nil {
+			return nil, err
+		}
+		pending := false
+		for _, sg := range all {
+			if sg.Status != "verified" && sg.Status != "failed" && sg.Status != "cancelled" {
+				pending = true
+				break
+			}
+		}
+		if !pending || time.Now().After(deadline) {
+			return all, nil
+		}
+		select {
+		case <-ctx.Done():
+			return all, ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
 }

@@ -115,7 +115,7 @@ func (a *fakeACPAgent) OnAuthenticate(ctx context.Context, req acp.AuthenticateR
 // context reaches the spawned command's environment.
 func TestExecuteFullRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	env := newRunEnvironment("run-1", "goal-1", "agent-1", dir, "http://127.0.0.1:7373")
+	env := newRunEnvironment("run-1", "goal-1", "agent-1", dir, "http://127.0.0.1:7373", "tok-1")
 	t.Cleanup(env.tm.cleanup)
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello worktree"), 0o644); err != nil {
 		t.Fatal(err)

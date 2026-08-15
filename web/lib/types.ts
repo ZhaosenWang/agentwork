@@ -1,5 +1,34 @@
 // API types — mirror the Go structs in internal/service.
 
+// ProbeCLI is one agent CLI a remote machine reported (CLI 分支 Phase 1).
+export interface ProbeCLI {
+  name: string;
+  version: string;
+  acp_spawn: string[];
+  skills_dir?: string;
+  profile_files?: string[];
+}
+
+// Skill is a platform-managed skill package (CLI 分支 Phase 4).
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  created_at: string;
+}
+
+// Machine is a remote host registered via `agentwork connect`.
+export interface Machine {
+  id: string;
+  name: string;
+  hostname: string;
+  version: string;
+  probed_clis: string; // JSON []ProbeCLI
+  last_seen_at: string;
+  status: string; // connected | offline
+  created_at: string;
+}
+
 export interface Runtime {
   id: string;
   name: string;
@@ -41,6 +70,7 @@ export interface Agent {
   model: string;
   env: Record<string, string>;
   mcp_servers: McpServer[]; // the agent's own tools (browser/db/…), always after the workspace server
+  skills: string[]; // platform-managed skill ids (CLI 分支 Phase 4) — pushed to the agent's machine
   max_concurrent: number;
   created_at: string;
 }

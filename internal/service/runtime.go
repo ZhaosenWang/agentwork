@@ -27,7 +27,10 @@ type Runtime struct {
 	// (remote agents need the daemon's public address); '' = the platform
 	// default (http://127.0.0.1:<listen port>).
 	AgentworkURL string `json:"agentwork_url"`
-	CreatedAt    string `json:"created_at"`
+	// MachineID is the registered machine that executes this runtime's
+	// runs (transport='agentwork'; '' = local/legacy transports).
+	MachineID string `json:"machine_id,omitempty"`
+	CreatedAt string `json:"created_at"`
 }
 
 func validProvider(p string) bool {
@@ -46,6 +49,10 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 		r.Transport = "stdio"
 	}
 	switch r.Transport {
+	case "agentwork":
+		if r.MachineID == "" {
+			return nil, NewValidationError("machine_id is required for agentwork transport")
+		}
 	case "stdio":
 		if r.Executable == "" {
 			return nil, NewValidationError("executable is required for stdio transport")
@@ -55,7 +62,7 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 			return nil, NewValidationError("endpoint is required for ws/tcp transport")
 		}
 	default:
-		return nil, NewValidationError("transport must be stdio, ws, or tcp")
+		return nil, NewValidationError("transport must be stdio, ws, tcp, or agentwork")
 	}
 	if r.Args == nil {
 		r.Args = []string{}
@@ -74,8 +81,8 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 	argsJSON, _ := json.Marshal(r.Args)
 	envJSON, _ := json.Marshal(r.Env)
 	_, err := s.st.DB().ExecContext(ctx,
-		`INSERT INTO runtime (id,name,transport,provider,executable,args,endpoint,env,agentwork_url,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.Name, r.Transport, r.Provider, r.Executable, string(argsJSON), r.Endpoint, string(envJSON), r.AgentworkURL, r.CreatedAt)
+		`INSERT INTO runtime (id,name,transport,provider,executable,args,endpoint,env,agentwork_url,machine_id,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		r.ID, r.Name, r.Transport, r.Provider, r.Executable, string(argsJSON), r.Endpoint, string(envJSON), r.AgentworkURL, r.MachineID, r.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert runtime: %w", err)
 	}
@@ -84,7 +91,7 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 
 func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,transport,provider,executable,args,endpoint,env,agentwork_url,created_at FROM runtime ORDER BY created_at`)
+		`SELECT id,name,transport,provider,executable,args,endpoint,env,agentwork_url,machine_id,created_at FROM runtime ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +100,7 @@ func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	for rows.Next() {
 		var r Runtime
 		var argsJSON, envJSON string
-		if err := rows.Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.AgentworkURL, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.AgentworkURL, &r.MachineID, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(argsJSON), &r.Args)
@@ -107,8 +114,8 @@ func (s *RuntimeService) Get(ctx context.Context, id string) (*Runtime, error) {
 	var r Runtime
 	var argsJSON, envJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,transport,provider,executable,args,endpoint,env,agentwork_url,created_at FROM runtime WHERE id=?`, id).
-		Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.AgentworkURL, &r.CreatedAt)
+		`SELECT id,name,transport,provider,executable,args,endpoint,env,agentwork_url,machine_id,created_at FROM runtime WHERE id=?`, id).
+		Scan(&r.ID, &r.Name, &r.Transport, &r.Provider, &r.Executable, &argsJSON, &r.Endpoint, &envJSON, &r.AgentworkURL, &r.MachineID, &r.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

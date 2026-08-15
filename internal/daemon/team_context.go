@@ -27,7 +27,7 @@ import (
 // intro, goal, team, the agent's own identity + role contract, and the tool
 // surface. Written in English (platform text is English, 决策 6-18); the
 // MATERIALS (titles, instructions, names) keep their own language.
-func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName, agentDesc, systemPrompt, runRole, goalTitle, policyText, domainType, domainName, worktreeRoot string) string {
+func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName, agentDesc, systemPrompt, runRole, goalTitle, policyText, domainType, domainName, worktreeRoot string, remote bool) string {
 	// The team comes from the goal's own squad assignment ('' = solo). The
 	// leader flag drives the owner contract's reviewer-only rule.
 	var squadID string
@@ -79,6 +79,15 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 	if self == "" {
 		self = "agent-" + short(agentID)
 	}
+	if remote {
+		// The agent-level persona (description + system prompt) rides
+		// AGENTS.md via config.push — the runtime's profile resolver loads
+		// it natively; the per-run role contract stays in the prompt.
+		b.WriteString(self)
+		b.WriteString("\n")
+		b.WriteString(roleContract(runRole, isLeader, squadID))
+		return b.String()
+	}
 	b.WriteString(self)
 	if s := strings.TrimSpace(agentDesc); s != "" {
 		b.WriteString(" — " + s)
@@ -88,6 +97,25 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 	}
 	b.WriteString("\n")
 	b.WriteString(roleContract(runRole, isLeader, squadID))
+
+	// Machine-executed runs (CLI 分支 Phase 2) get the CLI/native-tools
+	// variant: the worktree is the process cwd, collaboration is the
+	// agentwork CLI — no platform MCP servers are advertised there.
+	if remote {
+		b.WriteString("\n# Tools\n")
+		b.WriteString("- Workspace: your working directory IS the worktree — use your own\n")
+		b.WriteString("  file/terminal tools to read, write, and run commands directly.\n")
+		b.WriteString("- Collaboration: run the `agentwork` CLI in your terminal (start with\n")
+		b.WriteString("  `agentwork help`) — comments, consults, sub-goals, waiting, and\n")
+		b.WriteString("  verdicts are structured side effects through it. NEVER use file\n")
+		b.WriteString("  edits to communicate intent.\n")
+		b.WriteString("- Feed: `agentwork goal comments [--after <id>]` — the comment feed\n")
+		b.WriteString("  is the SHARED context. Pull it before acting when you lack\n")
+		b.WriteString("  background; pass the last comment id you saw as --after for\n")
+		b.WriteString("  incremental reads; if you do NOT remember what you have seen,\n")
+		b.WriteString("  pull WITHOUT --after (full feed) — never guess an --after.\n")
+		return b.String()
+	}
 
 	b.WriteString("\n# Tools\n")
 	b.WriteString("- Workspace (worktree root: " + worktreeRoot + "): agentwork_read_file /\n")

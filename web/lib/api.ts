@@ -19,6 +19,13 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 // ── Runtime ──
 export const listRuntimes = () => api<Runtime[]>("/runtimes");
+// Remote machines registered via `agentwork connect` (CLI 分支 Phase 1).
+export const listMachines = () => api<import("./types").Machine[]>("/machines");
+// Skills library (CLI 分支 Phase 4).
+export const listSkills = () => api<import("./types").Skill[]>("/skills");
+export const createSkill = (body: { name: string; description: string; files: Record<string, string> }) =>
+  api<import("./types").Skill>("/skills", { method: "POST", body: JSON.stringify(body) });
+export const deleteSkill = (id: string) => api<void>(`/skills/${id}`, { method: "DELETE" });
 export const getRuntime = (id: string) => api<Runtime>(`/runtimes/${id}`);
 export const createRuntime = (body: Omit<Runtime, "id" | "created_at">) =>
   api<Runtime>("/runtimes", { method: "POST", body: JSON.stringify(body) });

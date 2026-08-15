@@ -39,6 +39,11 @@ type Handlers struct {
 	// git exec). nil = the check is skipped (tests construct handlers
 	// without it).
 	Daemon *daemon.Daemon
+	// Machines is the remote-machine registry (the agentwork CLI's link,
+	// CLI 分支 Phase 1).
+	Machines *service.MachineService
+	// Skills is the skills library (CLI 分支 Phase 4).
+	Skills *service.SkillService
 }
 
 func (h *Handlers) Mount(mux *http.ServeMux) {
@@ -90,6 +95,10 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /schedules/{id}/enabled", h.setScheduleEnabled)
 
 	mux.HandleFunc("GET /domains", h.listDomains)
+	mux.HandleFunc("GET /machines", h.listMachines)
+	mux.HandleFunc("GET /skills", h.listSkills)
+	mux.HandleFunc("POST /skills", h.createSkill)
+	mux.HandleFunc("DELETE /skills/{id}", h.deleteSkill)
 	mux.HandleFunc("POST /domains", h.createDomain)
 	mux.HandleFunc("GET /domains/{id}", h.getDomain)
 	mux.HandleFunc("PUT /domains/{id}", h.updateDomain)
@@ -146,6 +155,9 @@ func (h *Handlers) createAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := h.Agent.Create(r.Context(), a)
+	if err == nil && h.Daemon != nil {
+		go h.Daemon.PushAgentSkills(context.Background(), out.ID)
+	}
 	writeJSON(w, out, err)
 }
 func (h *Handlers) listAgents(w http.ResponseWriter, r *http.Request) {
@@ -163,6 +175,9 @@ func (h *Handlers) updateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := h.Agent.Update(r.Context(), r.PathValue("id"), a)
+	if err == nil && h.Daemon != nil {
+		go h.Daemon.PushAgentSkills(context.Background(), out.ID)
+	}
 	writeJSON(w, out, err)
 }
 func (h *Handlers) deleteAgent(w http.ResponseWriter, r *http.Request) {
@@ -475,6 +490,50 @@ func (h *Handlers) listDomains(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Domain.List(r.Context())
 	writeJSON(w, out, err)
 }
+// listMachines returns the registered remote machines (CLI 分支 Phase 1):
+// connection status + the agent CLIs each machine probed.
+func (h *Handlers) listMachines(w http.ResponseWriter, r *http.Request) {
+	if h.Machines == nil {
+		writeJSON(w, []service.Machine{}, nil)
+		return
+	}
+	out, err := h.Machines.List(r.Context())
+	writeJSON(w, out, err)
+}
+
+// ── skills (CLI 分支 Phase 4) ──
+
+func (h *Handlers) listSkills(w http.ResponseWriter, r *http.Request) {
+	if h.Skills == nil {
+		writeJSON(w, []service.Skill{}, nil)
+		return
+	}
+	out, err := h.Skills.List(r.Context())
+	writeJSON(w, out, err)
+}
+
+func (h *Handlers) createSkill(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name        string            `json:"name"`
+		Description string            `json:"description"`
+		Files       map[string]string `json:"files"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Skills.Create(r.Context(), body.Name, body.Description, body.Files)
+	writeJSON(w, out, err)
+}
+
+func (h *Handlers) deleteSkill(w http.ResponseWriter, r *http.Request) {
+	if err := h.Skills.Delete(r.Context(), r.PathValue("id")); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (h *Handlers) getDomain(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Domain.Get(r.Context(), r.PathValue("id"))
 	writeJSON(w, out, err)

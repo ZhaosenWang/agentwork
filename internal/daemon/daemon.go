@@ -31,10 +31,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/eushing/agentwork/internal/link"
 	"github.com/eushing/agentwork/internal/logging"
 
 	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/gitutil"
 	"github.com/eushing/agentwork/internal/issue"
 	"github.com/eushing/agentwork/internal/mcp"
 	"github.com/eushing/agentwork/internal/notify"
@@ -167,6 +169,16 @@ type Daemon struct {
 	mcpExecs map[string]*mcp.Executor
 	stopped  bool
 	ctx      context.Context
+
+	// Machine link (CLI 分支 Phase 2): live /connect peers keyed by machine
+	// id, plus the per-run upload bookkeeping (event seq / last activity)
+	// for gap detection and the dispatched-run watchdog. Guarded by
+	// machineMu / machineLastEventMu.
+	machineMu     sync.Mutex
+	machinePeers  map[string]*link.Peer
+	machineLastEventMu sync.Mutex
+	machineLastSeq     map[string]int64
+	machineLastEvent   map[string]time.Time
 }
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.
@@ -201,6 +213,9 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		runCancelReasons:  make(map[string]string),
 		reviewReadyTimers: make(map[string]*time.Timer),
 		reviewReadyFired:  make(map[string]bool),
+		machinePeers:      make(map[string]*link.Peer),
+		machineLastSeq:    make(map[string]int64),
+		machineLastEvent:  make(map[string]time.Time),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
@@ -817,6 +832,21 @@ func (d *Daemon) StopRun(goalID, runID string) error {
 	_, registered := d.runCancels[runID]
 	d.mu.Unlock()
 	if !registered {
+		// Machine-dispatched runs (CLI 分支 Phase 2): the local cancel
+		// registry knows nothing about them — send run.cancel over the
+		// machine's link, then stamp cancelled locally (the stamp is the
+		// authority; the machine's late report is dropped as
+		// ErrRunAlreadyTerminal).
+		var machineID string
+		_ = d.st.DB().QueryRowContext(d.ctx,
+			`SELECT r.machine_id FROM run ru JOIN agent a ON a.id=ru.agent_id JOIN runtime r ON r.id=a.runtime_id WHERE ru.id=?`,
+			runID).Scan(&machineID)
+		if machineID != "" {
+			if peer := d.MachinePeer(machineID); peer != nil {
+				_ = peer.Notify(d.ctx, link.MethodRunCancel, link.RunCancelParams{RunID: runID, Reason: "stopped"})
+				logging.Infof("daemon: human stopped machine run %s (cancel sent to %s)", runID, machineID)
+			}
+		}
 		res, err := d.st.DB().ExecContext(d.ctx,
 			`UPDATE run SET status='cancelled', cancel_reason='stopped', finished_at=? WHERE id=? AND status='running'`,
 			nowStr(), runID)
@@ -1222,26 +1252,13 @@ func (d *Daemon) ensureSharedRepo(ctx context.Context, domainID, gitURL, gitCred
 // URLs are returned as-is.
 // sanitizeURL strips embedded credentials before a URL is logged — clone
 // URLs carry the platform token, and it must never reach the log file.
-func sanitizeURL(raw string) string {
-	if i := strings.Index(raw, "://"); i >= 0 {
-		rest := raw[i+3:]
-		if j := strings.Index(rest, "@"); j >= 0 && !strings.Contains(rest[:j], "/") {
-			return raw[:i+3] + rest[j+1:]
-		}
-	}
-	return raw
-}
+// Delegates to gitutil (shared with the agentwork CLI — Phase 3).
+func sanitizeURL(raw string) string { return gitutil.SanitizeURL(raw) }
 
-func gitCloneURL(gitURL, credentials string) string {
-	if credentials == "" || !strings.HasPrefix(gitURL, "https://") || strings.Contains(gitURL, "@") {
-		return gitURL
-	}
-	cred := credentials
-	if strings.Contains(gitURL, "gitcode.com") {
-		cred = "oauth2:" + credentials
-	}
-	return "https://" + cred + "@" + strings.TrimPrefix(gitURL, "https://")
-}
+// gitCloneURL embeds the domain's credentials into an HTTPS clone URL
+// (github token-as-username / gitcode oauth2:). Delegates to gitutil
+// (shared with the agentwork CLI — Phase 3).
+func gitCloneURL(gitURL, credentials string) string { return gitutil.CloneURL(gitURL, credentials) }
 
 // ensureRunWorktreeFor allocates the run's worktree (决策 6-2): owner runs
 // check out the goal branch (created from the domain's default branch on the
@@ -1522,13 +1539,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.runProcessorTask(ctx, q)
 		return
 	}
-	var title, desc, handoff, domainID, gitURL, defaultBranch, domainType, domainName, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials string
+	var title, desc, handoff, domainID, gitURL, defaultBranch, domainType, domainName, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials, gitIdentity, runtimeMachineID string
 	var agentName, agentDesc, triggerAuthorName, runtimeAgentworkURL string
 	var triggerAuthor, triggerCommentID, triggerCommentContent, runRole, subGoalID, wakeNote, wakeAnchorID string
 	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, COALESCE(d.type,''), COALESCE(d.name,''), a.system_prompt, a.name, COALESCE(a.description,''),
-		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, COALESCE(r.agentwork_url,''), a.max_concurrent, d.max_run_duration,
+		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, COALESCE(d.type,''), COALESCE(d.name,''), a.system_prompt, a.name, COALESCE(a.description,''), d.git_identity,
+		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, COALESCE(r.agentwork_url,''), COALESCE(r.machine_id,''), a.max_concurrent, d.max_run_duration,
 		        g.source_ref, d.git_credentials,
 		        r2.trigger_comment_id, COALESCE(c.author_type, ''), COALESCE(c.content, ''), COALESCE(ca.name,''), r2.role, r2.sub_goal_id, r2.wake_note, COALESCE(r2.wake_anchor,'')
 		 FROM run r2
@@ -1539,7 +1556,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 LEFT JOIN agent ca ON ca.id = c.author_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &agentName, &agentDesc, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &runtimeAgentworkURL, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &triggerAuthorName, &runRole, &subGoalID, &wakeNote, &wakeAnchorID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &agentName, &agentDesc, &gitIdentity, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &runtimeAgentworkURL, &runtimeMachineID, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &triggerAuthorName, &runRole, &subGoalID, &wakeNote, &wakeAnchorID)
 	// Claim visibility: which run, which agent, which role — the panel's
 	// answer to "who is doing what right now". The TITLE travels with the
 	// id: ids are for the system, humans read titles.
@@ -1645,6 +1662,57 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		)
 	}
 
+		var issueSection string
+		if len(issueComments) > 0 {
+			var ib strings.Builder
+			ib.WriteString("## Latest issue conversation (from the remote)\n")
+			for _, cm := range issueComments {
+				fmt.Fprintf(&ib, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
+			}
+			issueSection = ib.String()
+		}
+
+	// The domain's acceptance policy in NL (the "what counts as done" the
+	// OWNER defined) — the agent works toward it instead of finding out at
+	// verification time. Only the NL intent is injected; the compiled checks
+	// stay invisible (triangle separation: define stays with the human,
+	// execute with the agent, judge with the machine+human).
+	var policyText string
+	_ = d.st.DB().QueryRowContext(ctx,
+		`SELECT d.policy_text FROM goal g JOIN domain d ON d.id=g.domain_id WHERE g.id=?`, q.GoalID).Scan(&policyText)
+
+	// CLI 分支 Phase 2: machine-owned runtimes execute on their registered
+	// machine — assemble the SAME engineered prompt and dispatch it over
+	// the link. This goroutine's job ends at the ack; the run's lifecycle
+	// continues via the machine's claimed/event/finished uploads.
+	if transport == "agentwork" {
+		dispatchEnv := map[string]string{}
+		for k, v := range rtEnv {
+			dispatchEnv[k] = v
+		}
+		for k, v := range agentEnv {
+			dispatchEnv[k] = v
+		}
+		machinePrompt := d.assemblePrompt(ctx, q, promptInputs{
+			agentName: agentName, agentDesc: agentDesc, systemPrompt: systemPrompt, runRole: runRole,
+			goalTitle: goalTitle, policyText: policyText, domainType: domainType, domainName: domainName,
+			triggerCommentID: triggerCommentID, triggerAuthor: triggerAuthor, triggerAuthorName: triggerAuthorName,
+			triggerCommentContent: triggerCommentContent, title: title, desc: desc, handoff: handoff,
+			wakeNote: wakeNote, wakeAnchorID: wakeAnchorID, issueSection: issueSection, subGoalID: subGoalID,
+			consultRun: consultRun, reviewRun: reviewRun, verifyRun: verifyRun, subGoalRun: subGoalRun,
+		}, true, false, true, "")
+		d.dispatchToMachine(ctx, q, link.RunDispatchParams{
+			RunID: q.RunID, GoalID: q.GoalID, AgentID: q.AgentID,
+			Role: runRole, SubGoalID: subGoalID, Attempt: q.Attempt,
+			Token: q.Token, Prompt: machinePrompt,
+			Scratch: domainType == "scratch", DomainName: domainName,
+			DomainID: domainID, GitURL: gitURL, GitCredentials: gitCredentials,
+			DefaultBranch: defaultBranch, GitIdentity: gitIdentity,
+			ACPSpawn: args, Env: dispatchEnv, ServerURL: serverURL,
+		}, runtimeMachineID)
+		return
+	}
+
 	// Persistent session (决策 6-21): owner/review/consult runs of an ACP
 	// runtime ride the (agent, goal) session — ONE process + ONE ACP session
 	// across wakes. The session owns its worktree (owner: the goal branch's
@@ -1657,7 +1725,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		var err error
 		ls, sessionIsNew, err = d.acquireSession(ctx, q.RunID, q.GoalID, q.AgentID, provider, runRole, subGoalID,
 			scratchDomain, domainName, domainID, gitURL, gitCredentials, defaultBranch, serverURL,
-			transport, execPath, endpoint, args, rtEnv, taskEnv)
+			transport, execPath, endpoint, args, rtEnv, taskEnv, q.Token)
 		if err != nil {
 			d.failRun(ctx, q, fmt.Sprintf("session: %v", err))
 			return
@@ -1783,12 +1851,12 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		// re-pointed at this wake's run and worktree. Registered under the
 		// session key at creation; the URL was advertised at session/new.
 		env = ls.env
-		env.setRun(q.RunID, runRowWorkdir)
+		env.setRun(q.RunID, runRowWorkdir, q.Token)
 		mcpExec = ls.mcpExec
 		mcpExec.SetWorktree(runRowWorkdir)
 		mcpExec.SetCollaboration(q.GoalID, q.AgentID, q.RunID, d.commentSvc, d.goalSvc, d.runSvc, d.agentSvc, d.squadSvc)
 	} else {
-		env = newRunEnvironment(q.RunID, q.GoalID, q.AgentID, runRowWorkdir, serverURL)
+		env = newRunEnvironment(q.RunID, q.GoalID, q.AgentID, runRowWorkdir, serverURL, q.Token)
 		// Workspace MCP server (DESIGN.md 决策 4-8): every run advertises its
 		// workspace as an MCP server over HTTP at session/new — agents that do
 		// not delegate tools to client fs/terminal RPCs (opencode's tools are
@@ -1841,127 +1909,16 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// the WAKE LINE (every turn). The comment feed is PULLED via
 	// agentwork_get_comments, never injected wholesale — the wake line
 	// carries the triggering words, the feed is the shared context.
-	var issueSection string
-	if len(issueComments) > 0 {
-		var ib strings.Builder
-		ib.WriteString("## Latest issue conversation (from the remote)\n")
-		for _, cm := range issueComments {
-			fmt.Fprintf(&ib, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
-		}
-		issueSection = ib.String()
-	}
-	// The domain's acceptance policy in NL (the "what counts as done" the
-	// OWNER defined) — the agent works toward it instead of finding out at
-	// verification time. Only the NL intent is injected; the compiled checks
-	// stay invisible (triangle separation: define stays with the human,
-	// execute with the agent, judge with the machine+human).
-	var policyText string
-	_ = d.st.DB().QueryRowContext(ctx,
-		`SELECT d.policy_text FROM goal g JOIN domain d ON d.id=g.domain_id WHERE g.id=?`, q.GoalID).Scan(&policyText)
-
-	// The wake statement (决策 6-22): ONE unified shape — who mentioned the
-	// agent on WHICH comment, with the reason/task as the content. The
-	// anchor (comment id) is the get_comments(after=) handle.
-	var wakeWho, wakeAnchor, wakeContent string
-	switch {
-	case runRole == "owner" && triggerCommentID != "" && triggerAuthor == "human":
-		// A comment-triggered reopen (决策 4-1 修订): the human's follow-up
-		// comment IS this turn's ask — same mention shape as a consult.
-		wakeWho = "the user"
-		wakeAnchor = triggerCommentID
-		wakeContent = "> " + triggerCommentContent
-	case consultRun:
-		wakeWho = triggerAuthorName
-		if wakeWho == "" {
-			wakeWho = "the user"
-		}
-		wakeAnchor = triggerCommentID
-		wakeContent = "> " + triggerCommentContent
-	case reviewRun:
-		wakeWho = "the platform"
-		wakeAnchor = triggerCommentID
-		wakeContent = "Review the goal's outcome — inspect the diff and the feed."
-	case verifyRun:
-		wakeWho = "the platform"
-		wakeContent = "Verify this work item: " + title + "\n" + desc
-	case subGoalRun:
-		wakeWho = triggerAuthorName // the dispatcher (dispatch comment's author)
-		if wakeWho == "" {
-			wakeWho = "the platform"
-		}
-		wakeAnchor = triggerCommentID
-		wakeContent = title + "\n\n" + desc
-	case handoff != "":
-		wakeWho = "the platform"
-		// The handoff/reject note lands as the goal's latest comment — it IS
-		// the anchor for the next owner.
-		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT id FROM comment WHERE goal_id=? ORDER BY created_at DESC LIMIT 1`, q.GoalID).Scan(&wakeAnchor)
-		wakeContent = "> " + handoff
-	case wakeNote != "":
-		wakeWho = "the platform"
-		wakeAnchor = wakeAnchorID // the spawn-time anchor (决策 6-22)
-		wakeContent = wakeNote
-	default:
-		wakeWho = "the user"
-		// The assignment statement: the goal's FIRST comment (the human's
-		// creation words) anchors the run.
-		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT id FROM comment WHERE goal_id=? ORDER BY created_at ASC LIMIT 1`, q.GoalID).Scan(&wakeAnchor)
-		if strings.TrimSpace(desc) != "" {
-			wakeContent = desc
-		} else {
-			wakeContent = title
-		}
-	}
-	wakeLine := buildWakeLine(wakeAnchor, wakeWho, wakeContent)
-	if issueSection != "" {
-		wakeLine += "\n" + issueSection + "\n"
-	}
-
-	// Wake extras: sub-goal rework context, the mention-cycle hint, and the
-	// resolved-consult answers ride with the wake line.
-	var extras strings.Builder
-	if subGoalRun && subGoalID != "" {
-		var rejectSummary string
-		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT summary FROM verification_result WHERE sub_goal_id=? AND status='rejected' ORDER BY created_at DESC LIMIT 1`,
-			subGoalID).Scan(&rejectSummary); err == nil && strings.TrimSpace(rejectSummary) != "" {
-			extras.WriteString("\nYour previous round was REJECTED (fix from this — do NOT start over):\n" + rejectSummary + "\n")
-		}
-		var chStatus string
-		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT status FROM change WHERE sub_goal_id=? ORDER BY created_at DESC LIMIT 1`,
-			subGoalID).Scan(&chStatus); err == nil && chStatus == "conflict" {
-			extras.WriteString("\nYour previous Change CONFLICTED at integration — resolve it against the new integration base; your new Revision replaces the old one.\n")
-		}
-		if q.Attempt > 1 && !strings.Contains(extras.String(), "REJECTED") {
-			var lastFail string
-			if err := d.st.DB().QueryRowContext(ctx,
-				`SELECT result_summary FROM run WHERE sub_goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`,
-				subGoalID).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
-				extras.WriteString("\nYour previous round FAILED machine verification (fix the existing code, do NOT start over):\n" + truncateIn(lastFail, 1500) + "\n")
-			}
-		}
-	}
-	if n, err := d.agentTriggeredRunCount(ctx, q.GoalID); err == nil && n > service.MaxMentionHints {
-		extras.WriteString(fmt.Sprintf("\n⚠️ Collaboration warning: agents have handed this task back and forth %d times. Do NOT hand it off again — finish the remaining work yourself, or end your turn and leave it for a human.\n", n))
-	}
-	if runRole == "owner" {
-		if section := d.consultStatus(ctx, q.GoalID, q.AgentID, q.RunID); section != "" {
-			extras.WriteString(section)
-		}
-	}
-
 	var prompt string
-	if sessionRun && !sessionIsNew {
-		// The session remembers the fixed block — the wake line alone is the
-		// turn's delta (决策 6-22).
-		prompt = wakeLine + extras.String()
-	} else {
-		prompt = d.buildFixedBlock(ctx, q.GoalID, q.AgentID, agentName, agentDesc, systemPrompt, runRole, goalTitle, policyText, domainType, domainName, runRowWorkdir) +
-			"\n\n" + wakeLine + extras.String()
-	}
+	_ = prompt
+	prompt = d.assemblePrompt(ctx, q, promptInputs{
+		agentName: agentName, agentDesc: agentDesc, systemPrompt: systemPrompt, runRole: runRole,
+		goalTitle: goalTitle, policyText: policyText, domainType: domainType, domainName: domainName,
+		triggerCommentID: triggerCommentID, triggerAuthor: triggerAuthor, triggerAuthorName: triggerAuthorName,
+		triggerCommentContent: triggerCommentContent, title: title, desc: desc, handoff: handoff,
+		wakeNote: wakeNote, wakeAnchorID: wakeAnchorID, issueSection: issueSection, subGoalID: subGoalID,
+		consultRun: consultRun, reviewRun: reviewRun, verifyRun: verifyRun, subGoalRun: subGoalRun,
+	}, false, sessionRun, sessionIsNew, runRowWorkdir)
 	backend, err := d.protoReg.Get(provider)
 	if err != nil {
 		if !sessionRun {
@@ -2446,7 +2403,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 	// declares no fs/terminal capabilities and the processor agent's
 	// write/shell tools are rejected ("agent→client RPC not configured") —
 	// the compile run cannot land its checks.json artifact (a live failure).
-	env := newRunEnvironment(q.RunID, "", q.AgentID, runRowWorkdir, serverURL)
+	env := newRunEnvironment(q.RunID, "", q.AgentID, runRowWorkdir, serverURL, q.Token)
 	defer env.tm.cleanup()
 	d.mu.Lock()
 	mcpExec := mcp.NewExecutor(runRowWorkdir, env.runEnv(nil), env.tm)
@@ -3235,3 +3192,117 @@ func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, p
 		logging.Infof("daemon: schedule %s advance next_run_at: %v", r.ScheduleID, err)
 	}
 }
+
+// promptInputs carries everything the prompt assembly reads.
+type promptInputs struct {
+	agentName, agentDesc, systemPrompt, runRole, goalTitle, policyText, domainType, domainName string
+	triggerCommentID, triggerAuthor, triggerAuthorName, triggerCommentContent string
+	title, desc, handoff, wakeNote, wakeAnchorID, issueSection, subGoalID string
+	consultRun, reviewRun, verifyRun, subGoalRun bool
+}
+
+// assemblePrompt renders the complete run prompt — the fixed block (or, for
+// a resident session's follow-up wake, the wake line alone) + wake line +
+// extras. Shared by the local execution path and the machine dispatch
+// (CLI 分支 Phase 2): the machine gets the SAME engineered context.
+func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in promptInputs, remote, sessionRun, sessionIsNew bool, runRowWorkdir string) string {
+	var wakeWho, wakeAnchor, wakeContent string
+	switch {
+	case in.runRole == "owner" && in.triggerCommentID != "" && in.triggerAuthor == "human":
+		// A comment-triggered reopen (决策 4-1 修订): the human's follow-up
+		// comment IS this turn's ask — same mention shape as a consult.
+		wakeWho = "the user"
+		wakeAnchor = in.triggerCommentID
+		wakeContent = "> " + in.triggerCommentContent
+	case in.consultRun:
+		wakeWho = in.triggerAuthorName
+		if wakeWho == "" {
+			wakeWho = "the user"
+		}
+		wakeAnchor = in.triggerCommentID
+		wakeContent = "> " + in.triggerCommentContent
+	case in.reviewRun:
+		wakeWho = "the platform"
+		wakeAnchor = in.triggerCommentID
+		wakeContent = "Review the goal's outcome — inspect the diff and the feed."
+	case in.verifyRun:
+		wakeWho = "the platform"
+		wakeContent = "Verify this work item: " + in.title + "\n" + in.desc
+	case in.subGoalRun:
+		wakeWho = in.triggerAuthorName // the dispatcher (dispatch comment's author)
+		if wakeWho == "" {
+			wakeWho = "the platform"
+		}
+		wakeAnchor = in.triggerCommentID
+		wakeContent = in.title + "\n\n" + in.desc
+	case in.handoff != "":
+		wakeWho = "the platform"
+		// The handoff/reject note lands as the goal's latest comment — it IS
+		// the anchor for the next owner.
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT id FROM comment WHERE goal_id=? ORDER BY created_at DESC LIMIT 1`, q.GoalID).Scan(&wakeAnchor)
+		wakeContent = "> " + in.handoff
+	case in.wakeNote != "":
+		wakeWho = "the platform"
+		wakeAnchor = in.wakeAnchorID // the spawn-time anchor (决策 6-22)
+		wakeContent = in.wakeNote
+	default:
+		wakeWho = "the user"
+		// The assignment statement: the goal's FIRST comment (the human's
+		// creation words) anchors the run.
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT id FROM comment WHERE goal_id=? ORDER BY created_at ASC LIMIT 1`, q.GoalID).Scan(&wakeAnchor)
+		if strings.TrimSpace(in.desc) != "" {
+			wakeContent = in.desc
+		} else {
+			wakeContent = in.title
+		}
+	}
+	wakeLine := buildWakeLine(wakeAnchor, wakeWho, wakeContent)
+	if in.issueSection != "" {
+		wakeLine += "\n" + in.issueSection + "\n"
+	}
+
+	// Wake extras: sub-goal rework context, the mention-cycle hint, and the
+	// resolved-consult answers ride with the wake line.
+	var extras strings.Builder
+	if in.subGoalRun && in.subGoalID != "" {
+		var rejectSummary string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT summary FROM verification_result WHERE sub_goal_id=? AND status='rejected' ORDER BY created_at DESC LIMIT 1`,
+			in.subGoalID).Scan(&rejectSummary); err == nil && strings.TrimSpace(rejectSummary) != "" {
+			extras.WriteString("\nYour previous round was REJECTED (fix from this — do NOT start over):\n" + rejectSummary + "\n")
+		}
+		var chStatus string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT status FROM change WHERE sub_goal_id=? ORDER BY created_at DESC LIMIT 1`,
+			in.subGoalID).Scan(&chStatus); err == nil && chStatus == "conflict" {
+			extras.WriteString("\nYour previous Change CONFLICTED at integration — resolve it against the new integration base; your new Revision replaces the old one.\n")
+		}
+		if q.Attempt > 1 && !strings.Contains(extras.String(), "REJECTED") {
+			var lastFail string
+			if err := d.st.DB().QueryRowContext(ctx,
+				`SELECT result_summary FROM run WHERE sub_goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`,
+				in.subGoalID).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
+				extras.WriteString("\nYour previous round FAILED machine verification (fix the existing code, do NOT start over):\n" + truncateIn(lastFail, 1500) + "\n")
+			}
+		}
+	}
+	if n, err := d.agentTriggeredRunCount(ctx, q.GoalID); err == nil && n > service.MaxMentionHints {
+		extras.WriteString(fmt.Sprintf("\n⚠️ Collaboration warning: agents have handed this task back and forth %d times. Do NOT hand it off again — finish the remaining work yourself, or end your turn and leave it for a human.\n", n))
+	}
+	if in.runRole == "owner" {
+		if section := d.consultStatus(ctx, q.GoalID, q.AgentID, q.RunID); section != "" {
+			extras.WriteString(section)
+		}
+	}
+
+	if sessionRun && !sessionIsNew {
+		// The session remembers the fixed block — the wake line alone is the
+		// turn's delta (决策 6-22).
+		return wakeLine + extras.String()
+	}
+	return d.buildFixedBlock(ctx, q.GoalID, q.AgentID, in.agentName, in.agentDesc, in.systemPrompt, in.runRole, in.goalTitle, in.policyText, in.domainType, in.domainName, runRowWorkdir, remote) +
+		"\n\n" + wakeLine + extras.String()
+}
+

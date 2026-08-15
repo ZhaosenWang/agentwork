@@ -33,6 +33,7 @@ import (
 type runEnvironment struct {
 	runID, goalID, agentID string
 	serverURL              string // AGENTWORK_SERVER_URL for the CLI
+	token                  string // AGENTWORK_TOKEN — the per-run credential (CLI 分支 Phase 2)
 	tm                     *terminalManager
 
 	// workdir + runID are MUTABLE on a session-scoped handler (决策 6-21):
@@ -43,21 +44,24 @@ type runEnvironment struct {
 }
 
 // newRunEnvironment builds the per-run handler.
-func newRunEnvironment(runID, goalID, agentID, workdir, serverURL string) *runEnvironment {
+func newRunEnvironment(runID, goalID, agentID, workdir, serverURL, token string) *runEnvironment {
 	return &runEnvironment{
 		runID:     runID,
 		goalID:    goalID,
 		agentID:   agentID,
 		workdir:   workdir,
 		serverURL: serverURL,
+		token:     token,
 		tm:        newTerminalManager(),
 	}
 }
 
-// setRun binds the handler to the current wake's run + worktree (决策 6-21).
-func (e *runEnvironment) setRun(runID, workdir string) {
+// setRun binds the handler to the current wake's run + worktree + token
+// (决策 6-21): the session's env answers client RPCs across consecutive
+// wakes, each with its own run and credential.
+func (e *runEnvironment) setRun(runID, workdir, token string) {
 	e.mu.Lock()
-	e.runID, e.workdir = runID, workdir
+	e.runID, e.workdir, e.token = runID, workdir, token
 	e.mu.Unlock()
 }
 
@@ -77,6 +81,7 @@ func (e *runEnvironment) runEnv(agentEnv []acp.EnvVariable) []string {
 		"AGENTWORK_RUN_ID="+runID,
 		"AGENTWORK_AGENT_ID="+e.agentID,
 		"AGENTWORK_SERVER_URL="+e.serverURL,
+		"AGENTWORK_TOKEN="+e.token,
 	)
 	return env
 }

@@ -51,10 +51,29 @@ CREATE TABLE IF NOT EXISTS domain (
     created_at             TEXT NOT NULL
 );
 
+-- machine: one remote machine running `agentwork connect` — the execution
+-- host registered to the platform (CLI 分支 Phase 1). The probed agent
+-- CLIs ride probed_clis (JSON); they become runtime rows once remote
+-- execution lands (Phase 2). status flips offline via the server's stale
+-- sweep when heartbeats stop.
+CREATE TABLE IF NOT EXISTS machine (
+    id           TEXT PRIMARY KEY,
+    name         TEXT NOT NULL DEFAULT '',
+    hostname     TEXT NOT NULL DEFAULT '',
+    version      TEXT NOT NULL DEFAULT '',
+    probed_clis  TEXT NOT NULL DEFAULT '[]', -- JSON []link.ProbeCLI
+    last_seen_at TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'connected', -- connected|offline
+    created_at   TEXT NOT NULL
+);
+
 -- A runtime is a launch spec: how to connect to a protocol-speaking agent.
 -- Pure configuration; no capabilities of its own.
 -- transport=stdio → daemon spawns executable+args (subprocess).
 -- transport=ws|tcp → daemon dials endpoint (remote service; no spawn).
+-- transport=agentwork → the run is dispatched to the registered machine
+--   (runtime.machine_id) over its /connect link; the machine's agentwork
+--   spawns the CLI there (acp_spawn in args). CLI 分支 Phase 2.
 -- provider selects which backend speaks the agent's wire protocol:
 --   acp → JSON-RPC 2.0 (internal/proto/acp)
 --   jsonl → single-direction JSONL stream (claude/opencode style)
@@ -69,6 +88,7 @@ CREATE TABLE IF NOT EXISTS runtime (
     endpoint    TEXT NOT NULL DEFAULT '',      -- ws/tcp: "ws://host:port" or "host:port"; stdio: ''
     env         TEXT NOT NULL DEFAULT '{}',    -- JSON object of runtime env (stdio only)
     agentwork_url TEXT NOT NULL DEFAULT '',    -- advertised platform base URL for THIS runtime (remote agents need the daemon's public address); '' = http://127.0.0.1:<listen port>
+    machine_id     TEXT NOT NULL DEFAULT '',    -- transport=agentwork: the registered machine that executes this runtime's runs
     created_at  TEXT NOT NULL                  -- RFC3339
 );
 
@@ -87,8 +107,21 @@ CREATE TABLE IF NOT EXISTS agent (
     model           TEXT NOT NULL DEFAULT '',  -- optional override
     env             TEXT NOT NULL DEFAULT '{}', -- agent-level env, layered over runtime env
     mcp_servers     TEXT NOT NULL DEFAULT '[]', -- extra MCP servers advertised at session/new (acp.McpServer JSON array); the platform's workspace server is always prepended
+    skills          TEXT NOT NULL DEFAULT '[]', -- JSON []skill-id — platform-managed skills pushed to the agent's machine (CLI 分支 Phase 4)
     max_concurrent  INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL
+);
+
+-- skill: a platform-managed skill package (SKILL.md + resources) — the
+-- skills library agents get their skills from. Files live on disk under
+-- the skills root (<runsRoot>/skills/<id>/); the machine receives them
+-- via config.push and installs them under agentwork-<name>/ (CLI 分支
+-- Phase 4).
+CREATE TABLE IF NOT EXISTS skill (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
 );
 
 -- A squad is a routing group. It does no work itself: assigning a goal to a
@@ -183,6 +216,7 @@ CREATE TABLE IF NOT EXISTS run (
     base_ref           TEXT NOT NULL DEFAULT '',  -- subgoal runs: merge-base(goal branch, sub-goal branch) at run end — the Change revision's integration base
     head_ref           TEXT NOT NULL DEFAULT '',  -- subgoal runs: the branch head SHA the Change revision delivers
     dirty_snapshot     TEXT NOT NULL DEFAULT '',  -- retired (run-scoped workspaces, 决策 6-2); kept for now
+    token              TEXT NOT NULL DEFAULT '',  -- per-run execution credential (CLI 分支 Phase 2): issued at claim, sent to the executor, carried by the agent's CLI commands to /rpc; valid only while status='running'
     queued_at          TEXT NOT NULL,
     started_at         TEXT NOT NULL DEFAULT '',
     finished_at        TEXT NOT NULL DEFAULT '',

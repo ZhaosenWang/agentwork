@@ -169,6 +169,21 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	}
 	branchHead, err := gitRun(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branchName)
 	if err != nil || strings.TrimSpace(branchHead) == "" {
+		// Machine-executed goals (CLI 分支 Phase 3) pushed their branch to
+		// the remote as agentwork/<branch> (中转) — the deliver merges THAT
+		// when the local ref is absent. A local ref wins (daemon-executed
+		// goals still merge their own branch).
+		remoteBranch := "agentwork/" + branchName
+		if _, terr := gitRun(ctx, repo, "rev-parse", "--verify", "--quiet", "origin/"+remoteBranch); terr == nil {
+			if _, berr := gitRun(ctx, repo, "branch", branchName, "origin/"+remoteBranch); berr != nil {
+				d.finishDeliver(ctx, goalID, false, "deliver: adopt remote branch "+remoteBranch+": "+berr.Error())
+				return
+			}
+			logging.Infof("git: deliver %q (%s): branch %s adopted from origin/%s (machine-executed)", goalTitle, goalID, branchName, remoteBranch)
+			branchHead, _ = gitRun(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branchName)
+		}
+	}
+	if strings.TrimSpace(branchHead) == "" {
 		d.finishDeliver(ctx, goalID, false, "deliver: goal branch "+branchName+" missing — nothing to deliver")
 		return
 	}
@@ -269,6 +284,12 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		return
 	}
 	logging.Infof("git: deliver %q (%s): push done (%s)", goalTitle, goalID, time.Since(start).Round(time.Second))
+
+	// Cleanup: the 中转 branch on the remote (machine-executed goals push
+	// agentwork/<branch>) is disposable once merged — best-effort delete.
+	if out, derr := exec.CommandContext(ctx, "git", "-C", repo, "push", "origin", ":refs/heads/agentwork/"+branchName).CombinedOutput(); derr != nil {
+		logging.Infof("git: deliver %q (%s): cleanup remote branch agentwork/%s: %v %s", goalTitle, goalID, branchName, derr, strings.TrimSpace(string(out)))
+	}
 
 	// The delivered note carries the merge info; the fix commits travel
 	// STRUCTURED to the delivered event (the close comment links them).

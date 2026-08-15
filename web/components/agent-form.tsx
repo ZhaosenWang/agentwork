@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useCreateAgent, useUpdateAgent, useRuntimes } from "@/lib/queries";
+import { useCreateAgent, useUpdateAgent, useRuntimes, useSkills } from "@/lib/queries";
 import type { Agent, McpServer } from "@/lib/types";
 import { Button, Dialog, Field, inputCls } from "@/components/ui";
 
@@ -61,6 +61,8 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
   );
   const [mcpRows, setMcpRows] = useState<McpServer[]>(agent?.mcp_servers ?? []);
   const [maxConcurrent, setMaxConcurrent] = useState(String(agent?.max_concurrent ?? 1));
+  const [skills, setSkills] = useState<string[]>(agent?.skills ?? []);
+  const { data: skillLib } = useSkills();
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -80,6 +82,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
         .filter((m) => m.name.trim())
         .map((m) => ({ ...m, type: m.type === "stdio" ? "" : m.type })),
       max_concurrent: parseInt(maxConcurrent) || 1,
+      skills,
     };
     if (agent) {
       update.mutate({ id: agent.id, ...body }, { onSuccess: onClose });
@@ -118,6 +121,30 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
 
         <Field label="System Prompt">
           <textarea value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} className={`${inputCls} font-mono`} rows={3} />
+        </Field>
+
+        <Field label="Skills（平台技能库）" hint="勾选的 skill 会下发到该 agent 所在机器（agentwork-<名称>/ 命名空间）">
+          {skillLib && skillLib.length > 0 ? (
+            <div className="space-y-1">
+              {skillLib.map((sk) => (
+                <label key={sk.id} className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={skills.includes(sk.id)}
+                    onChange={(e) =>
+                      setSkills((prev) =>
+                        e.target.checked ? [...prev, sk.id] : prev.filter((x) => x !== sk.id)
+                      )
+                    }
+                  />
+                  <span className="font-medium">{sk.name}</span>
+                  {sk.description && <span className="text-xs text-zinc-500">— {sk.description}</span>}
+                </label>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-zinc-400">技能库为空——在「Skills」页面上传 skill 包</p>
+          )}
         </Field>
 
         <Field label="Model" hint="留空用 runtime 默认">

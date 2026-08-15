@@ -50,7 +50,7 @@ func seedCtx(t *testing.T) (*Daemon, *store.Store, string, string) {
 func TestFixedBlockShape(t *testing.T) {
 	d, st, goalID, agentID := seedCtx(t)
 	ctx := context.Background()
-	block := d.buildFixedBlock(ctx, goalID, agentID, "B", "the implementer", "sys", "owner", "g", "测试能过", "repo", "", "/tmp/wt")
+	block := d.buildFixedBlock(ctx, goalID, agentID, "B", "the implementer", "sys", "owner", "g", "测试能过", "repo", "", "/tmp/wt", false)
 
 	for _, want := range []string{
 		"# Background & Requirements", "# Goal", "# Team", "# Who You Are", "# Tools",
@@ -72,17 +72,17 @@ func TestFixedBlockShape(t *testing.T) {
 func TestFixedBlockRoleContracts(t *testing.T) {
 	d, _, goalID, agentID := seedCtx(t)
 	ctx := context.Background()
-	owner := d.buildFixedBlock(ctx, goalID, agentID, "B", "", "", "owner", "g", "", "repo", "", "/tmp/wt")
+	owner := d.buildFixedBlock(ctx, goalID, agentID, "B", "", "", "owner", "g", "", "repo", "", "/tmp/wt", false)
 	for _, want := range []string{"final message becomes your run's report", "never write ids", "JUDGED, not declared"} {
 		if !strings.Contains(owner, want) {
 			t.Fatalf("the owner contract must carry %q", want)
 		}
 	}
-	reviewer := d.buildFixedBlock(ctx, goalID, agentID, "B", "", "", "review", "g", "", "repo", "", "/tmp/wt")
+	reviewer := d.buildFixedBlock(ctx, goalID, agentID, "B", "", "", "review", "g", "", "repo", "", "/tmp/wt", false)
 	if !strings.Contains(reviewer, "REVIEW ONLY") || !strings.Contains(reviewer, "never do the work") {
 		t.Fatalf("the reviewer contract must be review-only, got:\n%s", reviewer)
 	}
-	sub := d.buildFixedBlock(ctx, goalID, agentID, "B", "", "", "subgoal", "g", "", "repo", "", "/tmp/wt")
+	sub := d.buildFixedBlock(ctx, goalID, agentID, "B", "", "", "subgoal", "g", "", "repo", "", "/tmp/wt", false)
 	if !strings.Contains(sub, "NEVER post your conclusions with agentwork_comment_goal") {
 		t.Fatalf("the subgoal contract must ban the double report, got:\n%s", sub)
 	}

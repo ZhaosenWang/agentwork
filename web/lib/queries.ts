@@ -6,6 +6,10 @@ import {
   createRuntime,
   deleteRuntime,
   testRuntime,
+  listMachines,
+  listSkills,
+  createSkill,
+  deleteSkill,
   listAgents,
   createAgent,
   updateAgent,
@@ -61,6 +65,8 @@ import type { WSEvent } from "./types";
 // ── Query keys ──
 export const qk = {
   runtimes: ["runtimes"] as const,
+  machines: ["machines"] as const,
+  skills: ["skills"] as const,
   agents: ["agents"] as const,
   goals: ["goals"] as const,
   goal: (id: string) => ["goals", id] as const,
@@ -98,6 +104,26 @@ export function useSavePlatformSettings() {
 // ── Runtime hooks ──
 export function useRuntimes() {
   return useQuery({ queryKey: qk.runtimes, queryFn: listRuntimes });
+}
+export function useMachines() {
+  return useQuery({ queryKey: qk.machines, queryFn: listMachines, refetchInterval: 10000 });
+}
+export function useSkills() {
+  return useQuery({ queryKey: qk.skills, queryFn: listSkills });
+}
+export function useCreateSkill() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: createSkill,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.skills }),
+  });
+}
+export function useDeleteSkill() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: deleteSkill,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.skills }),
+  });
 }
 export function useCreateRuntime() {
   const qc = useQueryClient();

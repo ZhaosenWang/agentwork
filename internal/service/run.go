@@ -621,6 +621,10 @@ type ClaimedRow struct {
 	GoalID  string
 	AgentID string
 	Attempt int
+	// Token is the per-run execution credential (CLI 分支 Phase 2): issued
+	// at claim, delivered to the executor, carried by the agent's CLI
+	// commands to /rpc. Valid only while the run is 'running'.
+	Token string
 }
 
 // Claim atomically claims the oldest queued run for one of the ready
@@ -662,12 +666,16 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 	var r ClaimedRow
 	err = tx.QueryRowContext(ctx,
 		`UPDATE run
-		 SET status='running', started_at=?
+		 SET status='running', started_at=?, token=lower(hex(randomblob(16)))
 		 WHERE id = (
 		   SELECT r.id FROM run r
 		   JOIN agent a ON a.id = r.agent_id
+		   JOIN runtime rt ON rt.id = a.runtime_id
 		   LEFT JOIN goal g ON g.id = r.goal_id
 		   WHERE r.status='queued' AND r.agent_id IN (`+placeholders+`)
+		     AND (rt.transport != 'agentwork'              -- machine-owned runtimes claim only while
+		          OR EXISTS (SELECT 1 FROM machine m       -- their machine is online (CLI 分支 Phase 2)
+		              WHERE m.id = rt.machine_id AND m.status='connected'))
 		     AND (g.id IS NULL                              -- processor runs have no goal
 		          OR g.status = 'active'
 		          OR (g.status = 'review' AND r.role = 'review'))
@@ -680,8 +688,8 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 		   ORDER BY r.queued_at
 		   LIMIT 1
 		 )
-		 RETURNING id, goal_id, agent_id, attempt`, append([]any{now()}, args...)...).
-		Scan(&r.RunID, &r.GoalID, &r.AgentID, &r.Attempt)
+		 RETURNING id, goal_id, agent_id, attempt, token`, append([]any{now()}, args...)...).
+		Scan(&r.RunID, &r.GoalID, &r.AgentID, &r.Attempt, &r.Token)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -791,6 +799,36 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 		}})
 	}
 	return nil
+}
+
+// RunIdentity is the (goal, agent, role) identity a per-run token resolves
+// to — the authority behind every /rpc collaboration call (CLI 分支 Phase 2).
+type RunIdentity struct {
+	RunID   string
+	GoalID  string
+	AgentID string
+	Role    string
+}
+
+// ResolveRunToken validates a per-run credential: it must belong to a run
+// that is STILL RUNNING (terminal runs' tokens are void). The resolved
+// identity is the only truth /rpc methods act on — self-reported ids in
+// params are ignored.
+func (s *RunService) ResolveRunToken(ctx context.Context, token string) (*RunIdentity, error) {
+	if token == "" {
+		return nil, NewValidationError("token is required")
+	}
+	var id RunIdentity
+	err := s.st.DB().QueryRowContext(ctx,
+		`SELECT id, goal_id, agent_id, role FROM run WHERE token=? AND status='running'`, token).
+		Scan(&id.RunID, &id.GoalID, &id.AgentID, &id.Role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, NewValidationError("invalid or expired token")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve run token: %w", err)
+	}
+	return &id, nil
 }
 
 // loadRunContext re-reads the minimal context the goal layer needs to
