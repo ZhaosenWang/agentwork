@@ -1387,11 +1387,17 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	// duplicate-decision guard (which protects the async merge) does not apply.
 	handoffLoopPark := strings.HasPrefix(g.ReviewRequest, "handoff_loop:")
 	if decision == "approve" || decision == "reject" || decision == "redirect" {
-		var lastDecision string
+		var lastDecision, lastRunID string
 		err := s.st.DB().QueryRowContext(ctx,
-			`SELECT decision FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, goalID).
-			Scan(&lastDecision)
-		if err == nil && !deliverFailed && !handoffLoopPark {
+			`SELECT decision, run_id FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, goalID).
+			Scan(&lastDecision, &lastRunID)
+		// The duplicate-decision guard protects the ASYNC deliver window of
+		// the CURRENT park — it must not fire across park cycles. A goal
+		// reopened by mention parks again with a NEW evidence run; the old
+		// cycle's approve is history (live: the reopened goal's approve was
+		// rejected with "already approved" because the FIRST cycle's row was
+		// the latest decision).
+		if err == nil && !deliverFailed && !handoffLoopPark && lastRunID == runID {
 			if decision == "approve" && lastDecision == "approve" {
 				// A human action with NO trace (no decision row, no log) is
 				// indistinguishable from a broken button — the rejected
