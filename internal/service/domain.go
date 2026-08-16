@@ -227,6 +227,12 @@ func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 	if d.DefaultBranch == "" {
 		d.DefaultBranch = "main"
 	}
+	// Issue tracking identity is DERIVED from the repo URL — the human
+	// already gave the URL; asking for owner/repo + platform again is
+	// double entry. Explicit values (edit-form corrections) win.
+	if d.IssueRepo == "" && d.GitURL != "" {
+		d.IssueRepo, d.IssueProvider = deriveIssueSource(d.GitURL)
+	}
 	if d.VerificationStrength == "" {
 		d.VerificationStrength = "medium"
 	}
@@ -341,13 +347,44 @@ func (s *DomainService) Delete(ctx context.Context, id string) error {
 // (shared by Create and Update): a repo AND an assignee must come together,
 // the platform token is required, the provider is github|gitcode, and the
 // assignee may be an agent or a squad.
+// deriveIssueSource infers the issue tracker identity (owner/repo +
+// provider) from the repo URL: https://gitcode.com/eushing/test-repo.git →
+// ("eushing/test-repo", "gitcode"). Handles https/http and ssh shapes.
+func deriveIssueSource(gitURL string) (ownerRepo, provider string) {
+	u := strings.TrimSpace(gitURL)
+	u = strings.TrimPrefix(u, "https://")
+	u = strings.TrimPrefix(u, "http://")
+	if i := strings.Index(u, "@"); i >= 0 { // git@host:owner/repo.git
+		u = strings.Replace(u[i+1:], ":", "/", 1)
+	}
+	u = strings.TrimSuffix(u, ".git")
+	parts := strings.Split(strings.Trim(u, "/"), "/")
+	if len(parts) < 3 {
+		return "", ""
+	}
+	host, owner, repo := parts[0], parts[len(parts)-2], parts[len(parts)-1]
+	if owner == "" || repo == "" {
+		return "", ""
+	}
+	switch {
+	case strings.Contains(host, "gitcode"):
+		provider = "gitcode"
+	case strings.Contains(host, "github"):
+		provider = "github"
+	}
+	return owner + "/" + repo, provider
+}
+
 func (s *DomainService) validateIssueTracking(ctx context.Context, d *Domain) error {
 	if d.Type == "scratch" && (d.IssueRepo != "" || d.IssueAssignee != "") {
 		return NewValidationError("issue tracking needs a repository — not available on a scratch domain")
 	}
-	if d.IssueRepo != "" || d.IssueAssignee != "" {
-		if d.IssueRepo == "" || d.IssueAssignee == "" {
-			return NewValidationError("issue tracking needs both issue_repo and issue_assignee")
+	if d.IssueAssignee != "" {
+		// The ASSIGNEE is the opt-in switch: issue_repo is derived from the
+		// repo URL (or corrected explicitly), so a repo domain always has
+		// one — only a missing assignee-side pair is an error.
+		if d.IssueRepo == "" {
+			return NewValidationError("issue tracking needs an issue_repo (derivable from git_url)")
 		}
 		if d.GitCredentials == "" {
 			return NewValidationError("issue tracking needs git_credentials (the platform token)")

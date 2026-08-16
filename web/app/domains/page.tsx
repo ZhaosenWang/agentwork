@@ -77,6 +77,20 @@ function renderRunEvent(ev: { type?: string; text?: string; tool?: string; input
   }
 }
 
+// deriveIssueSrc mirrors the backend's deriveIssueSource: the issue repo +
+// platform come from the repo URL — never ask the human twice.
+function deriveIssueSrc(gitUrl: string): string {
+  let u = gitUrl.trim().replace(/^https?:\/\//, "").replace(/\.git$/, "");
+  const at = u.indexOf("@");
+  if (at >= 0) u = u.slice(at + 1).replace(":", "/");
+  const parts = u.replace(/^\/|\/$/g, "").split("/");
+  if (parts.length < 3) return "";
+  const host = parts[0];
+  const ownerRepo = `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+  const provider = host.includes("gitcode") ? "GitCode" : host.includes("github") ? "GitHub" : "";
+  return provider ? `${ownerRepo} @ ${provider}` : ownerRepo;
+}
+
 export default function DomainsPage() {
   useGoalEvents();
   const { data: domains, isLoading } = useDomains();
@@ -824,12 +838,11 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const [name, setName] = useState("");
   const [domainType, setDomainType] = useState<"repo" | "scratch">("repo");
   const [gitUrl, setGitUrl] = useState("");
+  const [defaultBranch, setDefaultBranch] = useState("");
   const [policyText, setPolicyText] = useState("");
   const [processorAgent, setProcessorAgent] = useState("");
-  const [issueRepo, setIssueRepo] = useState("");
   const [issueAssigneeType, setIssueAssigneeType] = useState("agent");
   const [issueAssignee, setIssueAssignee] = useState("");
-  const [issueProvider, setIssueProvider] = useState("github");
   const [gitCredentials, setGitCredentials] = useState("");
   const [gitIdentity, setGitIdentity] = useState("");
   // 决策 6-24 延伸：repo 域必须通过「测试连接」才能创建（后端同样强制，
@@ -839,7 +852,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     create.mutate(
-      { name, type: domainType, git_url: domainType === "scratch" ? "" : gitUrl, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: issueRepo, issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: issueProvider, git_credentials: gitCredentials, git_identity: gitIdentity },
+      { name, type: domainType, git_url: domainType === "scratch" ? "" : gitUrl, default_branch: domainType === "scratch" ? "" : defaultBranch, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: "", issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: "", git_credentials: gitCredentials, git_identity: gitIdentity },
       {
         onSuccess: (d) => {
           if (policyText.trim() && processorAgent) {
@@ -889,34 +902,34 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
         </Field>
         )}
         {domainType === "repo" && (
-        <Field label="Git 身份（commit 作者，可选）" hint='格式：名字 &lt;邮箱&gt;，如 agentwork[bot] &lt;bot@local&gt;——不填默认 agentwork[bot]'>
-          <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
+        <Field label="默认分支" hint="留空 = 仓库的默认分支（main/master 自动探测）">
+          <input value={defaultBranch} onChange={(e) => { setDefaultBranch(e.target.value); setGitTestPassed(null); }} className={inputCls} placeholder="main" />
         </Field>
         )}
-        <Field label="自然语言验收要求（可选，创建后可再编译）" hint="例如：测试必须通过，改动要带测试">
-          <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="用一句话描述这个项目怎么算“干对了”…" />
-        </Field>
-        <Field label="处理器 agent（可选）">
-          <select value={processorAgent} onChange={(e) => setProcessorAgent(e.target.value)} className={inputCls}>
-            <option value="">选择…</option>
-            {agents?.map((a) => (
-              <option key={a.id} value={a.id}>{a.name}</option>
-            ))}
-          </select>
-        </Field>
+        <details className="text-xs">
+          <summary className="cursor-pointer text-zinc-400 hover:text-zinc-600">高级设置</summary>
+          <div className="mt-2 space-y-4">
+            {domainType === "repo" && (
+              <Field label="Git 身份（commit 作者，可选）" hint='格式：名字 &lt;邮箱&gt;，如 agentwork[bot] &lt;bot@local&gt;——不填默认 agentwork[bot]'>
+                <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
+              </Field>
+            )}
+            <Field label="自然语言验收要求（可选，创建后可再编译）" hint="例如：测试必须通过，改动要带测试">
+              <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="用一句话描述这个项目怎么算“干对了”…" />
+            </Field>
+            <Field label="处理器 agent（可选）">
+              <select value={processorAgent} onChange={(e) => setProcessorAgent(e.target.value)} className={inputCls}>
+                <option value="">选择…</option>
+                {agents?.map((a) => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
+              </select>
+            </Field>
+          </div>
+        </details>
         {domainType === "repo" && (
         <>
-        <Field label="Issue 追踪（可选，M4-B）" hint="仓库的 open issue 自动变成任务，处理完自动 close">
-          <input value={issueRepo} onChange={(e) => setIssueRepo(e.target.value)} className={inputCls} placeholder="owner/repo，如 yusheng-g/agentwork" />
-          <div className="mt-2 flex gap-2 items-center">
-            <label className="text-xs text-gray-500">平台：</label>
-            <select value={issueProvider} onChange={(e) => setIssueProvider(e.target.value)} className={inputCls}>
-              <option value="github">GitHub</option>
-              <option value="gitcode">GitCode</option>
-            </select>
-          </div>
-        </Field>
-        <Field label="issue 处理方（选填，配了 issue_repo 后生效）" hint="选 agent 由单个 agent 处理；选 squad 由小队处理（含自动审查）">
+        <Field label="issue 处理方（选填）" hint={`issue 仓库与平台从仓库地址自动识别${deriveIssueSrc(gitUrl) ? `：${deriveIssueSrc(gitUrl)}` : ""}；选了处理方后，仓库的 open issue 自动变成任务，处理完自动 close`}>
           <div className="flex gap-2 items-center">
             <select
               value={issueAssigneeType}
@@ -941,7 +954,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
         <Field label="平台操作 token（git_credentials）" hint="bot 账号 token（决策 3-5）：issue 评论/close + git push 都以此身份出现。权限需覆盖：仓库读写（Contents）+ issues 读写。GitHub 用 fine-grained PAT 只授权本仓库；GitCode 用 token-classic">
           <input value={gitCredentials} onChange={(e) => { setGitCredentials(e.target.value); setGitTestPassed(null); }} className={inputCls} placeholder="GitHub PAT 或 GitCode token（bot 账号，需仓库+issue 读写）" type="password" />
         </Field>
-        <GitTestButton gitUrl={gitUrl} defaultBranch="" gitCredentials={gitCredentials} onResult={(r) => setGitTestPassed(r.ok && r.branch_exists)} />
+        <GitTestButton gitUrl={gitUrl} defaultBranch={defaultBranch} gitCredentials={gitCredentials} onResult={(r) => setGitTestPassed(r.ok && r.branch_exists)} />
         {gitTestPassed !== true && (
           <p className="text-xs text-amber-600">⚠ 需先通过「测试连接」才能创建（后端同样强制）</p>
         )}
