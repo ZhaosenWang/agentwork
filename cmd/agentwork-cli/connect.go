@@ -142,13 +142,12 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	}
 	peer := link.NewPeer(conn)
 	defer peer.Close()
-	// Phase 2: the machine executes dispatched runs over THIS link — wire
-	// the executor's handlers, and cancel everything in flight when the
-	// link dies (the platform reclaims them via RecoverStuckRunning).
+	// Phase 2, PULL model: the machine POLLS for work over THIS link
+	// (run.poll — the daemon never writes dispatches; the push direction
+	// kept dying in one-way link stalls). Cancel everything in flight when
+	// the link dies (the platform reclaims them via RecoverStuckRunning).
 	exec := newExecutor(peer, st.Server)
 	defer exec.shutdown()
-	peer.Handle(link.MethodRunDispatch, exec.handleDispatch)
-	peer.Handle(link.MethodRunCancel, exec.handleCancel)
 	// config.push (Phase 4): land the agent's skill packages in the
 	// platform-managed staging dir (~/.agentwork/skills/<agentID>/...) —
 	// the executor copies them into each run's workdir at spawn as
@@ -229,6 +228,47 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	// Heartbeat every 5s until the link dies or we're interrupted.
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
+	// Work poll (PULL model) runs on its OWN goroutine: every second the
+	// machine asks the daemon for the next dispatch and any queued cancels
+	// — the daemon never pushes. A lost response is retried by the next
+	// tick (at-least-once; the daemon re-serves, the executor dedupes).
+	// A stalled poll response must NEVER block the heartbeat/reconnect
+	// loop — it did once (live: the Call hung on a lost response, the
+	// main loop froze, heartbeats stopped, the machine went offline; the
+	// SIGUSR1 dump caught the main goroutine in the Call), so the poll
+	// has both its own goroutine AND a per-call timeout.
+	go func() {
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		pollErrLogged := false
+		for {
+			select {
+			case <-tick.C:
+			case <-peer.Done():
+				return
+			case <-ctx.Done():
+				return
+			}
+			pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			var res link.RunPollResult
+			if err := peer.Call(pollCtx, link.MethodRunPoll, link.RunPollParams{}, &res); err != nil {
+				if !pollErrLogged {
+					cliLogf("link: poll: %v (further failures suppressed)", err)
+					pollErrLogged = true
+				}
+				cancel()
+				continue
+			}
+			cancel()
+			pollErrLogged = false
+			for _, c := range res.Cancels {
+				exec.cancelRun(c)
+			}
+			if res.Run != nil {
+				exec.startIfNew(*res.Run)
+			}
+		}
+	}()
 	// Periodic re-probe: an installed/uninstalled agent CLI changes the
 	// machine's capability set. When the signature drifts, push a fresh
 	// probe report — the platform marks vanished CLIs' runtimes absent.

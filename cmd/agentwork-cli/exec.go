@@ -16,23 +16,25 @@ import (
 	"github.com/eushing/agentwork/internal/runtime"
 )
 
-// executor is the machine's run engine (CLI 分支 Phase 2): run.dispatch
-// spawns the ACP runtime with the daemon-assembled prompt, streams events
-// back (per-run seq, 100ms batches), and reports the terminal state via
-// run.finished. The machine NEVER queries the platform — the dispatch
-// payload is a complete readonly snapshot.
+// executor is the machine's run engine (CLI 分支 Phase 2, PULL model):
+// the run.poll response carries the dispatch; execute spawns the ACP
+// runtime with the daemon-assembled prompt, streams events back (per-run
+// seq, 100ms batches), and reports the terminal state via run.finished.
+// The machine NEVER queries the platform — the dispatch payload is a
+// complete readonly snapshot.
 type executor struct {
 	peer *link.Peer
 	// serverURL is the platform address THIS machine dialed (connect
 	// --server / default) — the same address the agent's CLI callbacks use.
 	serverURL string
 
-	mu      sync.Mutex
-	cancels map[string]context.CancelFunc // runID → turn cancel
+	mu       sync.Mutex
+	cancels  map[string]context.CancelFunc // runID → turn cancel
+	sessions map[string]string             // sessionID → the in-flight runID holding it (resume mutual exclusion)
 }
 
 func newExecutor(peer *link.Peer, serverURL string) *executor {
-	return &executor{peer: peer, serverURL: serverURL, cancels: map[string]context.CancelFunc{}}
+	return &executor{peer: peer, serverURL: serverURL, cancels: map[string]context.CancelFunc{}, sessions: map[string]string{}}
 }
 
 // reprobeAfterSpawnFailure re-probes the machine and pushes a fresh probe
@@ -68,21 +70,26 @@ func (e *executor) shutdown() {
 	}
 }
 
-// handleDispatch implements run.dispatch on the machine link.
-func (e *executor) handleDispatch(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
-	var p link.RunDispatchParams
-	if err := json.Unmarshal(raw, &p); err != nil || p.RunID == "" || p.Prompt == "" || len(p.ACPSpawn) == 0 {
-		return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "run_id, prompt, and acp_spawn are required"}
+// startIfNew launches a polled dispatch unless the run is already in
+// flight — the poll delivery is at-least-once (a lost response makes the
+// daemon re-serve the same dispatch) and the executor is the dedupe.
+func (e *executor) startIfNew(p link.RunDispatchParams) {
+	if p.RunID == "" || p.Prompt == "" || len(p.ACPSpawn) == 0 {
+		cliLogf("exec: malformed dispatch dropped (run_id=%q)", p.RunID)
+		return
+	}
+	e.mu.Lock()
+	_, running := e.cancels[p.RunID]
+	e.mu.Unlock()
+	if running {
+		return // already in flight — duplicate serve from a lost response
 	}
 	cliLogf("exec: run %s dispatch received (role=%s attempt=%d agent=%s proc=%v)", p.RunID, p.Role, p.Attempt, p.AgentID, p.Proc)
 	go e.execute(p)
-	return link.RunDispatchResult{Accepted: true}, nil
 }
 
-// handleCancel implements run.cancel (notification).
-func (e *executor) handleCancel(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
-	var p link.RunCancelParams
-	_ = json.Unmarshal(raw, &p)
+// cancelRun implements run.cancel — delivered in the poll response.
+func (e *executor) cancelRun(p link.RunCancelParams) {
 	cliLogf("exec: run %s cancel received (reason=%s)", p.RunID, p.Reason)
 	e.mu.Lock()
 	cancel := e.cancels[p.RunID]
@@ -91,7 +98,6 @@ func (e *executor) handleCancel(ctx context.Context, raw json.RawMessage) (any, 
 	if cancel != nil {
 		cancel()
 	}
-	return nil, nil
 }
 
 // execute runs one dispatched run to completion.
@@ -103,6 +109,11 @@ func (e *executor) execute(p link.RunDispatchParams) {
 	defer func() {
 		e.mu.Lock()
 		delete(e.cancels, p.RunID)
+		for sid, rid := range e.sessions {
+			if rid == p.RunID {
+				delete(e.sessions, sid)
+			}
+		}
 		e.mu.Unlock()
 		cancel()
 	}()
@@ -204,28 +215,36 @@ func (e *executor) execute(p link.RunDispatchParams) {
 		copyAgentSkills(p.AgentID, workdir, subdir, p.Scratch)
 	}
 
-	conn, err := runtime.Open(ctx, runtime.Spec{
-		Transport:  "stdio",
-		Executable: p.ACPSpawn[0],
-		Args:       p.ACPSpawn[1:],
-		Env:        p.Env,
-		Cwd:        workdir,
-	}, e.buildEnv(p, workdir))
+	// openSession spawns the CLI and opens its ACP session (used for the
+	// initial open AND the post-resume fallback).
+	openSession := func() (proto.Session, error) {
+		conn, err := runtime.Open(ctx, runtime.Spec{
+			Transport:  "stdio",
+			Executable: p.ACPSpawn[0],
+			Args:       p.ACPSpawn[1:],
+			Env:        p.Env,
+			Cwd:        workdir,
+		}, e.buildEnv(p, workdir))
+		if err != nil {
+			return nil, fmt.Errorf("runtime: %w", err)
+		}
+		backend := &acpbackend.Backend{}
+		sess, err := backend.OpenSession(ctx, proto.SessionSpec{Conn: conn, Cwd: workdir})
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("session: %w", err)
+		}
+		return sess, nil
+	}
+
+	sess, err := openSession()
 	if err != nil {
 		// The spawn failed — likely an uninstalled CLI. Re-probe and push
 		// a fresh report so the platform marks the runtime absent and
 		// stops dispatching to it (multica's runtime_not_found recovery,
 		// without waiting for the periodic probe).
 		e.reprobeAfterSpawnFailure()
-		e.finish(p, "", "", "failed", fmt.Sprintf("runtime: %v", err))
-		return
-	}
-
-	backend := &acpbackend.Backend{}
-	sess, err := backend.OpenSession(ctx, proto.SessionSpec{Conn: conn, Cwd: workdir})
-	if err != nil {
-		_ = conn.Close()
-		e.finish(p, "", "", "failed", fmt.Sprintf("session: %v", err))
+		e.finish(p, "", "", "failed", err.Error())
 		return
 	}
 	sessionID = sess.SessionID()
@@ -236,11 +255,26 @@ func (e *executor) execute(p link.RunDispatchParams) {
 	// prompt (never silently restart). Load failure: the CLI's fresh
 	// process cannot resolve the id — continue on the fresh session; the
 	// cwd-keyed project store still gives partial continuity.
+	resumed := false
 	if p.PriorSessionID != "" && !p.Proc {
 		if p.PriorWorkDir == workdir {
-			if err := sess.LoadSession(ctx, p.PriorSessionID); err != nil {
+			// Mutual exclusion: one session, one in-flight run. A prior
+			// run that the daemon expired while its exec kept running
+			// still HOLDS the session — resuming it collides two runs on
+			// one conversation (live: the collision's killed turn left a
+			// poisoned history).
+			e.mu.Lock()
+			_, held := e.sessions[p.PriorSessionID]
+			e.mu.Unlock()
+			if held {
+				cliLogf("exec: run %s prior session %s still in flight — continuing fresh", p.RunID, shortSHA(p.PriorSessionID))
+			} else if err := sess.LoadSession(ctx, p.PriorSessionID); err != nil {
 				cliLogf("exec: run %s session/load %s failed: %v — continuing fresh", p.RunID, shortSHA(p.PriorSessionID), err)
 			} else {
+				resumed = true
+				e.mu.Lock()
+				e.sessions[p.PriorSessionID] = p.RunID
+				e.mu.Unlock()
 				cliLogf("exec: run %s session resumed (%s)", p.RunID, shortSHA(p.PriorSessionID))
 			}
 		} else {
@@ -268,6 +302,23 @@ func (e *executor) execute(p link.RunDispatchParams) {
 	}
 
 	run, err := sess.Prompt(ctx, p.Prompt)
+	if err != nil && resumed {
+		// A resumed session can be POISONED by a killed turn: the CLI's
+		// persisted history carries an empty assistant message and EVERY
+		// future prompt on the session fails (live: "message at position
+		// 26 with role 'assistant' must not be empty" burned the attempt).
+		// Fall back to a fresh session ONCE — the workdir continuity
+		// survives, only the conversation memory is lost.
+		cliLogf("exec: run %s prompt failed on resumed session (%v) — reopening fresh", p.RunID, err)
+		sess.Close()
+		sess, err = openSession()
+		if err != nil {
+			e.finish(p, workdir, "", "failed", "fresh session after resume: "+err.Error())
+			return
+		}
+		sessionID = sess.SessionID()
+		run, err = sess.Prompt(ctx, p.Prompt)
+	}
 	if err != nil {
 		e.finish(p, workdir, sessionID, "failed", fmt.Sprintf("prompt: %v", err))
 		return

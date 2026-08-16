@@ -188,6 +188,11 @@ type Daemon struct {
 	machineLastSeq     map[string]int64
 	machineLastEvent   map[string]time.Time
 	machineRunMachine  map[string]string // runID → the machine it was dispatched to (ownership anchor for report ingestion)
+	// PULL dispatch (multica-style): the daemon never writes dispatches
+	// over the link — the machine's run.poll serves from these queues.
+	machinePendingMu sync.Mutex
+	machinePending   map[string][]*pendingRun // machineID → queued dispatches
+	machineCancels   map[string][]link.RunCancelParams
 }
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.
@@ -224,6 +229,8 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		machinePeers:      make(map[string]*link.Peer),
 		machineLastSeq:    make(map[string]int64),
 		machineRunMachine: make(map[string]string),
+		machinePending:    make(map[string][]*pendingRun),
+		machineCancels:    make(map[string][]link.RunCancelParams),
 		machineLastEvent:  make(map[string]time.Time),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
@@ -851,10 +858,9 @@ func (d *Daemon) StopRun(goalID, runID string) error {
 			`SELECT r.machine_id FROM run ru JOIN agent a ON a.id=ru.agent_id JOIN runtime r ON r.id=a.runtime_id WHERE ru.id=?`,
 			runID).Scan(&machineID)
 		if machineID != "" {
-			if peer := d.MachinePeer(machineID); peer != nil {
-				_ = peer.Notify(d.ctx, link.MethodRunCancel, link.RunCancelParams{RunID: runID, Reason: "stopped"})
-				logging.Infof("daemon: human stopped machine run %s (cancel sent to %s)", runID, machineID)
-			}
+			// PULL model: the cancel rides the machine's next poll.
+			d.enqueueMachineCancel(machineID, link.RunCancelParams{RunID: runID, Reason: "stopped"})
+			logging.Infof("daemon: human stopped machine run %s (cancel queued for %s)", runID, machineID)
 		}
 		res, err := d.st.DB().ExecContext(d.ctx,
 			`UPDATE run SET status='cancelled', cancel_reason='stopped', finished_at=? WHERE id=? AND status='running'`,

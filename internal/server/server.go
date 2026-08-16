@@ -212,6 +212,16 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			logging.Infof("connect: machine %q (%s) registered, %d agent CLI(s) probed", p.Name, p.Hostname, len(p.CLIs))
 			return link.RegisterResult{OK: true, ServerVersion: daemon.DaemonVersion}, nil
 		})
+		peer.Handle(link.MethodRunPoll, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			id := machineID()
+			if id == "" {
+				return nil, &link.RPCError{Code: link.CodeForbidden, Message: "register first"}
+			}
+			// The machine's identity is the CONNECTION's registered id —
+			// a self-reported machine_id in the params must not steal
+			// another machine's dispatch.
+			return s.d.DequeueMachineDispatch(id), nil
+		})
 		peer.Handle(link.MethodRunClaimed, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 			var p link.RunClaimedParams
 			if err := json.Unmarshal(raw, &p); err != nil || p.RunID == "" {

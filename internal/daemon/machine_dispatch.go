@@ -58,41 +58,110 @@ func (d *Daemon) MachinePeer(machineID string) *link.Peer {
 	return d.machinePeers[machineID]
 }
 
-// dispatchToMachine sends an assembled run over the machine's link and
-// starts its watchdog. On missing peer or rejection the run fails with a
-// clear reason (the claim gate keeps offline machines from claiming in the
-// first place — this is the narrow race where the machine dropped between
-// claim and dispatch).
+// pendingRun is one dispatch queued for a machine's poll.
+type pendingRun struct {
+	runID  string
+	params link.RunDispatchParams
+	enqAt  time.Time
+}
+
+// pickupTimeout is how long a dispatch waits in the machine's queue — the
+// machine polls every second, so 60s rides out transient one-way stalls
+// (a lost poll response is retried a second later) while still failing
+// fast on a dead link.
+const pickupTimeout = 60 * time.Second
+
+// dispatchToMachine QUEUES an assembled run for the machine's poll
+// (PULL model — multica-style: the daemon never writes the dispatch over
+// the link; the push direction kept dying in one-way link stalls). The
+// machine picks it up via run.poll; a dispatch never picked up within
+// pickupTimeout fails the run. On a missing machine the run fails with a
+// clear reason (the claim gate keeps offline machines from claiming in
+// the first place — this is the narrow race where the machine dropped
+// between claim and dispatch).
 func (d *Daemon) dispatchToMachine(ctx context.Context, q *service.ClaimedRow, p link.RunDispatchParams, machineID string) {
-	peer := d.MachinePeer(machineID)
-	if peer == nil {
+	if d.MachinePeer(machineID) == nil {
 		d.failRun(ctx, q, fmt.Sprintf("machine offline — the machine must run `agentwork connect` (machine %s)", machineID))
 		return
 	}
-	// Stamp the ownership anchor BEFORE the wire send: every /connect report
-	// (claimed/events/finished) is checked against run.machine_id — no other
-	// machine can complete or pollute this run.
+	// Stamp the ownership anchor BEFORE enqueueing: every /connect report
+	// (claimed/events/finished) is checked against run.machine_id — no
+	// other machine can complete or pollute this run.
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE run SET machine_id=? WHERE id=? AND status='running'`, machineID, q.RunID); err != nil {
 		logging.Infof("dispatch: stamp machine %s on run %s: %v", machineID, q.RunID, err)
 	}
-	callCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	var res link.RunDispatchResult
-	if err := peer.Call(callCtx, link.MethodRunDispatch, p, &res); err != nil {
-		d.failRun(ctx, q, fmt.Sprintf("dispatch: %v", err))
-		return
-	}
-	if !res.Accepted {
-		d.failRun(ctx, q, "dispatch rejected: "+res.Reason)
-		return
-	}
 	d.machineLastEventMu.Lock()
-	d.machineLastEvent[q.RunID] = time.Now()
 	d.machineRunMachine[q.RunID] = machineID
 	d.machineLastEventMu.Unlock()
-	go d.runMachineWatchdog(q.RunID, machineID)
-	logging.Infof("dispatch: run %s → machine %s (role=%s, attempt=%d)", q.RunID, machineID, p.Role, q.Attempt)
+	d.machinePendingMu.Lock()
+	d.machinePending[machineID] = append(d.machinePending[machineID], &pendingRun{runID: q.RunID, params: p, enqAt: time.Now()})
+	d.machinePendingMu.Unlock()
+	logging.Infof("dispatch: run %s queued for machine %s (role=%s, attempt=%d — poll pickup)", q.RunID, machineID, p.Role, q.Attempt)
+	// Unpicked dispatch must not hang the run: expire it after the
+	// pickup window (covers a machine that never polls again). The
+	// failure fires ONLY when the entry is still queued — a claimed ack
+	// arriving inside the window removes it, and the machineRunMachine
+	// map alone is NOT proof of non-pickup (it lives until the run
+	// finishes; a claimed run must never be failed here).
+	go func() {
+		<-time.After(pickupTimeout)
+		d.machinePendingMu.Lock()
+		removed := false
+		for i, pr := range d.machinePending[machineID] {
+			if pr.runID == q.RunID {
+				d.machinePending[machineID] = append(d.machinePending[machineID][:i], d.machinePending[machineID][i+1:]...)
+				removed = true
+				break
+			}
+		}
+		d.machinePendingMu.Unlock()
+		if !removed {
+			return
+		}
+		// The machine may have picked the dispatch up while the claimed
+		// ack was lost — cancel it so the orphan exec stops (a killed
+		// turn otherwise leaves poisoned history in the CLI's session
+		// store, and the NEXT run's resume dies on it).
+		d.enqueueMachineCancel(machineID, link.RunCancelParams{RunID: q.RunID, Reason: "dispatch_timeout"})
+		d.failRun(context.Background(), q, "the machine did not pick up the dispatch (60s poll timeout)")
+	}()
+}
+
+// DequeueMachineDispatch serves the machine's run.poll: the oldest queued
+// dispatch — re-served until run.claimed acknowledges delivery
+// (at-least-once; the executor dedupes on an in-flight run id) — plus the
+// queued cancels. Expired entries are failed here too (the poll is the
+// machine's heartbeat for the queue).
+func (d *Daemon) DequeueMachineDispatch(machineID string) link.RunPollResult {
+	var res link.RunPollResult
+	d.machinePendingMu.Lock()
+	defer d.machinePendingMu.Unlock()
+	var kept []*pendingRun
+	for _, pr := range d.machinePending[machineID] {
+		if time.Since(pr.enqAt) > pickupTimeout {
+			d.machinePendingMu.Unlock()
+			d.failRun(context.Background(), &service.ClaimedRow{RunID: pr.runID}, "the machine did not pick up the dispatch (60s poll timeout)")
+			d.machinePendingMu.Lock()
+			continue
+		}
+		kept = append(kept, pr)
+	}
+	d.machinePending[machineID] = kept
+	if len(kept) > 0 {
+		res.Run = &kept[0].params
+	}
+	res.Cancels = d.machineCancels[machineID]
+	d.machineCancels[machineID] = nil
+	return res
+}
+
+// enqueueMachineCancel queues a run.cancel for the machine's next poll
+// (the PULL equivalent of the old push notification).
+func (d *Daemon) enqueueMachineCancel(machineID string, c link.RunCancelParams) {
+	d.machinePendingMu.Lock()
+	d.machineCancels[machineID] = append(d.machineCancels[machineID], c)
+	d.machinePendingMu.Unlock()
 }
 
 // IngestRunClaimed — the machine's run.claimed ack: publish the bus event
@@ -113,6 +182,22 @@ func (d *Daemon) IngestRunClaimed(ctx context.Context, mid string, p link.RunCla
 	if status != "running" {
 		return nil // late ack from a stale exec — the run is already decided
 	}
+	// The claim IS the delivery ack for the pull queue: retire the pending
+	// entry (a lost poll response re-serves; this stops the re-serving),
+	// arm the watchdog's activity stamp, and start the watchdog — execution
+	// really began only now.
+	d.machinePendingMu.Lock()
+	for i, pr := range d.machinePending[mid] {
+		if pr.runID == p.RunID {
+			d.machinePending[mid] = append(d.machinePending[mid][:i], d.machinePending[mid][i+1:]...)
+			break
+		}
+	}
+	d.machinePendingMu.Unlock()
+	d.machineLastEventMu.Lock()
+	d.machineLastEvent[p.RunID] = time.Now()
+	d.machineLastEventMu.Unlock()
+	go d.runMachineWatchdog(p.RunID, mid)
 	d.bus.Publish(ctx, events.Event{Topic: "run:claimed", Payload: map[string]any{
 		"run_id": p.RunID, "goal_id": goalID, "agent_id": agentID,
 		"attempt": attempt, "started_at": time.Now().UTC().Format(time.RFC3339Nano),
@@ -320,9 +405,8 @@ func (d *Daemon) runMachineWatchdog(runID, machineID string) {
 		}
 		if cancelSent.IsZero() {
 			logging.Infof("machine: watchdog firing for run %s (%s)", runID, reason)
-			if peer := d.MachinePeer(machineID); peer != nil {
-				_ = peer.Notify(context.Background(), link.MethodRunCancel, link.RunCancelParams{RunID: runID, Reason: reason})
-			}
+			// PULL model: the cancel rides the machine's next poll.
+			d.enqueueMachineCancel(machineID, link.RunCancelParams{RunID: runID, Reason: reason})
 			cancelSent = time.Now()
 			continue
 		}
@@ -392,10 +476,16 @@ func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSu
 
 	// Adopt the transferred branch (retries cover the git host's ref
 	// visibility delay — live: a fetch at finished+0ms missed a push that
-	// was already on the remote). A local ref already present wins.
+	// was already on the remote). When the run reports a HeadSHA the
+	// TRANSFER REF IS AUTHORITATIVE: a local branch is only the PREVIOUS
+	// turn's adoption and must not win over this run's push (live: the
+	// stale local ref "won", the tip mismatch hard-failed the run). The
+	// local ref is a fallback only when nothing was pushed (zero-change).
 	adopted := false
-	if _, err := gitRun(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branchName); err == nil {
-		adopted = true
+	if headSHA == "" {
+		if _, err := gitRun(ctx, repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+branchName); err == nil {
+			adopted = true
+		}
 	}
 	for attempt := 0; !adopted && attempt < 5; attempt++ {
 		if attempt > 0 {
@@ -409,7 +499,7 @@ func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSu
 		if _, err := gitRun(ctx, repo, "fetch", "origin"); err != nil {
 			continue
 		}
-		if _, err := gitRun(ctx, repo, "branch", branchName, "origin/agentwork/"+branchName); err == nil {
+		if _, err := gitRun(ctx, repo, "branch", "-f", branchName, "origin/agentwork/"+branchName); err == nil {
 			adopted = true
 		}
 	}

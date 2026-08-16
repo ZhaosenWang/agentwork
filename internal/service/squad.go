@@ -378,7 +378,7 @@ rest is the platform's and the human's.
 
 const squadParentStatusNotOwned = `You were consulted on a goal someone else owns (guest run, READ-ONLY — your
 edits are discarded by the platform). Do NOT change this goal's status, do NOT
-hand it off, do NOT split it — answer the question via
-` + "`agentwork goal comment`" + ` and end your turn. No agent sets goal status; completion is judged by the
-platform + human.
+hand it off, do NOT split it — answer the question via the agentwork goal
+comment command and end your turn. No agent sets goal status; completion is
+judged by the platform + human.
 `

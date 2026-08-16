@@ -21,9 +21,12 @@ const (
 	MethodMachineHeartbeat   = "machine.heartbeat"
 	MethodMachineProbeUpdate = "machine.probe_update"
 
-	// daemon → machine (Phase 2)
-	MethodRunDispatch = "run.dispatch" // request, ack
-	MethodRunCancel   = "run.cancel"   // notification
+	// machine → daemon (Phase 2, PULL model — multica-style): the machine
+	// POLLS for work; the daemon never pushes to the machine's link. The
+	// push direction (run.dispatch) kept dying in one-way link stalls
+	// (live: three instant write timeouts, goals failed) — the
+	// machine→daemon direction has never failed.
+	MethodRunPoll = "run.poll" // request — response carries the next dispatch + cancels
 
 	// machine → daemon (Phase 2)
 	MethodRunClaimed    = "run.claimed"     // request, ack
@@ -278,18 +281,28 @@ type RunDispatchParams struct {
 	Env      map[string]string `json:"env,omitempty"`      // runtime env + agent env (merged daemon-side)
 }
 
-// RunDispatchResult is the run.dispatch ack — the machine accepts or
-// rejects (rejecting leaves the run queued for another attempt).
-type RunDispatchResult struct {
-	Accepted bool   `json:"accepted"`
-	Reason   string `json:"reason,omitempty"`
-}
-
 // RunCancelParams is the run.cancel notification (daemon → machine): stop
-// the in-flight execution of a run.
+// the in-flight execution of a run. Delivered in the poll response (the
+// PULL model has no daemon→machine push).
 type RunCancelParams struct {
 	RunID  string `json:"run_id"`
 	Reason string `json:"reason"`
+}
+
+// RunPollParams is the run.poll request (machine → daemon): the machine's
+// work poll — the daemon answers with the next dispatch (if any) plus the
+// cancels queued for it. The machine calls this on a tick; there is no
+// daemon→machine push anymore. The daemon identifies the machine by its
+// CONNECTION's registered id, not by anything in this message — the body
+// is empty by design.
+type RunPollParams struct{}
+
+// RunPollResult is the run.poll response: at most one dispatch (the
+// daemon re-serves it until run.claimed acknowledges delivery — the
+// executor dedupes on an in-flight run id) plus any queued cancels.
+type RunPollResult struct {
+	Run      *RunDispatchParams `json:"run,omitempty"`
+	Cancels  []RunCancelParams  `json:"cancels,omitempty"`
 }
 
 // RunClaimedParams is the run.claimed ack (machine → daemon): the machine

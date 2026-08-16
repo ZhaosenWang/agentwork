@@ -134,7 +134,16 @@ func (p *Peer) write(msg any) error {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
 	_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	return p.conn.WriteJSON(msg)
+	if err := p.conn.WriteJSON(msg); err != nil {
+		// A failed (or deadline-expired) frame CORRUPTS the WebSocket
+		// stream — gorilla's contract: the connection must die. A
+		// half-dead link that still carries the other direction is the
+		// worst failure mode (live: daemon→machine responses died while
+		// heartbeats kept flowing and nothing ever detected it).
+		p.Close()
+		return err
+	}
+	return nil
 }
 
 // Wait blocks until the link dies or Close is called, returning the exit
@@ -242,15 +251,10 @@ func (p *Peer) dispatchRequest(method string, id *string, raw json.RawMessage) {
 	if id == nil {
 		return // notification — no reply
 	}
-	if rpcErr != nil {
-		p.writeMu.Lock()
-		_ = p.conn.WriteJSON(wireResponse{JSONRPC: "2.0", ID: id, Error: rpcErr})
-		p.writeMu.Unlock()
-		return
-	}
-	p.writeMu.Lock()
-	_ = p.conn.WriteJSON(wireResponse{JSONRPC: "2.0", ID: id, Result: rpcMarshal(result)})
-	p.writeMu.Unlock()
+	// Route the response through write() — the deadline + the
+	// close-on-failure contract apply to responses too (a swallowed
+	// response-write error left the link half-dead and invisible).
+	_ = p.write(wireResponse{JSONRPC: "2.0", ID: id, Result: rpcMarshal(result), Error: rpcErr})
 }
 
 // Close tears the connection down; Wait returns afterwards.

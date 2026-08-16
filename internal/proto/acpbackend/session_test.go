@@ -163,8 +163,8 @@ func TestSessionBackendCancelKeepsSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancel() // the platform cancels this wake
-	close(hold)
 	res1 := <-run1.Result
+	close(hold) // release the fake only AFTER the verdict — its late response can never beat the cancel
 	if res1.Status != proto.StatusCancelled {
 		t.Fatalf("a cancelled wake reports cancelled, got %v (err %v)", res1.Status, res1.Err)
 	}
