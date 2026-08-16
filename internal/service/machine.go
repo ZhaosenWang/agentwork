@@ -77,14 +77,24 @@ func (s *MachineService) Heartbeat(ctx context.Context, machineID string) error 
 	return nil
 }
 
-// UpdateProbe stores a fresh probe report.
+// UpdateProbe stores a fresh probe report AND reconciles the machine's
+// runtime rows against it (a CLI that vanished from the probe is marked
+// absent — the claim gate then stops dispatching to it).
 func (s *MachineService) UpdateProbe(ctx context.Context, machineID, probedCLIsJSON string) error {
 	if _, err := s.st.DB().ExecContext(ctx,
 		`UPDATE machine SET probed_clis=?, last_seen_at=? WHERE id=?`,
 		probedCLIsJSON, now(), machineID); err != nil {
 		return fmt.Errorf("machine probe update: %w", err)
 	}
-	return nil
+	var name string
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT name FROM machine WHERE id=?`, machineID).Scan(&name); err != nil {
+		return err
+	}
+	var clis []link.ProbeCLI
+	if err := json.Unmarshal([]byte(probedCLIsJSON), &clis); err != nil {
+		return nil
+	}
+	return s.ReconcileProbeRuntimes(ctx, machineID, name, clis)
 }
 
 // List returns every registered machine, most recently seen first.
@@ -134,25 +144,45 @@ func MarshalProbedCLIs(v any) string {
 	return string(b)
 }
 
-// UpsertProbeRuntimes creates/updates one runtime row per probed CLI
-// (CLI 分支 Phase 2): name = "<cli>@<machineName>", transport='agentwork',
-// machine_id = the registered machine, args = the CLI's acp_spawn. Runs
-// assigned to these runtimes are dispatched over the machine's /connect
-// link. Keyed by runtime.name (UNIQUE) — a re-register refreshes the row.
-// Disappeared CLIs keep their rows (their agents just don't get runs while
-// the CLI is absent).
-func (s *MachineService) UpsertProbeRuntimes(ctx context.Context, machineID, machineName string, clis []link.ProbeCLI) error {
+// ReconcileProbeRuntimes syncs the machine's runtime rows with a probe
+// report (CLI 分支 Phase 2 + probe reconciliation): one row per probed
+// CLI — name = "<cli>@<machineName>", keyed by runtime.name (UNIQUE) —
+// upserted and marked active. Rows of THIS machine that are NOT in the
+// report are marked ABSENT (the CLI was uninstalled): the row survives
+// (agents reference it) but the claim gate rejects it and the web shows
+// the absence. Runs assigned to active runtimes dispatch over the
+// machine's /connect link.
+func (s *MachineService) ReconcileProbeRuntimes(ctx context.Context, machineID, machineName string, clis []link.ProbeCLI) error {
+	present := map[string]bool{}
 	for _, c := range clis {
 		argsJSON, _ := json.Marshal(c.ACPSpawn)
 		name := c.Name + "@" + machineName
+		present[name] = true
 		if _, err := s.st.DB().ExecContext(ctx,
-			`INSERT INTO runtime (id,name,machine_id,args,env,created_at)
-			 VALUES (?,?,?,?,'{}',?)
+			`INSERT INTO runtime (id,name,machine_id,args,env,status,created_at)
+			 VALUES (?,?,?,?,'{}','active',?)
 			 ON CONFLICT(name) DO UPDATE SET
-			   args=excluded.args, machine_id=excluded.machine_id`,
+			   args=excluded.args, machine_id=excluded.machine_id, status='active'`,
 			newID(), name, machineID, string(argsJSON), now()); err != nil {
 			return fmt.Errorf("upsert probe runtime %s: %w", name, err)
 		}
+	}
+	if len(present) == 0 {
+		if _, err := s.st.DB().ExecContext(ctx,
+			`UPDATE runtime SET status='absent' WHERE machine_id=? AND status='active'`, machineID); err != nil {
+			return fmt.Errorf("mark runtimes absent: %w", err)
+		}
+		return nil
+	}
+	names := make([]string, 0, len(present))
+	for n := range present {
+		names = append(names, n)
+	}
+	ph, phArgs := inPlaceholders(names)
+	if _, err := s.st.DB().ExecContext(ctx,
+		`UPDATE runtime SET status='absent' WHERE machine_id=? AND status='active' AND name NOT IN (`+ph+`)`,
+		append([]any{machineID}, phArgs...)...); err != nil {
+		return fmt.Errorf("mark runtimes absent: %w", err)
 	}
 	return nil
 }

@@ -13,6 +13,13 @@ function RuntimeRow({ rt, machineName, onDelete }: { rt: Runtime; machineName: s
       <td className="px-4 py-3">
         <span className="px-2 py-0.5 text-xs rounded bg-emerald-50 text-emerald-700">{machineName || "—"}</span>
       </td>
+      <td className="px-4 py-3">
+        {rt.status === "absent" ? (
+          <span className="px-2 py-0.5 text-xs rounded bg-amber-50 text-amber-700">CLI 已不在机器上</span>
+        ) : (
+          <span className="px-2 py-0.5 text-xs rounded bg-zinc-50 text-zinc-500">active</span>
+        )}
+      </td>
       <td className="px-4 py-3 text-zinc-600 font-mono text-xs">{(rt.args ?? []).join(" ")}</td>
       <td className="px-4 py-3 text-zinc-400">{new Date(rt.created_at).toLocaleString()}</td>
       <td className="px-4 py-3 text-right">
@@ -67,6 +74,7 @@ export default function RuntimesPage() {
               <tr className="text-left text-xs text-zinc-400 border-b border-zinc-100">
                 <th className="px-4 py-2.5 font-medium">名称</th>
                 <th className="px-4 py-2.5 font-medium">机器</th>
+                <th className="px-4 py-2.5 font-medium">状态</th>
                 <th className="px-4 py-2.5 font-medium">启动参数（acp_spawn）</th>
                 <th className="px-4 py-2.5 font-medium">创建时间</th>
                 <th className="px-4 py-2.5 font-medium text-right">操作</th>

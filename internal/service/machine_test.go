@@ -102,8 +102,8 @@ func TestUpsertProbeRuntimes(t *testing.T) {
 	ctx := context.Background()
 
 	clis := []link.ProbeCLI{{Name: "claude", Version: "2.1", ACPSpawn: []string{"claude", "--acp"}}}
-	if err := svc.UpsertProbeRuntimes(ctx, "m1", "dev", clis); err != nil {
-		t.Fatalf("upsert: %v", err)
+	if err := svc.ReconcileProbeRuntimes(ctx, "m1", "dev", clis); err != nil {
+		t.Fatalf("reconcile: %v", err)
 	}
 	rtSvc := NewRuntimeService(st)
 	all, err := rtSvc.List(ctx)
@@ -111,7 +111,7 @@ func TestUpsertProbeRuntimes(t *testing.T) {
 		t.Fatalf("expected 1 runtime, got %d (err %v)", len(all), err)
 	}
 	r := all[0]
-	if r.Name != "claude@dev" || r.MachineID != "m1" {
+	if r.Name != "claude@dev" || r.MachineID != "m1" || r.Status != "active" {
 		t.Fatalf("probe runtime mismatch: %+v", r)
 	}
 	if len(r.Args) != 2 || r.Args[0] != "claude" || r.Args[1] != "--acp" {
@@ -119,20 +119,38 @@ func TestUpsertProbeRuntimes(t *testing.T) {
 	}
 
 	// Re-register (new machine id, same CLI) refreshes the same row.
-	if err := svc.UpsertProbeRuntimes(ctx, "m2", "dev", clis); err != nil {
-		t.Fatalf("re-upsert: %v", err)
+	if err := svc.ReconcileProbeRuntimes(ctx, "m2", "dev", clis); err != nil {
+		t.Fatalf("re-reconcile: %v", err)
 	}
 	all, _ = rtSvc.List(ctx)
 	if len(all) != 1 || all[0].MachineID != "m2" {
 		t.Fatalf("re-register must refresh, got %+v", all)
 	}
 
-	// A second CLI on the same machine adds a second row.
-	if err := svc.UpsertProbeRuntimes(ctx, "m2", "dev", []link.ProbeCLI{{Name: "opencode", ACPSpawn: []string{"opencode", "acp", "--pure"}}}); err != nil {
-		t.Fatalf("second upsert: %v", err)
+	// A second CLI on the same machine adds a second row — and the FIRST
+	// CLI, gone from this report, is marked ABSENT (uninstalled).
+	if err := svc.ReconcileProbeRuntimes(ctx, "m2", "dev", []link.ProbeCLI{{Name: "opencode", ACPSpawn: []string{"opencode", "acp", "--pure"}}}); err != nil {
+		t.Fatalf("second reconcile: %v", err)
 	}
 	all, _ = rtSvc.List(ctx)
 	if len(all) != 2 {
 		t.Fatalf("expected 2 runtimes, got %d", len(all))
+	}
+	byName := map[string]string{}
+	for _, rt := range all {
+		byName[rt.Name] = rt.Status
+	}
+	if byName["claude@dev"] != "absent" || byName["opencode@dev"] != "active" {
+		t.Fatalf("the vanished CLI must be absent and the new one active, got %v", byName)
+	}
+	// An empty report marks every runtime of the machine absent.
+	if err := svc.ReconcileProbeRuntimes(ctx, "m2", "dev", nil); err != nil {
+		t.Fatalf("empty reconcile: %v", err)
+	}
+	all, _ = rtSvc.List(ctx)
+	for _, rt := range all {
+		if rt.Status != "absent" {
+			t.Fatalf("an empty probe must mark %s absent, got %s", rt.Name, rt.Status)
+		}
 	}
 }

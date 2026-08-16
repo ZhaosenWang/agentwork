@@ -35,6 +35,7 @@ export interface Runtime {
   machine_id: string; // the registered machine that executes this runtime's runs
   args: string[]; // acp_spawn — how the machine starts the CLI
   env: Record<string, string>;
+  status: string; // active | absent — absent = the machine's latest probe no longer sees the CLI
   created_at: string;
 }
 

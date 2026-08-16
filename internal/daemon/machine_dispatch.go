@@ -218,10 +218,25 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, mid string, p link.RunFi
 			logging.Infof("machine: run %s: mark session: %v", p.RunID, err)
 		}
 	}
-	// Processor runs (goal-less) complete through their artifact paths,
-	// not the goal reconcile.
+	// ACK NOW, process in the background: the completion pipeline
+	// (verification = venv+pip, minutes on a cold cache) ran INSIDE the
+	// link handler and the machine's 30s Call raced it (live: "context
+	// deadline exceeded" stashes on every finish while the daemon was
+	// verifying) — and the daemon's busiest window was exactly when the
+	// next dispatch's write timed out. The guards above stay synchronous;
+	// everything below is safe to defer (Finish is conditional and the
+	// completion stamps are idempotent).
+	go d.finishMachineRun(context.Background(), p, kind, runType, domainID)
+	return nil
+}
+
+// finishMachineRun runs the completion pipeline for an accepted terminal
+// report: processor artifacts OR the verification+gate evaluation+Finish
+// chain. It must never run on the link handler goroutine.
+func (d *Daemon) finishMachineRun(ctx context.Context, p link.RunFinishedParams, kind, runType, domainID string) {
 	if kind == "processor" {
-		return d.ingestProcessorFinished(ctx, p, runType, domainID)
+		d.ingestProcessorFinished(ctx, p, runType, domainID)
+		return
 	}
 	if p.Status == "completed" {
 		// The platform verifies (invariant 9 — the worker never verifies
@@ -241,10 +256,9 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, mid string, p link.RunFi
 	d.machineLastEventMu.Unlock()
 	if err := d.runSvc.Finish(ctx, p.RunID, p.Status, p.Summary); err != nil && !errors.Is(err, service.ErrRunAlreadyTerminal) {
 		logging.Infof("machine: finish run %s: %v", p.RunID, err)
-		return &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+		return
 	}
 	logging.Infof("machine: run %s finished (%s)", p.RunID, p.Status)
-	return nil
 }
 
 // ingestProcessorFinished completes a machine-dispatched processor run

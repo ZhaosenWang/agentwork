@@ -24,6 +24,9 @@ type Runtime struct {
 	// MachineID is the registered machine that executes this runtime's
 	// runs (transport='agentwork'; '' = local/legacy transports).
 	MachineID string `json:"machine_id,omitempty"`
+	// Status: active | absent — absent = the machine's latest probe no
+	// longer sees this CLI (uninstalled); the claim gate rejects it.
+	Status    string `json:"status"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -59,7 +62,7 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 
 func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,machine_id,args,env,created_at FROM runtime ORDER BY created_at`)
+		`SELECT id,name,machine_id,args,env,status,created_at FROM runtime ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +71,7 @@ func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	for rows.Next() {
 		var r Runtime
 		var argsJSON, envJSON string
-		if err := rows.Scan(&r.ID, &r.Name, &r.MachineID, &argsJSON, &envJSON, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.MachineID, &argsJSON, &envJSON, &r.Status, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(argsJSON), &r.Args)

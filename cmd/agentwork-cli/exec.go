@@ -35,6 +35,24 @@ func newExecutor(peer *link.Peer, serverURL string) *executor {
 	return &executor{peer: peer, serverURL: serverURL, cancels: map[string]context.CancelFunc{}}
 }
 
+// reprobeAfterSpawnFailure re-probes the machine and pushes a fresh probe
+// report after a spawn failure — an uninstalled CLI should be marked
+// absent immediately, not at the next 5-minute probe tick.
+func (e *executor) reprobeAfterSpawnFailure() {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		st, err := loadState()
+		if err != nil || st.MachineID == "" {
+			return
+		}
+		_ = e.peer.Notify(ctx, link.MethodMachineProbeUpdate, link.ProbeUpdateParams{
+			MachineID: st.MachineID,
+			CLIs:      probeCLIs(ctx),
+		})
+	}()
+}
+
 // shutdown cancels every in-flight run (the link died — the platform will
 // reclaim them via RecoverStuckRunning).
 func (e *executor) shutdown() {
@@ -194,6 +212,11 @@ func (e *executor) execute(p link.RunDispatchParams) {
 		Cwd:        workdir,
 	}, e.buildEnv(p, workdir))
 	if err != nil {
+		// The spawn failed — likely an uninstalled CLI. Re-probe and push
+		// a fresh report so the platform marks the runtime absent and
+		// stops dispatching to it (multica's runtime_not_found recovery,
+		// without waiting for the periodic probe).
+		e.reprobeAfterSpawnFailure()
 		e.finish(p, "", "", "failed", fmt.Sprintf("runtime: %v", err))
 		return
 	}

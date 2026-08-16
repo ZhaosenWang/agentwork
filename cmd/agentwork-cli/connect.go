@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -99,6 +100,19 @@ func connectCmd(args []string) {
 	// the process must exit promptly, never strand on a stuck link.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// SIGUSR1 dumps every goroutine's stack into the CLI log — the
+	// sidecar's "hang detector" for the next link-stall (a blocked
+	// readLoop left no trace before).
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGUSR1)
+		for range ch {
+			buf := make([]byte, 1<<20)
+			n := runtime.Stack(buf, true)
+			cliLogf("=== goroutine dump (SIGUSR1) ===\n%s", buf[:n])
+		}
+	}()
 
 	backoff := time.Second
 	for {
@@ -215,6 +229,11 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	// Heartbeat every 5s until the link dies or we're interrupted.
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
+	// Periodic re-probe: an installed/uninstalled agent CLI changes the
+	// machine's capability set. When the signature drifts, push a fresh
+	// probe report — the platform marks vanished CLIs' runtimes absent.
+	probeTick := time.NewTicker(5 * time.Minute)
+	defer probeTick.Stop()
 	for {
 		select {
 		case <-tick.C:
@@ -224,6 +243,18 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 			}
 			st.ConnectedAt = time.Now()
 			saveState(st)
+		case <-probeTick.C:
+			fresh := probeCLIs(ctx)
+			if probeSig(fresh) != probeSig(clis) {
+				clis = fresh
+				st.ProbedCLIs = fresh
+				saveState(st)
+				if err := peer.Notify(ctx, link.MethodMachineProbeUpdate, link.ProbeUpdateParams{MachineID: st.MachineID, CLIs: fresh}); err != nil {
+					cliLogf("link: probe update: %v", err)
+				} else {
+					cliLogf("link: probe updated (%d agent CLI(s))", len(fresh))
+				}
+			}
 		case <-peer.Done():
 			cliLogf("link: closed")
 			return fmt.Errorf("link closed")
@@ -231,6 +262,15 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 			return nil
 		}
 	}
+}
+
+// probeSig is the probe report's change-detection fingerprint.
+func probeSig(clis []link.ProbeCLI) string {
+	parts := make([]string, 0, len(clis))
+	for _, c := range clis {
+		parts = append(parts, c.Name+"@"+c.Version)
+	}
+	return strings.Join(parts, ",")
 }
 
 // connectWSURL derives the /connect WebSocket URL from the server flag

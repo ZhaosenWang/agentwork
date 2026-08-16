@@ -196,7 +196,8 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			}
 			// Phase 2: each probed CLI becomes an executable runtime row
 			// owned by this machine — runs on it dispatch over the link.
-			if err := machineSvc.UpsertProbeRuntimes(ctx, p.MachineID, p.Name, p.CLIs); err != nil {
+			// The reconcile also marks CLIs gone from the probe absent.
+			if err := machineSvc.ReconcileProbeRuntimes(ctx, p.MachineID, p.Name, p.CLIs); err != nil {
 				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
 			}
 			// Bind the live peer: dispatched runs for this machine's

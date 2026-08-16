@@ -81,6 +81,10 @@ CREATE TABLE IF NOT EXISTS runtime (
     machine_id    TEXT NOT NULL DEFAULT '',    -- the registered machine that executes this runtime's runs
     args          TEXT NOT NULL DEFAULT '[]',  -- acp_spawn: how the machine starts the CLI
     env           TEXT NOT NULL DEFAULT '{}',  -- runtime env (layered over the machine env at spawn)
+    -- status: active | absent — absent = the machine's latest probe no
+    -- longer sees this CLI (uninstalled). The row survives (agents
+    -- reference it) but the claim gate rejects it.
+    status        TEXT NOT NULL DEFAULT 'active',
     created_at    TEXT NOT NULL                -- RFC3339
 );
 
