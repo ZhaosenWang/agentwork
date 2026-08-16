@@ -640,18 +640,17 @@ func (d *Daemon) PushAgentSkills(ctx context.Context, agentID string) {
 	skillSvc := service.NewSkillService(d.st)
 	var pushes []link.SkillPush
 	for _, sid := range skillIDs {
-		files, err := skillSvc.Files(ctx, sid)
-		if err != nil {
-			logging.Infof("machine: skills push %s: load %s: %v", agentID, sid, err)
-			continue
-		}
 		var name string
 		_ = d.st.DB().QueryRowContext(ctx, `SELECT name FROM skill WHERE id=?`, sid).Scan(&name)
-		sp := link.SkillPush{Name: name}
-		for _, path := range service.SortedFilePaths(files) {
-			sp.Files = append(sp.Files, link.SkillFile{Path: path, Content: files[path]})
+		// The push carries the skill's ORIGINAL zip archive (scripts and
+		// binary assets included) — the machine extracts it with the same
+		// safe extractor the platform used (zipx, both ends).
+		archive, err := skillSvc.PackageZip(ctx, sid)
+		if err != nil {
+			logging.Infof("machine: skills push %s: archive %s: %v", agentID, sid, err)
+			continue
 		}
-		pushes = append(pushes, sp)
+		pushes = append(pushes, link.SkillPush{Name: name, Archive: archive})
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

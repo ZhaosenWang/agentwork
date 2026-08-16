@@ -522,6 +522,33 @@ func (h *Handlers) listSkills(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) createSkill(w http.ResponseWriter, r *http.Request) {
+	// Two upload modes: a multipart form carrying the skill as a ZIP
+	// archive (scripts + binary assets — the way the web UI uploads), or
+	// the legacy JSON body of text files (=== blocks) which the service
+	// archives the same way.
+	ct := r.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "multipart/form-data") {
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		name := strings.TrimSpace(r.FormValue("name"))
+		description := r.FormValue("description")
+		file, _, err := r.FormFile("file")
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("file is required: %w", err))
+			return
+		}
+		defer file.Close()
+		zipData, err := io.ReadAll(file)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		out, err := h.Skills.CreateFromZip(r.Context(), name, description, zipData)
+		writeJSON(w, out, err)
+		return
+	}
 	var body struct {
 		Name        string            `json:"name"`
 		Description string            `json:"description"`

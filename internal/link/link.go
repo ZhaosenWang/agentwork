@@ -334,15 +334,13 @@ type RunEventBatchParams struct {
 // ── config push (machine link, Phase 4) ──
 
 // SkillFile is one file of a skill package.
-type SkillFile struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
-}
-
-// SkillPush is one skill package to install on the machine.
+// SkillPush is one skill package to install on the machine. The ORIGINAL
+// zip archive rides the wire (JSON base64) — skills carry scripts and
+// binary assets, not just SKILL.md text; the machine extracts it with the
+// same safe extractor the platform used (zipx, both ends).
 type SkillPush struct {
-	Name  string      `json:"name"`
-	Files []SkillFile `json:"files"`
+	Name    string `json:"name"`
+	Archive []byte `json:"archive"` // the skill's ORIGINAL zip (JSON base64)
 }
 
 // ConfigPushParams — the daemon pushes an agent's selected skills to its

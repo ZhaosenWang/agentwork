@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/eushing/agentwork/internal/store"
+	"github.com/eushing/agentwork/internal/zipx"
 )
 
 // Skill is a platform-managed skill package (SKILL.md + resources) — the
@@ -39,6 +40,60 @@ func skillDir(skillID string) string {
 // (path → content; SKILL.md is required — a skill without instructions is
 // a file dump, not a skill).
 func (s *SkillService) Create(ctx context.Context, name, description string, files map[string]string) (*Skill, error) {
+	// Text-block mode builds the SAME archive shape a zip upload
+	// produces — the push layer sends the original archive either way.
+	zipData, err := zipx.Build(files)
+	if err != nil {
+		return nil, NewValidationError(err.Error())
+	}
+	return s.createFromArchive(ctx, name, description, files, zipData)
+}
+
+// CreateFromZip uploads a skill as a ZIP archive (SKILL.md + scripts /
+// references / binary assets) — the archive is validated, extracted into
+// the skill's library dir, and KEPT for push (the machine receives the
+// original bytes and extracts them itself).
+func (s *SkillService) CreateFromZip(ctx context.Context, name, description string, zipData []byte) (*Skill, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, NewValidationError("name is required")
+	}
+	var n int
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM skill WHERE name=?`, name).Scan(&n); err != nil {
+		return nil, fmt.Errorf("check skill name: %w", err)
+	}
+	if n > 0 {
+		return nil, NewValidationError(fmt.Sprintf("skill %q already exists", name))
+	}
+	sk := &Skill{ID: newID(), Name: name, Description: description, CreatedAt: now()}
+	if _, err := s.st.DB().ExecContext(ctx,
+		`INSERT INTO skill (id,name,description,created_at) VALUES (?,?,?,?)`,
+		sk.ID, sk.Name, sk.Description, sk.CreatedAt); err != nil {
+		return nil, fmt.Errorf("insert skill: %w", err)
+	}
+	dir := skillDir(sk.ID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
+		return nil, fmt.Errorf("mkdir skill dir: %w", err)
+	}
+	if err := zipx.Extract(zipData, dir); err != nil {
+		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
+		return nil, NewValidationError(err.Error())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err != nil {
+		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
+		return nil, NewValidationError("SKILL.md is required (the skill's instructions)")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "package.zip"), zipData, 0o644); err != nil {
+		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
+		return nil, fmt.Errorf("store skill archive: %w", err)
+	}
+	return sk, nil
+}
+
+// createFromArchive shares the DB insert + validation between the two
+// upload modes (the text-block mode has no pre-validated zip yet).
+func (s *SkillService) createFromArchive(ctx context.Context, name, description string, files map[string]string, zipData []byte) (*Skill, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return nil, NewValidationError("name is required")
@@ -63,7 +118,34 @@ func (s *SkillService) Create(ctx context.Context, name, description string, fil
 		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
 		return nil, err
 	}
+	// Keep the archive for push (the machine extracts the original bytes).
+	if err := os.WriteFile(filepath.Join(skillDir(sk.ID), "package.zip"), zipData, 0o644); err != nil {
+		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
+		return nil, fmt.Errorf("store skill archive: %w", err)
+	}
 	return sk, nil
+}
+
+// PackageZip returns the skill's ORIGINAL archive for config.push — the
+// machine receives the bytes and extracts them into the agent's staging
+// dir (zipx.Extract on both ends). Skills created before the zip pipeline
+// have no stored archive: rebuild one from the extracted files once (and
+// persist it) so every skill pushes the same way.
+func (s *SkillService) PackageZip(ctx context.Context, id string) ([]byte, error) {
+	b, err := os.ReadFile(filepath.Join(skillDir(id), "package.zip"))
+	if err == nil {
+		return b, nil
+	}
+	files, err := s.Files(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("load skill files: %w", err)
+	}
+	zipData, err := zipx.Build(files)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild skill archive: %w", err)
+	}
+	_ = os.WriteFile(filepath.Join(skillDir(id), "package.zip"), zipData, 0o644)
+	return zipData, nil
 }
 
 // writeFiles materializes the skill's files under its directory. Paths are

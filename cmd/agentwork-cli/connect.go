@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/eushing/agentwork/internal/link"
+	"github.com/eushing/agentwork/internal/zipx"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -175,28 +176,15 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 				continue
 			}
 			target := filepath.Join(root, sk.Name)
-			bad := false
-			for _, f := range sk.Files {
-				if filepath.IsAbs(f.Path) || f.Path == ".." || strings.HasPrefix(f.Path, "../") {
-					res.Errors = append(res.Errors, fmt.Sprintf("%s: invalid path %q", sk.Name, f.Path))
-					bad = true
-					break
-				}
-				path := filepath.Join(target, filepath.FromSlash(f.Path))
-				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-					res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", sk.Name, err))
-					bad = true
-					break
-				}
-				if err := os.WriteFile(path, []byte(f.Content), 0o644); err != nil {
-					res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", sk.Name, err))
-					bad = true
-					break
-				}
+			_ = os.RemoveAll(target)
+			// The skill rides as its ORIGINAL zip — scripts and binary
+			// assets included. Extract with the same safe extractor the
+			// platform used (zipx, both ends).
+			if err := zipx.Extract(sk.Archive, target); err != nil {
+				res.Errors = append(res.Errors, fmt.Sprintf("%s: %v", sk.Name, err))
+				continue
 			}
-			if !bad {
-				res.Written = append(res.Written, sk.Name)
-			}
+			res.Written = append(res.Written, sk.Name)
 		}
 		cliLogf("config.push: installed %d skill(s) for agent %s into %s", len(res.Written), p.AgentID, root)
 		return res, nil

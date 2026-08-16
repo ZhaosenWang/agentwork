@@ -229,7 +229,13 @@ func (e *executor) execute(p link.RunDispatchParams) {
 			return nil, fmt.Errorf("runtime: %w", err)
 		}
 		backend := &acpbackend.Backend{}
-		sess, err := backend.OpenSession(ctx, proto.SessionSpec{Conn: conn, Cwd: workdir})
+		// autopermit answers the CLI's permission requests (allow the
+		// strongest option) and implements the delegated fs/terminal RPCs
+		// — the machine runs autonomously, nobody clicks "allow", and the
+		// platform judges the OUTCOME, not individual tool calls (live:
+		// an unhandled permission request came back as "The user rejected
+		// permission" and killed the agent's work).
+		sess, err := backend.OpenSession(ctx, proto.SessionSpec{Conn: conn, Cwd: workdir, ClientHandler: newAutopermit(workdir)})
 		if err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("session: %w", err)

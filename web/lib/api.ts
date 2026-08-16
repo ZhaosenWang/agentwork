@@ -23,8 +23,16 @@ export const listRuntimes = () => api<Runtime[]>("/runtimes");
 export const listMachines = () => api<import("./types").Machine[]>("/machines");
 // Skills library (CLI 分支 Phase 4).
 export const listSkills = () => api<import("./types").Skill[]>("/skills");
-export const createSkill = (body: { name: string; description: string; files: Record<string, string> }) =>
-  api<import("./types").Skill>("/skills", { method: "POST", body: JSON.stringify(body) });
+// Skills upload as a ZIP archive (SKILL.md + scripts/binary assets) via
+// multipart form — the platform keeps the original archive and pushes it
+// to the machines.
+export const createSkill = (body: { name: string; description: string; file: File }) => {
+  const fd = new FormData();
+  fd.append("name", body.name);
+  fd.append("description", body.description);
+  fd.append("file", body.file);
+  return api<import("./types").Skill>("/skills", { method: "POST", body: fd });
+};
 export const deleteSkill = (id: string) => api<void>(`/skills/${id}`, { method: "DELETE" });
 export const getRuntime = (id: string) => api<Runtime>(`/runtimes/${id}`);
 export const createRuntime = (body: Omit<Runtime, "id" | "created_at">) =>

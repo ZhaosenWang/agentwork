@@ -53,34 +53,20 @@ export default function SkillsPage() {
   );
 }
 
-// CreateSkillDialog uploads a skill package: the SKILL.md instructions are
-// the core; extra files (scripts, references) come as repeated
-// "=== <path>" blocks in the same textarea.
+// CreateSkillDialog uploads a skill package as a ZIP archive — SKILL.md
+// plus scripts/references/binary assets, packaged however the user likes.
+// The platform keeps the original archive and pushes it to the machines.
 function CreateSkillDialog({ onClose }: { onClose: () => void }) {
   const create = useCreateSkill();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
-  const [filesText, setFilesText] = useState("=== SKILL.md\n\n");
-
-  const parseFiles = (): Record<string, string> | null => {
-    const files: Record<string, string> = {};
-    const blocks = filesText.split(/^=== /m);
-    for (const block of blocks) {
-      const nl = block.indexOf("\n");
-      if (nl <= 0) continue;
-      const path = block.slice(0, nl).trim();
-      if (!path) continue;
-      files[path] = block.slice(nl + 1).replace(/\n$/, "");
-    }
-    return files;
-  };
+  const [file, setFile] = useState<File | null>(null);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    const files = parseFiles();
-    if (!files) return;
+    if (!file) return;
     create.mutate(
-      { name, description, files },
+      { name, description, file },
       { onSuccess: onClose }
     );
   };
@@ -106,14 +92,15 @@ function CreateSkillDialog({ onClose }: { onClose: () => void }) {
         <Field label="描述（可选）">
           <input value={description} onChange={(e) => setDescription(e.target.value)} className={inputCls} placeholder="一句话说明这个 skill 干什么" />
         </Field>
-        <Field label="文件" hint="=== 路径 开头分段；SKILL.md 必填。脚本/参考文件同样格式追加。">
-          <textarea
-            value={filesText}
-            onChange={(e) => setFilesText(e.target.value)}
-            className={`${inputCls} font-mono`}
-            rows={14}
-            placeholder={"=== SKILL.md\n\n<skill 的指令：什么时候用、怎么用>…\n\n=== scripts/check.sh\n#!/bin/sh\n…"}
+        <Field label="Skill 包（.zip）" hint="包含 SKILL.md（必填）+ 脚本/参考文件/图片等；平台原样下发到机器解压。">
+          <input
+            type="file"
+            accept=".zip"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            className={`${inputCls} file:mr-3 file:rounded-lg file:border-0 file:bg-indigo-50 file:px-3 file:py-1 file:text-sm file:text-indigo-700`}
+            required
           />
+          {file && <p className="text-xs text-zinc-500">已选择：{file.name}（{(file.size / 1024).toFixed(0)} KB）</p>}
         </Field>
         {create.isError && <p className="text-sm text-red-500">{String(create.error)}</p>}
       </form>
