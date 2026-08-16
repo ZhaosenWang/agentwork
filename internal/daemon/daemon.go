@@ -1704,7 +1704,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			goalTitle: goalTitle, policyText: policyText, domainType: domainType, domainName: domainName,
 			triggerCommentID: triggerCommentID, triggerAuthor: triggerAuthor, triggerAuthorName: triggerAuthorName,
 			triggerCommentContent: triggerCommentContent, title: title, desc: desc, handoff: handoff,
-			wakeNote: wakeNote, wakeAnchorID: wakeAnchorID, issueSection: issueSection, subGoalID: subGoalID,
+			wakeNote: wakeNote, wakeAnchorID: wakeAnchorID, subGoalID: subGoalID,
 			consultRun: consultRun, reviewRun: reviewRun, verifyRun: verifyRun, subGoalRun: subGoalRun,
 		})
 		// The stored prompt is the TASK message only — the fixed block and
@@ -1723,7 +1723,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			DefaultBranch: defaultBranch, GitIdentity: gitIdentity,
 			ACPSpawn: args, Env: dispatchEnv,
 			ProjectSkillsDir: d.projectSkillsDirFor(ctx, runtimeMachineID, args),
-			RunProfile:       d.buildRunProfile(ctx, q.GoalID, q.AgentID, agentName, runRole, goalTitle, policyText, domainType, domainName),
+			RunProfile:       d.buildRunProfile(ctx, q.GoalID, q.AgentID, agentName, runRole, goalTitle, policyText, domainType, domainName, issueSection),
 			PriorSessionID:   priorSession,
 			PriorWorkDir:     priorWorkdir,
 		}, runtimeMachineID)
@@ -2495,7 +2495,7 @@ func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, p
 type promptInputs struct {
 	agentName, systemPrompt, runRole, goalTitle, policyText, domainType, domainName string
 	triggerCommentID, triggerAuthor, triggerAuthorName, triggerCommentContent string
-	title, desc, handoff, wakeNote, wakeAnchorID, issueSection, subGoalID string
+	title, desc, handoff, wakeNote, wakeAnchorID, subGoalID string
 	consultRun, reviewRun, verifyRun, subGoalRun bool
 }
 
@@ -2557,9 +2557,7 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 		}
 	}
 	wakeLine := buildWakeLine(wakeAnchor, wakeWho, wakeContent)
-	if in.issueSection != "" {
-		wakeLine += "\n" + in.issueSection + "\n"
-	}
+
 
 	// Wake extras: sub-goal rework context, the mention-cycle hint, and the
 	// resolved-consult answers ride with the wake line.

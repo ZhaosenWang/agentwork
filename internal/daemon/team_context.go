@@ -73,9 +73,9 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 	if self == "" {
 		self = "agent-" + short(agentID)
 	}
-	// The agent-level persona (description + system prompt) AND the team
-	// (squad roster + briefing) ride AGENTS.md — the runtime's profile
-	// resolver loads them natively; the per-run role contract stays here.
+	// The agent-level persona (system prompt) AND the team (squad roster +
+	// briefing) ride AGENTS.md — the runtime's profile resolver loads them
+	// natively; the per-run role contract stays here.
 	b.WriteString(self)
 	b.WriteString("\n")
 	b.WriteString(roleContract(runRole, isLeader, squadID))
@@ -99,8 +99,14 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 // block (platform background, goal, role contract, tool surface) plus the
 // team profile. Shipped in the dispatch payload and merged into the
 // workdir's AGENTS.md at spawn — the user message carries the task only.
-func (d *Daemon) buildRunProfile(ctx context.Context, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName string) string {
+func (d *Daemon) buildRunProfile(ctx context.Context, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName, issueSection string) string {
 	block := d.buildFixedBlock(ctx, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName)
+	// The public-issue contract + the remote conversation snapshot are
+	// CONTEXT (standing rules for this run), not the task — they ride
+	// AGENTS.md like the rest of the profile.
+	if issueSection != "" {
+		block += "\n\n" + issueSection
+	}
 	if team := d.buildTeamProfile(ctx, goalID, agentID); team != "" {
 		return block + "\n\n" + team
 	}
