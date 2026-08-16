@@ -83,16 +83,16 @@ func BuildCard(c *card.Card) (string, error) {
 		}
 	}
 
-	// Separator + footer note.
+	// Separator + footer. The legacy `note` tag is REJECTED by card schema
+	// V2 ("no longer support this capability" — every digest card failed
+	// to send) — a div + plain_text renders the footer without it.
 	if c.Footer != "" {
 		elems = append(elems, map[string]any{"tag": "hr"})
 		elems = append(elems, map[string]any{
-			"tag": "note",
-			"elements": []map[string]any{
-				{
-					"tag":     "plain_text",
-					"content": c.Footer,
-				},
+			"tag": "div",
+			"text": map[string]any{
+				"tag":     "plain_text",
+				"content": c.Footer,
 			},
 		})
 	}

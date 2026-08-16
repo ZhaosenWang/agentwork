@@ -77,11 +77,13 @@ func TestBuildCardWithFooter(t *testing.T) {
 	if !strings.Contains(result, `"tag":"hr"`) {
 		t.Error("footer should produce hr element")
 	}
-	if !strings.Contains(result, `"tag":"note"`) {
-		t.Error("footer should produce note element")
+	// The legacy `note` tag is REJECTED by card schema V2 — the footer is a
+	// div + plain_text now.
+	if strings.Contains(result, `"tag":"note"`) {
+		t.Error("footer must not use the note tag (rejected by card schema V2)")
 	}
-	if !strings.Contains(result, "note text") {
-		t.Error("footer should contain note text")
+	if !strings.Contains(result, `"tag":"div"`) || !strings.Contains(result, "note text") {
+		t.Error("footer should render a div carrying the note text")
 	}
 }
 
