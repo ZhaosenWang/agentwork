@@ -88,7 +88,7 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 	return &a, nil
 }
 
-// Update edits an agent's identity/persona (name, description, system_prompt,
+// Update edits an agent's identity/persona (name, system_prompt,
 // max_concurrent, env). A changed system_prompt takes effect on the agent's
 // NEXT run — in-flight runs keep their snapshot.
 func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, error) {
@@ -105,7 +105,7 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 	mcpJSON, _ := json.Marshal(a.McpServers)
 	skillsJSON, _ := json.Marshal(a.Skills)
 	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE agent SET name=?, description=?, system_prompt=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
+		`UPDATE agent SET name=?, system_prompt=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
 		a.Name, a.SystemPrompt, a.MaxConcurrent, string(envJSON), string(mcpJSON), string(skillsJSON), id); err != nil {
 		return nil, fmt.Errorf("update agent: %w", err)
 	}
@@ -114,7 +114,7 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
+		`SELECT id,name,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
 		 FROM agent ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -139,7 +139,7 @@ func (s *AgentService) Get(ctx context.Context, id string) (*Agent, error) {
 	var a Agent
 	var envJSON, mcpJSON, skillsJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
+		`SELECT id,name,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
 		 FROM agent WHERE id=?`, id).
 		Scan(&a.ID, &a.Name, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
