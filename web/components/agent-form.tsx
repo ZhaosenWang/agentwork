@@ -72,7 +72,6 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
     }
     const body = {
       name,
-      description: agent?.description ?? "",
       runtime_id: runtimeId,
       system_prompt: systemPrompt,
       model,

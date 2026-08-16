@@ -54,7 +54,6 @@ export interface McpServer {
 export interface Agent {
   id: string;
   name: string;
-  description: string;
   runtime_id: string;
   system_prompt: string;
   model: string;

@@ -1555,11 +1555,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		return
 	}
 	var title, desc, handoff, domainID, gitURL, defaultBranch, domainType, domainName, systemPrompt, argsJSON, rtEnvJSON, sourceRef, gitCredentials, gitIdentity, runtimeMachineID string
-	var agentName, agentDesc, triggerAuthorName string
+	var agentName, triggerAuthorName string
 	var triggerAuthor, triggerCommentID, triggerCommentContent, runRole, subGoalID, wakeNote, wakeAnchorID string
 	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
-		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, COALESCE(d.type,''), COALESCE(d.name,''), a.system_prompt, a.name, COALESCE(a.description,''), d.git_identity,
+		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, COALESCE(d.type,''), COALESCE(d.name,''), a.system_prompt, a.name, d.git_identity,
 		        r.args, r.env, COALESCE(r.machine_id,''), a.max_concurrent, d.max_run_duration,
 		        g.source_ref, d.git_credentials,
 		        r2.trigger_comment_id, COALESCE(c.author_type, ''), COALESCE(c.content, ''), COALESCE(ca.name,''), r2.role, r2.sub_goal_id, r2.wake_note, COALESCE(r2.wake_anchor,'')
@@ -1571,7 +1571,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 LEFT JOIN agent ca ON ca.id = c.author_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &agentName, &agentDesc, &gitIdentity, &argsJSON, &rtEnvJSON, &runtimeMachineID, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &triggerAuthorName, &runRole, &subGoalID, &wakeNote, &wakeAnchorID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &agentName, &gitIdentity, &argsJSON, &rtEnvJSON, &runtimeMachineID, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &triggerAuthorName, &runRole, &subGoalID, &wakeNote, &wakeAnchorID)
 	// Claim visibility: which run, which agent, which role — the panel's
 	// answer to "who is doing what right now". The TITLE travels with the
 	// id: ids are for the system, humans read titles.
@@ -1688,7 +1688,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			dispatchEnv["AGENTWORK_ISSUE_NUMBER"] = issueNumber
 		}
 		machinePrompt := d.assemblePrompt(ctx, q, promptInputs{
-			agentName: agentName, agentDesc: agentDesc, systemPrompt: systemPrompt, runRole: runRole,
+			agentName: agentName, systemPrompt: systemPrompt, runRole: runRole,
 			goalTitle: goalTitle, policyText: policyText, domainType: domainType, domainName: domainName,
 			triggerCommentID: triggerCommentID, triggerAuthor: triggerAuthor, triggerAuthorName: triggerAuthorName,
 			triggerCommentContent: triggerCommentContent, title: title, desc: desc, handoff: handoff,
@@ -2481,7 +2481,7 @@ func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, p
 
 // promptInputs carries everything the prompt assembly reads.
 type promptInputs struct {
-	agentName, agentDesc, systemPrompt, runRole, goalTitle, policyText, domainType, domainName string
+	agentName, systemPrompt, runRole, goalTitle, policyText, domainType, domainName string
 	triggerCommentID, triggerAuthor, triggerAuthorName, triggerCommentContent string
 	title, desc, handoff, wakeNote, wakeAnchorID, issueSection, subGoalID string
 	consultRun, reviewRun, verifyRun, subGoalRun bool

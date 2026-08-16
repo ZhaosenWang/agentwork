@@ -153,7 +153,7 @@ export function useCreateAgent() {
 export function useUpdateAgent() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, ...body }: { id: string; name: string; description: string; runtime_id: string; system_prompt: string; model: string; env: Record<string, string>; max_concurrent: number }) =>
+    mutationFn: ({ id, ...body }: { id: string; name: string; runtime_id: string; system_prompt: string; model: string; env: Record<string, string>; max_concurrent: number }) =>
       updateAgent(id, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.agents }),
   });

@@ -528,17 +528,25 @@ func writeAgentProfile(agentID, systemPrompt string) error {
 	return os.WriteFile(path, []byte(systemPrompt), 0o644)
 }
 
-// syncAgentProfile copies the agent's pushed AGENTS.md into the run's
-// workdir (the runtime's profile resolver walks up from cwd). Returns the
-// profile's content ('' = none pushed) so the commit step can recognize it.
+// syncAgentProfile APPENDS the agent's pushed AGENTS.md into the run's
+// workdir (the runtime's profile resolver walks up from cwd) — a
+// repo-owned AGENTS.md in the checkout survives (its instructions are the
+// project's ground truth and must not be clobbered; the platform profile
+// rides below it). Returns the merged content so the commit step can
+// recognize the platform-written suffix.
 func syncAgentProfile(agentID, workdir string) string {
 	b, err := os.ReadFile(filepath.Join(agentProfileDir(agentID), "AGENTS.md"))
 	if err != nil {
 		return ""
 	}
-	content := string(b)
-	_ = os.WriteFile(filepath.Join(workdir, "AGENTS.md"), b, 0o644)
-	return content
+	persona := string(b)
+	path := filepath.Join(workdir, "AGENTS.md")
+	merged := persona
+	if existing, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(existing)) != "" {
+		merged = string(existing) + "\n\n" + persona
+	}
+	_ = os.WriteFile(path, []byte(merged), 0o644)
+	return merged
 }
 
 // machineSkillRoot is where config.push lands an agent's skill packages on

@@ -97,7 +97,6 @@ CREATE TABLE IF NOT EXISTS runtime (
 CREATE TABLE IF NOT EXISTS agent (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
-    description     TEXT NOT NULL DEFAULT '',
     runtime_id      TEXT NOT NULL REFERENCES runtime(id),
     system_prompt   TEXT NOT NULL DEFAULT '',
     model           TEXT NOT NULL DEFAULT '',  -- optional override

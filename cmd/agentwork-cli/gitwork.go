@@ -208,7 +208,12 @@ func gitAddExcludeArgs(excludeProfile bool) []string {
 func commitAndPush(ctx context.Context, p link.RunDispatchParams, wt, repo, branch, runID, pushedProfile string) (string, error) {
 	excludeProfile := false
 	if pushedProfile != "" {
-		if b, err := os.ReadFile(filepath.Join(wt, "AGENTS.md")); err == nil && string(b) == pushedProfile {
+		// The workdir's AGENTS.md = repo-owned content (if any) + the
+		// platform-written suffix. Unchanged suffix → exclude the whole
+		// file (the repo part is already committed); an agent edit above
+		// the suffix is intentionally kept out too — the platform section
+		// must never ride a commit.
+		if b, err := os.ReadFile(filepath.Join(wt, "AGENTS.md")); err == nil && strings.HasSuffix(string(b), pushedProfile) {
 			excludeProfile = true
 		}
 	}
