@@ -1713,7 +1713,17 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			`UPDATE run SET prompt=? WHERE id=?`, machinePrompt, q.RunID); err != nil {
 			logging.Infof("daemon: run %s: store prompt: %v", q.RunID, err)
 		}
-		priorSession, priorWorkdir := d.priorSessionFor(ctx, q.GoalID, q.AgentID, subGoalID)
+		// The resume pointer is a WRITABLE-role privilege: an ACP session
+		// has ONE writer at a time — owner/subgoal runs load their own
+		// (goal/subgoal, agent) session (single-flight serializes them).
+		// Read-only roles (consult/review/verify) answer from a FRESH
+		// session and must NEVER load a live session (they'd collide with
+		// its writer — the old code sent the pointer to every role and was
+		// only saved by the workdir-mismatch branch).
+		priorSession, priorWorkdir := "", ""
+		if runRole == "owner" || runRole == "subgoal" {
+			priorSession, priorWorkdir = d.priorSessionFor(ctx, q.GoalID, q.AgentID, subGoalID)
+		}
 		d.dispatchToMachine(ctx, q, link.RunDispatchParams{
 			RunID: q.RunID, GoalID: q.GoalID, AgentID: q.AgentID,
 			Role: runRole, SubGoalID: subGoalID, Attempt: q.Attempt,
