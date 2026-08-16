@@ -487,7 +487,7 @@ func (s *Session) notify(ctx context.Context, method string, params any) error {
 		JSONRPC string `json:"jsonrpc"`
 		Method  string `json:"method"`
 		Params  any    `json:"params,omitempty"`
-	}{JSONRPC: "2.0", Method: method, Params: params}
+	}{JSONRPC: "2.0", Method: method, Params: normalizeNilSlices(params)}
 	body, _ := json.Marshal(notif)
 	s.writeMu.Lock()
 	_, err := s.w.Write(append(body, '\n'))
