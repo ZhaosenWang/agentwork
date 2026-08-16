@@ -181,9 +181,18 @@ func (h *Handlers) updateAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out, err)
 }
 func (h *Handlers) deleteAgent(w http.ResponseWriter, r *http.Request) {
+	// Resolve the machine BEFORE the delete — after it, the agent row is
+	// gone and the machine's skill dirs would keep the stale union.
+	machineID := ""
+	if h.Daemon != nil {
+		machineID = h.Daemon.AgentMachineID(r.Context(), r.PathValue("id"))
+	}
 	if err := h.Agent.Delete(r.Context(), r.PathValue("id")); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
+	}
+	if h.Daemon != nil && machineID != "" {
+		go h.Daemon.PushMachineSkills(context.Background(), machineID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -527,9 +536,22 @@ func (h *Handlers) createSkill(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) deleteSkill(w http.ResponseWriter, r *http.Request) {
-	if err := h.Skills.Delete(r.Context(), r.PathValue("id")); err != nil {
+	skillID := r.PathValue("id")
+	// Collect the users BEFORE the delete; after it, each affected agent's
+	// machine gets a config.push whose expected set no longer contains the
+	// skill — the machine removes the directory.
+	agents := []string{}
+	if h.Daemon != nil {
+		agents = h.Daemon.SkillAgents(r.Context(), skillID)
+	}
+	if err := h.Skills.Delete(r.Context(), skillID); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if h.Daemon != nil {
+		for _, id := range agents {
+			go h.Daemon.PushAgentSkills(context.Background(), id)
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

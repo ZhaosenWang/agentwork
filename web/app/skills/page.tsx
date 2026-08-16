@@ -13,7 +13,7 @@ export default function SkillsPage() {
     <div className="p-6 max-w-4xl mx-auto space-y-4">
       <PageHeader title="Skills" />
       <p className="text-sm text-gray-500 -mt-3">
-        平台技能库：上传 skill 包（SKILL.md 指令），勾选给 agent 后下发到它所在机器（agentwork-&lt;名称&gt;/ 命名空间，不碰你手动装的 skills）。
+        平台技能库：上传 skill 包（SKILL.md 指令），勾选给 agent 后下发到它所在机器；run 启动时按原名装入工作目录的项目级 skills 目录（.claude/skills / .opencode/skill / .agents/skills，取决于 agent CLI），不碰你机器上手动装的全局 skills。
       </p>
       <div className="mb-4">
         <Button onClick={() => setShowCreate(true)}>上传 Skill</Button>
@@ -100,7 +100,7 @@ function CreateSkillDialog({ onClose }: { onClose: () => void }) {
       }
     >
       <form id="skill-form" onSubmit={submit} className="space-y-4">
-        <Field label="名称" hint="agent 看到的名字；机器上安装为 agentwork-<名称>/">
+        <Field label="名称" hint="agent 看到的名字；原名装入 run 工作目录的项目级 skills">
           <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required placeholder="code-review-checklist" />
         </Field>
         <Field label="描述（可选）">

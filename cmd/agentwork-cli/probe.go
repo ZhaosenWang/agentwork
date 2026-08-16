@@ -20,35 +20,57 @@ const probeTimeout = 5 * time.Second
 // (CLI 分支 Phase 1). Each entry maps a CLI to: the probe command (runs
 // fast and prints a version), how to start it as an ACP stdio server, and
 // where its skills / profile files live (config push lands in Phase 4).
+// ProjectSkillsDir is the relative directory inside a run workdir where
+// the CLI loads PROJECT-level skills — the executor stages the agent's
+// skills there and the commit excludes every probed dir.
 // Code map for now — it graduates to a config table when the set grows.
 var probeTable = []struct {
-	Name         string
-	ProbeCmd     string   // run with sh -c; success = installed
-	ACPSpawn     []string // how to start it as an ACP stdio server
-	SkillsDir    string   // ~ expanded
-	ProfileFiles []string
+	Name             string
+	ProbeCmd         string   // run with sh -c; success = installed
+	ACPSpawn         []string // how to start it as an ACP stdio server
+	SkillsDir        string   // ~ expanded (global skills)
+	ProjectSkillsDir string   // relative, inside a run workdir
+	ProfileFiles     []string
 }{
 	{
-		Name:      "claude",
-		ProbeCmd:  "claude --version",
-		ACPSpawn:  []string{"claude", "--acp"},
-		SkillsDir: "~/.claude/skills",
-		ProfileFiles: []string{"CLAUDE.md", "AGENTS.md"},
+		Name:             "claude",
+		ProbeCmd:         "claude --version",
+		ACPSpawn:         []string{"claude", "--acp"},
+		SkillsDir:        "~/.claude/skills",
+		ProjectSkillsDir: ".claude/skills",
+		ProfileFiles:     []string{"CLAUDE.md", "AGENTS.md"},
 	},
 	{
-		Name:      "opencode",
-		ProbeCmd:  "opencode --version",
-		ACPSpawn:  []string{"opencode", "acp", "--pure"},
-		SkillsDir: "~/.config/opencode/skills",
-		ProfileFiles: []string{"AGENTS.md"},
+		Name:             "opencode",
+		ProbeCmd:         "opencode --version",
+		ACPSpawn:         []string{"opencode", "acp", "--pure"},
+		SkillsDir:        "~/.config/opencode/skills",
+		ProjectSkillsDir: ".opencode/skill",
+		ProfileFiles:     []string{"AGENTS.md"},
 	},
 	{
-		Name:      "openagent",
-		ProbeCmd:  "openagent --version",
-		ACPSpawn:  []string{"openagent", "acp"},
-		SkillsDir: "~/.openagent/skills",
-		ProfileFiles: []string{"SOUL.md", "SYSTEM.md", "AGENTS.md"},
+		Name:             "openagent",
+		ProbeCmd:         "openagent --version",
+		ACPSpawn:         []string{"openagent", "acp"},
+		SkillsDir:        "~/.openagent/skills",
+		ProjectSkillsDir: ".agents/skills", // the AgentSkills standard (npx skills add)
+		ProfileFiles:     []string{"SOUL.md", "SYSTEM.md", "AGENTS.md"},
 	},
+}
+
+// projectSkillsDirs returns every project-level skills directory the probe
+// table knows — the git exclusion set (staged skills are platform
+// infrastructure, never the agent's commit) and the executor's fallback.
+func projectSkillsDirs() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range probeTable {
+		if e.ProjectSkillsDir != "" && !seen[e.ProjectSkillsDir] {
+			seen[e.ProjectSkillsDir] = true
+			out = append(out, e.ProjectSkillsDir)
+		}
+	}
+	return out
 }
 
 // probeCLIs scans the environment for the probe-table CLIs. Probe commands
@@ -61,11 +83,12 @@ func probeCLIs(ctx context.Context) []link.ProbeCLI {
 			continue
 		}
 		out = append(out, link.ProbeCLI{
-			Name:         e.Name,
-			Version:      probeVersion(ctx, e.ProbeCmd),
-			ACPSpawn:     e.ACPSpawn,
-			SkillsDir:    expandHome(e.SkillsDir),
-			ProfileFiles: e.ProfileFiles,
+			Name:             e.Name,
+			Version:          probeVersion(ctx, e.ProbeCmd),
+			ACPSpawn:         e.ACPSpawn,
+			SkillsDir:        expandHome(e.SkillsDir),
+			ProjectSkillsDir: e.ProjectSkillsDir,
+			ProfileFiles:     e.ProfileFiles,
 		})
 	}
 	return out

@@ -123,7 +123,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
           <textarea value={systemPrompt} onChange={(e) => setSystemPrompt(e.target.value)} className={`${inputCls} font-mono`} rows={3} />
         </Field>
 
-        <Field label="Skills（平台技能库）" hint="勾选的 skill 会下发到该 agent 所在机器（agentwork-<名称>/ 命名空间）">
+        <Field label="Skills（平台技能库）" hint="勾选的 skill 会下发到该 agent 所在机器，run 时按原名装入工作目录的项目级 skills">
           {skillLib && skillLib.length > 0 ? (
             <div className="space-y-1">
               {skillLib.map((sk) => (

@@ -43,6 +43,14 @@ import (
 	"github.com/google/uuid"
 )
 
+// DaemonVersion is the agentwork-daemon build version, echoed in register
+// results — the CLI and the daemon warn each other on a mismatch (protocol
+// drift between an old binary and a new daemon surfaces at connect time).
+// var (not const): the release build stamps the real version via
+// -ldflags "-X <pkg>.DaemonVersion=$AGENTWORK_COMPILE_VERSION" (build.sh)
+// so the CLI and the daemon ship one shared version stamp.
+var DaemonVersion = "0.0.1-beta.1"
+
 // dispatchTickInterval is how often the daemon claims queued runs. Claims are
 // per-agent (only within the set of agents with free worker slots), so this
 // bounds perceived latency without hot-looping.
@@ -50,6 +58,15 @@ const dispatchTickInterval = 500 * time.Millisecond
 
 // scheduleTickInterval is how often the daemon scans schedule for due firings.
 const scheduleTickInterval = 5 * time.Second
+
+// scheduleFireTTL is how long a schedule-fired run may sit queued before the
+// fire is a miss ("cron: miss = miss"): a fire born while its machine was
+// offline must not execute stale work hours later.
+const scheduleFireTTL = 30 * time.Minute
+
+// scheduleStaleSweepInterval is how often the daemon expires queued schedule
+// fires past the TTL.
+const scheduleStaleSweepInterval = 2 * time.Minute
 
 // worktreeCleanupInterval is how often the daemon sweeps expired goal
 // worktrees (M1: every 6h).
@@ -325,6 +342,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	dispatchTick := time.NewTicker(dispatchTickInterval)
 	scheduleTick := time.NewTicker(scheduleTickInterval)
+	staleTick := time.NewTicker(scheduleStaleSweepInterval)
 	cleanupTick := time.NewTicker(worktreeCleanupInterval)
 	digestTick := time.NewTicker(digestTickInterval)
 	issueTick := time.NewTicker(issuePollInterval)
@@ -332,6 +350,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.runLogTailer(ctx)
 	defer dispatchTick.Stop()
 	defer scheduleTick.Stop()
+	defer staleTick.Stop()
 	defer cleanupTick.Stop()
 	defer digestTick.Stop()
 	defer issueTick.Stop()
@@ -346,6 +365,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.dispatchOnce(ctx)
 		case <-scheduleTick.C:
 			d.dispatchSchedules(ctx)
+		case <-staleTick.C:
+			d.expireStaleScheduledRuns(ctx)
 		case <-cleanupTick.C:
 			d.cleanupWorktrees(ctx)
 		case <-digestTick.C:
@@ -355,6 +376,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-runawayTick.C:
 			d.reapRunawayRuns(ctx)
 		}
+	}
+}
+
+// expireStaleScheduledRuns closes schedule fires that never dispatched
+// because their machine was offline past the TTL.
+func (d *Daemon) expireStaleScheduledRuns(ctx context.Context) {
+	n, err := d.runSvc.ExpireStaleScheduledRuns(ctx, time.Now().Add(-scheduleFireTTL))
+	if err != nil {
+		logging.Infof("daemon: expire stale scheduled runs: %v", err)
+	} else if n > 0 {
+		logging.Infof("daemon: expired %d stale scheduled run(s) (queued past %s — machine offline at fire time)", n, scheduleFireTTL)
 	}
 }
 
@@ -1665,6 +1697,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			DomainID: domainID, GitURL: gitURL, GitCredentials: gitCredentials,
 			DefaultBranch: defaultBranch, GitIdentity: gitIdentity,
 			ACPSpawn: args, Env: dispatchEnv,
+			ProjectSkillsDir: d.projectSkillsDirFor(ctx, runtimeMachineID, args),
 		}, runtimeMachineID)
 		return
 	}

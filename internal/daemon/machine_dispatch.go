@@ -220,7 +220,7 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, mid string, p link.RunFi
 		// its own work): setup+verify+guards run on the adopted branch,
 		// and a red result flips the report to failed (the local path's
 		// semantics: verification failure = run failure + retry chain).
-		if failReport := d.processMachineRunCompletion(ctx, p.RunID, p.Summary); failReport != "" {
+		if failReport := d.processMachineRunCompletion(ctx, p.RunID, p.Summary, p.HeadSHA); failReport != "" {
 			p.Status = "failed"
 			p.Summary = failReport
 		}
@@ -320,7 +320,12 @@ func (d *Daemon) runMachineWatchdog(runID, machineID string) {
 // gates_hit. Returns a failure report when verification or guards fail —
 // the caller flips the run to failed. The daemon computes, the goal layer
 // judges; the worker never verifies its own work (invariant 9).
-func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSummary string) string {
+//
+// headSHA is the transfer tip the machine reported: when non-empty, the
+// adopted branch must point AT it, and a branch that cannot be adopted at
+// all is a hard failure — a completed run that pushed work must never fall
+// back to the zero-change path (a lost push is not "no changes").
+func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSummary, headSHA string) string {
 	var goalID, role, subGoalID, domainID, gitURL, defaultBranch, gitCredentials, domainType string
 	if err := d.st.DB().QueryRowContext(ctx,
 		`SELECT r.goal_id, r.role, r.sub_goal_id, d.id, d.git_url, d.default_branch, d.git_credentials, COALESCE(d.type,'')
@@ -343,10 +348,15 @@ func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSu
 		return "" // the verifier's own run has no policy verification
 	}
 
+	// The domain lock covers ONLY the shared-repo git mutations (ensure,
+	// fetch, branch adopt, worktree add) — verification and guards run on
+	// this run's PRIVATE worktree and must not serialize every other run's
+	// completion on the domain (a slow test suite once held the lock for
+	// minutes). Released explicitly before verification below.
 	unlock := d.lockDomain(domainID)
-	defer unlock()
 	repo := domainRepoPath(domainID)
 	if err := d.ensureSharedRepo(ctx, domainID, gitURL, gitCredentials); err != nil {
+		unlock()
 		logging.Infof("machine: completion %s: prepare repo: %v", runID, err)
 		return ""
 	}
@@ -369,6 +379,7 @@ func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSu
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
+				unlock()
 				return ""
 			case <-time.After(2 * time.Second):
 			}
@@ -380,6 +391,20 @@ func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSu
 			adopted = true
 		}
 	}
+	// The machine reported a pushed commit: the adoption MUST reproduce it
+	// exactly — a lost push must never fall through to the zero-change path
+	// and complete silently.
+	if headSHA != "" {
+		if !adopted {
+			unlock()
+			return fmt.Sprintf("transfer branch missing: the machine pushed %s but origin/agentwork/%s was not visible after retries", headSHA, branchName)
+		}
+		tip := strings.TrimSpace(mustGit(ctx, repo, "rev-parse", "refs/heads/"+branchName))
+		if tip != headSHA {
+			unlock()
+			return fmt.Sprintf("transfer mismatch: adopted branch tip %s does not match the pushed commit %s", tip, headSHA)
+		}
+	}
 	// Verification target: the adopted branch, or origin/<default> when no
 	// transfer exists (a zero-change run — the state equals the base; the
 	// local path runs verification on zero-change runs too).
@@ -389,9 +414,11 @@ func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSu
 	}
 	wt := filepath.Join(runsRoot(), "gates", runID)
 	if _, err := gitRun(ctx, repo, "worktree", "add", "--force", "--detach", wt, target); err != nil {
+		unlock()
 		logging.Infof("machine: completion %s: worktree: %v", runID, err)
 		return ""
 	}
+	unlock()
 	defer func() {
 		_, _ = gitRun(context.Background(), repo, "worktree", "remove", "--force", wt)
 	}()
@@ -486,10 +513,10 @@ func (d *Daemon) PushMachineSkills(ctx context.Context, machineID string) {
 // via config.push. No-op for local/legacy runtimes and offline machines
 // (the register-time full sync covers those).
 func (d *Daemon) PushAgentSkills(ctx context.Context, agentID string) {
-	var skillsJSON, runtimeID, machineID, systemPrompt string
+	var skillsJSON, machineID, systemPrompt string
 	if err := d.st.DB().QueryRowContext(ctx,
-		`SELECT a.skills, a.runtime_id, r.machine_id, a.system_prompt FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`,
-		agentID).Scan(&skillsJSON, &runtimeID, &machineID, &systemPrompt); err != nil || machineID == "" {
+		`SELECT a.skills, r.machine_id, a.system_prompt FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`,
+		agentID).Scan(&skillsJSON, &machineID, &systemPrompt); err != nil || machineID == "" {
 		return // local/legacy runtime — nothing to push
 	}
 	peer := d.MachinePeer(machineID)
@@ -520,7 +547,6 @@ func (d *Daemon) PushAgentSkills(ctx context.Context, agentID string) {
 	if err := peer.Call(callCtx, link.MethodConfigPush, link.ConfigPushParams{
 		AgentID:      agentID,
 		SystemPrompt: systemPrompt,
-		SkillsDir:    d.machineSkillsDir(ctx, machineID, runtimeID),
 		Skills:       pushes,
 	}, &res); err != nil {
 		logging.Infof("machine: skills push %s: %v", agentID, err)
@@ -533,10 +559,14 @@ func (d *Daemon) PushAgentSkills(ctx context.Context, agentID string) {
 	logging.Infof("machine: skills push %s: %d skill(s) installed", agentID, len(res.Written))
 }
 
-// machineSkillsDir resolves the CLI's skills directory from the machine's
-// probe report (the probe stored it at register time); '' = the CLI's
-// default fallback (~/.claude/skills).
-func (d *Daemon) machineSkillsDir(ctx context.Context, machineID, runtimeID string) string {
+// projectSkillsDirFor resolves a run's CLI's project-level skills
+// directory from the machine's probe report (the CLI knowledge lives in
+// the CLI's probe table; the daemon reads it back). '' = not probed —
+// the executor falls back to its own mapping.
+func (d *Daemon) projectSkillsDirFor(ctx context.Context, machineID string, spawn []string) string {
+	if machineID == "" || len(spawn) == 0 {
+		return ""
+	}
 	var probedJSON string
 	if err := d.st.DB().QueryRowContext(ctx,
 		`SELECT probed_clis FROM machine WHERE id=?`, machineID).Scan(&probedJSON); err != nil {
@@ -546,21 +576,43 @@ func (d *Daemon) machineSkillsDir(ctx context.Context, machineID, runtimeID stri
 	if err := json.Unmarshal([]byte(probedJSON), &clis); err != nil {
 		return ""
 	}
-	var spawnJSON string
-	if err := d.st.DB().QueryRowContext(ctx,
-		`SELECT args FROM runtime WHERE id=?`, runtimeID).Scan(&spawnJSON); err != nil {
-		return ""
-	}
-	var spawn []string
-	_ = json.Unmarshal([]byte(spawnJSON), &spawn)
-	cliName := ""
-	if len(spawn) > 0 {
-		cliName = spawn[0]
-	}
+	cliName := filepath.Base(spawn[0])
 	for _, c := range clis {
-		if c.Name == cliName {
-			return c.SkillsDir
+		if c.Name == cliName || (len(c.ACPSpawn) > 0 && filepath.Base(c.ACPSpawn[0]) == cliName) {
+			return c.ProjectSkillsDir
 		}
 	}
 	return ""
+}
+
+// AgentMachineID resolves the machine an agent's runtime lives on ('' for
+// local/legacy or unknown agents).
+func (d *Daemon) AgentMachineID(ctx context.Context, agentID string) string {
+	var machineID string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT r.machine_id FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`,
+		agentID).Scan(&machineID); err != nil {
+		return ""
+	}
+	return machineID
+}
+
+// SkillAgents returns the agents that have the skill selected (their
+// machines get a re-push after a library deletion so the skill's directory
+// is cleaned up).
+func (d *Daemon) SkillAgents(ctx context.Context, skillID string) []string {
+	rows, err := d.st.DB().QueryContext(ctx,
+		`SELECT id FROM agent WHERE skills LIKE ?`, `%"`+skillID+`"%`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }

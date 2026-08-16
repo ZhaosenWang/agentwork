@@ -127,42 +127,58 @@ func ensureGitWorkdir(ctx context.Context, p link.RunDispatchParams) (workdir, r
 
 // commitAndPush commits the run's changes onto the branch (when there are
 // any) and pushes it to the remote as agentwork/<branch> — the 中转 push.
-// A no-change run pushes nothing.
-func commitAndPush(ctx context.Context, p link.RunDispatchParams, wt, repo, branch, runID, pushedProfile string) error {
-	// The platform-written AGENTS.md (config.push) is NOT the agent's work:
-	// when unchanged, it stays out of the commit (git add -A minus the one
-	// path). An agent-modified profile IS its own file and gets committed.
+// A no-change run pushes nothing. Returns the pushed commit's sha ('' =
+// nothing staged): the sha rides the terminal report, and the daemon
+// hard-fails a completed run whose reported sha it cannot adopt — a lost
+// push must never masquerade as "no changes to verify".
+// gitAddExcludeArgs are the pathspec excludes for the run's `git add -A`:
+// EVERY project-level skill directory the probe table knows (the staged
+// skills are platform-managed infrastructure — their source of truth is
+// the skills library — and NEVER become the agent's commit); the pushed
+// AGENTS.md profile is excluded only while unchanged (an agent-modified
+// profile IS its own file and gets committed).
+func gitAddExcludeArgs(excludeProfile bool) []string {
+	excludes := []string{}
+	for _, dir := range projectSkillsDirs() {
+		excludes = append(excludes, ":(exclude)"+dir)
+	}
+	if excludeProfile {
+		excludes = append(excludes, ":(exclude)AGENTS.md")
+	}
+	return excludes
+}
+
+func commitAndPush(ctx context.Context, p link.RunDispatchParams, wt, repo, branch, runID, pushedProfile string) (string, error) {
+	excludeProfile := false
 	if pushedProfile != "" {
 		if b, err := os.ReadFile(filepath.Join(wt, "AGENTS.md")); err == nil && string(b) == pushedProfile {
-			if out, err := runGit(ctx, wt, "add", "-A", "--", ":(exclude)AGENTS.md"); err != nil {
-				return fmt.Errorf("git add: %v: %s", err, out)
-			}
-			return commitAndPushStaged(ctx, p, wt, repo, branch, runID)
+			excludeProfile = true
 		}
 	}
-	if out, err := runGit(ctx, wt, "add", "-A"); err != nil {
-		return fmt.Errorf("git add: %v: %s", err, out)
+	args := append([]string{"add", "-A", "--"}, gitAddExcludeArgs(excludeProfile)...)
+	if out, err := runGit(ctx, wt, args...); err != nil {
+		return "", fmt.Errorf("git add: %v: %s", err, out)
 	}
 	return commitAndPushStaged(ctx, p, wt, repo, branch, runID)
 }
 
 // commitAndPushStaged commits/pushes whatever is staged (shared by the
 // normal and AGENTS.md-excluded paths).
-func commitAndPushStaged(ctx context.Context, p link.RunDispatchParams, wt, repo, branch, runID string) error {
+func commitAndPushStaged(ctx context.Context, p link.RunDispatchParams, wt, repo, branch, runID string) (string, error) {
 	if _, err := runGit(ctx, wt, "diff", "--cached", "--quiet"); err == nil {
-		return nil // nothing staged — no commit, no push
+		return "", nil // nothing staged — no commit, no push
 	}
 	args := []string{"commit", "-m", "agentwork run " + runID}
 	if name, email := splitIdentity(p.GitIdentity); name != "" {
 		args = append([]string{"-c", "user.name=" + name, "-c", "user.email=" + email}, args...)
 	}
 	if out, err := runGit(ctx, wt, args...); err != nil {
-		return fmt.Errorf("commit: %v: %s", err, out)
+		return "", fmt.Errorf("commit: %v: %s", err, out)
 	}
 	if out, err := runGit(ctx, wt, "push", "origin", branch+":refs/heads/agentwork/"+branch); err != nil {
-		return fmt.Errorf("push %s: %v: %s", branch, err, out)
+		return "", fmt.Errorf("push %s: %v: %s", branch, err, out)
 	}
-	return nil
+	return runGit(ctx, wt, "rev-parse", "HEAD")
 }
 
 // splitIdentity parses the domain's git_identity ("name <email>") for the

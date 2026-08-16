@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/eushing/agentwork/internal/link"
@@ -65,21 +66,50 @@ func TestGitWorkdirAndTransferPush(t *testing.T) {
 		t.Fatalf("worktree must be a git checkout: %v", err)
 	}
 
-	// A change commits + pushes to origin as agentwork/feat-goal-1.
+	// A change commits + pushes to origin as agentwork/feat-goal-1. The
+	// platform-staged project skills (every probed dir: .claude/skills,
+	// .opencode/skill, .agents/skills) are infrastructure and must NEVER
+	// ride the agent's commit.
 	if err := os.WriteFile(filepath.Join(wt, "done.txt"), []byte("done"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := commitAndPush(ctx, p, wt, repo, branch, p.RunID, ""); err != nil {
+	for _, skillDir := range projectSkillsDirs() {
+		if err := os.MkdirAll(filepath.Join(wt, skillDir, "demo"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(wt, skillDir, "demo", "SKILL.md"), []byte("---\nname: demo\n---\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sha, err := commitAndPush(ctx, p, wt, repo, branch, p.RunID, "")
+	if err != nil {
 		t.Fatalf("commit/push: %v", err)
 	}
-	if out, err := runGit(ctx, repo, "ls-remote", "origin", "refs/heads/agentwork/feat-goal-1"); err != nil || out == "" {
+	if sha == "" {
+		t.Fatalf("commit/push must report the pushed sha for a change run")
+	}
+	tree, _ := runGit(ctx, wt, "ls-tree", "-r", "--name-only", "HEAD")
+	for _, skillDir := range projectSkillsDirs() {
+		if strings.Contains(tree, skillDir) {
+			t.Fatalf("staged project skills (%s) must not be committed, tree has:\n%s", skillDir, tree)
+		}
+	}
+	out, err := runGit(ctx, repo, "ls-remote", "origin", "refs/heads/agentwork/feat-goal-1")
+	if err != nil || out == "" {
 		t.Fatalf("transfer push must land agentwork/feat-goal-1 on origin: %q %v", out, err)
+	}
+	if !strings.HasPrefix(out, sha) {
+		t.Fatalf("origin ref must point at the reported sha: got %q want prefix %q", out, sha)
 	}
 
 	// A no-change run pushes nothing (the branch stays where it was).
 	before, _ := runGit(ctx, repo, "ls-remote", "origin", "refs/heads/agentwork/feat-goal-1")
-	if err := commitAndPush(ctx, p, wt, repo, branch, p.RunID, ""); err != nil {
+	sha2, err := commitAndPush(ctx, p, wt, repo, branch, p.RunID, "")
+	if err != nil {
 		t.Fatalf("no-change commit: %v", err)
+	}
+	if sha2 != "" {
+		t.Fatalf("a no-change run must report an empty sha, got %q", sha2)
 	}
 	after, _ := runGit(ctx, repo, "ls-remote", "origin", "refs/heads/agentwork/feat-goal-1")
 	if before != after {

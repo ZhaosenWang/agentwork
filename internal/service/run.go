@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/logging"
@@ -737,6 +738,53 @@ func (s *RunService) RecoverStuckRunning(ctx context.Context) (int, error) {
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
+}
+
+// ExpireStaleScheduledRuns closes schedule-fired runs that sat queued past
+// the TTL: a fire born while its machine was offline is a MISS, not a
+// backlog item (the user's cron semantics: miss = miss). The fired goal is
+// cancelled (no retry chain — a stale fire must not burn attempts hours
+// later) and its schedule_run row is stamped missed. Returns how many were
+// expired.
+func (s *RunService) ExpireStaleScheduledRuns(ctx context.Context, before time.Time) (int, error) {
+	rows, err := s.st.DB().QueryContext(ctx,
+		`SELECT r.id, r.goal_id, sr.schedule_id FROM run r
+		 JOIN schedule_run sr ON sr.goal_id = r.goal_id
+		 WHERE r.status='queued' AND r.queued_at != '' AND r.queued_at < ?`,
+		before.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return 0, fmt.Errorf("scan stale scheduled runs: %w", err)
+	}
+	type staleRow struct{ runID, goalID, scheduleID string }
+	var stale []staleRow
+	for rows.Next() {
+		var r staleRow
+		if err := rows.Scan(&r.runID, &r.goalID, &r.scheduleID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		stale = append(stale, r)
+	}
+	rows.Close()
+
+	n := 0
+	for _, r := range stale {
+		if s.goalSvc != nil {
+			if _, err := s.goalSvc.Cancel(ctx, r.goalID); err != nil && !errors.Is(err, ErrNotFound) {
+				logging.Infof("run: expire stale scheduled run %s: cancel goal %s: %v", r.runID, r.goalID, err)
+				continue
+			}
+		}
+		if _, err := s.st.DB().ExecContext(ctx,
+			`UPDATE schedule_run SET status='missed' WHERE schedule_id=? AND goal_id=?`,
+			r.scheduleID, r.goalID); err != nil {
+			logging.Infof("run: expire stale scheduled run %s: stamp missed: %v", r.runID, err)
+			continue
+		}
+		logging.Infof("run: schedule fire %s missed (goal %s cancelled — queued past the TTL, machine offline)", r.scheduleID, r.goalID)
+		n++
+	}
+	return n, nil
 }
 
 // MarkSession stamps the protocol-returned session id once runTask has opened

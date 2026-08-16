@@ -130,9 +130,28 @@ func changeIntegrate(changeID string) {
 		return
 	}
 	cwd, _ := os.Getwd()
+	// The change head lives on the remote (pushed by the assignee's run) —
+	// refresh origin first or the merge fails on a stale clone and is
+	// misreported as a conflict (waking the assignee for nothing).
+	fetch := exec.Command("git", "fetch", "origin")
+	fetch.Dir = cwd
+	_ = fetch.Run() // best-effort: a scratch/offline workdir may have no origin
 	cmd := exec.Command("git", "merge", "--no-ff", begun.HeadRef, "-m", "Integrate "+changeID)
 	cmd.Dir = cwd
 	out, mergeErr := cmd.CombinedOutput()
+	if mergeErr != nil {
+		// One retry: the change head may not be reachable from the default
+		// refspec — ask the remote for the object itself.
+		fetchSha := exec.Command("git", "fetch", "origin", begun.HeadRef)
+		fetchSha.Dir = cwd
+		if fetchSha.Run() == nil {
+			retry := exec.Command("git", "merge", "--no-ff", begun.HeadRef, "-m", "Integrate "+changeID)
+			retry.Dir = cwd
+			if retryOut, rerr := retry.CombinedOutput(); rerr == nil {
+				out, mergeErr = retryOut, nil
+			}
+		}
+	}
 	if mergeErr != nil {
 		// Conflict: abort in the worktree, report — the platform marks the
 		// change conflicted and wakes the assignee.

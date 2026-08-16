@@ -19,7 +19,11 @@ import (
 )
 
 // cliVersion is the agentwork CLI build version, reported in register.
-const cliVersion = "0.1.0"
+// var (not const): the release build stamps the real version via
+// -ldflags "-X <pkg>.cliVersion=$AGENTWORK_COMPILE_VERSION" (build.sh) so
+// the CLI and the daemon ship one shared version — the register-time
+// version check depends on both being built from the same stamp.
+var cliVersion = "0.0.1-beta.1"
 
 // stateFile is where connect persists the machine identity + last
 // connection state (status reads it — no IPC needed in Phase 1).
@@ -126,18 +130,18 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	defer exec.shutdown()
 	peer.Handle(link.MethodRunDispatch, exec.handleDispatch)
 	peer.Handle(link.MethodRunCancel, exec.handleCancel)
-	// config.push (Phase 4): install the agent's selected skills under
-	// <skills_dir>/agentwork-<name>/ — namespaced, idempotent overwrite.
+	// config.push (Phase 4): land the agent's skill packages in the
+	// platform-managed staging dir (~/.agentwork/skills/<agentID>/...) —
+	// the executor copies them into each run's workdir at spawn as
+	// PROJECT-level skills (original names, the user's own global skills
+	// untouched). The agent's whole staging dir is rebuilt from scratch, so
+	// removals propagate.
 	peer.Handle(link.MethodConfigPush, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 		var p link.ConfigPushParams
 		if err := json.Unmarshal(raw, &p); err != nil || p.AgentID == "" {
 			return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "agent_id is required"}
 		}
 		res := link.ConfigPushResult{}
-		dir := expandHome(p.SkillsDir)
-		if dir == "" {
-			dir = expandHome("~/.claude/skills")
-		}
 		// The agent-level persona (system prompt) rides AGENTS.md in the
 		// per-agent config dir — the runtime's profile resolver loads it
 		// natively from the workdir; the per-run role contract stays in the
@@ -145,9 +149,14 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 		if err := writeAgentProfile(p.AgentID, p.SystemPrompt); err != nil {
 			res.Errors = append(res.Errors, fmt.Sprintf("AGENTS.md: %v", err))
 		}
+		root := machineSkillRoot(p.AgentID)
+		_ = os.RemoveAll(root)
 		for _, sk := range p.Skills {
-			target := filepath.Join(dir, "agentwork-"+sanitizeName(sk.Name))
-			_ = os.RemoveAll(target) // overwrite from scratch — removals propagate
+			if sk.Name == "" || sk.Name == "." || sk.Name == ".." || strings.ContainsAny(sk.Name, "/\\") {
+				res.Errors = append(res.Errors, fmt.Sprintf("%q: invalid skill name", sk.Name))
+				continue
+			}
+			target := filepath.Join(root, sk.Name)
 			bad := false
 			for _, f := range sk.Files {
 				if filepath.IsAbs(f.Path) || f.Path == ".." || strings.HasPrefix(f.Path, "../") {
@@ -171,7 +180,7 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 				res.Written = append(res.Written, sk.Name)
 			}
 		}
-		fmt.Printf("config.push: installed %d skill(s) for agent %s into %s\n", len(res.Written), p.AgentID, dir)
+		fmt.Printf("config.push: installed %d skill(s) for agent %s into %s\n", len(res.Written), p.AgentID, root)
 		return res, nil
 	})
 
@@ -191,6 +200,9 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 		CLIs:      clis,
 	}, &res); err != nil {
 		return fmt.Errorf("register: %w", err)
+	}
+	if res.ServerVersion != "" && res.ServerVersion != cliVersion {
+		fmt.Printf("warning: daemon v%s vs CLI v%s — protocol drift possible\n", res.ServerVersion, cliVersion)
 	}
 	fmt.Println("registered")
 	flushPendingReports(peer)

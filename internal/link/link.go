@@ -83,7 +83,12 @@ type ProbeCLI struct {
 	Name         string   `json:"name"`                   // claude | opencode | openagent
 	Version      string   `json:"version"`                // from the probe command
 	ACPSpawn     []string `json:"acp_spawn"`              // how to start it as an ACP stdio server
-	SkillsDir    string   `json:"skills_dir,omitempty"`   // where its skills live (~/.claude/skills)
+	SkillsDir    string   `json:"skills_dir,omitempty"`   // where its GLOBAL skills live (~/.claude/skills)
+	// ProjectSkillsDir is the relative directory inside a run workdir where
+	// this CLI loads PROJECT-level skills (.claude/skills, .opencode/skill,
+	// .agents/skills) — the executor stages the agent's skills there, and
+	// the commit excludes every probed dir. '' = the executor's fallback.
+	ProjectSkillsDir string   `json:"project_skills_dir,omitempty"`
 	ProfileFiles []string `json:"profile_files,omitempty"` // CLAUDE.md / AGENTS.md / SOUL.md …
 }
 
@@ -99,6 +104,9 @@ type RegisterParams struct {
 // RegisterResult is the machine.register response payload.
 type RegisterResult struct {
 	OK bool `json:"ok"`
+	// ServerVersion is the daemon's own version — the CLI warns on a
+	// mismatch (protocol drift between an old binary and a new daemon).
+	ServerVersion string `json:"server_version,omitempty"`
 }
 
 // HeartbeatParams is the machine.heartbeat notification payload.
@@ -248,6 +256,11 @@ type RunDispatchParams struct {
 
 	// Runtime spawn config (from the machine-owned runtime row).
 	ACPSpawn []string          `json:"acp_spawn"`          // argv of the ACP stdio server
+	// ProjectSkillsDir: the run's CLI's project-level skills directory
+	// (from the machine's probe report) — the executor stages the agent's
+	// skills there. '' = not probed; the executor falls back to its own
+	// CLI mapping.
+	ProjectSkillsDir string `json:"project_skills_dir,omitempty"`
 	Env      map[string]string `json:"env,omitempty"`      // runtime env + agent env (merged daemon-side)
 }
 
@@ -311,13 +324,16 @@ type SkillPush struct {
 // own skills. Idempotent overwrite: register-time full sync replays
 // offline edits safely.
 type ConfigPushParams struct {
-	AgentID string      `json:"agent_id"`
+	AgentID string `json:"agent_id"`
 	// SystemPrompt rides as AGENTS.md — the agent-level persona goes through
 	// the FILE channel (the runtime's profile resolver loads it natively);
 	// the per-run role contract stays in the prompt.
-	SystemPrompt string      `json:"system_prompt,omitempty"`
-	SkillsDir    string      `json:"skills_dir,omitempty"` // from the machine's probe report; '' = ~/.claude/skills
-	Skills       []SkillPush `json:"skills"`
+	SystemPrompt string `json:"system_prompt,omitempty"`
+	// Skills: the agent's skill packages, landed in the machine's
+	// platform-managed staging dir (~/.agentwork/skills/<agentID>/...) and
+	// copied into each run's workdir at spawn (project-level skills — the
+	// user's own global skills are never touched, names stay original).
+	Skills []SkillPush `json:"skills"`
 }
 
 // ConfigPushResult is the config.push ack.
@@ -336,7 +352,12 @@ type RunFinishedParams struct {
 	// report whose token doesn't match the run's CURRENT claim (a stashed
 	// report from an exec killed before a daemon restart must not cancel
 	// the re-dispatched attempt). Empty = legacy CLI, not verifiable.
-	Token    string `json:"token,omitempty"`
+	Token string `json:"token,omitempty"`
+	// HeadSHA is the transfer-branch tip the machine committed + pushed
+	// ('' = nothing committed, a genuine zero-change run). A completed
+	// report with a HeadSHA the daemon cannot adopt is HARD-FAILED — a
+	// lost push must not masquerade as "no changes to verify".
+	HeadSHA  string `json:"head_sha,omitempty"`
 	Evidence string `json:"evidence,omitempty"` // JSON bundle (scratch runs: '')
 	// Artifacts: processor runs' FILE results (checks.json etc.), uploaded
 	// from the machine — the platform reads structured side effects, never

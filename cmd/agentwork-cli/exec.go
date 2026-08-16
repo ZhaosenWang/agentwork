@@ -144,6 +144,18 @@ func (e *executor) execute(p link.RunDispatchParams) {
 	pushedProfile := ""
 	if !p.Proc {
 		pushedProfile = syncAgentProfile(p.AgentID, workdir)
+		// Skills ride the workdir too (project-level): staged from the
+		// pushed dir under their ORIGINAL names — the user's own global
+		// skills are never touched. Scratch workdirs are platform-owned
+		// and wiped first so deselected skills disappear; repo workdirs
+		// are overwrite-only (the repo may have its own files there).
+		// The dir comes from the machine's probe report (dispatch);
+		// '' = legacy daemon — fall back to the local CLI mapping.
+		subdir := p.ProjectSkillsDir
+		if subdir == "" {
+			subdir = skillSubdir(p.ACPSpawn[0])
+		}
+		copyAgentSkills(p.AgentID, workdir, subdir, p.Scratch)
 	}
 
 	conn, err := runtime.Open(ctx, runtime.Spec{
@@ -230,15 +242,18 @@ loop:
 	case proto.StatusCancelled:
 		status = "cancelled"
 	}
+	headSHA := ""
 	if status == "completed" && !p.Scratch && !p.Proc {
-		if err := commitAndPush(context.Background(), p, workdir, repo, branch, p.RunID, pushedProfile); err != nil {
+		sha, err := commitAndPush(context.Background(), p, workdir, repo, branch, p.RunID, pushedProfile)
+		if err != nil {
 			e.finish(p, "failed", "commit/push: "+err.Error())
 			return
 		}
+		headSHA = sha
 	}
 	// Processor runs upload their FILE results (the platform reads
 	// structured side effects, never agent stdout).
-	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output, Token: p.Token}
+	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output, Token: p.Token, HeadSHA: headSHA}
 	if p.Proc && status == "completed" {
 		finishParams.Artifacts = map[string]string{}
 		for _, f := range p.ArtifactFiles {
@@ -355,6 +370,74 @@ func syncAgentProfile(agentID, workdir string) string {
 	content := string(b)
 	_ = os.WriteFile(filepath.Join(workdir, "AGENTS.md"), b, 0o644)
 	return content
+}
+
+// machineSkillRoot is where config.push lands an agent's skill packages on
+// the machine (~/.agentwork/skills/<agentID>/<skillName>/...) — the
+// platform-managed staging dir; the executor copies them into each run's
+// workdir at spawn.
+func machineSkillRoot(agentID string) string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".agentwork", "skills", agentID)
+}
+
+// skillSubdir maps a probed CLI (the acp_spawn executable) to its
+// project-level skill directory inside a run workdir — the legacy-daemon
+// fallback when the dispatch carries no ProjectSkillsDir. Project skills
+// load from cwd — no global install, no collision with the user's own
+// skills.
+func skillSubdir(cli string) string {
+	base := filepath.Base(cli)
+	switch {
+	case strings.HasPrefix(base, "opencode"):
+		return ".opencode/skill"
+	case strings.HasPrefix(base, "claude"):
+		return ".claude/skills"
+	default:
+		return ".agents/skills" // the AgentSkills standard (npx skills add)
+	}
+}
+
+// copyAgentSkills stages the agent's pushed skill packages into the
+// workdir's project-level skill directory. wipe removes the target subdir
+// first (platform-owned scratch workdirs); repo workdirs are overwrite-only
+// — the repository's own files in that path are preserved.
+func copyAgentSkills(agentID, workdir, subdir string, wipe bool) {
+	root := machineSkillRoot(agentID)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return // no skills pushed — nothing to stage
+	}
+	target := filepath.Join(workdir, subdir)
+	if wipe {
+		_ = os.RemoveAll(target)
+	}
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		src := filepath.Join(root, ent.Name())
+		dst := filepath.Join(target, ent.Name())
+		_ = filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return nil // never follow symlinks
+			}
+			rel, err := filepath.Rel(src, path)
+			if err != nil {
+				return nil
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			out := filepath.Join(dst, rel)
+			if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+				return nil
+			}
+			_ = os.WriteFile(out, b, 0o644)
+			return nil
+		})
+	}
 }
 
 // machineProcWorkdir is where a processor run works on the machine.
