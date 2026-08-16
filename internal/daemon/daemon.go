@@ -1653,13 +1653,25 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	}
 
 		var issueSection string
+		if issueRepo != "" {
+			// The run's goal tracks a PUBLIC issue on the git host. Anything
+			// the agent posts there with `agentwork issue comment` is read by
+			// humans outside the platform — the contract rides EVERY run that
+			// can touch the issue, not the user-written persona (which is
+			// easy to leave unconfigured).
+			issueSection = "## Source issue (public)\n" +
+				"This goal tracks a PUBLIC issue (" + issueRepo + "#" + issueNumber + ") on the git host. " +
+				"Comments you post there with `agentwork issue comment` are read by humans outside the platform — " +
+				"write professionally and completely (current status / plan / blockers / conclusions), " +
+				"never mention platform-internal ids or process details.\n"
+		}
 		if len(issueComments) > 0 {
 			var ib strings.Builder
-			ib.WriteString("## Latest issue conversation (from the remote)\n")
+			ib.WriteString("\n## Latest issue conversation (from the remote)\n")
 			for _, cm := range issueComments {
 				fmt.Fprintf(&ib, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
 			}
-			issueSection = ib.String()
+			issueSection += ib.String()
 		}
 
 	// The domain's acceptance policy in NL (the "what counts as done" the

@@ -41,35 +41,47 @@ func newAutopermit(cwd string) *autopermit {
 // CLI offered (allow_always > allow_once); only-reject menus cancel the
 // request so the tool call fails visibly instead of hanging.
 func (a *autopermit) HandleRequestPermission(ctx context.Context, req acp.RequestPermissionRequest) (*acp.RequestPermissionResponse, error) {
+	var opts []string
+	for _, o := range req.Options {
+		opts = append(opts, string(o.Kind)+":"+o.OptionID)
+	}
+	cliLogf("autopermit: permission request tool=%q title=%q kind=%s options=%v", req.ToolCall.Title, req.ToolCall.Kind, req.ToolCall.Status, opts)
 	var allowOnce string
 	for _, o := range req.Options {
 		switch o.Kind {
 		case acp.PermissionAllowAlways:
 			id := o.OptionID
+			cliLogf("autopermit: approved allow_always (%s)", id)
 			return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{OptionID: &id}}, nil
 		case acp.PermissionAllowOnce:
 			allowOnce = o.OptionID
 		}
 	}
 	if allowOnce != "" {
+		cliLogf("autopermit: approved allow_once (%s)", allowOnce)
 		return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{OptionID: &allowOnce}}, nil
 	}
+	cliLogf("autopermit: no allow option offered — cancelling")
 	return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: true}}, nil
 }
 
 func (a *autopermit) HandleReadTextFile(ctx context.Context, req acp.ReadTextFileRequest) (*acp.ReadTextFileResponse, error) {
+	cliLogf("autopermit: fs read %s", req.Path)
 	b, err := os.ReadFile(req.Path)
 	if err != nil {
+		cliLogf("autopermit: fs read %s failed: %v", req.Path, err)
 		return nil, err
 	}
 	return &acp.ReadTextFileResponse{Content: string(b)}, nil
 }
 
 func (a *autopermit) HandleWriteTextFile(ctx context.Context, req acp.WriteTextFileRequest) (*acp.WriteTextFileResponse, error) {
+	cliLogf("autopermit: fs write %s (%d bytes)", req.Path, len(req.Content))
 	if err := os.MkdirAll(filepath.Dir(req.Path), 0o755); err != nil {
 		return nil, err
 	}
 	if err := os.WriteFile(req.Path, []byte(req.Content), 0o644); err != nil {
+		cliLogf("autopermit: fs write %s failed: %v", req.Path, err)
 		return nil, err
 	}
 	return &acp.WriteTextFileResponse{}, nil
