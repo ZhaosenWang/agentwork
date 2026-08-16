@@ -115,4 +115,24 @@ func TestGitWorkdirAndTransferPush(t *testing.T) {
 	if before != after {
 		t.Fatalf("no-change run must not push, ref moved %q → %q", before, after)
 	}
+
+	// A turn that produces commits WITHOUT staged changes (`agentwork
+	// change integrate` merges directly into the worktree) must still
+	// publish: the branch tip differs from the transfer ref. Live: the
+	// leader's merge commit was dropped, the approved goal's deliver found
+	// no branch and failed.
+	if out, err := runGit(ctx, wt, "-c", "user.name=a", "-c", "user.email=a@b", "commit", "--allow-empty", "-m", "integrate change"); err != nil {
+		t.Fatalf("integrate-style commit: %v: %s", err, out)
+	}
+	sha3, err := commitAndPush(ctx, p, wt, repo, branch, p.RunID, "")
+	if err != nil {
+		t.Fatalf("integrate publish: %v", err)
+	}
+	if sha3 == "" {
+		t.Fatalf("a turn with a local merge commit must publish (empty sha reported)")
+	}
+	out2, err := runGit(ctx, repo, "ls-remote", "origin", "refs/heads/agentwork/feat-goal-1")
+	if err != nil || !strings.HasPrefix(out2, sha3) {
+		t.Fatalf("transfer ref must advance to the merge commit: %q %v", out2, err)
+	}
 }

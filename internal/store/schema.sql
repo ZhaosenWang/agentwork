@@ -69,8 +69,8 @@ CREATE TABLE IF NOT EXISTS machine (
 
 -- A runtime is the launch spec of one probed agent CLI on one registered
 -- machine (CLI 分支): id + machine + how the machine spawns it (args =
--- acp_spawn) + env + the advertised platform URL. The local-transport
--- concepts (transport/provider/executable/endpoint) are RETIRED — the
+-- acp_spawn) + env. The local-transport concepts
+-- (transport/provider/executable/endpoint/agentwork_url) are RETIRED — the
 -- daemon never opens a transport; every run dispatches over the machine's
 -- /connect link. The wire protocol is the MACHINE's implementation detail
 -- (always ACP today; a future a2a backend would live in the machine's

@@ -1548,13 +1548,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.runProcessorTask(ctx, q)
 		return
 	}
-	var title, desc, handoff, domainID, gitURL, defaultBranch, domainType, domainName, systemPrompt, transport, provider, execPath, argsJSON, endpoint, rtEnvJSON, sourceRef, gitCredentials, gitIdentity, runtimeMachineID string
-	var agentName, agentDesc, triggerAuthorName, runtimeAgentworkURL string
+	var title, desc, handoff, domainID, gitURL, defaultBranch, domainType, domainName, systemPrompt, argsJSON, rtEnvJSON, sourceRef, gitCredentials, gitIdentity, runtimeMachineID string
+	var agentName, agentDesc, triggerAuthorName string
 	var triggerAuthor, triggerCommentID, triggerCommentContent, runRole, subGoalID, wakeNote, wakeAnchorID string
 	var maxConcurrent, maxRunDuration int
 	err := d.st.DB().QueryRowContext(ctx,
 		`SELECT g.title, g.description, g.handoff_note, d.id, d.git_url, d.default_branch, COALESCE(d.type,''), COALESCE(d.name,''), a.system_prompt, a.name, COALESCE(a.description,''), d.git_identity,
-		        r.transport, r.provider, r.executable, r.args, r.endpoint, r.env, COALESCE(r.agentwork_url,''), COALESCE(r.machine_id,''), a.max_concurrent, d.max_run_duration,
+		        r.args, r.env, COALESCE(r.machine_id,''), a.max_concurrent, d.max_run_duration,
 		        g.source_ref, d.git_credentials,
 		        r2.trigger_comment_id, COALESCE(c.author_type, ''), COALESCE(c.content, ''), COALESCE(ca.name,''), r2.role, r2.sub_goal_id, r2.wake_note, COALESCE(r2.wake_anchor,'')
 		 FROM run r2
@@ -1565,7 +1565,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		 LEFT JOIN comment c ON c.id = r2.trigger_comment_id
 		 LEFT JOIN agent ca ON ca.id = c.author_id
 		 WHERE r2.id = ?`, q.RunID).
-		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &agentName, &agentDesc, &gitIdentity, &transport, &provider, &execPath, &argsJSON, &endpoint, &rtEnvJSON, &runtimeAgentworkURL, &runtimeMachineID, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &triggerAuthorName, &runRole, &subGoalID, &wakeNote, &wakeAnchorID)
+		Scan(&title, &desc, &handoff, &domainID, &gitURL, &defaultBranch, &domainType, &domainName, &systemPrompt, &agentName, &agentDesc, &gitIdentity, &argsJSON, &rtEnvJSON, &runtimeMachineID, &maxConcurrent, &maxRunDuration, &sourceRef, &gitCredentials, &triggerCommentID, &triggerAuthor, &triggerCommentContent, &triggerAuthorName, &runRole, &subGoalID, &wakeNote, &wakeAnchorID)
 	// Claim visibility: which run, which agent, which role — the panel's
 	// answer to "who is doing what right now". The TITLE travels with the
 	// id: ids are for the system, humans read titles.
@@ -1688,7 +1688,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			triggerCommentContent: triggerCommentContent, title: title, desc: desc, handoff: handoff,
 			wakeNote: wakeNote, wakeAnchorID: wakeAnchorID, issueSection: issueSection, subGoalID: subGoalID,
 			consultRun: consultRun, reviewRun: reviewRun, verifyRun: verifyRun, subGoalRun: subGoalRun,
-		}, true, false, true, "")
+		})
+		// The stored prompt is the TASK message only — the fixed block and
+		// the team ride the workdir's AGENTS.md (buildRunProfile).
+		if _, err := d.st.DB().ExecContext(ctx,
+			`UPDATE run SET prompt=? WHERE id=?`, machinePrompt, q.RunID); err != nil {
+			logging.Infof("daemon: run %s: store prompt: %v", q.RunID, err)
+		}
 		d.dispatchToMachine(ctx, q, link.RunDispatchParams{
 			RunID: q.RunID, GoalID: q.GoalID, AgentID: q.AgentID,
 			Role: runRole, SubGoalID: subGoalID, Attempt: q.Attempt,
@@ -1698,6 +1704,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			DefaultBranch: defaultBranch, GitIdentity: gitIdentity,
 			ACPSpawn: args, Env: dispatchEnv,
 			ProjectSkillsDir: d.projectSkillsDirFor(ctx, runtimeMachineID, args),
+			RunProfile:       d.buildRunProfile(ctx, q.GoalID, q.AgentID, agentName, runRole, goalTitle, policyText, domainType, domainName),
 		}, runtimeMachineID)
 		return
 	}
@@ -1705,7 +1712,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 	// The unified execution model (CLI 分支): every run dispatches to its
 	// machine over the /connect link. Legacy transports have no executor
 	// anymore — fail with a pointer instead of pretending to run.
-	d.failRun(ctx, q, fmt.Sprintf("legacy runtime transport %q is no longer executed locally — run `agentwork connect` and point the agent at a machine-owned runtime", transport))
+	d.failRun(ctx, q, "this runtime has no machine — run `agentwork connect` and point the agent at a machine-owned runtime")
 }
 
 // runProcessorTask executes a platform-internal processor run: opens the
@@ -1874,27 +1881,6 @@ func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, su
 		"run_id": q.RunID, "domain_id": domainID, "error": summary,
 	}})
 }
-
-// worktreeGuidance is the execution-environment contract for PROCESSOR runs
-// (决策 4-8) — the one-shot platform-internal runs (compile/intake) still
-// use it; worker runs get the same contract inside the fixed context block
-// (决策 6-22).
-func worktreeGuidance(workdir string) string {
-	return fmt.Sprintf(`
-## Workspace
-
-Your worktree lives on the PLATFORM machine — it is not your environment:
-
-- Worktree root: %s
-- ACCESS THE WORKTREE ONLY THROUGH THE PLATFORM'S CHANNELS:
-  * MCP server "agentwork" (advertised at session start) — its tools operate on the worktree: agentwork_read_file (read a file), agentwork_write_file (write a file), agentwork_edit_file (edit a file), agentwork_list_dir (list a directory), agentwork_grep (search the codebase), and the command trio agentwork_terminal_create → agentwork_terminal_output → agentwork_terminal_release (commands are ASYNC: create returns a terminal id immediately, poll output until exited=true passing the returned cursor back, then release to clean up)
-  * Client capabilities over ACP — fs/read_text_file, fs/write_text_file, terminal/*
-  Your own local file/shell tools operate on YOUR environment — NOT the worktree. On a remote runtime your local tools cannot reach the worktree at all; locally they only happen to work when the working directory points at it
-- Commands that touch the worktree run through the platform's execution channel (agentwork_terminal_create or terminal/*), on the platform machine, with the worktree as their working directory
-- Verification, review and delivery read only what you wrote through these channels
-`, workdir)
-}
-
 
 // nowStr is the daemon-side UTC timestamp helper (service.now is private).
 func nowStr() string { return time.Now().UTC().Format(time.RFC3339Nano) }
@@ -2478,7 +2464,7 @@ type promptInputs struct {
 // a resident session's follow-up wake, the wake line alone) + wake line +
 // extras. Shared by the local execution path and the machine dispatch
 // (CLI 分支 Phase 2): the machine gets the SAME engineered context.
-func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in promptInputs, remote, sessionRun, sessionIsNew bool, runRowWorkdir string) string {
+func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in promptInputs) string {
 	var wakeWho, wakeAnchor, wakeContent string
 	switch {
 	case in.runRole == "owner" && in.triggerCommentID != "" && in.triggerAuthor == "human":
@@ -2570,12 +2556,11 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 		}
 	}
 
-	if sessionRun && !sessionIsNew {
-		// The session remembers the fixed block — the wake line alone is the
-		// turn's delta (决策 6-22).
-		return wakeLine + extras.String()
-	}
-	return d.buildFixedBlock(ctx, q.GoalID, q.AgentID, in.agentName, in.agentDesc, in.systemPrompt, in.runRole, in.goalTitle, in.policyText, in.domainType, in.domainName, runRowWorkdir, remote) +
-		"\n\n" + wakeLine + extras.String()
+	// The user message is the TASK and nothing else: the fixed block
+	// (background/goal/role contract/tools) and the team ride AGENTS.md
+	// (buildRunProfile, shipped in the dispatch payload and merged into the
+	// workdir's AGENTS.md at spawn). Every run is a fresh session, so the
+	// wake line alone is the whole message.
+	return wakeLine + extras.String()
 }
 

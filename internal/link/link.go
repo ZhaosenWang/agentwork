@@ -261,6 +261,12 @@ type RunDispatchParams struct {
 	// skills there. '' = not probed; the executor falls back to its own
 	// CLI mapping.
 	ProjectSkillsDir string `json:"project_skills_dir,omitempty"`
+	// RunProfile: the run's full CONTEXT layer — platform background, the
+	// goal (title + acceptance policy), the team (squad roster + playbook
+	// + leader protocol), the agent's role contract, and the tool surface.
+	// Persona material: the executor merges it into the workdir's
+	// AGENTS.md at spawn. The Prompt is the TASK and nothing else.
+	RunProfile string `json:"run_profile,omitempty"`
 	Env      map[string]string `json:"env,omitempty"`      // runtime env + agent env (merged daemon-side)
 }
 

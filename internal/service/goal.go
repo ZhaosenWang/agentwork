@@ -73,6 +73,17 @@ type goalRunContext struct {
 
 const maxAttempts = 3
 
+// retryBackoffFor spaces retry attempts: attempt 2 waits 30s, attempt 3
+// waits 60s (capped at 5m). A transient failure (dead link, machine
+// stall) must not burn the whole retry budget in one second.
+func retryBackoffFor(attempt int) time.Duration {
+	delay := 30 * time.Second << (attempt - 2)
+	if delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	return delay
+}
+
 // Handoff-cycle guard thresholds (决策 5-7): ≥4 ownership transitions write a
 // system warning comment; ≥8 park the goal in review for a human decision —
 // a collaboration anomaly is not a task failure (unlike the mention pingpong
@@ -1213,18 +1224,32 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			// lose the successor run. The retry events publish after the
 			// commit (invariant 13, via commitAndEmit).
 			attempt := rc.Attempt + 1
-			_, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, rc.AgentID, attempt, rc.IsLeaderRun, rc.SquadID, "", "")
+			run, runEv, err := s.runSvc.EnqueueExistingTx(ctx, tx, rc.GoalID, rc.AgentID, attempt, rc.IsLeaderRun, rc.SquadID, "", "")
 			if err != nil {
 				pendingEvents = append(pendingEvents, events.Event{Topic: "goal:retry_failed", Payload: map[string]any{
 					"goal_id": rc.GoalID, "error": err.Error(),
 				}})
 			} else {
-				if runEv != nil {
-					pendingEvents = append(pendingEvents, *runEv)
+				// Backoff: the successor run is NOT claimable until its
+				// queued_at is due. Without it, a transient failure burns
+				// the whole retry budget in one second (live: three dispatch
+				// writes timed out on a frozen link and the goal died
+				// instantly — "重试" was theater).
+				delay := retryBackoffFor(attempt)
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE run SET queued_at=? WHERE id=?`,
+					time.Now().UTC().Add(delay).Format(time.RFC3339Nano), run.ID); err != nil {
+					pendingEvents = append(pendingEvents, events.Event{Topic: "goal:retry_failed", Payload: map[string]any{
+						"goal_id": rc.GoalID, "error": fmt.Sprintf("backoff: %v", err),
+					}})
+				} else {
+					if runEv != nil {
+						pendingEvents = append(pendingEvents, *runEv)
+					}
+					pendingEvents = append(pendingEvents, events.Event{Topic: "goal:retrying", Payload: map[string]any{
+						"goal_id": rc.GoalID, "attempt": attempt, "backoff_seconds": int(delay.Seconds()),
+					}})
 				}
-				pendingEvents = append(pendingEvents, events.Event{Topic: "goal:retrying", Payload: map[string]any{
-					"goal_id": rc.GoalID, "attempt": attempt,
-				}})
 			}
 		} else {
 			if _, err := tx.ExecContext(ctx,
@@ -2069,7 +2094,7 @@ func (s *GoalService) compileWakeNoteTx(ctx context.Context, tx *sql.Tx, goalID,
 			if len(titles) == 0 {
 				continue // raced to rework — nothing to name
 			}
-			bullets = append(bullets, fmt.Sprintf("- Sub-goal(s) %q failed — decide: cancel or re-create (inspect with agentwork_get_sub_goal, cancel with agentwork_cancel_sub_goal)", strings.Join(titles, ", ")))
+			bullets = append(bullets, fmt.Sprintf("- Sub-goal(s) %q failed — decide: cancel or re-create (inspect with `agentwork subgoal get <id>`, cancel with `agentwork subgoal cancel <id>`)", strings.Join(titles, ", ")))
 		case "integration":
 			// The two faces of "integration": ready changes to merge, and
 			// no-code wrapups (verified sub-goals whose deliverable lives in
@@ -2079,7 +2104,7 @@ func (s *GoalService) compileWakeNoteTx(ctx context.Context, tx *sql.Tx, goalID,
 				return "", "", err
 			}
 			if ready > 0 {
-				bullets = append(bullets, fmt.Sprintf("- %d change(s) ready to integrate — inspect with agentwork_get_change, merge each with agentwork_integrate_change", ready))
+				bullets = append(bullets, fmt.Sprintf("- %d change(s) ready to integrate — inspect with `agentwork change list`, merge each with `agentwork change integrate <id>`", ready))
 			}
 			titles, err := s.noChangeVerifiedTitlesTx(ctx, tx, goalID)
 			if err != nil {

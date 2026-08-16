@@ -39,11 +39,15 @@ func newExecutor(peer *link.Peer, serverURL string) *executor {
 // reclaim them via RecoverStuckRunning).
 func (e *executor) shutdown() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	n := len(e.cancels)
 	for _, cancel := range e.cancels {
 		cancel()
 	}
 	e.cancels = map[string]context.CancelFunc{}
+	e.mu.Unlock()
+	if n > 0 {
+		cliLogf("exec: link died — cancelling %d in-flight run(s)", n)
+	}
 }
 
 // handleDispatch implements run.dispatch on the machine link.
@@ -52,6 +56,7 @@ func (e *executor) handleDispatch(ctx context.Context, raw json.RawMessage) (any
 	if err := json.Unmarshal(raw, &p); err != nil || p.RunID == "" || p.Prompt == "" || len(p.ACPSpawn) == 0 {
 		return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "run_id, prompt, and acp_spawn are required"}
 	}
+	cliLogf("exec: run %s dispatch received (role=%s attempt=%d agent=%s proc=%v)", p.RunID, p.Role, p.Attempt, p.AgentID, p.Proc)
 	go e.execute(p)
 	return link.RunDispatchResult{Accepted: true}, nil
 }
@@ -60,6 +65,7 @@ func (e *executor) handleDispatch(ctx context.Context, raw json.RawMessage) (any
 func (e *executor) handleCancel(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 	var p link.RunCancelParams
 	_ = json.Unmarshal(raw, &p)
+	cliLogf("exec: run %s cancel received (reason=%s)", p.RunID, p.Reason)
 	e.mu.Lock()
 	cancel := e.cancels[p.RunID]
 	delete(e.cancels, p.RunID)
@@ -136,14 +142,36 @@ func (e *executor) execute(p link.RunDispatchParams) {
 			e.finish(p, "failed", fmt.Sprintf("git: %v", err))
 			return
 		}
-		defer cleanupGit()
+		// The cleanup runs AFTER the finish report — a hang here (repo lock
+		// contention with the daemon's completion worktrees) stalls the
+		// sidecar's hottest window. Probe it: the timeout keeps the process
+		// responsive and the log line tells us where the stall was.
+		defer func() {
+			done := make(chan struct{})
+			go func() { cleanupGit(); close(done) }()
+			select {
+			case <-done:
+				cliLogf("exec: run %s git cleanup done", p.RunID)
+			case <-time.After(60 * time.Second):
+				cliLogf("exec: run %s git cleanup TIMED OUT after 60s (worktree left for the daemon's sweeps)", p.RunID)
+			}
+		}()
 	}
 
 	// The agent's persona (pushed via config.push) rides AGENTS.md in the
-	// workdir — the runtime loads it natively.
+	// workdir — the runtime loads it natively. The run's CONTEXT layer
+	// (platform background, goal, team, role contract, tool surface —
+	// shipped in the dispatch) is persona material too and is merged into
+	// the same file; the prompt carries the task only.
 	pushedProfile := ""
 	if !p.Proc {
 		pushedProfile = syncAgentProfile(p.AgentID, workdir)
+		if p.RunProfile != "" {
+			if b, err := os.ReadFile(filepath.Join(workdir, "AGENTS.md")); err == nil {
+				pushedProfile = string(b) + "\n\n" + p.RunProfile
+				_ = os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(pushedProfile), 0o644)
+			}
+		}
 		// Skills ride the workdir too (project-level): staged from the
 		// pushed dir under their ORIGINAL names — the user's own global
 		// skills are never touched. Scratch workdirs are platform-owned
@@ -177,11 +205,23 @@ func (e *executor) execute(p link.RunDispatchParams) {
 		e.finish(p, "failed", fmt.Sprintf("session: %v", err))
 		return
 	}
-	defer sess.Close()
+	// Probe like the git cleanup: a session close that hangs (child process
+	// refusing to die) must not stall the sidecar.
+	defer func() {
+		done := make(chan struct{})
+		go func() { sess.Close(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			cliLogf("exec: run %s session close TIMED OUT after 30s", p.RunID)
+		}
+	}()
 
 	// Ack the daemon: execution really started (run.claimed — the review
 	// window's "审查中" flip hangs on it).
-	_ = callRPC(e.peer, link.MethodRunClaimed, link.RunClaimedParams{RunID: p.RunID}, nil, 15*time.Second)
+	if err := callRPC(e.peer, link.MethodRunClaimed, link.RunClaimedParams{RunID: p.RunID}, nil, 15*time.Second); err != nil {
+		cliLogf("exec: run %s claimed ack failed: %v", p.RunID, err)
+	}
 
 	run, err := sess.Prompt(ctx, p.Prompt)
 	if err != nil {
@@ -195,13 +235,19 @@ func (e *executor) execute(p link.RunDispatchParams) {
 	buf := []link.RunEvent{}
 	tick := time.NewTicker(100 * time.Millisecond)
 	defer tick.Stop()
+	flushErrLogged := false
 	flush := func() {
 		if len(buf) == 0 {
 			return
 		}
-		_ = e.peer.Notify(ctx, link.MethodRunEventBatch, link.RunEventBatchParams{
+		if err := e.peer.Notify(ctx, link.MethodRunEventBatch, link.RunEventBatchParams{
 			RunID: p.RunID, SeqStart: buf[0].Seq, Events: buf,
-		})
+		}); err != nil && !flushErrLogged {
+			// First failure only — a dead link would otherwise flood the
+			// log every 100ms.
+			cliLogf("exec: run %s event batch failed (seq %d..%d, %d events): %v", p.RunID, buf[0].Seq, buf[len(buf)-1].Seq, len(buf), err)
+			flushErrLogged = true
+		}
 		buf = nil
 	}
 	defer flush()
@@ -246,8 +292,12 @@ loop:
 	if status == "completed" && !p.Scratch && !p.Proc {
 		sha, err := commitAndPush(context.Background(), p, workdir, repo, branch, p.RunID, pushedProfile)
 		if err != nil {
+			cliLogf("exec: run %s commit/push failed: %v", p.RunID, err)
 			e.finish(p, "failed", "commit/push: "+err.Error())
 			return
+		}
+		if sha != "" {
+			cliLogf("exec: run %s pushed %s → agentwork/%s", p.RunID, shortSHA(sha), branch)
 		}
 		headSHA = sha
 	}
@@ -262,7 +312,14 @@ loop:
 			}
 		}
 	}
-	_ = callRPC(e.peer, link.MethodRunFinished, finishParams, nil, 30*time.Second)
+	if err := callRPC(e.peer, link.MethodRunFinished, finishParams, nil, 30*time.Second); err != nil {
+		// A lost terminal report would leave the run 'running' until the
+		// daemon restarts — stash it for the next register.
+		cliLogf("exec: run %s → %s (report stashed — link down: %v)", p.RunID, status, err)
+		stashPendingReport(finishParams)
+		return
+	}
+	cliLogf("exec: run %s → %s", p.RunID, status)
 }
 
 // finish uploads run.finished — the daemon runs Finish + reconcile. If the
@@ -274,10 +331,21 @@ loop:
 // daemon re-dispatched after recovery).
 func (e *executor) finish(p link.RunDispatchParams, status, summary string) {
 	report := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: summary, Token: p.Token}
-	if err := callRPC(e.peer, link.MethodRunFinished, report, nil, 30*time.Second); err == nil {
+	err := callRPC(e.peer, link.MethodRunFinished, report, nil, 30*time.Second)
+	if err == nil {
+		cliLogf("exec: run %s → %s", p.RunID, status)
 		return
 	}
+	cliLogf("exec: run %s → %s (report stashed — link down: %v)", p.RunID, status, err)
 	stashPendingReport(report)
+}
+
+// shortSHA trims a commit sha for log lines.
+func shortSHA(s string) string {
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
 }
 
 // pendingReportFile is where unreported terminal states wait for the next

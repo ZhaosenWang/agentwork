@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/eushing/agentwork/internal/service"
@@ -11,23 +12,23 @@ import (
 //
 // Every prompt is assembled from exactly two pieces:
 //
-//   - the FIXED BLOCK (platform / goal / team / self / tools) — injected
-//     once per (agent, goal) session, and per run for non-ACP runtimes
-//     (every run is a fresh session there);
+//   - the FIXED BLOCK (platform / goal / self / tools) — the task message;
 //   - the WAKE LINE (who woke you + anchor + reason/task) — injected every
 //     turn.
 //
-// The comment feed is PULLED via agentwork_get_comments, never injected
-// wholesale (决策 4-6 revised: the wake line carries the triggering words,
-// the feed is the shared context the agent pulls on demand). AGENTWORK.md
-// is retired — its content always came from DB fields (agent system_prompt,
-// squad instructions, roster) and now rides the fixed block directly.
+// The TEAM (squad roster + playbook + leader protocol) is per-run PERSONA
+// material: it rides the workdir's AGENTS.md (shipped in the dispatch
+// payload, merged by the executor at spawn — see buildTeamProfile), never
+// the prompt. The comment feed is PULLED via `agentwork goal comments`,
+// never injected wholesale (决策 4-6 revised: the wake line carries the
+// triggering words, the feed is the shared context the agent pulls on
+// demand).
 
 // buildFixedBlock renders the session-fixed context (决策 6-22): platform
-// intro, goal, team, the agent's own identity + role contract, and the tool
+// intro, goal, the agent's own identity + role contract, and the CLI tool
 // surface. Written in English (platform text is English, 决策 6-18); the
 // MATERIALS (titles, instructions, names) keep their own language.
-func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName, agentDesc, systemPrompt, runRole, goalTitle, policyText, domainType, domainName, worktreeRoot string, remote bool) string {
+func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName string) string {
 	// The team comes from the goal's own squad assignment ('' = solo). The
 	// leader flag drives the owner contract's reviewer-only rule.
 	var squadID string
@@ -47,8 +48,8 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 	b.WriteString("You are working on agentwork — a multi-agent collaboration platform.\n")
 	b.WriteString("Goals are executed by agents; the platform judges completion (machine\n")
 	b.WriteString("verification + gates), and humans approve at checkpoints. You\n")
-	b.WriteString("coordinate ONLY through the agentwork MCP tools — structured side\n")
-	b.WriteString("effects, never shell, never file edits to communicate intent.\n")
+	b.WriteString("coordinate ONLY through the `agentwork` CLI — structured side effects,\n")
+	b.WriteString("never shell, never file edits to communicate intent.\n")
 	b.WriteString("LANGUAGE: write every comment/report in the SAME language as the goal's\n")
 	b.WriteString("description and the human's messages.\n")
 
@@ -67,73 +68,75 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 		b.WriteString("only inside this goal's directory.\n")
 	}
 
-	b.WriteString("\n# Team\n")
-	if squadID == "" {
-		b.WriteString("Working solo — no team on this goal.\n")
-	} else {
-		d.writeTeamBlock(ctx, &b, squadID, agentID, isLeader)
-	}
-
 	b.WriteString("\n# Who You Are\n")
 	self := agentName
 	if self == "" {
 		self = "agent-" + short(agentID)
 	}
-	if remote {
-		// The agent-level persona (description + system prompt) rides
-		// AGENTS.md via config.push — the runtime's profile resolver loads
-		// it natively; the per-run role contract stays in the prompt.
-		b.WriteString(self)
-		b.WriteString("\n")
-		b.WriteString(roleContract(runRole, isLeader, squadID))
-		return b.String()
-	}
+	// The agent-level persona (description + system prompt) AND the team
+	// (squad roster + briefing) ride AGENTS.md — the runtime's profile
+	// resolver loads them natively; the per-run role contract stays here.
 	b.WriteString(self)
-	if s := strings.TrimSpace(agentDesc); s != "" {
-		b.WriteString(" — " + s)
-	}
-	if s := strings.TrimSpace(systemPrompt); s != "" && s != agentDesc {
-		b.WriteString("\n" + s)
-	}
 	b.WriteString("\n")
 	b.WriteString(roleContract(runRole, isLeader, squadID))
 
-	// Machine-executed runs (CLI 分支 Phase 2) get the CLI/native-tools
-	// variant: the worktree is the process cwd, collaboration is the
-	// agentwork CLI — no platform MCP servers are advertised there.
-	if remote {
-		b.WriteString("\n# Tools\n")
-		b.WriteString("- Workspace: your working directory IS the worktree — use your own\n")
-		b.WriteString("  file/terminal tools to read, write, and run commands directly.\n")
-		b.WriteString("- Collaboration: run the `agentwork` CLI in your terminal (start with\n")
-		b.WriteString("  `agentwork help`) — comments, consults, sub-goals, waiting, and\n")
-		b.WriteString("  verdicts are structured side effects through it. NEVER use file\n")
-		b.WriteString("  edits to communicate intent.\n")
-		b.WriteString("- Feed: `agentwork goal comments [--after <id>]` — the comment feed\n")
-		b.WriteString("  is the SHARED context. Pull it before acting when you lack\n")
-		b.WriteString("  background; pass the last comment id you saw as --after for\n")
-		b.WriteString("  incremental reads; if you do NOT remember what you have seen,\n")
-		b.WriteString("  pull WITHOUT --after (full feed) — never guess an --after.\n")
-		return b.String()
-	}
-
 	b.WriteString("\n# Tools\n")
-	b.WriteString("- Workspace (worktree root: " + worktreeRoot + "): agentwork_read_file /\n")
-	b.WriteString("  agentwork_write_file / agentwork_terminal_create → terminal_output →\n")
-	b.WriteString("  terminal_release. Commands run on the PLATFORM machine, with the\n")
-	b.WriteString("  worktree as the working directory. Your own local tools operate on\n")
-	b.WriteString("  YOUR environment — NOT the worktree; remote runtimes cannot reach it\n")
-	b.WriteString("  at all.\n")
-	b.WriteString("- Collaboration: agentwork_comment_goal / agentwork_consult_agent /\n")
-	b.WriteString("  agentwork_handoff_goal / agentwork_create_sub_goal /\n")
-	b.WriteString("  agentwork_integrate_change / agentwork_get_change /\n")
-	b.WriteString("  agentwork_get_sub_goal / agentwork_get_verification /\n")
-	b.WriteString("  agentwork_cancel_sub_goal / agentwork_verify_sub_goal.\n")
-	b.WriteString("- Feed: agentwork_get_comments(goal_id?, after?, limit?) — the comment\n")
-	b.WriteString("  feed is the SHARED context. Pull it before acting when you lack\n")
-	b.WriteString("  background. Pass the last comment id you saw as `after` for\n")
-	b.WriteString("  incremental reads; if you do NOT remember what you have seen, pull\n")
-	b.WriteString("  WITHOUT `after` (full feed) — never guess an `after`.\n")
+	b.WriteString("- Workspace: your working directory IS the worktree — use your own\n")
+	b.WriteString("  file/terminal tools to read, write, and run commands directly.\n")
+	b.WriteString("- Collaboration: run the `agentwork` CLI in your terminal (start with\n")
+	b.WriteString("  `agentwork help`) — comments, consults, sub-goals, waiting, and\n")
+	b.WriteString("  verdicts are structured side effects through it. NEVER use file\n")
+	b.WriteString("  edits to communicate intent.\n")
+	b.WriteString("- Feed: `agentwork goal comments [--after <id>]` — the comment feed\n")
+	b.WriteString("  is the SHARED context. Pull it before acting when you lack\n")
+	b.WriteString("  background; pass the last comment id you saw as --after for\n")
+	b.WriteString("  incremental reads; if you do NOT remember what you have seen,\n")
+	b.WriteString("  pull WITHOUT --after (full feed) — never guess an --after.\n")
+	return b.String()
+}
+
+// buildRunProfile assembles the run's whole AGENTS.md layer: the fixed
+// block (platform background, goal, role contract, tool surface) plus the
+// team profile. Shipped in the dispatch payload and merged into the
+// workdir's AGENTS.md at spawn — the user message carries the task only.
+func (d *Daemon) buildRunProfile(ctx context.Context, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName string) string {
+	block := d.buildFixedBlock(ctx, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName)
+	if team := d.buildTeamProfile(ctx, goalID, agentID); team != "" {
+		return block + "\n\n" + team
+	}
+	return block
+}
+
+// buildTeamProfile assembles the per-run TEAM context — squad roster,
+// playbook, and (for the leader) the operating protocol. It rides the
+// workdir's AGENTS.md (shipped in the dispatch payload, merged by the
+// executor at spawn), NOT the prompt: team structure is persona material,
+// stable across a goal's turns. '' = solo run.
+func (d *Daemon) buildTeamProfile(ctx context.Context, goalID, agentID string) string {
+	var squadID string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT COALESCE((SELECT assignee_id FROM goal WHERE id=? AND assignee_type='squad'), '')`, goalID).Scan(&squadID); err != nil || squadID == "" {
+		return ""
+	}
+	var leaderID string
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, squadID).Scan(&leaderID)
+	isLeader := leaderID == agentID
+	if isLeader {
+		// The leader gets the full operating protocol (roster + delegation
+		// rules + reviewer rule + playbook) from the squad service.
+		if d.squadSvc == nil {
+			return ""
+		}
+		brief, err := d.squadSvc.BuildLeaderBriefing(ctx, squadID, true)
+		if err != nil {
+			return ""
+		}
+		return brief
+	}
+	// Members see the roster + playbook (their role contract is in the prompt).
+	var b strings.Builder
+	b.WriteString("# Team\n\n")
+	d.writeTeamBlock(ctx, &b, squadID, agentID, false)
 	return b.String()
 }
 
@@ -154,7 +157,7 @@ func (d *Daemon) writeTeamBlock(ctx context.Context, b *strings.Builder, squadID
 		if leaderID == selfAgentID {
 			marker = " (you, leader)"
 		}
-		b.WriteString("- " + lname + marker + "\n")
+		b.WriteString("- " + lname + marker + d.agentSkillLine(ctx, leaderID) + "\n")
 	}
 	rows, err := d.st.DB().QueryContext(ctx,
 		`SELECT m.member_id, a.name, COALESCE(m.role,'') FROM squad_member m
@@ -177,15 +180,39 @@ func (d *Daemon) writeTeamBlock(ctx context.Context, b *strings.Builder, squadID
 			if role != "" {
 				marker += " — " + role
 			}
-			b.WriteString("- " + name + marker + "\n")
+			b.WriteString("- " + name + marker + d.agentSkillLine(ctx, id) + "\n")
 		}
 		rows.Close()
 	}
 	if s := strings.TrimSpace(instructions); s != "" {
 		b.WriteString("\nTeam playbook (written by the owner):\n" + s + "\n")
 	}
-	b.WriteString("\nResolve ids with agentwork_agent_list / agentwork_squad_list before\n")
-	b.WriteString("consults and handoffs.\n")
+	b.WriteString("\nResolve ids with `agentwork agent list` / `agentwork squad list`\n")
+	b.WriteString("before consults and handoffs.\n")
+}
+
+// agentSkillLine renders an agent's selected skill names for the roster
+// ('' = none) — the leader divides work by what members can actually do.
+func (d *Daemon) agentSkillLine(ctx context.Context, agentID string) string {
+	var raw string
+	if err := d.st.DB().QueryRowContext(ctx, `SELECT skills FROM agent WHERE id=?`, agentID).Scan(&raw); err != nil || raw == "" || raw == "[]" {
+		return ""
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil || len(ids) == 0 {
+		return ""
+	}
+	var names []string
+	for _, id := range ids {
+		var name string
+		if err := d.st.DB().QueryRowContext(ctx, `SELECT name FROM skill WHERE id=?`, id).Scan(&name); err == nil && name != "" {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return " — skills: " + strings.Join(names, ", ")
 }
 
 // roleContract renders the behavioral contract for the run's role — the
@@ -194,26 +221,28 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 	leader := isLeader || (squadID != "" && runRole == "owner")
 	switch runRole {
 	case "owner":
-		s := "You are this goal's owner. Break the goal into work items with\n" +
-			"agentwork_create_sub_goal and dispatch them (a sub-goal runs on its\n" +
-			"own branch with machine verification and produces a Change the\n" +
-			"platform wakes you to integrate). Ask teammates with\n" +
-			"agentwork_consult_agent; transfer ownership with\n" +
-			"agentwork_handoff_goal. Members are NOT auto-dispatched — you\n" +
-			"delegate explicitly. Your final message becomes your run's report in\n" +
-			"the feed. NEVER post your conclusions with agentwork_comment_goal and\n" +
-			"then summarize them again in the final message — the report\n" +
-			"double-posts (feed noise; a live failure: the delegation was\n" +
-			"announced three times). After a dispatch-only turn keep the final\n" +
-			"message MINIMAL (one short sentence) — never repeat the dispatch,\n" +
-			"never write ids (goal/sub-goal/agent/squad ids are system handles,\n" +
-			"the feed is read by humans). Completion is JUDGED, not declared:\n" +
-			"the platform's machine\n" +
-			"verification + gates + the human's approval decide — never set the\n" +
-			"goal's status yourself.\n"
+		s := "You are this goal's owner. Break the goal into work items and\n" +
+			"dispatch them: `agentwork subgoal create --title T --assignee <agent-id>\n" +
+			"[--description D]` (a sub-goal runs on its own branch with machine\n" +
+			"verification and produces a Change the platform wakes you to\n" +
+			"integrate with `agentwork change integrate <id>`). Ask teammates\n" +
+			"(read-only consult) by commenting a mention:\n" +
+			"`agentwork goal comment --text \"[@Name](mention://agent/<id>)\"`.\n" +
+			"Transfer ownership with `agentwork goal assign <agent-id>`. Members\n" +
+			"are NOT auto-dispatched — you delegate explicitly. Your final message becomes your run's report in the feed (the platform posts it). NEVER\n" +
+			"post your conclusions with `agentwork goal comment` and then\n" +
+			"summarize them again in the final message — the report double-posts\n" +
+			"(feed noise;\n" +
+			"a live failure: the delegation was announced three times). After a\n" +
+			"dispatch-only turn keep the final message MINIMAL (one short\n" +
+			"sentence) — never repeat the dispatch, never write ids\n" +
+			"(goal/sub-goal/agent/squad ids are system handles, the feed is\n" +
+			"read by humans). Completion is JUDGED, not declared: the\n" +
+			"platform's machine verification + gates + the human's approval\n" +
+			"decide — never set the goal's status yourself.\n"
 		if leader {
 			s += "\nREVIEWER-ONLY RULE: members with role=\"reviewer\" REVIEW ONLY —\n" +
-				"never dispatch work items to them (create_sub_goal rejects it).\n" +
+				"never dispatch work items to them (subgoal create rejects it).\n" +
 				"After your turn ends the platform pulls the reviewers in\n" +
 				"automatically; you never hand work to a reviewer.\n"
 		}
@@ -221,8 +250,8 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 	case "subgoal":
 		return "You implement this work item. When the work is DONE, end your turn\n" +
 			"with your final message — the platform posts it to the feed as your\n" +
-			"report. NEVER post your conclusions with agentwork_comment_goal and\n" +
-			"then summarize them again in the final message (the report\n" +
+			"report. NEVER post your conclusions with `agentwork goal comment`\n" +
+			"and then summarize them again in the final message (the report\n" +
 			"double-posts — feed noise). The platform machine-verifies your\n" +
 			"branch and produces a Change; the OWNER integrates it. You do not\n" +
 			"create sub-goals, hand off, or integrate — those are the owner's\n" +
@@ -230,23 +259,24 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 	case "consult":
 		return "You are consulted (READ-ONLY): answer the question in your final\n" +
 			"message — the platform posts it to the feed as your answer (do NOT\n" +
-			"post a duplicate with agentwork_comment_goal). Do not modify files,\n" +
-			"do not commit, do not execute the task itself — your edits are\n" +
-			"discarded by the platform.\n"
+			"post a duplicate with `agentwork goal comment`). Do not modify\n" +
+			"files, do not commit, do not execute the task itself — your edits\n" +
+			"are discarded by the platform.\n"
 	case "review":
 		return "You REVIEW ONLY — give your opinion, never do the work. Inspect the\n" +
 			"worktree's changes (diff, tests, quality) AND the goal's comment\n" +
-			"feed (pull it with agentwork_get_comments). If the diff is empty,\n" +
-			"the goal's deliverable lives in the feed — judge whether the goal\n" +
-			"was actually fulfilled there, and say so explicitly; never report a\n" +
-			"missing diff as the answer itself. End your turn with your opinion\n" +
-			"as the final message — the platform posts it to the feed (the\n" +
-			"approver reads it there; do NOT post a duplicate with\n" +
-			"agentwork_comment_goal).\n"
+			"feed (pull it with `agentwork goal comments`). If the diff is\n" +
+			"empty, the goal's deliverable lives in the feed — judge whether\n" +
+			"the goal was actually fulfilled there, and say so explicitly;\n" +
+			"never report a missing diff as the answer itself. End your turn\n" +
+			"with your opinion as the final message — the platform posts it to\n" +
+			"the feed (the approver reads it there; do NOT post a duplicate\n" +
+			"with `agentwork goal comment`).\n"
 	case "verify":
 		return "You are the verifier for a work item: judge it, then issue\n" +
-			"agentwork_verify_sub_goal(verdict, summary, evidence) ONCE and end\n" +
-			"your turn. You may RUN tests, but never modify files or commit.\n"
+			"`agentwork subgoal verify <id> --verdict passed|rejected [--summary S]\n" +
+			"[--evidence E]` ONCE and end your turn. You may RUN tests, but\n" +
+			"never modify files or commit.\n"
 	}
 	return ""
 }
@@ -254,7 +284,7 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 // buildWakeLine renders the per-turn wake statement (决策 6-22): ONE
 // unified shape for every wake path — "You were mentioned by <who>
 // (comment <id>):" + the reason/task. The anchor is the handle the agent
-// passes back to agentwork_get_comments(after=). English platform text;
+// passes back to `agentwork goal comments --after`. English platform text;
 // materials keep their language.
 func buildWakeLine(anchorCommentID, who, content string) string {
 	anchor := ""

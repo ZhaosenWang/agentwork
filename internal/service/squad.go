@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -305,11 +306,28 @@ func (s *SquadService) renderRoster(ctx context.Context, sq *Squad, members []Sq
 	return b.String()
 }
 
-// agentSkillNames is a placeholder: agentwork has no Skill table yet (deferred
-// per DESIGN.md). Returns nil so the roster shows "no skills assigned".
+// agentSkillNames resolves an agent's selected skills (agent.skills JSON →
+// skill table names) for the roster — the leader divides work by what
+// members can actually do.
 func (s *SquadService) agentSkillNames(ctx context.Context, agentID string) []string {
-	_ = sort.Strings // reserved for future skill ordering
-	return nil
+	var raw string
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT skills FROM agent WHERE id=?`, agentID).Scan(&raw); err != nil || raw == "" || raw == "[]" {
+		return nil
+	}
+	var ids []string
+	if err := json.Unmarshal([]byte(raw), &ids); err != nil || len(ids) == 0 {
+		return nil
+	}
+	var names []string
+	for _, id := range ids {
+		var name string
+		if err := s.st.DB().QueryRowContext(ctx, `SELECT name FROM skill WHERE id=?`, id).Scan(&name); err == nil && name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (s *SquadService) agentName(ctx context.Context, agentID string) string {
@@ -326,16 +344,19 @@ func (s *SquadService) agentName(ctx context.Context, agentID string) string {
 // squad_briefing.go). Wording is plain so it's easy to tune.
 
 const squadOperatingProtocolHeader = `You are the LEADER (coordinator) of a squad. Break the goal into parts and
-dispatch them: agentwork_create_sub_goal for each work item (own
-assignee, own worktree, machine verification), then keep coordinating or
-end your turn — the platform wakes you when changes are ready
-(agentwork_integrate_change). Ask teammates with agentwork_consult_agent
-(read-only; the platform resumes you after the answer). You do NOT
-implement the whole task yourself — members do the work; members are NOT
-auto-dispatched, you delegate explicitly.
+dispatch them with the agentwork CLI:
+  agentwork subgoal create --title T --assignee <agent-id> [--description D]
+(each work item runs on its own worktree with machine verification and
+produces a Change; the platform wakes you when changes are ready — merge
+each with ` + "`agentwork change integrate <id>`" + `). Ask teammates (read-only
+consult; the platform resumes you after the answer) by commenting a
+mention:
+  agentwork goal comment --text "[@Name](mention://agent/<id>)"
+You do NOT implement the whole task yourself — members do the work;
+members are NOT auto-dispatched, you delegate explicitly.
 
 REVIEWER-ONLY RULE: members with role="reviewer" REVIEW ONLY — never
-dispatch work items to them (create_sub_goal rejects it). After your turn
+dispatch work items to them (subgoal create rejects it). After your turn
 ends the platform automatically pulls the reviewers in, then the human
 approves; you never hand work to a reviewer yourself.
 
@@ -357,7 +378,7 @@ rest is the platform's and the human's.
 
 const squadParentStatusNotOwned = `You were consulted on a goal someone else owns (guest run, READ-ONLY — your
 edits are discarded by the platform). Do NOT change this goal's status, do NOT
-hand it off, do NOT split it — answer the question via agentwork_comment_goal
-and end your turn. No agent sets goal status; completion is judged by the
+hand it off, do NOT split it — answer the question via
+` + "`agentwork goal comment`" + ` and end your turn. No agent sets goal status; completion is judged by the
 platform + human.
 `

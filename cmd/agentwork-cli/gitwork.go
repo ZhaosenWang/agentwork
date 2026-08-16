@@ -163,10 +163,18 @@ func commitAndPush(ctx context.Context, p link.RunDispatchParams, wt, repo, bran
 }
 
 // commitAndPushStaged commits/pushes whatever is staged (shared by the
-// normal and AGENTS.md-excluded paths).
+// normal and AGENTS.md-excluded paths). A turn that produced NO staged
+// changes may still have commits to publish: `agentwork change integrate`
+// merges directly into the worktree (a merge commit, nothing staged) — the
+// push must happen whenever the branch tip differs from the transfer ref
+// (live: the leader integrated the change, the run reported an empty sha,
+// the approved goal's deliver found no branch and failed the goal).
 func commitAndPushStaged(ctx context.Context, p link.RunDispatchParams, wt, repo, branch, runID string) (string, error) {
 	if _, err := runGit(ctx, wt, "diff", "--cached", "--quiet"); err == nil {
-		return "", nil // nothing staged — no commit, no push
+		if transferUpToDate(ctx, wt, branch) {
+			return "", nil // nothing staged AND nothing new to publish
+		}
+		return pushTransfer(ctx, wt, branch)
 	}
 	args := []string{"commit", "-m", "agentwork run " + runID}
 	if name, email := splitIdentity(p.GitIdentity); name != "" {
@@ -175,10 +183,31 @@ func commitAndPushStaged(ctx context.Context, p link.RunDispatchParams, wt, repo
 	if out, err := runGit(ctx, wt, args...); err != nil {
 		return "", fmt.Errorf("commit: %v: %s", err, out)
 	}
+	return pushTransfer(ctx, wt, branch)
+}
+
+// pushTransfer publishes the branch tip as the agentwork/<branch> transfer
+// ref and returns the pushed sha.
+func pushTransfer(ctx context.Context, wt, branch string) (string, error) {
 	if out, err := runGit(ctx, wt, "push", "origin", branch+":refs/heads/agentwork/"+branch); err != nil {
 		return "", fmt.Errorf("push %s: %v: %s", branch, err, out)
 	}
 	return runGit(ctx, wt, "rev-parse", "HEAD")
+}
+
+// transferUpToDate reports whether the worktree's HEAD already IS the
+// transfer ref's tip (nothing to push). A missing ref = never pushed —
+// must push.
+func transferUpToDate(ctx context.Context, wt, branch string) bool {
+	remote, err := runGit(ctx, wt, "rev-parse", "--verify", "--quiet", "origin/agentwork/"+branch)
+	if err != nil || remote == "" {
+		return false
+	}
+	head, err := runGit(ctx, wt, "rev-parse", "HEAD")
+	if err != nil {
+		return true
+	}
+	return head == remote
 }
 
 // splitIdentity parses the domain's git_identity ("name <email>") for the

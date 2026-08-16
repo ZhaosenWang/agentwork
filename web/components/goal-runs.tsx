@@ -182,6 +182,14 @@ function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentNa
 
       {open && (
         <div className="border-t border-zinc-100 bg-zinc-50/60 p-4 space-y-3">
+          {run.prompt && (
+            <div className="text-xs text-zinc-700">
+              <div className="text-[11px] font-medium text-zinc-400 uppercase tracking-wide mb-1">任务指令（prompt）</div>
+              <div className="max-h-72 overflow-y-auto whitespace-pre-wrap font-mono text-zinc-600 bg-white rounded-lg border border-zinc-200/60 p-2.5">
+                {run.prompt}
+              </div>
+            </div>
+          )}
           {run.result_summary && (
             <div className="text-xs text-zinc-700">
               <div className="text-[11px] font-medium text-zinc-400 uppercase tracking-wide mb-1">结果</div>

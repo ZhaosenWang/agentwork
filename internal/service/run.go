@@ -47,7 +47,7 @@ type Run struct {
 	RunKind   string `json:"run_kind"` // worker|processor (platform-internal)
 	RunType   string `json:"run_type"` // processor tasks: compile|intake (M3)
 	DomainID  string `json:"domain_id"`
-	Prompt    string `json:"prompt"` // processor runs only
+	Prompt    string `json:"prompt"` // the assembled task message — processor runs: the processing instruction; worker runs: stored at dispatch so the human can inspect what the agent was told
 	SessionID string `json:"session_id"`
 	Workdir   string `json:"workdir"`
 	Status    string `json:"status"`
@@ -673,7 +673,8 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 		   JOIN agent a ON a.id = r.agent_id
 		   JOIN runtime rt ON rt.id = a.runtime_id
 		   LEFT JOIN goal g ON g.id = r.goal_id
-		   WHERE r.status='queued' AND r.agent_id IN (`+placeholders+`)
+		   WHERE r.status='queued' AND r.queued_at <= ?   -- retry backoff: future-dated runs wait
+		     AND r.agent_id IN (`+placeholders+`)
 		     AND (rt.machine_id = '' OR EXISTS (         -- machine-owned runtimes claim only while
 		          SELECT 1 FROM machine m                 -- their machine is online (CLI 分支)
 		          WHERE m.id = rt.machine_id AND m.status='connected'))
@@ -689,7 +690,7 @@ func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedR
 		   ORDER BY r.queued_at
 		   LIMIT 1
 		 )
-		 RETURNING id, goal_id, agent_id, attempt, token`, append([]any{now()}, args...)...).
+		 RETURNING id, goal_id, agent_id, attempt, token`, append([]any{now(), now()}, args...)...).
 		Scan(&r.RunID, &r.GoalID, &r.AgentID, &r.Attempt, &r.Token)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -960,7 +961,7 @@ func (s *RunService) ReconcilePendingTerminal(ctx context.Context) (int, error) 
 
 func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,session_id,workdir,status,role,attempt,result_summary,cancel_reason,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
+		`SELECT id,goal_id,agent_id,run_kind,run_type,domain_id,prompt,session_id,workdir,status,role,attempt,result_summary,cancel_reason,trigger_comment_id,is_leader_run,squad_id,queued_at,started_at,finished_at,created_at
 		 FROM run WHERE goal_id=? ORDER BY queued_at`, goalID)
 	if err != nil {
 		return nil, err
@@ -970,7 +971,7 @@ func (s *RunService) List(ctx context.Context, goalID string) ([]Run, error) {
 	for rows.Next() {
 		var r Run
 		var leaderFlag int
-		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.SessionID, &r.Workdir, &r.Status, &r.Role, &r.Attempt, &r.ResultSummary, &r.CancelReason, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.GoalID, &r.AgentID, &r.RunKind, &r.RunType, &r.DomainID, &r.Prompt, &r.SessionID, &r.Workdir, &r.Status, &r.Role, &r.Attempt, &r.ResultSummary, &r.CancelReason, &r.TriggerCommentID, &leaderFlag, &r.SquadID, &r.QueuedAt, &r.StartedAt, &r.FinishedAt, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		r.IsLeaderRun = leaderFlag != 0

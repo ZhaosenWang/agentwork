@@ -88,7 +88,7 @@ func connectCmd(args []string) {
 	saveState(st)
 
 	wsURL := connectWSURL(*server, *token)
-	fmt.Printf("agentwork connect: server=%s machine=%q (%s)\n", *server, st.Name, st.MachineID)
+	cliLogf("agentwork connect: server=%s machine=%q (%s)", *server, st.Name, st.MachineID)
 
 	// One cancellable ctx for the whole session: Ctrl+C / SIGTERM aborts
 	// dialing, in-flight calls, heartbeats AND the reconnect backoff —
@@ -99,7 +99,7 @@ func connectCmd(args []string) {
 	backoff := time.Second
 	for {
 		if err := runLink(ctx, wsURL, st, *name, hostname); err != nil {
-			fmt.Printf("connect: %v — reconnecting in %s\n", err, backoff)
+			cliLogf("connect: %v — reconnecting in %s", err, backoff)
 		}
 		select {
 		case <-ctx.Done():
@@ -119,6 +119,7 @@ func connectCmd(args []string) {
 func runLink(ctx context.Context, wsURL string, st cliState, name, hostname string) error {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
+		cliLogf("link: dial %s: %v", wsURL, err)
 		return fmt.Errorf("dial: %w", err)
 	}
 	peer := link.NewPeer(conn)
@@ -180,16 +181,12 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 				res.Written = append(res.Written, sk.Name)
 			}
 		}
-		fmt.Printf("config.push: installed %d skill(s) for agent %s into %s\n", len(res.Written), p.AgentID, root)
+		cliLogf("config.push: installed %d skill(s) for agent %s into %s", len(res.Written), p.AgentID, root)
 		return res, nil
 	})
 
 	clis := probeCLIs(ctx)
-	fmt.Printf("probed %d agent CLI(s):", len(clis))
-	for _, c := range clis {
-		fmt.Printf(" %s(%s)", c.Name, c.Version)
-	}
-	fmt.Println()
+	cliLogf("link: probed %d agent CLI(s)", len(clis))
 
 	var res link.RegisterResult
 	if err := peer.Call(ctx, link.MethodMachineRegister, link.RegisterParams{
@@ -199,12 +196,13 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 		Version:   cliVersion,
 		CLIs:      clis,
 	}, &res); err != nil {
+		cliLogf("link: register: %v", err)
 		return fmt.Errorf("register: %w", err)
 	}
 	if res.ServerVersion != "" && res.ServerVersion != cliVersion {
-		fmt.Printf("warning: daemon v%s vs CLI v%s — protocol drift possible\n", res.ServerVersion, cliVersion)
+		cliLogf("link: warning: daemon v%s vs CLI v%s — protocol drift possible", res.ServerVersion, cliVersion)
 	}
-	fmt.Println("registered")
+	cliLogf("link: registered")
 	flushPendingReports(peer)
 	st.ConnectedAt = time.Now()
 	st.ProbedCLIs = clis
@@ -217,11 +215,13 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 		select {
 		case <-tick.C:
 			if err := peer.Notify(ctx, link.MethodMachineHeartbeat, link.HeartbeatParams{MachineID: st.MachineID}); err != nil {
+				cliLogf("link: heartbeat: %v", err)
 				return fmt.Errorf("heartbeat: %w", err)
 			}
 			st.ConnectedAt = time.Now()
 			saveState(st)
 		case <-peer.Done():
+			cliLogf("link: closed")
 			return fmt.Errorf("link closed")
 		case <-ctx.Done():
 			return nil

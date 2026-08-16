@@ -37,7 +37,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 	// write_file call missing its required path arg, then a raw shell heredoc
 	// terminal_create cannot run — command must be an executable). State the
 	// full path so the write_file path argument is unambiguous.
-	prompt += fmt.Sprintf("\n\n产物文件绝对路径：%s\n（用 agentwork_write_file 的 path 参数写入此绝对路径；不要猜测工作目录，不要用 shell 重定向）\n",
+	prompt += fmt.Sprintf("\n\nArtifact file ABSOLUTE path: %s\n(Write it there with your file tools; do NOT guess the working directory, do NOT use shell redirection)\n",
 		filepath.Join(workdir, "intake.json"))
 	var argsJSON, rtEnvJSON, intakeMachineID string
 	var maxConcurrent int
