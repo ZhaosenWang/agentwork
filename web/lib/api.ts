@@ -5,10 +5,11 @@ import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/backend";
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...init,
-  });
+  // FormData (multipart) 的 Content-Type 必须交给浏览器自动生成（带
+  // boundary）；显式声明 application/json 会覆盖 boundary，服务端会把
+  // multipart 字节当 JSON 解析（invalid character '-' in numeric literal）。
+  const headers = init?.body instanceof FormData ? undefined : { "Content-Type": "application/json" };
+  const res = await fetch(`${API_BASE}${path}`, { headers, ...init });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${res.status}: ${text}`);

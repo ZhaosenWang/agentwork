@@ -38,9 +38,19 @@ func Extract(data []byte, dest string) error {
 	if err := os.MkdirAll(dest, 0o755); err != nil {
 		return err
 	}
+	prefix := stripSingleTopDir(zr.File)
 	var total int64
 	for _, f := range zr.File {
 		name := f.Name
+		if prefix != "" {
+			if !strings.HasPrefix(name, prefix) {
+				continue
+			}
+			name = strings.TrimPrefix(name, prefix)
+			if name == "" {
+				continue // the stripped top-level directory itself
+			}
+		}
 		if strings.HasPrefix(name, "/") || strings.Contains(name, "..") || strings.Contains(name, `\`) {
 			return fmt.Errorf("unsafe path %q in archive", name)
 		}
@@ -81,6 +91,51 @@ func Extract(data []byte, dest string) error {
 		}
 	}
 	return nil
+}
+
+// stripSingleTopDir detects the common "zip the whole folder" shape — every
+// entry nested under one top-level directory (`zip -r skill.zip aliyunrds/`).
+// It returns that directory's name with a trailing slash to strip, or "" when
+// the archive is already flat (or has multiple top-level entries, which would
+// make stripping ambiguous).
+func stripSingleTopDir(files []*zip.File) string {
+	top := ""
+	for _, f := range files {
+		name := f.Name
+		if name == "" {
+			continue
+		}
+		trimmed := strings.TrimSuffix(name, "/")
+		if trimmed == "" {
+			continue // the archive root itself
+		}
+		idx := strings.IndexByte(trimmed, '/')
+		var comp string
+		if idx < 0 {
+			// A root-level entry: a file means the archive is already flat
+			// (never strip); a directory is a candidate top-level dir.
+			if !f.FileInfo().IsDir() {
+				return ""
+			}
+			comp = trimmed
+		} else {
+			comp = trimmed[:idx]
+		}
+		// A traversal/absolute/empty top component must never be stripped —
+		// those entries fall through to the unsafe-path rejection in Extract.
+		if comp == "" || comp == "." || comp == ".." || strings.ContainsAny(comp, `/\`) {
+			return ""
+		}
+		if top == "" {
+			top = comp
+		} else if top != comp {
+			return "" // entries under different top-level paths
+		}
+	}
+	if top == "" {
+		return ""
+	}
+	return top + "/"
 }
 
 // Build assembles a skill zip from a path→content map (the platform's
