@@ -532,8 +532,10 @@ func writeAgentProfile(agentID, systemPrompt string) error {
 // workdir (the runtime's profile resolver walks up from cwd) — a
 // repo-owned AGENTS.md in the checkout survives (its instructions are the
 // project's ground truth and must not be clobbered; the platform profile
-// rides below it). Returns the merged content so the commit step can
-// recognize the platform-written suffix.
+// rides below it). Persistent workdirs and the stable chat directory are
+// staged REPEATEDLY: if the persona is already present, return the file
+// as-is instead of appending a duplicate. Returns the content so the
+// commit step can recognize the platform-written suffix.
 func syncAgentProfile(agentID, workdir string) string {
 	b, err := os.ReadFile(filepath.Join(agentProfileDir(agentID), "AGENTS.md"))
 	if err != nil {
@@ -541,12 +543,17 @@ func syncAgentProfile(agentID, workdir string) string {
 	}
 	persona := string(b)
 	path := filepath.Join(workdir, "AGENTS.md")
-	merged := persona
-	if existing, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(existing)) != "" {
-		merged = string(existing) + "\n\n" + persona
+	existing, err := os.ReadFile(path)
+	if err == nil && strings.TrimSpace(string(existing)) != "" {
+		if strings.Contains(string(existing), persona) {
+			return string(existing) // already staged — never duplicate
+		}
+		merged := string(existing) + "\n\n" + persona
+		_ = os.WriteFile(path, []byte(merged), 0o644)
+		return merged
 	}
-	_ = os.WriteFile(path, []byte(merged), 0o644)
-	return merged
+	_ = os.WriteFile(path, []byte(persona), 0o644)
+	return persona
 }
 
 // machineSkillRoot is where config.push lands an agent's skill packages on

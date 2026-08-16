@@ -28,6 +28,16 @@ const (
 	// machine→daemon direction has never failed.
 	MethodRunPoll = "run.poll" // request — response carries the next dispatch + cancels
 
+	// chat (ACP relay, Phase 6): the daemon exposes GET /agents/{id}/chat
+	// (WebSocket upgrade) to web ACP clients; the channel is a pure
+	// TRANSPORT relay — ACP frames pass through unparsed, the session
+	// lifecycle (new/list/load/prompt/events/permission) is the protocol's
+	// own business.
+	MethodChatOpen  = "chat.open"  // daemon → machine (request): spawn the agent CLI + ACP connection
+	MethodChatFrame = "chat.frame" // daemon → machine (request): one ACP frame to the CLI's stdin
+	MethodChatClose = "chat.close" // daemon → machine (notification): kill the chat process
+	MethodChatClosed = "chat.closed" // machine → daemon (notification): the CLI exited
+
 	// machine → daemon (Phase 2)
 	MethodRunClaimed    = "run.claimed"     // request, ack
 	MethodRunEventBatch = "run.event_batch" // notification (batched stream events)
@@ -295,6 +305,55 @@ type RunCancelParams struct {
 // daemon→machine push anymore. The daemon identifies the machine by its
 // CONNECTION's registered id, not by anything in this message — the body
 // is empty by design.
+// ChatOpenParams is the chat.open request (daemon → machine): spawn the
+// agent's CLI for a chat session and open its ACP connection. The cwd is
+// the agent's STABLE chat directory (~/.agentwork/chat/<agentID>/) — the
+// CLI keys its session store by cwd, so session/list + session/load work
+// across connections.
+type ChatOpenParams struct {
+	AgentID   string            `json:"agent_id"`
+	ACPSpawn  []string          `json:"acp_spawn"` // how to start the CLI (acp_spawn)
+	Env       map[string]string `json:"env"`
+	Cwd       string            `json:"cwd"`
+	SkillsDir string            `json:"skills_dir,omitempty"` // project skills dir inside cwd ('' = .claude/skills)
+}
+
+// ChatOpenResult is the chat.open response: the chat id the frames ride,
+// plus the RESOLVED absolute chat directory — the daemon injects it into
+// session/new (and replaces '~'-poisoned cwd values on session/load): the
+// web never invents machine-local paths.
+type ChatOpenResult struct {
+	ChatID string `json:"chat_id"`
+	Cwd    string `json:"cwd"`
+}
+
+// ChatFrameParams is one ACP frame in either direction (daemon → machine
+// request: write to the CLI's stdin; machine → daemon notification: a
+// frame the CLI wrote to stdout). Frame is the raw JSON-RPC message.
+//
+// Seq orders the machine→daemon direction: the daemon's /connect readLoop
+// dispatches every frame on its own goroutine, so a reply flood arrives at
+// the web socket SCRAMBLED (live: the agent's answer read like shuffled
+// words). The machine stamps each stdout line with a per-chat monotonic
+// counter; the daemon's writer pump re-orders by it.
+type ChatFrameParams struct {
+	ChatID string          `json:"chat_id"`
+	Seq    int64           `json:"seq,omitempty"` // machine→daemon only; 0 = unordered (legacy CLI)
+	Frame  json.RawMessage `json:"frame"`
+}
+
+// ChatCloseParams is the chat.close notification: kill the chat process.
+type ChatCloseParams struct {
+	ChatID string `json:"chat_id"`
+}
+
+// ChatClosedParams is the chat.closed notification: the CLI exited (its
+// frames stop; the daemon closes the web socket).
+type ChatClosedParams struct {
+	ChatID string `json:"chat_id"`
+	Reason string `json:"reason,omitempty"`
+}
+
 type RunPollParams struct{}
 
 // RunPollResult is the run.poll response: at most one dispatch (the

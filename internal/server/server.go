@@ -212,6 +212,18 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			logging.Infof("connect: machine %q (%s) registered, %d agent CLI(s) probed", p.Name, p.Hostname, len(p.CLIs))
 			return link.RegisterResult{OK: true, ServerVersion: daemon.DaemonVersion}, nil
 		})
+		peer.Handle(link.MethodChatFrame, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			var p link.ChatFrameParams
+			_ = json.Unmarshal(raw, &p)
+			s.d.MachineChatFrame(p)
+			return nil, nil // notification — no reply
+		})
+		peer.Handle(link.MethodChatClosed, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			var p link.ChatClosedParams
+			_ = json.Unmarshal(raw, &p)
+			s.d.MachineChatClosed(p)
+			return nil, nil // notification — no reply
+		})
 		peer.Handle(link.MethodRunPoll, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 			id := machineID()
 			if id == "" {
@@ -278,6 +290,45 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		})
 		peer.Wait()
 	})
+	// The agent chat (Phase 6): a WebSocket upgrade for web ACP clients —
+	// the daemon opens a machine-side chat channel and relays ACP frames
+	// UNPARSED in both directions. The agent id comes from the PATH; the
+	// frames carry no platform metadata.
+	mux.HandleFunc("GET /agents/{id}/acp", func(w http.ResponseWriter, r *http.Request) {
+		agentID := r.PathValue("id")
+		conn, err := connectUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		chatID, err := s.d.OpenChatForAgent(r.Context(), agentID)
+		if err != nil {
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","error":{"code":-32000,"message":"`+err.Error()+`"}}`))
+			_ = conn.Close()
+			return
+		}
+		s.d.BindChatSink(chatID,
+			func(b []byte) error { return conn.WriteMessage(websocket.TextMessage, b) },
+			func() { _ = conn.Close() })
+		defer s.d.CloseChat(chatID)
+		// Web → machine: one ACP frame per text message.
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				// The error names who killed the socket: a close frame
+				// (1000/1001) = the browser closed deliberately (panel
+				// unmounted); EOF / connection reset = the wire dropped it
+				// (the Next dev proxy sits in between); a protocol error =
+				// the browser rejected a frame. One line decides the fix.
+				logging.Infof("chat: %s web read: %v", chatID, err)
+				return
+			}
+			if err := s.d.ChatWrite(chatID, msg); err != nil {
+				logging.Infof("chat: %s web→machine: %v", chatID, err)
+				return
+			}
+		}
+	})
+
 	// The agent rpc (CLI 分支 Phase 2): one-shot JSON-RPC over WS — the
 	// agent's collaboration commands dial this per invocation, carrying the
 	// per-run token in params. The token is the ONLY identity: it resolves

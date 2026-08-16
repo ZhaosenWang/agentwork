@@ -193,6 +193,10 @@ type Daemon struct {
 	machinePendingMu sync.Mutex
 	machinePending   map[string][]*pendingRun // machineID → queued dispatches
 	machineCancels   map[string][]link.RunCancelParams
+
+	// chat is the ACP chat relay (Phase 6): web sockets ↔ machine chat
+	// channels, frames unparsed.
+	chat chatRelay
 }
 
 // agentWorker schedules one agent's runs with a concurrency semaphore.

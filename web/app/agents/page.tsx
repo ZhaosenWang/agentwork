@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useAgents, useRuntimes, useDeleteAgent, useGoalEvents } from "@/lib/queries";
 import { AgentForm } from "@/components/agent-form";
+import { ChatPanel } from "@/components/chat-panel";
 import { Button, PageHeader, Empty } from "@/components/ui";
 import type { Agent } from "@/lib/types";
 
@@ -13,6 +14,7 @@ export default function AgentsPage() {
   const del = useDeleteAgent();
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<Agent | null>(null);
+  const [chatting, setChatting] = useState<Agent | null>(null);
 
   const runtimeName = (id: string) => runtimes?.find((r) => r.id === id)?.name ?? id;
 
@@ -25,6 +27,9 @@ export default function AgentsPage() {
 
       {showForm && <AgentForm onClose={() => setShowForm(false)} />}
       {editing && <AgentForm agent={editing} onClose={() => setEditing(null)} />}
+      {chatting && (
+        <ChatPanel agentId={chatting.id} agentName={chatting.name} onClose={() => setChatting(null)} />
+      )}
 
       {isLoading && <p className="text-sm text-zinc-400">加载中…</p>}
 
@@ -53,7 +58,13 @@ export default function AgentsPage() {
                   <td className="px-4 py-3 text-zinc-600">{a.model || "-"}</td>
                   <td className="px-4 py-3 text-zinc-600">{a.max_concurrent}</td>
                   <td className="px-4 py-3 text-zinc-400">{new Date(a.created_at).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right">
+                  <td className="px-4 py-3 text-right space-x-2">
+                    <button
+                      onClick={() => setChatting(a)}
+                      className="text-xs text-indigo-600 hover:text-indigo-800 transition-colors"
+                    >
+                      聊天
+                    </button>
                     <button
                       onClick={() => del.mutate(a.id)}
                       className="text-xs text-zinc-400 hover:text-red-600 transition-colors"

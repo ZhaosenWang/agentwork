@@ -51,7 +51,7 @@ var probeTable = []struct {
 	{
 		Name:             "openagent",
 		ProbeCmd:         "openagent --version",
-		ACPSpawn:         []string{"openagent", "acp"},
+		ACPSpawn:         []string{"openagent", "serve", "--acp"},
 		SkillsDir:        "~/.openagent/skills",
 		ProjectSkillsDir: ".agents/skills", // the AgentSkills standard (npx skills add)
 		ProfileFiles:     []string{"SOUL.md", "SYSTEM.md", "AGENTS.md"},
@@ -102,7 +102,7 @@ func probeRuns(ctx context.Context, cmd string) bool {
 }
 
 // probeVersion runs the probe command and returns its first output line,
-// trimmed ('' when the CLI prints nothing).
+// trimmed (” when the CLI prints nothing).
 func probeVersion(ctx context.Context, cmd string) string {
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
@@ -117,7 +117,7 @@ func probeVersion(ctx context.Context, cmd string) string {
 	return line
 }
 
-// expandHome resolves a leading ~ ('' input passes through).
+// expandHome resolves a leading ~ (” input passes through).
 func expandHome(p string) string {
 	if !strings.HasPrefix(p, "~") {
 		return p

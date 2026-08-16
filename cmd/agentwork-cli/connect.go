@@ -149,6 +149,18 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	// the link dies (the platform reclaims them via RecoverStuckRunning).
 	exec := newExecutor(peer, st.Server)
 	defer exec.shutdown()
+	// Chat relay (Phase 6): transport-only ACP bridge for the web chat —
+	// frames flow unparsed in both directions.
+	chat := newChatBridge()
+	peer.Handle(link.MethodChatOpen, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+		return chat.handleChatOpen(ctx, raw, peer)
+	})
+	peer.Handle(link.MethodChatFrame, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+		return chat.handleChatFrame(ctx, raw)
+	})
+	peer.Handle(link.MethodChatClose, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+		return chat.handleChatClose(ctx, raw)
+	})
 	// config.push (Phase 4): land the agent's skill packages in the
 	// platform-managed staging dir (~/.agentwork/skills/<agentID>/...) —
 	// the executor copies them into each run's workdir at spawn as
