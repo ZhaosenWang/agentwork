@@ -31,6 +31,11 @@ state, in-process event bus, Go daemon + Next.js web UI.
   completion/failure pushes, a daily digest
 - **Real-time web UI** — live event stream, execution timeline, sub-goal /
   change / verification panels
+- **Agent chat (ACP bridge)** — the web is a real ACP client for each agent:
+  `GET /agents/{id}/acp` relays ACP frames unparsed to the machine-side CLI;
+  sessions are the CLI's own (list/load/new), permission requests surface as
+  an approval modal, and turns can be interrupted or retried on a fresh
+  session when poisoned history fails at the input layer
 
 > **One-line mental model:** a **goal** is a work item and the sole holder of
 > state authority; a **run** is one agent's turn on it — runs report up, never
@@ -47,11 +52,14 @@ state, in-process event bus, Go daemon + Next.js web UI.
 ### Backend
 
 ```bash
-go build -o agentwork-daemon ./cmd/agentwork-daemon
-go build -o agentwork-cli ./cmd/agentwork-cli
+./build.sh   # builds build/agentwork (CLI) + build/agentwork-daemon
+             # with one shared version stamp (AGENTWORK_COMPILE_VERSION)
 
 # Start the daemon (default :7373)
-./agentwork-daemon
+./build/agentwork-daemon
+
+# And on the machine that runs the agents:
+./build/agentwork connect
 ```
 
 ### Frontend
@@ -68,8 +76,12 @@ npm run build && npm start
    (or leave it unfrozen to force a human checkpoint)
 2. Create a **runtime** (e.g. `opencode acp --pure`, stdio + acp) and an
    **agent**
-3. Create a **goal**, assign the agent, and watch the loop run: execution →
+3. Run `agentwork connect` on your machine — the daemon dispatches runs to
+   it via `run.poll` (pull model)
+4. Create a **goal**, assign the agent, and watch the loop run: execution →
    verification → review → your approval → automatic delivery
+5. Or chat with any agent directly from the Agents page — a per-agent ACP
+   session with the persona/skills staged fresh at every open
 
 ## Core concepts
 
@@ -80,6 +92,7 @@ npm run build && npm start
 | **Run** | One agent's turn on a goal. Status: queued → running → completed / failed / cancelled, plus a **role** (owner / subgoal / consult / review / verify). No authority — it reports to the goal layer. |
 | **Runtime** | A launch spec — transport (stdio/ws/tcp) + provider (acp/jsonl/jsonrpc) + executable/args or endpoint + env. |
 | **Agent** | A runtime + persona (system prompt / model / env / extra MCP servers / max concurrency). |
+| **Chat** | A direct ACP conversation with an agent over `GET /agents/{id}/acp` — the daemon relays frames unparsed to the machine-side CLI; sessions live in the CLI's own store, permissions are answered in the panel. |
 | **Squad** | A routing group that does no work itself: goals route to its leader, who delegates via sub-goals; members with role=reviewer are auto-pulled into review checkpoints. |
 | **Sub-goal** | A work item split off a goal (not a child goal — no recursion). Own assignee + optional agent verifier; machine retries (≤3) and verifier rejections are counted separately. |
 | **Change** | A sub-goal's logical deliverable: ready → integrating → integrated, or conflict → assignee rework → revision N+1. The owner integrates it via the `integrate_change` tool. |
@@ -106,30 +119,38 @@ every session (plus `verify_sub_goal`, `integrate_change`, `get_change`,
 ## Architecture
 
 ```
-                    ┌────────────── HTTP API + WS hub ──────────┐
-                    │   goals/runs/sub-goals/changes/…           │
-                    ▼                                             ▼
-              service layer (state authority)             web UI (Next.js)
-                    │  bus.Publish (after commit)                │
-                    ▼                                            │
-               SQLite (truth) ── daemon scheduler ───────────────┤
-                                    │ claim run → runTask        │
-                                    ▼                            │
-                             runtime.Open(spec)                  │
-                                    │  acp | jsonl | jsonrpc     │
-                                    ▼                            │
-                             agent CLI subprocess                │
-                              (stdio/ws/tcp)                     │
-                              └─ fs/terminal RPC + agentwork MCP  │
-                                 (worktree, tools)               │
-                    ┌───────────────┬────────────────────────────┘
-                    ▼               ▼
-             machine verify /   review gate → deliver
-             guards (domain)    (human approve → merge+re-verify+push)
+                 ┌────────────── HTTP API + WS hub ──────────────┐
+                 │   goals/runs/sub-goals/changes/…               │
+                 │   + /agents/{id}/acp (ACP chat relay)          │
+                 ▼                                               ▼
+           service layer (state authority)                web UI (Next.js)
+                 │  bus.Publish (after commit)              │ ACP client (chat)
+                 ▼                                           │
+            SQLite (truth) ── daemon scheduler ──────────────┤
+                                 │ run.poll / chat.*        │
+                                 ▼                           ▼
+                          agentwork connect   ◄──  /connect (JSON-RPC)
+                                 │  runTask, chat bridge (spawn + relay)
+                                 ▼
+                          runtime.Open(spec)
+                                 │  acp | jsonl | jsonrpc
+                                 ▼
+                          agent CLI subprocess ◄── ACP frames relayed unparsed
+                           (stdio/ws/tcp)
+                           └─ fs/terminal RPC + agentwork MCP
+                              (worktree, tools)
+                 ┌───────────────┬─────────────────────────────┘
+                 ▼               ▼
+          machine verify /   review gate → deliver
+          guards (domain)    (human approve → merge+re-verify+push)
 ```
 
 - **Event ≠ truth** — the bus is a wakeup hint; every transition is a
   conditional DB transaction, idempotent under replay
+- **Machine executor** — `agentwork connect` holds a persistent JSON-RPC
+  link and pulls work (`run.poll`); it executes runs, hosts the per-agent chat
+  bridge (spawns the CLI, relays ACP frames unparsed, tears down gracefully
+  with stdin EOF before the kill)
 - **Per-run worktrees** — `~/.agentwork/runs/<runID>` ephemeral git worktrees
   against per-domain bare repos; crash recovery replays terminal runs and
   re-derives attention at startup
@@ -138,12 +159,13 @@ every session (plus `verify_sub_goal`, `integrate_change`, `get_change`,
 
 ## CLI tool
 
-`agentwork-cli` is a human debugging tool (agents use the MCP tools). It needs
-`AGENTWORK_SERVER_URL` (or runs against `http://localhost:7373` by default):
+`agentwork` is the **machine executor** and a human debugging tool (agents
+use the MCP tools):
 
 ```bash
-agentwork-cli goal list --limit 5
-agentwork-cli stats
+agentwork connect               # the machine side: pulls dispatches, runs them, hosts chats
+agentwork goal list --limit 5   # debugging commands (default http://localhost:7373,
+agentwork stats                 #   or set AGENTWORK_SERVER_URL)
 ```
 
 ## Tech stack

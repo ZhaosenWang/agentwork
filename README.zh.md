@@ -26,6 +26,10 @@ daemon + Next.js Web 界面。
   飞书入站（@机器人 建任务）
 - **飞书通知** — 审批卡（IM 内直接批/驳）、完成/失败推送、每日摘要
 - **实时 Web UI** — 事件流、执行时间线、子任务 / 变更 / 验证记录面板
+- **Agent 聊天（ACP 桥）** — Web 就是每个 agent 的真实 ACP 客户端：
+  `GET /agents/{id}/acp` 把 ACP 帧原样中继到机器侧 CLI；会话是 CLI 自己的
+  （list/load/new），权限请求弹出审批框，回合可中断；毒会话历史在输入层
+  失败时自动换新会话重试
 
 > **一句话脑图：** **goal** 是工作条目，状态权威的唯一持有者；**run** 是某个
 > agent 在它上面的一次执行——run 只汇报、不决策。完成与否由平台判定，卡点由人
@@ -42,11 +46,14 @@ daemon + Next.js Web 界面。
 ### 后端
 
 ```bash
-go build -o agentwork-daemon ./cmd/agentwork-daemon
-go build -o agentwork-cli ./cmd/agentwork-cli
+./build.sh   # 产出 build/agentwork（CLI）+ build/agentwork-daemon，
+             # 带同一版本戳（AGENTWORK_COMPILE_VERSION）
 
 # 启动 daemon（默认 :7373）
-./agentwork-daemon
+./build/agentwork-daemon
+
+# 在跑 agent 的机器上：
+./build/agentwork connect
 ```
 
 ### 前端
@@ -61,8 +68,11 @@ npm run build && npm start
 
 1. 创建**项目**（域）：仓库地址 + 自然语言验收策略（不确认冻结则强制人工卡点）
 2. 创建 **runtime**（如 `opencode acp --pure`，stdio + acp）和 **agent**
-3. 创建 **goal**、指派给 agent，看闭环跑起来：执行 → 验证 → 卡点 → 你审批 →
+3. 在机器上运行 `agentwork connect`——daemon 通过 `run.poll` 把任务派给
+   它（拉取模型）
+4. 创建 **goal**、指派给 agent，看闭环跑起来：执行 → 验证 → 卡点 → 你审批 →
    自动交付
+5. 或者直接在 Agent 页面与任意 agent 聊天——每次打开都会重新下发人设和技能
 
 ## 核心概念
 
@@ -73,6 +83,7 @@ npm run build && npm start
 | **Run** | 某个 agent 在 goal 上的一次执行。状态五态 + **角色**（owner / subgoal / consult / review / verify）。无权威——终态上报 goal 层仲裁 |
 | **Runtime** | 启动规格——transport（stdio/ws/tcp）+ provider（acp/jsonl/jsonrpc）+ executable/args 或 endpoint + env |
 | **Agent** | runtime + 人设（system prompt / model / env / 额外 MCP 服务器 / 并发数） |
+| **聊天（Chat）** | 通过 `GET /agents/{id}/acp` 与 agent 的直接 ACP 会话——daemon 把帧原样中继到机器侧 CLI；会话存于 CLI 自己的存储，权限在面板里审批 |
 | **Squad** | 路由组，不干活：goal 路由到 leader，由其拆子任务；role=reviewer 的成员在卡点时被平台自动拉入审查 |
 | **子任务（Sub-goal）** | 从 goal 拆出的工作项（不是 child goal，不可递归）。独立 assignee + 可选 agent verifier；机器重试（≤3）与验证驳回分开计数 |
 | **Change** | 子任务的逻辑交付物：ready → integrating → integrated，或 conflict → 返修 → 修订 N+1。owner 用 `integrate_change` 集成 |
@@ -98,30 +109,37 @@ agent 只通过每次会话广告的 `agentwork` MCP 工具协作（另有 `veri
 ## 架构
 
 ```
-                    ┌────────────── HTTP API + WS hub ──────────┐
-                    │   goals/runs/sub-goals/changes/…           │
-                    ▼                                             ▼
-              service 层（状态权威）                       Web UI（Next.js）
-                    │  bus.Publish（commit 后）                  │
-                    ▼                                            │
-               SQLite（真相） ── daemon 调度器 ─────────────────┤
-                                    │ claim run → runTask        │
-                                    ▼                            │
-                             runtime.Open(spec)                  │
-                                    │  acp | jsonl | jsonrpc     │
-                                    ▼                            │
-                             agent CLI 子进程                    │
-                              （stdio/ws/tcp）                   │
-                              └─ fs/terminal RPC + agentwork MCP  │
-                                 （worktree、工具）               │
-                    ┌───────────────┬────────────────────────────┘
-                    ▼               ▼
-             机器验证 / 约束     卡点 → 交付
-             （域验收策略）      （人批 → 合并+复验+推送）
+                 ┌────────────── HTTP API + WS hub ──────────────┐
+                 │   goals/runs/sub-goals/changes/…               │
+                 │   + /agents/{id}/acp（ACP 聊天中继）            │
+                 ▼                                               ▼
+           service 层（状态权威）                       Web UI（Next.js）
+                 │  bus.Publish（commit 后）                │ ACP 客户端（聊天）
+                 ▼                                           │
+            SQLite（真相） ── daemon 调度器 ─────────────────┤
+                                 │ run.poll / chat.*        │
+                                 ▼                           ▼
+                          agentwork connect   ◄──  /connect（JSON-RPC）
+                                 │  runTask、聊天桥（spawn + 中继）
+                                 ▼
+                          runtime.Open(spec)
+                                 │  acp | jsonl | jsonrpc
+                                 ▼
+                          agent CLI 子进程 ◄── ACP 帧原样中继
+                           （stdio/ws/tcp）
+                           └─ fs/terminal RPC + agentwork MCP
+                              （worktree、工具）
+                 ┌───────────────┬─────────────────────────────┘
+                 ▼               ▼
+         机器验证 / 约束     卡点 → 交付
+         （域验收策略）      （人批 → 合并+复验+推送）
 ```
 
 - **Event ≠ 真相** — 事件总线只是唤醒提示；一切状态转移都是条件化 DB 事务，
   重放幂等
+- **机器执行器** — `agentwork connect` 持有一条常驻 JSON-RPC 链接并拉取
+  工作（`run.poll`）；它执行 run、托管每个 agent 的聊天桥（spawn CLI、原样
+  中继 ACP 帧、关闭时先 stdin EOF 优雅收尾再杀进程）
 - **run 级 worktree** — `~/.agentwork/runs/<runID>` 临时 git worktree，基于每域
   bare 仓；崩溃恢复在启动时重放未仲裁的终态 run 并重推导 attention
 - **Coordinator** — 派生的 OwnerAttention（integration / recovery /
@@ -129,12 +147,12 @@ agent 只通过每次会话广告的 `agentwork` MCP 工具协作（另有 `veri
 
 ## CLI 工具
 
-`agentwork-cli` 是人调试用的工具（agent 走 MCP 工具）。默认连
-`http://localhost:7373`（或设 `AGENTWORK_SERVER_URL`）：
+`agentwork` 既是**机器执行器**，也是人调试用的工具（agent 走 MCP 工具）：
 
 ```bash
-agentwork-cli goal list --limit 5
-agentwork-cli stats
+agentwork connect               # 机器侧：拉取派发、执行 run、托管聊天桥
+agentwork goal list --limit 5   # 调试命令（默认连 http://localhost:7373，
+agentwork stats                 #   或设 AGENTWORK_SERVER_URL）
 ```
 
 ## 技术栈
