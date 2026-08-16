@@ -87,6 +87,10 @@ func connectCmd(args []string) {
 	st.Name = *name
 	saveState(st)
 
+	// Persistent goal worktrees accumulate on the machine — prune those no
+	// run touched for 30 days before connecting.
+	pruneStaleGoalWorkdirs()
+
 	wsURL := connectWSURL(*server, *token)
 	cliLogf("agentwork connect: server=%s machine=%q (%s)", *server, st.Name, st.MachineID)
 

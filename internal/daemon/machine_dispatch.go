@@ -210,6 +210,14 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, mid string, p link.RunFi
 		logging.Infof("machine: run %s: stale terminal report dropped (token mismatch — the run was re-claimed)", p.RunID)
 		return nil
 	}
+	// Record the session + workdir — the resume pointer the NEXT writable
+	// run of this goal/sub-goal carries (multica-style session continuity;
+	// the machine resumes only when the workdir still matches).
+	if kind != "processor" && (p.SessionID != "" || p.WorkDir != "") {
+		if err := d.runSvc.MarkSession(ctx, p.RunID, p.SessionID, p.WorkDir); err != nil {
+			logging.Infof("machine: run %s: mark session: %v", p.RunID, err)
+		}
+	}
 	// Processor runs (goal-less) complete through their artifact paths,
 	// not the goal reconcile.
 	if kind == "processor" {

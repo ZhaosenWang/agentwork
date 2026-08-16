@@ -1695,6 +1695,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			`UPDATE run SET prompt=? WHERE id=?`, machinePrompt, q.RunID); err != nil {
 			logging.Infof("daemon: run %s: store prompt: %v", q.RunID, err)
 		}
+		priorSession, priorWorkdir := d.priorSessionFor(ctx, q.GoalID, q.AgentID, subGoalID)
 		d.dispatchToMachine(ctx, q, link.RunDispatchParams{
 			RunID: q.RunID, GoalID: q.GoalID, AgentID: q.AgentID,
 			Role: runRole, SubGoalID: subGoalID, Attempt: q.Attempt,
@@ -1705,6 +1706,8 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			ACPSpawn: args, Env: dispatchEnv,
 			ProjectSkillsDir: d.projectSkillsDirFor(ctx, runtimeMachineID, args),
 			RunProfile:       d.buildRunProfile(ctx, q.GoalID, q.AgentID, agentName, runRole, goalTitle, policyText, domainType, domainName),
+			PriorSessionID:   priorSession,
+			PriorWorkDir:     priorWorkdir,
 		}, runtimeMachineID)
 		return
 	}
@@ -1880,6 +1883,24 @@ func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, su
 	d.bus.Publish(ctx, events.Event{Topic: "domain:compile_failed", Payload: map[string]any{
 		"run_id": q.RunID, "domain_id": domainID, "error": summary,
 	}})
+}
+
+// priorSessionFor resolves the (session, workdir) a previous WRITABLE run
+// of the same goal (or sub-goal) recorded — the multica-style resume
+// pointer carried in the dispatch. The machine resumes only when its
+// computed workdir matches PriorWorkDir.
+func (d *Daemon) priorSessionFor(ctx context.Context, goalID, agentID, subGoalID string) (string, string) {
+	var sessionID, workdir string
+	if subGoalID != "" {
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT session_id, workdir FROM run WHERE sub_goal_id=? AND agent_id=? AND role='subgoal' AND session_id != '' ORDER BY finished_at DESC LIMIT 1`,
+			subGoalID, agentID).Scan(&sessionID, &workdir)
+	} else {
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT session_id, workdir FROM run WHERE goal_id=? AND agent_id=? AND role='owner' AND session_id != '' ORDER BY finished_at DESC LIMIT 1`,
+			goalID, agentID).Scan(&sessionID, &workdir)
+	}
+	return sessionID, workdir
 }
 
 // nowStr is the daemon-side UTC timestamp helper (service.now is private).

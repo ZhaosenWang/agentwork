@@ -267,6 +267,14 @@ type RunDispatchParams struct {
 	// Persona material: the executor merges it into the workdir's
 	// AGENTS.md at spawn. The Prompt is the TASK and nothing else.
 	RunProfile string `json:"run_profile,omitempty"`
+	// PriorSessionID/PriorWorkDir: the (session, workdir) a previous
+	// WRITABLE run of the same goal (or sub-goal) recorded — the
+	// multica-style resume pointer. The executor resumes the session only
+	// when its computed workdir matches PriorWorkDir (agent CLI sessions
+	// are keyed by cwd — a mismatched pointer can never resolve); a
+	// mismatch drops the resume and says so in the prompt.
+	PriorSessionID string `json:"prior_session_id,omitempty"`
+	PriorWorkDir   string `json:"prior_workdir,omitempty"`
 	Env      map[string]string `json:"env,omitempty"`      // runtime env + agent env (merged daemon-side)
 }
 
@@ -365,6 +373,10 @@ type RunFinishedParams struct {
 	// lost push must not masquerade as "no changes to verify".
 	HeadSHA  string `json:"head_sha,omitempty"`
 	Evidence string `json:"evidence,omitempty"` // JSON bundle (scratch runs: '')
+	// SessionID/WorkDir record the run's ACP session + workdir — the
+	// resume pointer for the NEXT writable run of this goal/sub-goal.
+	SessionID string `json:"session_id,omitempty"`
+	WorkDir   string `json:"workdir,omitempty"`
 	// Artifacts: processor runs' FILE results (checks.json etc.), uploaded
 	// from the machine — the platform reads structured side effects, never
 	// agent stdout (决策 5.3/§9).

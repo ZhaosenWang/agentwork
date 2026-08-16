@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/eushing/agentwork/internal/gitutil"
 	"github.com/eushing/agentwork/internal/link"
@@ -113,16 +114,72 @@ func ensureGitWorkdir(ctx context.Context, p link.RunDispatchParams) (workdir, r
 			return "", "", "", nil, fmt.Errorf("branch %s: %v: %s", branch, err, out)
 		}
 	}
+	// Workdir residency (multica-style session continuity): WRITABLE runs
+	// (owner/subgoal) get a PERSISTENT workdir keyed by (goal, agent) /
+	// (subgoal, agent) — the worktree survives across turns, so dirt, the
+	// branch checkout, and the agent CLI's cwd-keyed session store all
+	// continue (a prior session id resolves only in the exact cwd it was
+	// recorded against). Read-only roles (consult/review/verify) keep a
+	// fresh per-run workdir — their edits die with it (the discard
+	// mechanism). A same-run retry lands on the same key, subsuming the
+	// old per-runID reuse.
+	persistent := p.Role == "owner" || p.Role == "subgoal"
 	wt := machineRunWorkdir(p.RunID)
+	if persistent {
+		wt = goalAgentWorkdir(p.GoalID, p.SubGoalID, p.AgentID)
+	}
 	if _, err := os.Stat(filepath.Join(wt, ".git")); err != nil {
 		if out, err := runGit(ctx, repo, "worktree", "add", "--force", wt, branch); err != nil {
 			return "", "", "", nil, fmt.Errorf("worktree add: %v: %s", err, out)
 		}
 	}
 	cleanup = func() {
+		if persistent {
+			// The worktree outlives the run. Touch its mtime — the
+			// connect-start prune (pruneStaleGoalWorkdirs) removes
+			// goal workdirs untouched for 30 days.
+			_ = os.Chtimes(wt, time.Now(), time.Now())
+			return
+		}
 		_, _ = runGit(context.Background(), repo, "worktree", "remove", "--force", wt)
 	}
 	return wt, repo, branch, cleanup, nil
+}
+
+// goalAgentWorkdir is the persistent workdir for a WRITABLE run — keyed by
+// (goal, agent) for owner runs, (goal, subgoal, agent) for sub-goal runs.
+func goalAgentWorkdir(goalID, subGoalID, agentID string) string {
+	home, _ := os.UserHomeDir()
+	if subGoalID != "" {
+		return filepath.Join(home, ".agentwork", "runs", "goal", goalID, "sg", subGoalID, agentID)
+	}
+	return filepath.Join(home, ".agentwork", "runs", "goal", goalID, agentID)
+}
+
+// pruneStaleGoalWorkdirs removes persistent goal worktrees untouched for
+// 30 days (their mtime is refreshed at every run's end) — they would
+// otherwise accumulate forever: the daemon's sweeps never reach the
+// machine's disk.
+func pruneStaleGoalWorkdirs() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	root := filepath.Join(home, ".agentwork", "runs", "goal")
+	cutoff := time.Now().Add(-30 * 24 * time.Hour)
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || !info.IsDir() {
+			return nil
+		}
+		if _, serr := os.Stat(filepath.Join(path, ".git")); serr != nil {
+			return nil // not a worktree root — descend
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.RemoveAll(path)
+			return filepath.SkipDir
+		}
+		return nil
+	})
 }
 
 // commitAndPush commits the run's changes onto the branch (when there are

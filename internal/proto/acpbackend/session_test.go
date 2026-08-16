@@ -25,6 +25,11 @@ type fakeAgent struct {
 	mu        sync.Mutex
 	prompts   []string
 	sessionID acp.SessionId
+	// hold, when set, blocks OnPrompt until it closes — lets a test cancel
+	// the turn BEFORE the fake can respond (deterministic cancel ordering
+	// instead of racing an immediate response, which flaked under full-suite
+	// load).
+	hold chan struct{}
 }
 
 func (f *fakeAgent) OnInitialize(ctx context.Context, req acp.InitializeRequest) (*acp.InitializeResponse, error) {
@@ -59,6 +64,9 @@ func (f *fakeAgent) OnPrompt(ctx context.Context, req acp.PromptRequest, s acp.S
 	f.mu.Lock()
 	f.prompts = append(f.prompts, textOf(req.Prompt))
 	f.mu.Unlock()
+	if f.hold != nil {
+		<-f.hold
+	}
 	if err := s.SendAgentMessage("answer: " + textOf(req.Prompt)); err != nil {
 		return nil, err
 	}
@@ -141,7 +149,12 @@ func TestSessionBackendMultiPrompt(t *testing.T) {
 // prompt; the SESSION survives and serves the next wake (决策 6-21 cancel
 // semantics — a cancelled run is not a dead session).
 func TestSessionBackendCancelKeepsSession(t *testing.T) {
-	f := &fakeAgent{}
+	// The fake holds its response until the test releases it — the cancel
+	// lands BEFORE the fake can complete, so the cancelled outcome is
+	// deterministic (an immediately-responding fake raced the cancel and
+	// flaked under full-suite load).
+	hold := make(chan struct{})
+	f := &fakeAgent{hold: hold}
 	s := openTestSession(t, f)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -150,6 +163,7 @@ func TestSessionBackendCancelKeepsSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	cancel() // the platform cancels this wake
+	close(hold)
 	res1 := <-run1.Result
 	if res1.Status != proto.StatusCancelled {
 		t.Fatalf("a cancelled wake reports cancelled, got %v (err %v)", res1.Status, res1.Err)

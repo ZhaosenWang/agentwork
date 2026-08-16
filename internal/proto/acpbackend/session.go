@@ -22,6 +22,7 @@ type session struct {
 	sess      *acp.Session
 	conn      proto.Conn
 	sessionID string
+	cwd       string
 
 	// turnMu serializes wakes: one prompt at a time per session (a concurrent
 	// wake — e.g. a consult on the owner while its run is live — waits).
@@ -66,7 +67,7 @@ func (b *Backend) OpenSession(ctx context.Context, spec proto.SessionSpec) (prot
 		conn.Close()
 		return nil, err
 	}
-	s := &session{sess: sess, conn: conn, sessionID: string(newResp.SessionID)}
+	s := &session{sess: sess, conn: conn, sessionID: string(newResp.SessionID), cwd: spec.Cwd}
 	// ONE handler for the session's whole life — it routes to the current
 	// turn's forwarder.
 	sess.SetEventHandler(s)
@@ -75,6 +76,19 @@ func (b *Backend) OpenSession(ctx context.Context, spec proto.SessionSpec) (prot
 	}
 	return s, nil
 }
+
+// LoadSession resumes a prior session by id (session/load, history
+// replay) — the multica-style resume pointer carried in the dispatch.
+func (s *session) LoadSession(ctx context.Context, priorSessionID string) error {
+	_, err := s.sess.LoadSession(ctx, acp.LoadSessionRequest{
+		SessionID: priorSessionID,
+		Cwd:       s.cwd,
+	})
+	return err
+}
+
+// SessionID returns the ACP session id.
+func (s *session) SessionID() string { return s.sessionID }
 
 // Prompt runs one turn. Serialized by turnMu; the events/results channels
 // are per-turn and close when the turn ends.

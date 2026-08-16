@@ -132,6 +132,16 @@ type Session interface {
 	Prompt(ctx context.Context, prompt string) (*Run, error)
 	// Cancel interrupts the in-flight turn if any.
 	Cancel(ctx context.Context) error
+	// LoadSession resumes a PRIOR session by id (session/load, history
+	// replay) — the multica-style resume pointer: turns on the same
+	// (agent, goal, workdir) continue their conversation instead of
+	// starting cold. Fails when the CLI's ACP server cannot resolve the
+	// id (a fresh process without a persistent session store) — callers
+	// fall back to the fresh session they already hold.
+	LoadSession(ctx context.Context, priorSessionID string) error
+	// SessionID returns the ACP session id ('' until session/new) — the
+	// run records it as the next turn's resume pointer.
+	SessionID() string
 	// Close tears the session down (protocol close + transport close +
 	// process cleanup).
 	Close() error

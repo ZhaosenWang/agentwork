@@ -136,3 +136,53 @@ func TestGitWorkdirAndTransferPush(t *testing.T) {
 		t.Fatalf("transfer ref must advance to the merge commit: %q %v", out2, err)
 	}
 }
+
+// TestPersistentGoalWorkdir: WRITABLE runs share one workdir per
+// (goal, agent) — the worktree outlives the run (session continuity:
+// dirt, the branch checkout, and the cwd-keyed CLI session store all
+// continue). Read-only roles keep a fresh per-run workdir — their edits
+// die with it.
+func TestPersistentGoalWorkdir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ctx := context.Background()
+	url := seedRepo(t)
+	p := link.RunDispatchParams{
+		RunID: "run-1", GoalID: "goal-1", AgentID: "agent-a",
+		DomainID: "dom-1", GitURL: url, DefaultBranch: "master",
+		Role: "owner",
+	}
+	wt1, _, branch1, cleanup1, err := ensureGitWorkdir(ctx, p)
+	if err != nil {
+		t.Fatalf("workdir: %v", err)
+	}
+	defer cleanup1()
+
+	// A second run of the same (goal, agent) with a DIFFERENT run id lands
+	// on the SAME workdir.
+	p2 := p
+	p2.RunID = "run-2"
+	wt2, _, branch2, cleanup2, err := ensureGitWorkdir(ctx, p2)
+	if err != nil {
+		t.Fatalf("workdir 2: %v", err)
+	}
+	defer cleanup2()
+	if wt1 != wt2 || branch1 != branch2 {
+		t.Fatalf("persistent workdir must be shared: %s vs %s", wt1, wt2)
+	}
+
+	// A read-only role gets a fresh per-run dir.
+	p3 := p
+	p3.RunID = "run-3"
+	p3.Role = "review"
+	wt3, _, _, cleanup3, err := ensureGitWorkdir(ctx, p3)
+	if err != nil {
+		t.Fatalf("workdir 3: %v", err)
+	}
+	defer cleanup3()
+	if wt3 == wt1 {
+		t.Fatalf("read-only runs must get fresh workdirs, got the owner's %s", wt3)
+	}
+	if !strings.Contains(wt3, "run-3") {
+		t.Fatalf("read-only workdir must be per-run: %s", wt3)
+	}
+}

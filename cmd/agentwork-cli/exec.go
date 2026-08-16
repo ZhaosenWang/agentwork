@@ -94,20 +94,20 @@ func (e *executor) execute(p link.RunDispatchParams) {
 	// local directory layout (mirrors the daemon's); git domains get a
 	// worktree on the goal branch — and the completed run's changes are
 	// committed + pushed as agentwork/<branch> (中转, Phase 3).
-	var workdir, repo, branch string
+	var workdir, repo, branch, sessionID string
 	var cleanupGit func()
 	if p.Proc {
 		workdir = machineProcWorkdir(p.RunID)
 		if p.Scratch {
 			if err := os.MkdirAll(workdir, 0o755); err != nil {
-				e.finish(p, "failed", fmt.Sprintf("workdir: %v", err))
+				e.finish(p, "", "", "failed", fmt.Sprintf("workdir: %v", err))
 				return
 			}
 		} else {
 			var err error
 			repo, err = ensureBareRepo(ctx, p)
 			if err != nil {
-				e.finish(p, "failed", fmt.Sprintf("git: %v", err))
+				e.finish(p, "", "", "failed", fmt.Sprintf("git: %v", err))
 				return
 			}
 			def := p.DefaultBranch
@@ -115,7 +115,7 @@ func (e *executor) execute(p link.RunDispatchParams) {
 				def = "main"
 			}
 			if out, err := runGit(ctx, repo, "worktree", "add", "--force", "--detach", workdir, "origin/"+def); err != nil {
-				e.finish(p, "failed", fmt.Sprintf("worktree add: %v: %s", err, out))
+				e.finish(p, "", "", "failed", fmt.Sprintf("worktree add: %v: %s", err, out))
 				return
 			}
 			defer func() {
@@ -132,14 +132,14 @@ func (e *executor) execute(p link.RunDispatchParams) {
 		var err error
 		workdir, err = scratchWorkdir(p)
 		if err != nil {
-			e.finish(p, "failed", fmt.Sprintf("workdir: %v", err))
+			e.finish(p, "", "", "failed", fmt.Sprintf("workdir: %v", err))
 			return
 		}
 	} else {
 		var err error
 		workdir, repo, branch, cleanupGit, err = ensureGitWorkdir(ctx, p)
 		if err != nil {
-			e.finish(p, "failed", fmt.Sprintf("git: %v", err))
+			e.finish(p, "", "", "failed", fmt.Sprintf("git: %v", err))
 			return
 		}
 		// The cleanup runs AFTER the finish report — a hang here (repo lock
@@ -194,7 +194,7 @@ func (e *executor) execute(p link.RunDispatchParams) {
 		Cwd:        workdir,
 	}, e.buildEnv(p, workdir))
 	if err != nil {
-		e.finish(p, "failed", fmt.Sprintf("runtime: %v", err))
+		e.finish(p, "", "", "failed", fmt.Sprintf("runtime: %v", err))
 		return
 	}
 
@@ -202,9 +202,30 @@ func (e *executor) execute(p link.RunDispatchParams) {
 	sess, err := backend.OpenSession(ctx, proto.SessionSpec{Conn: conn, Cwd: workdir})
 	if err != nil {
 		_ = conn.Close()
-		e.finish(p, "failed", fmt.Sprintf("session: %v", err))
+		e.finish(p, "", "", "failed", fmt.Sprintf("session: %v", err))
 		return
 	}
+	sessionID = sess.SessionID()
+
+	// Session resume (multica-style): a prior session id resolves ONLY in
+	// the exact workdir it was recorded against — agent CLI session stores
+	// are keyed by cwd. Mismatch: drop the pointer and say so in the
+	// prompt (never silently restart). Load failure: the CLI's fresh
+	// process cannot resolve the id — continue on the fresh session; the
+	// cwd-keyed project store still gives partial continuity.
+	if p.PriorSessionID != "" && !p.Proc {
+		if p.PriorWorkDir == workdir {
+			if err := sess.LoadSession(ctx, p.PriorSessionID); err != nil {
+				cliLogf("exec: run %s session/load %s failed: %v — continuing fresh", p.RunID, shortSHA(p.PriorSessionID), err)
+			} else {
+				cliLogf("exec: run %s session resumed (%s)", p.RunID, shortSHA(p.PriorSessionID))
+			}
+		} else {
+			p.Prompt += "\n\nYour previous session could not be resumed: the working directory for this turn differs from the recorded one — you are starting fresh in this workspace."
+			cliLogf("exec: run %s prior session dropped (workdir %s != prior %s)", p.RunID, workdir, p.PriorWorkDir)
+		}
+	}
+
 	// Probe like the git cleanup: a session close that hangs (child process
 	// refusing to die) must not stall the sidecar.
 	defer func() {
@@ -225,7 +246,7 @@ func (e *executor) execute(p link.RunDispatchParams) {
 
 	run, err := sess.Prompt(ctx, p.Prompt)
 	if err != nil {
-		e.finish(p, "failed", fmt.Sprintf("prompt: %v", err))
+		e.finish(p, workdir, sessionID, "failed", fmt.Sprintf("prompt: %v", err))
 		return
 	}
 
@@ -271,14 +292,14 @@ loop:
 			flush()
 		case <-ctx.Done():
 			_ = sess.Cancel(context.Background())
-			e.finish(p, "cancelled", "cancelled by platform")
+			e.finish(p, workdir, sessionID, "cancelled", "cancelled by platform")
 			return
 		}
 	}
 
 	result, ok := <-run.Result
 	if !ok {
-		e.finish(p, "failed", "backend closed result channel")
+		e.finish(p, workdir, sessionID, "failed", "backend closed result channel")
 		return
 	}
 	status := "completed"
@@ -293,7 +314,7 @@ loop:
 		sha, err := commitAndPush(context.Background(), p, workdir, repo, branch, p.RunID, pushedProfile)
 		if err != nil {
 			cliLogf("exec: run %s commit/push failed: %v", p.RunID, err)
-			e.finish(p, "failed", "commit/push: "+err.Error())
+			e.finish(p, workdir, sessionID, "failed", "commit/push: "+err.Error())
 			return
 		}
 		if sha != "" {
@@ -303,7 +324,7 @@ loop:
 	}
 	// Processor runs upload their FILE results (the platform reads
 	// structured side effects, never agent stdout).
-	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output, Token: p.Token, HeadSHA: headSHA}
+	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output, Token: p.Token, HeadSHA: headSHA, SessionID: sessionID, WorkDir: workdir}
 	if p.Proc && status == "completed" {
 		finishParams.Artifacts = map[string]string{}
 		for _, f := range p.ArtifactFiles {
@@ -329,8 +350,8 @@ loop:
 // echoes the dispatch's per-run TOKEN: the daemon swallows stale reports
 // (an exec killed before a daemon restart must not cancel the attempt the
 // daemon re-dispatched after recovery).
-func (e *executor) finish(p link.RunDispatchParams, status, summary string) {
-	report := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: summary, Token: p.Token}
+func (e *executor) finish(p link.RunDispatchParams, workdir, sessionID, status, summary string) {
+	report := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: summary, Token: p.Token, SessionID: sessionID, WorkDir: workdir}
 	err := callRPC(e.peer, link.MethodRunFinished, report, nil, 30*time.Second)
 	if err == nil {
 		cliLogf("exec: run %s → %s", p.RunID, status)
