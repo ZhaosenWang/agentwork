@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/service"
 )
 
@@ -189,6 +190,7 @@ func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
 		_ = json.Unmarshal([]byte(raw), &st)
 	}
 	if st.IntakeAgent == "" {
+		logging.Warnf("intake: platform.m3 intake_agent unset — inbound IM messages will be rejected (Settings → 全局解析 Agent)")
 		return "", errors.New("未配置任务解析 agent（设置页 → 全局解析 Agent）")
 	}
 	return st.IntakeAgent, nil

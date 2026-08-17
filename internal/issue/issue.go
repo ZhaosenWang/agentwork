@@ -317,7 +317,8 @@ func (c *Closer) OnDelivered(ctx context.Context, goalID, note string, commits [
 	}
 	for _, line := range commits {
 		if len(line) >= 40 && isHexSHA(line[:40]) {
-			sha, title := line[:40], strings.TrimSpace(line[40:])
+			sha := line[:40]
+			title, _, _ := strings.Cut(strings.TrimSpace(line[40:]), "\n")
 			comment += fmt.Sprintf("\n- [%s %s](%s)", sha[:8], title, client.CommitURL(repo, sha))
 		}
 	}

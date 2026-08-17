@@ -15,6 +15,7 @@ import (
 
 	"github.com/eushing/agentwork/internal/daemon"
 	"github.com/eushing/agentwork/internal/issue"
+	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/notify"
 	"github.com/eushing/agentwork/internal/service"
 )
@@ -797,6 +798,18 @@ func (h *Handlers) getPlatformSettings(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) putPlatformSettings(w http.ResponseWriter, r *http.Request) {
 	var body platformSettings
+	// Merge-write: preload the existing blob, then overlay the request body.
+	// Go's json.Decode leaves absent fields untouched and only overwrites on
+	// an explicit "". This stops a partial PUT (e.g. just digest_time) from
+	// wiping a configured intake_agent back to "".
+	if raw, err := h.Settings.Get(r.Context(), platformSettingsKey); err == nil && raw != "" {
+		if err := json.Unmarshal([]byte(raw), &body); err != nil {
+			logging.Warnf("settings: platform settings blob corrupt, merge-write starts fresh: %v", err)
+		}
+	}
+	if v, _ := h.Settings.Get(r.Context(), webhookSecretKey); v != "" {
+		body.WebhookSecret = v
+	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, nil, service.NewValidationError("invalid body: "+err.Error()))
 		return
