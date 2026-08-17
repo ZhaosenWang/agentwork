@@ -66,6 +66,15 @@ func saveState(s cliState) {
 	_ = os.WriteFile(stateFile(), b, 0o644)
 }
 
+// scanDirsFlag collects repeatable --scan flags.
+type scanDirsFlag []string
+
+func (s *scanDirsFlag) String() string { return strings.Join(*s, ",") }
+func (s *scanDirsFlag) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 // connectCmd runs `agentwork connect`: dial the daemon's /connect link,
 // register this machine (probing its agent CLIs), then heartbeat until
 // interrupted. Reconnects with exponential backoff.
@@ -74,6 +83,8 @@ func connectCmd(args []string) {
 	server := fs.String("server", defaultServerURL, "agentwork-daemon address")
 	token := fs.String("token", "", "register token (daemon-side platform.worker_token; empty = none)")
 	name := fs.String("name", "", "machine display name (default: hostname)")
+	var scanDirs scanDirsFlag
+	fs.Var(&scanDirs, "scan", "extra directory (or glob, e.g. /opt/*/ or /opt/**/) to scan for agent CLIs not on PATH (repeatable; ~ expanded)")
 	fs.Parse(args)
 
 	hostname, _ := os.Hostname()
@@ -117,7 +128,7 @@ func connectCmd(args []string) {
 
 	backoff := time.Second
 	for {
-		if err := runLink(ctx, wsURL, st, *name, hostname); err != nil {
+		if err := runLink(ctx, wsURL, st, *name, hostname, []string(scanDirs)); err != nil {
 			cliLogf("connect: %v — reconnecting in %s", err, backoff)
 		}
 		select {
@@ -135,7 +146,7 @@ func connectCmd(args []string) {
 // runLink holds one connection: register → heartbeat loop → drain until
 // the link dies or ctx is cancelled. Returns the exit error for the
 // reconnect loop (nil on ctx cancellation — that is a clean shutdown).
-func runLink(ctx context.Context, wsURL string, st cliState, name, hostname string) error {
+func runLink(ctx context.Context, wsURL string, st cliState, name, hostname string, scanDirs []string) error {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		cliLogf("link: dial %s: %v", wsURL, err)
@@ -202,7 +213,7 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 		return res, nil
 	})
 
-	clis := probeCLIs(ctx)
+	clis := probeCLIs(ctx, scanDirs)
 	cliLogf("link: probed %d agent CLI(s)", len(clis))
 
 	var res link.RegisterResult
@@ -284,7 +295,7 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 			st.ConnectedAt = time.Now()
 			saveState(st)
 		case <-probeTick.C:
-			fresh := probeCLIs(ctx)
+			fresh := probeCLIs(ctx, scanDirs)
 			if probeSig(fresh) != probeSig(clis) {
 				clis = fresh
 				st.ProbedCLIs = fresh

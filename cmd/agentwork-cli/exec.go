@@ -50,7 +50,7 @@ func (e *executor) reprobeAfterSpawnFailure() {
 		}
 		_ = e.peer.Notify(ctx, link.MethodMachineProbeUpdate, link.ProbeUpdateParams{
 			MachineID: st.MachineID,
-			CLIs:      probeCLIs(ctx),
+			CLIs:      probeCLIs(ctx, nil),
 		})
 	}()
 }

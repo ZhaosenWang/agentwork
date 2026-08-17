@@ -1477,6 +1477,13 @@ func (d *Daemon) cleanupWorktrees(ctx context.Context) {
 // The durable state is the commits; a crashed run's uncommitted WIP is lost
 // (A5 recovery = transcript + committed state).
 func (d *Daemon) sweepRunWorktrees(ctx context.Context) {
+	// First boot: the runs root does not exist yet — create it instead of
+	// logging a spurious sweep error (live: a fresh daemon reported
+	// "read runs root: no such file or directory").
+	if err := os.MkdirAll(runsRoot(), 0o755); err != nil {
+		logging.Errorf("daemon: sweep run worktrees: mkdir runs root: %v", err)
+		return
+	}
 	repoRoot := filepath.Join(runsRoot(), "repos")
 	// Run worktrees live directly under runsRoot() as <runID>/ dirs, alongside
 	// the named siblings (repos/, proc/, scratch/, deliver-*). Sweep only the

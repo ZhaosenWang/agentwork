@@ -106,14 +106,16 @@ func issueCmd(serverURL, goalID string, args []string) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `agentwork-cli — agent-side tool (called by agents during task execution)
+	fmt.Fprintln(os.Stderr, `agentwork — agent-side tool (called by agents during task execution)
 and remote-machine sidecar (register this host to agentwork-daemon).
 
 Subcommands:
-  connect [--server URL] [--token T] [--name N]
+  connect [--server URL] [--token T] [--name N] [--scan DIR|GLOB ...]
                                              connect this machine to agentwork-daemon (default
                                              127.0.0.1:7373, no auth), probe its agent CLIs and
-                                             register them; heartbeats until interrupted
+                                             register them; --scan adds a directory to search for
+                                             agent CLIs not on PATH (repeatable; ~ expanded);
+                                             heartbeats until interrupted
   status                                     show the persisted connection state (machine id,
                                              server, last heartbeat, probed agent CLIs)
   goal list [--limit N] [--status S] [--json]  list goals (JSON — the default format; --json requests

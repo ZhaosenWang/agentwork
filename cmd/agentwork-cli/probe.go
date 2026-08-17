@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/eushing/agentwork/internal/link"
 )
 
@@ -73,19 +74,45 @@ func projectSkillsDirs() []string {
 	return out
 }
 
-// probeCLIs scans the environment for the probe-table CLIs. Probe commands
+// probeCLIs scans the environment for the probe-table CLIs: PATH first,
+// then each --scan directory (a CLI installed outside PATH — the common
+// case for absolute-path installs). When a scan dir resolves the CLI, the
+// reported ACPSpawn carries the ABSOLUTE executable so the runtime row
+// spawns correctly on a machine whose PATH never sees it. Probe commands
 // get a hard timeout derived from ctx (a hung version check must not stall
 // registration; Ctrl+C aborts probing too).
-func probeCLIs(ctx context.Context) []link.ProbeCLI {
+func probeCLIs(ctx context.Context, scanDirs []string) []link.ProbeCLI {
 	out := []link.ProbeCLI{}
 	for _, e := range probeTable {
-		if !probeRuns(ctx, e.ProbeCmd) {
-			continue
+		spawn := e.ACPSpawn
+		extraPath := "" // scan dir that resolved the CLI (empty = found on PATH)
+		if !probeRuns(ctx, e.ProbeCmd, "") {
+			for _, pattern := range scanDirs {
+				for _, d := range scanDirsFor(pattern) {
+					if abs, err := filepath.Abs(d); err == nil {
+						d = abs
+					}
+					if !probeRuns(ctx, e.ProbeCmd, d) {
+						continue
+					}
+					extraPath = d
+					break
+				}
+				if extraPath != "" {
+					break
+				}
+			}
+			if extraPath == "" {
+				continue
+			}
+		}
+		if extraPath != "" {
+			spawn = append([]string{filepath.Join(extraPath, e.Name)}, e.ACPSpawn[1:]...)
 		}
 		out = append(out, link.ProbeCLI{
 			Name:             e.Name,
-			Version:          probeVersion(ctx, e.ProbeCmd),
-			ACPSpawn:         e.ACPSpawn,
+			Version:          probeVersion(ctx, e.ProbeCmd, extraPath),
+			ACPSpawn:         spawn,
 			SkillsDir:        expandHome(e.SkillsDir),
 			ProjectSkillsDir: e.ProjectSkillsDir,
 			ProfileFiles:     e.ProfileFiles,
@@ -94,19 +121,50 @@ func probeCLIs(ctx context.Context) []link.ProbeCLI {
 	return out
 }
 
-// probeRuns reports whether the probe command executes successfully.
-func probeRuns(ctx context.Context, cmd string) bool {
+// scanDirsFor expands one --scan argument into concrete directories: ~ is
+// expanded, glob patterns are resolved via doublestar (`*` one segment,
+// `**` recursive — /opt/**/ = any depth under /opt), and non-directory
+// matches are dropped. Plain paths pass through unchanged.
+func scanDirsFor(pattern string) []string {
+	pattern = expandHome(pattern)
+	if !strings.ContainsAny(pattern, "*?[") {
+		return []string{pattern}
+	}
+	matches, err := doublestar.FilepathGlob(pattern)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if fi, err := os.Stat(m); err == nil && fi.IsDir() {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// probeRuns reports whether the probe command executes successfully, with
+// extraPath (a --scan dir) prepended to PATH when non-empty.
+func probeRuns(ctx context.Context, cmd, extraPath string) bool {
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	return exec.CommandContext(pctx, "sh", "-c", cmd).Run() == nil
+	c := exec.CommandContext(pctx, "sh", "-c", cmd)
+	if extraPath != "" {
+		c.Env = append(os.Environ(), "PATH="+extraPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	return c.Run() == nil
 }
 
 // probeVersion runs the probe command and returns its first output line,
 // trimmed (” when the CLI prints nothing).
-func probeVersion(ctx context.Context, cmd string) string {
+func probeVersion(ctx context.Context, cmd, extraPath string) string {
 	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	b, err := exec.CommandContext(pctx, "sh", "-c", cmd).CombinedOutput()
+	c := exec.CommandContext(pctx, "sh", "-c", cmd)
+	if extraPath != "" {
+		c.Env = append(os.Environ(), "PATH="+extraPath+string(os.PathListSeparator)+os.Getenv("PATH"))
+	}
+	b, err := c.CombinedOutput()
 	if err != nil {
 		return ""
 	}
