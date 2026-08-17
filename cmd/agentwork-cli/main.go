@@ -27,14 +27,23 @@ const (
 
 var httpClient = &http.Client{Timeout: httpTimeout}
 
+// serverURL resolves the daemon's HTTP base address the SAME way connect
+// resolves its WebSocket address: the AGENTWORK_SERVER_URL env var (injected
+// by the executor at spawn) with the default listen addr fallback. Every
+// command reads it here — no caller threads a serverURL parameter through
+// the dispatch chain (the agent CLI and the human debugging CLI share one
+// binary and one resolution path).
+func serverURL() string {
+	if u := os.Getenv("AGENTWORK_SERVER_URL"); u != "" {
+		return u
+	}
+	return defaultServerURL
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
-	}
-	serverURL := os.Getenv("AGENTWORK_SERVER_URL")
-	if serverURL == "" {
-		serverURL = defaultServerURL
 	}
 	goalID := os.Getenv("AGENTWORK_GOAL_ID")
 	agentID := os.Getenv("AGENTWORK_AGENT_ID")
@@ -47,19 +56,19 @@ func main() {
 		statusCmd(os.Args[2:])
 		return
 	case "goal":
-		goalCmd(serverURL, goalID, agentID, os.Args[2:])
+		goalCmd(goalID, agentID, os.Args[2:])
 	case "agent":
-		agentCmd(serverURL, os.Args[2:])
+		agentCmd(os.Args[2:])
 	case "squad":
-		squadCmd(serverURL, os.Args[2:])
+		squadCmd(os.Args[2:])
 	case "stats":
-		statsCmd(serverURL, os.Args[2:])
+		statsCmd(os.Args[2:])
 	case "subgoal":
 		subgoalCmd(os.Args[2:])
 	case "change":
 		changeCmd(os.Args[2:])
 	case "issue":
-		issueCmd(serverURL, goalID, os.Args[2:])
+		issueCmd(goalID, os.Args[2:])
 	case "version":
 		versionCmd()
 		return
@@ -75,7 +84,7 @@ func main() {
 // issueCmd lets the agent reply to the issue behind its current goal (M4-B):
 // the platform owns the GitHub token and executes the comment — the agent
 // only produces the structured side effect.
-func issueCmd(serverURL, goalID string, args []string) {
+func issueCmd(goalID string, args []string) {
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: agentwork-cli issue comment --text \"...\"")
 		os.Exit(2)
@@ -93,7 +102,7 @@ func issueCmd(serverURL, goalID string, args []string) {
 	if err != nil {
 		fail(err.Error())
 	}
-	resp, err := http.Post(serverURL+"/issue-comments", "application/json", strings.NewReader(string(body)))
+	resp, err := http.Post(serverURL()+"/issue-comments", "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		fail("issue comment: " + err.Error())
 	}
@@ -158,24 +167,24 @@ Environment (injected by daemon):
 
 // ── goal ──
 
-func goalCmd(serverURL, goalID, agentID string, args []string) {
+func goalCmd(goalID, agentID string, args []string) {
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: agentwork-cli goal <list|assign|create|comment|wait>")
 		os.Exit(2)
 	}
 	switch args[0] {
 	case "list":
-		goalList(serverURL, args[1:])
+		goalList(args[1:])
 	case "assign":
-		goalAssign(serverURL, goalID, args[1:])
+		goalAssign(goalID, args[1:])
 	case "create":
-		goalCreate(serverURL, goalID, agentID, args[1:])
+		goalCreate(goalID, agentID, args[1:])
 	case "comment":
-		goalComment(serverURL, goalID, args[1:])
+		goalComment(goalID, args[1:])
 	case "comments":
-		goalComments(serverURL, goalID, args[1:])
+		goalComments(goalID, args[1:])
 	case "wait":
-		goalWait(serverURL, goalID, args[1:])
+		goalWait(goalID, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown goal subcommand %q\n", args[0])
 		os.Exit(2)
@@ -190,7 +199,7 @@ func goalCmd(serverURL, goalID, agentID string, args []string) {
 // recent matches. Output is JSON — the CLI's native format (agents parse
 // stdout), so it is also the default; --json is the explicit selector for
 // that format.
-func goalList(serverURL string, args []string) {
+func goalList(args []string) {
 	fs := flag.NewFlagSet("goal list", flag.ExitOnError)
 	limit := fs.Int("limit", 0, "max number of goals to return (0 = all)")
 	status := fs.String("status", "", "only list goals with this status (exact match)")
@@ -201,11 +210,11 @@ func goalList(serverURL string, args []string) {
 	// JSON, so the body is streamed through unchanged.
 	_ = jsonOut
 	if *status == "" {
-		get(goalListURL(serverURL, *limit))
+		get(goalListURL(*limit))
 		return
 	}
 	var goals []json.RawMessage
-	if err := getJSON(goalListURL(serverURL, 0), &goals); err != nil {
+	if err := getJSON(goalListURL(0), &goals); err != nil {
 		fail("%v", err)
 	}
 	out := filterGoalsByStatus(goals, *status)
@@ -237,15 +246,22 @@ func filterGoalsByStatus(goals []json.RawMessage, want string) []json.RawMessage
 }
 
 // goalListURL builds the GET /goals URL, appending ?limit=N when N > 0.
-func goalListURL(serverURL string, limit int) string {
-	url := serverURL + "/goals"
+func goalListURL(limit int) string {
+	url := serverURL() + "/goals"
 	if limit > 0 {
 		url += fmt.Sprintf("?limit=%d", limit)
 	}
 	return url
 }
 
-func goalAssign(serverURL, goalID string, args []string) {
+// goalAssign hands the current goal off to another agent via /rpc — the
+// per-run token (env AGENTWORK_TOKEN) is the identity, resolved server-side
+// to the actor. The HTTP /goals/{id}/assign surface carries no agent
+// identity (it is the human's action), so an agent handoff over HTTP lost
+// its actor and the service-layer owner check was skipped (any agent could
+// grab any goal). Over /rpc the token anchors the actor and Assign enforces
+// "only the current owner can hand off".
+func goalAssign(goalID string, args []string) {
 	fs := flag.NewFlagSet("goal assign", flag.ExitOnError)
 	note := fs.String("note", "", "handoff note for the next agent")
 	fs.Parse(args)
@@ -256,11 +272,19 @@ func goalAssign(serverURL, goalID string, args []string) {
 	if goalID == "" {
 		fail("AGENTWORK_GOAL_ID not set")
 	}
-	body := map[string]string{"assignee_type": "agent", "assignee_id": fs.Arg(0), "handoff_note": *note}
-	post(serverURL+"/goals/"+goalID+"/assign", body)
+	var out map[string]any
+	if err := rpcCall(link.MethodGoalAssign, link.GoalAssignParams{
+		RPCToken:     rpcToken(),
+		AssigneeType: "agent",
+		AssigneeID:   fs.Arg(0),
+		HandoffNote:  *note,
+	}, &out); err != nil {
+		fail("%v", err)
+	}
+	rpcPrintJSON(out)
 }
 
-func goalCreate(serverURL, goalID, agentID string, args []string) {
+func goalCreate(goalID, agentID string, args []string) {
 	fs := flag.NewFlagSet("goal create", flag.ExitOnError)
 	title := fs.String("title", "", "goal title (required)")
 	description := fs.String("description", "", "goal description (the work to do)")
@@ -291,13 +315,13 @@ func goalCreate(serverURL, goalID, agentID string, args []string) {
 		"created_by_type": "agent",
 		"created_by_id":   agentID,
 	}
-	post(serverURL+"/goals", body)
+	post(serverURL()+"/goals", body)
 }
 
 // goalComment posts a comment on the run's goal via /rpc — the per-run
 // token (env AGENTWORK_TOKEN) is the identity; the daemon resolves it to
 // the run's goal and agent.
-func goalComment(serverURL, goalID string, args []string) {
+func goalComment(goalID string, args []string) {
 	fs := flag.NewFlagSet("goal comment", flag.ExitOnError)
 	text := fs.String("text", "", "comment text (required; may contain a structured mention)")
 	parent := fs.String("parent", "", "parent comment id (optional — replies thread under it)")
@@ -320,7 +344,7 @@ func goalComment(serverURL, goalID string, args []string) {
 
 // goalComments pulls the run's goal comment feed via /rpc — the shared
 // context. --after reads incrementally from the last seen comment id.
-func goalComments(serverURL, goalID string, args []string) {
+func goalComments(goalID string, args []string) {
 	fs := flag.NewFlagSet("goal comments", flag.ExitOnError)
 	after := fs.String("after", "", "only comments after this id (incremental read)")
 	limit := fs.Int("limit", 50, "max comments to return")
@@ -338,7 +362,7 @@ func goalComments(serverURL, goalID string, args []string) {
 
 // goalWait parks until the goal's sub-goals settle (or the server-side
 // timeout) via /rpc, then prints their states.
-func goalWait(serverURL, goalID string, args []string) {
+func goalWait(goalID string, args []string) {
 	var states []map[string]any
 	if err := rpcCall(link.MethodGoalWait, link.GoalWaitParams{RPCToken: rpcToken()}, &states); err != nil {
 		fail("%v", err)
@@ -349,28 +373,28 @@ func goalWait(serverURL, goalID string, args []string) {
 
 // ── agent / squad ──
 
-func agentCmd(serverURL string, args []string) {
+func agentCmd(args []string) {
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: agentwork-cli agent <list>")
 		os.Exit(2)
 	}
 	switch args[0] {
 	case "list":
-		get(serverURL + "/agents")
+		get(serverURL() + "/agents")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown agent subcommand %q\n", args[0])
 		os.Exit(2)
 	}
 }
 
-func squadCmd(serverURL string, args []string) {
+func squadCmd(args []string) {
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: agentwork-cli squad <list>")
 		os.Exit(2)
 	}
 	switch args[0] {
 	case "list":
-		get(serverURL + "/squads")
+		get(serverURL() + "/squads")
 	default:
 		fmt.Fprintf(os.Stderr, "unknown squad subcommand %q\n", args[0])
 		os.Exit(2)
@@ -441,27 +465,27 @@ func bucketRuns(runs []cliRun) statusBucket {
 }
 
 // runsListURL builds the GET /goals/{id}/runs URL.
-func runsListURL(serverURL, goalID string) string {
-	return serverURL + "/goals/" + goalID + "/runs"
+func runsListURL(goalID string) string {
+	return serverURL() + "/goals/" + goalID + "/runs"
 }
 
 // statsCmd implements `stats`: goal stats come from GET /goals; run stats are
 // aggregated by fanning out to GET /goals/{id}/runs for every goal and
 // summing the per-status counts. Output is a single JSON object, matching the
 // JSON output style of the other commands.
-func statsCmd(serverURL string, args []string) {
+func statsCmd(args []string) {
 	fs := flag.NewFlagSet("stats", flag.ExitOnError)
 	fs.Parse(args)
 
 	var goals []cliGoal
-	if err := getJSON(goalListURL(serverURL, 0), &goals); err != nil {
+	if err := getJSON(goalListURL(0), &goals); err != nil {
 		fail("%v", err)
 	}
 
 	var allRuns []cliRun
 	for _, g := range goals {
 		var runs []cliRun
-		if err := getJSON(runsListURL(serverURL, g.ID), &runs); err != nil {
+		if err := getJSON(runsListURL(g.ID), &runs); err != nil {
 			fail("%v", err)
 		}
 		allRuns = append(allRuns, runs...)

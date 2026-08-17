@@ -39,7 +39,7 @@ func newExecutor(peer *link.Peer, serverURL string) *executor {
 
 // reprobeAfterSpawnFailure re-probes the machine and pushes a fresh probe
 // report after a spawn failure — an uninstalled CLI should be marked
-// absent immediately, not at the next 5-minute probe tick.
+// absent immediately, not at the next 1-minute probe tick.
 func (e *executor) reprobeAfterSpawnFailure() {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

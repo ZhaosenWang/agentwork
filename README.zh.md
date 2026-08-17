@@ -19,7 +19,7 @@ daemon + Next.js Web 界面。
   机器或 agent 验证）；验证通过的子任务产出 **Change**（带修订版本），owner
   集成——冲突会自动唤醒 assignee 返修
 - **四种协作行为** — Comment（说）/ Consult（问）/ Handoff（接力）/ Sub-goal
-  （拆活），以 MCP 工具暴露，owner 权限内联
+  （拆活），以 `agentwork` CLI 暴露，owner 权限在服务端强制
 - **多协议多传输** — ACP / JSONL / JSON-RPC × stdio / ws / tcp；agent 可挂
   自己的额外 MCP 服务器
 - **多触发渠道** — Web、cron 定时、GitHub/GitCode issue（webhook + 轮询）、
@@ -95,16 +95,18 @@ npm run build && npm start
 
 ## 协作（四种行为）
 
-| 行为 | 工具 | 权限 |
+| 行为 | CLI 命令 | 权限 |
 |---|---|---|
-| **Comment**（说） | `comment_goal` | 任何人 |
-| **Consult**（问） | `consult_agent` | goal 的 owner |
-| **Handoff**（接力） | `handoff_goal` | goal 的 owner |
-| **Sub-goal**（拆活） | `create_sub_goal` / `cancel_sub_goal` | goal 的 owner |
+| **Comment**（说） | `agentwork goal comment --text T` | 任何人 |
+| **Consult**（问） | `goal comment` 里 mention：`[@Name](mention://agent/<id>)` | goal 的 owner |
+| **Handoff**（接力） | `agentwork goal assign <to-agent-id> [--note N]` | goal 的 owner |
+| **Sub-goal**（拆活） | `agentwork subgoal create --title T --assignee A` / `subgoal cancel <id>` | goal 的 owner |
 
-agent 只通过每次会话广告的 `agentwork` MCP 工具协作（另有 `verify_sub_goal`、
-`integrate_change`、`get_change`、`get_sub_goal`、`get_verification` 及
-`*_list` 工具）。完整模型见 [Collaboration.v2.md](Collaboration.v2.md)。
+agent 只通过 `agentwork` CLI（守护进程二进制的 shim，spawn 时放进 agent 的 PATH）
+协作。每条命令携带 per-run token（`AGENTWORK_TOKEN`），守护进程 `/rpc` 端点将其
+解析为 run 的 `(goal, agent, role)`——token 是唯一身份，自报 id 被忽略，handoff
+的 owner 校验在服务端强制。另有 `subgoal verify`、`change integrate` 及
+`*_list` 命令。完整模型见 [Collaboration.v2.md](Collaboration.v2.md)。
 
 ## 架构
 
@@ -127,8 +129,8 @@ agent 只通过每次会话广告的 `agentwork` MCP 工具协作（另有 `veri
                                  ▼
                           agent CLI 子进程 ◄── ACP 帧原样中继
                            （stdio/ws/tcp）
-                           └─ fs/terminal RPC + agentwork MCP
-                              （worktree、工具）
+                           └─ fs/terminal RPC + agentwork CLI（/rpc）
+                              （worktree、协作命令）
                  ┌───────────────┬─────────────────────────────┘
                  ▼               ▼
          机器验证 / 约束     卡点 → 交付
@@ -147,7 +149,7 @@ agent 只通过每次会话广告的 `agentwork` MCP 工具协作（另有 `veri
 
 ## CLI 工具
 
-`agentwork` 既是**机器执行器**，也是人调试用的工具（agent 走 MCP 工具）：
+`agentwork` 既是**机器执行器**，也是人调试用的工具（agent 走 `agentwork` CLI shim 协作）：
 
 ```bash
 agentwork connect               # 机器侧：拉取派发、执行 run、托管聊天桥

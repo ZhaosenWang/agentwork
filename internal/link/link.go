@@ -48,6 +48,7 @@ const (
 	MethodGoalComment  = "goal.comment"
 	MethodGoalComments = "goal.comments"
 	MethodGoalList     = "goal.list"
+	MethodGoalAssign   = "goal.assign" // agent handoff — actor resolved from the run token (the HTTP surface carries no agent identity)
 	MethodAgentList    = "agent.list"
 	MethodSquadList    = "squad.list"
 	MethodSubGoalList  = "subgoal.list"
@@ -156,6 +157,17 @@ type GoalCommentsParams struct {
 	RPCToken
 	After string `json:"after,omitempty"`
 	Limit int    `json:"limit,omitempty"`
+}
+
+// GoalAssignParams hands the run's goal off to another agent. The actor is
+// resolved from the run token — the HTTP /goals/{id}/assign surface carries
+// no agent identity, so an agent's `goal assign` via HTTP lost its actor and
+// the service-layer owner check was skipped (any agent could grab any goal).
+type GoalAssignParams struct {
+	RPCToken
+	AssigneeType string `json:"assignee_type"` // "agent" | "squad" | "human"
+	AssigneeID   string `json:"assignee_id,omitempty"`
+	HandoffNote  string `json:"handoff_note,omitempty"`
 }
 
 // GoalListParams lists goals (the agent resolves ids for mentions).

@@ -11,21 +11,23 @@ import (
 )
 
 // TestGoalListURL: no limit (or non-positive) → bare /goals; positive limit
-// → ?limit=N appended.
+// → ?limit=N appended. The base URL comes from AGENTWORK_SERVER_URL (the
+// same env every command reads — no parameter threading).
 func TestGoalListURL(t *testing.T) {
+	const base = "http://127.0.0.1:7373"
+	t.Setenv("AGENTWORK_SERVER_URL", base)
 	cases := []struct {
-		serverURL string
-		limit     int
-		want      string
+		limit int
+		want  string
 	}{
-		{"http://127.0.0.1:7373", 0, "http://127.0.0.1:7373/goals"},
-		{"http://127.0.0.1:7373", -1, "http://127.0.0.1:7373/goals"},
-		{"http://127.0.0.1:7373", 1, "http://127.0.0.1:7373/goals?limit=1"},
-		{"http://127.0.0.1:7373", 10, "http://127.0.0.1:7373/goals?limit=10"},
+		{0, base + "/goals"},
+		{-1, base + "/goals"},
+		{1, base + "/goals?limit=1"},
+		{10, base + "/goals?limit=10"},
 	}
 	for _, c := range cases {
-		if got := goalListURL(c.serverURL, c.limit); got != c.want {
-			t.Fatalf("goalListURL(%q, %d) = %q, want %q", c.serverURL, c.limit, got, c.want)
+		if got := goalListURL(c.limit); got != c.want {
+			t.Fatalf("goalListURL(%d) = %q, want %q", c.limit, got, c.want)
 		}
 	}
 }
@@ -76,7 +78,8 @@ func TestGoalListStatusEndToEnd(t *testing.T) {
 	old := os.Stdout
 	pr, pw, _ := os.Pipe()
 	os.Stdout = pw
-	goalList(srv.URL, []string{"--status", "active"})
+	t.Setenv("AGENTWORK_SERVER_URL", srv.URL)
+	goalList([]string{"--status", "active"})
 	_ = pw.Close()
 	os.Stdout = old
 	out, _ := io.ReadAll(pr)
@@ -118,7 +121,8 @@ func TestGoalListStatusLimitEndToEnd(t *testing.T) {
 	old := os.Stdout
 	pr, pw, _ := os.Pipe()
 	os.Stdout = pw
-	goalList(srv.URL, []string{"--status", "active", "--limit", "1"})
+	t.Setenv("AGENTWORK_SERVER_URL", srv.URL)
+	goalList([]string{"--status", "active", "--limit", "1"})
 	_ = pw.Close()
 	os.Stdout = old
 	out, _ := io.ReadAll(pr)
@@ -146,19 +150,21 @@ func TestVersionCmd(t *testing.T) {
 	}
 }
 
-// TestRunsListURL: GET /goals/{id}/runs URL building.
+// TestRunsListURL: GET /goals/{id}/runs URL building. The base URL comes
+// from AGENTWORK_SERVER_URL (the same env every command reads).
 func TestRunsListURL(t *testing.T) {
+	const base = "http://127.0.0.1:7373"
+	t.Setenv("AGENTWORK_SERVER_URL", base)
 	cases := []struct {
-		serverURL string
-		goalID    string
-		want      string
+		goalID string
+		want   string
 	}{
-		{"http://127.0.0.1:7373", "g1", "http://127.0.0.1:7373/goals/g1/runs"},
-		{"http://127.0.0.1:7373", "a/b", "http://127.0.0.1:7373/goals/a/b/runs"},
+		{"g1", base + "/goals/g1/runs"},
+		{"a/b", base + "/goals/a/b/runs"},
 	}
 	for _, c := range cases {
-		if got := runsListURL(c.serverURL, c.goalID); got != c.want {
-			t.Fatalf("runsListURL(%q, %q) = %q, want %q", c.serverURL, c.goalID, got, c.want)
+		if got := runsListURL(c.goalID); got != c.want {
+			t.Fatalf("runsListURL(%q) = %q, want %q", c.goalID, got, c.want)
 		}
 	}
 }
@@ -311,7 +317,8 @@ func TestGoalListJSONFlag(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			out := captureStdout(t, func() { goalList(srv.URL, c.args) })
+			t.Setenv("AGENTWORK_SERVER_URL", srv.URL)
+			out := captureStdout(t, func() { goalList(c.args) })
 			var got []cliGoal
 			if err := json.Unmarshal(out, &got); err != nil {
 				t.Fatalf("goal list output is not valid JSON: %v\n%s", err, out)
@@ -353,11 +360,12 @@ func TestStatsCmdEndToEnd(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	t.Setenv("AGENTWORK_SERVER_URL", srv.URL)
 
 	old := os.Stdout
 	pr, pw, _ := os.Pipe()
 	os.Stdout = pw
-	statsCmd(srv.URL, nil)
+	statsCmd(nil)
 	_ = pw.Close()
 	os.Stdout = old
 	out, _ := io.ReadAll(pr)
@@ -399,11 +407,12 @@ func TestStatsCmdEndToEndEmpty(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
+	t.Setenv("AGENTWORK_SERVER_URL", srv.URL)
 
 	old := os.Stdout
 	pr, pw, _ := os.Pipe()
 	os.Stdout = pw
-	statsCmd(srv.URL, nil)
+	statsCmd(nil)
 	_ = pw.Close()
 	os.Stdout = old
 	out, _ := io.ReadAll(pr)

@@ -287,21 +287,26 @@ func (d *Daemon) IngestRunFinished(ctx context.Context, mid string, p link.RunFi
 	if machineID != "" && machineID != mid {
 		return &link.RPCError{Code: link.CodeForbidden, Message: "not this machine's run"}
 	}
-	if status != "running" {
-		logging.Infof("machine: run %s: late terminal report (%s) dropped — run is %s", p.RunID, p.Status, status)
-		return nil
-	}
+	// The token gates everything that writes run state — including the
+	// session pointer. A stale report from a re-claimed run (old token, the
+	// run was reset queued then re-claimed with a fresh token) must not
+	// overwrite the new run's session pointer. The handoff-cut case (status
+	// already 'cancelled', token STILL matches — onGoalAssigned does not
+	// rotate the token) is the reason MarkSession lives here, before the
+	// status guard: a handoff cut must still record the session the
+	// still-running executor was using, or the next owner loses memory.
 	if p.Token != "" && p.Token != token {
 		logging.Infof("machine: run %s: stale terminal report dropped (token mismatch — the run was re-claimed)", p.RunID)
 		return nil
 	}
-	// Record the session + workdir — the resume pointer the NEXT writable
-	// run of this goal/sub-goal carries (multica-style session continuity;
-	// the machine resumes only when the workdir still matches).
 	if kind != "processor" && (p.SessionID != "" || p.WorkDir != "") {
 		if err := d.runSvc.MarkSession(ctx, p.RunID, p.SessionID, p.WorkDir); err != nil {
 			logging.Infof("machine: run %s: mark session: %v", p.RunID, err)
 		}
+	}
+	if status != "running" {
+		logging.Infof("machine: run %s: late terminal report (%s) dropped — run is %s", p.RunID, p.Status, status)
+		return nil
 	}
 	// ACK NOW, process in the background: the completion pipeline
 	// (verification = venv+pip, minutes on a cold cache) ran INSIDE the

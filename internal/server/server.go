@@ -388,6 +388,31 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			return out, nil
 		})
 
+		// goal.assign — the agent handoff path. The HTTP /goals/{id}/assign
+		// surface carries no agent identity (single-user, the human's action),
+		// so an agent's `goal assign` via HTTP arrived with actor="" → defaulted
+		// to "human" → the service-layer owner check (决策 5-6) was skipped and
+		// ANY agent could grab ANY goal. Over /rpc the run token resolves the
+		// actor, and Assign enforces "only the current owner can hand off".
+		peer.Handle(link.MethodGoalAssign, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			id, rpcErr := resolve(raw)
+			if rpcErr != nil {
+				return nil, rpcErr
+			}
+			var p link.GoalAssignParams
+			if err := json.Unmarshal(raw, &p); err != nil || p.AssigneeType == "" {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "assignee_type is required"}
+			}
+			if p.AssigneeType != "human" && p.AssigneeID == "" {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "assignee_id is required for agent/squad"}
+			}
+			out, err := s.goalSvc.Assign(ctx, id.GoalID, p.AssigneeType, p.AssigneeID, p.HandoffNote, "agent", id.AgentID)
+			if err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			return out, nil
+		})
+
 		peer.Handle(link.MethodGoalList, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 			if _, rpcErr := resolve(raw); rpcErr != nil {
 				return nil, rpcErr

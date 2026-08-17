@@ -115,6 +115,47 @@ func TestHandoffEventRecorded(t *testing.T) {
 	}
 }
 
+// TestHandoffEventRecordsAgentActor is the regression for the goal-assign-via-
+// HTTP identity loss. When an agent hands off over /rpc, the run token resolves
+// to (actorType="agent", actorID=<owner agent>); the HTTP surface passed ("","")
+// and the actor defaulted to "human" — so the audit row's actor_type/actor_id
+// was always "human"/"" even for an agent-initiated handoff, breaking the
+// audit chain. This test pins that an agent actor is recorded faithfully.
+func TestHandoffEventRecordsAgentActor(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	ownerRun, err := rs.EnqueueForGoal(ctx, *g)
+	if err != nil {
+		t.Fatalf("enqueue owner: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='running', started_at=? WHERE id=?`, now(), ownerRun.ID); err != nil {
+		t.Fatalf("stamp running: %v", err)
+	}
+
+	// The agent-initiated handoff: actorType="agent", actorID=a (the owner).
+	// Over HTTP this arrived as ("","") → "human"/"" and the owner check was
+	// skipped; over /rpc the token resolves to the real agent actor.
+	if _, err := gs.Assign(ctx, g.ID, "agent", b, "I'll hand this to b", "agent", a); err != nil {
+		t.Fatalf("agent handoff must succeed: %v", err)
+	}
+	var actorType, actorID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT actor_type, actor_id FROM handoff_event WHERE goal_id=?`, g.ID).Scan(&actorType, &actorID); err != nil {
+		t.Fatalf("handoff_event row: %v", err)
+	}
+	if actorType != "agent" || actorID != a {
+		t.Fatalf("agent handoff must record actor_type=agent actor_id=%s, got %q/%q — the audit chain breaks when the actor is lost (the HTTP-surface bug)", a, actorType, actorID)
+	}
+}
+
 // TestHandoffCycleWarnAndPark: ≥4 handoffs write a system warning comment;
 // ≥8 park the goal in review — approve releases it (NO deliver), reject
 // fails it (决策 5-7: a collaboration anomaly is not an automatic failure).

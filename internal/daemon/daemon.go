@@ -1928,15 +1928,23 @@ func (d *Daemon) failProcessorRun(ctx context.Context, q *service.ClaimedRow, su
 // of the same goal (or sub-goal) recorded — the multica-style resume
 // pointer carried in the dispatch. The machine resumes only when its
 // computed workdir matches PriorWorkDir.
+//
+// Only a COMPLETED run's session is a safe resume target: a cancelled run
+// (handoff cut, watchdog, timeout) may carry a session POISONED by a killed
+// turn — the CLI's persisted history can hold an empty assistant message
+// that fails every future prompt (the executor's fresh-fallback exists for
+// exactly this, but resuming a known-poisoned session is a wasted failure +
+// memory loss). When no completed run exists yet, the pointer stays empty
+// and the next run starts fresh — preferable to resuming a poisoned session.
 func (d *Daemon) priorSessionFor(ctx context.Context, goalID, agentID, subGoalID string) (string, string) {
 	var sessionID, workdir string
 	if subGoalID != "" {
 		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT session_id, workdir FROM run WHERE sub_goal_id=? AND agent_id=? AND role='subgoal' AND session_id != '' ORDER BY finished_at DESC LIMIT 1`,
+			`SELECT session_id, workdir FROM run WHERE sub_goal_id=? AND agent_id=? AND role='subgoal' AND status='completed' AND session_id != '' ORDER BY finished_at DESC LIMIT 1`,
 			subGoalID, agentID).Scan(&sessionID, &workdir)
 	} else {
 		_ = d.st.DB().QueryRowContext(ctx,
-			`SELECT session_id, workdir FROM run WHERE goal_id=? AND agent_id=? AND role='owner' AND session_id != '' ORDER BY finished_at DESC LIMIT 1`,
+			`SELECT session_id, workdir FROM run WHERE goal_id=? AND agent_id=? AND role='owner' AND status='completed' AND session_id != '' ORDER BY finished_at DESC LIMIT 1`,
 			goalID, agentID).Scan(&sessionID, &workdir)
 	}
 	return sessionID, workdir
@@ -2602,6 +2610,34 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 				`SELECT result_summary FROM run WHERE sub_goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`,
 				in.subGoalID).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
 				extras.WriteString("\nYour previous round FAILED machine verification (fix the existing code, do NOT start over):\n" + truncateIn(lastFail, 1500) + "\n")
+			}
+		}
+	}
+	// Handoff memory (the cross-agent gap): a new owner's ACP session cannot
+	// load the previous owner's session (different persona, different
+	// persistent workdir keyed by (goal, agent) — the workdir-mismatch branch
+	// in the executor drops the pointer). The previous owner's last run report
+	// is the only memory that travels across the handoff, so inject it as
+	// context — without it the new owner starts blind ("像没有记忆一样").
+	// Only a COMPLETED run's report is real work context: a cancelled run's
+	// summary is "cancelled by platform" (platform noise, not the agent's
+	// words) and a failed run's summary is a verification trace — neither is
+	// the "continue from this" handoff the new owner needs, and a cancelled
+	// run ordered latest would mask the real completed report below it.
+	if in.runRole == "owner" && in.handoff != "" {
+		var prevSummary, prevAgentName string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT r.result_summary, COALESCE(a.name, '')
+			   FROM run r LEFT JOIN agent a ON a.id = r.agent_id
+			  WHERE r.goal_id=? AND r.role='owner' AND r.status='completed' AND r.result_summary != ''
+			  ORDER BY r.finished_at DESC LIMIT 1`,
+			q.GoalID).Scan(&prevSummary, &prevAgentName); err == nil {
+			if s := strings.TrimSpace(prevSummary); s != "" {
+				who := "the previous owner"
+				if prevAgentName != "" {
+					who = prevAgentName
+				}
+				extras.WriteString("\nPrevious owner's last report (" + who + ", do NOT start over — continue from this):\n" + truncateIn(s, 2000) + "\n")
 			}
 		}
 	}

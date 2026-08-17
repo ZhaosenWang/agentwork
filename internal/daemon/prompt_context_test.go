@@ -155,3 +155,126 @@ func TestWakeLineShapes(t *testing.T) {
 		t.Fatalf("assignment wake line:\n%s", wl)
 	}
 }
+
+// TestHandoffPromptCarriesPreviousOwnerReport is the regression for the
+// "agent 像没有记忆一样" handoff bug — the cross-agent memory gap. A new owner's
+// ACP session cannot load the previous owner's session (different persona +
+// agent-keyed persistent workdir), so the ONLY memory that travels across a
+// handoff is the previous owner's last run report. assemblePrompt's handoff
+// branch must inject it; without it the new owner starts blind and repeats
+// the previous owner's exploration.
+func TestHandoffPromptCarriesPreviousOwnerReport(t *testing.T) {
+	d, st, goalID, agentID := seedCtx(t)
+	ctx := context.Background()
+
+	// A previous owner run of this goal completed with a substantive report.
+	// The new owner (agentID here — seedCtx assigns the goal to it; we simulate
+	// a prior owner by inserting an older run under a different agent row that
+	// shares the same runtime).
+	var rtID string
+	if err := st.DB().QueryRowContext(ctx, `SELECT id FROM runtime LIMIT 1`).Scan(&rtID); err != nil {
+		t.Fatalf("load runtime: %v", err)
+	}
+	prevAgent, err := service.NewAgentService(st, events.NewBus()).Create(ctx, service.Agent{Name: "PrevOwner", RuntimeID: rtID})
+	if err != nil {
+		t.Fatalf("seed prev owner: %v", err)
+	}
+	// Seed a runtime row for the prev agent's runtime FK (seedCtx created rt
+	// with machine m1; reuse it).
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,status,role,attempt,result_summary,finished_at,queued_at,created_at)
+		 VALUES ('run-prev',?,?,?,?,?,?,?,?,?,?,?)`,
+		goalID, prevAgent.ID, "worker", "worker", "completed", "owner", 1,
+		"已经把登录页改好了，剩下的注册页还没动，token 放在 .env 里", "2026-08-17T10:00:00Z", "2026-08-17T09:00:00Z", "2026-08-17T09:00:00Z"); err != nil {
+		t.Fatalf("insert prev run: %v", err)
+	}
+
+	// A handoff wake: the new owner's prompt carries the handoff note + the
+	// previous owner's report as context.
+	q := &service.ClaimedRow{RunID: "run-new", GoalID: goalID, AgentID: agentID, Attempt: 1}
+	prompt := d.assemblePrompt(ctx, q, promptInputs{
+		runRole: "owner", goalTitle: "g",
+		handoff: "你来接手注册页",
+	})
+	if !strings.Contains(prompt, "你来接手注册页") {
+		t.Fatalf("handoff prompt must carry the handoff note, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Previous owner's last report") {
+		t.Fatalf("handoff prompt must label the previous owner's report, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "已经把登录页改好了") {
+		t.Fatalf("handoff prompt must carry the previous owner's report text — without it the new owner starts with no memory, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "PrevOwner") {
+		t.Fatalf("handoff prompt must name the previous owner (not just 'the previous owner'), got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "do NOT start over") {
+		t.Fatalf("handoff prompt must tell the new owner to continue, not restart, got:\n%s", prompt)
+	}
+}
+
+// TestHandoffPromptNoReportWhenNoPriorRun: a handoff with no previous owner
+// report (first handoff ever, or the prior run was cancelled mid-flight with
+// no summary) must not inject an empty "Previous owner's last report" block —
+// that would confuse the new owner with a blank citation.
+func TestHandoffPromptNoReportWhenNoPriorRun(t *testing.T) {
+	d, _, goalID, agentID := seedCtx(t)
+	ctx := context.Background()
+	q := &service.ClaimedRow{RunID: "run-new", GoalID: goalID, AgentID: agentID, Attempt: 1}
+	prompt := d.assemblePrompt(ctx, q, promptInputs{
+		runRole: "owner", goalTitle: "g",
+		handoff: "first handoff, no prior work",
+	})
+	if strings.Contains(prompt, "Previous owner's last report") {
+		t.Fatalf("handoff prompt must NOT inject an empty report block when there is no prior summary, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "first handoff, no prior work") {
+		t.Fatalf("handoff prompt must still carry the handoff note, got:\n%s", prompt)
+	}
+}
+
+// TestHandoffPromptSkipsCancelledRunSummary: a cancelled run's summary is
+// platform noise ("cancelled by platform"), not the agent's work report. When
+// a cancelled owner run is the LATEST by finished_at but an older completed
+// run carries the real report, the handoff memory must pick the completed
+// report — never the cancelled noise (which would mask the real context and
+// tell the new owner to "continue from" a cancellation message).
+func TestHandoffPromptSkipsCancelledRunSummary(t *testing.T) {
+	d, st, goalID, agentID := seedCtx(t)
+	ctx := context.Background()
+	var rtID string
+	if err := st.DB().QueryRowContext(ctx, `SELECT id FROM runtime LIMIT 1`).Scan(&rtID); err != nil {
+		t.Fatalf("load runtime: %v", err)
+	}
+	prevAgent, err := service.NewAgentService(st, events.NewBus()).Create(ctx, service.Agent{Name: "PrevOwner", RuntimeID: rtID})
+	if err != nil {
+		t.Fatalf("seed prev owner: %v", err)
+	}
+	// An older COMPLETED run with the real report.
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,status,role,attempt,result_summary,finished_at,queued_at,created_at)
+		 VALUES ('run-done',?,?,?,?,?,?,?,?,?,?,?)`,
+		goalID, prevAgent.ID, "worker", "worker", "completed", "owner", 1,
+		"登录页已完成，注册页待做", "2026-08-17T10:00:00Z", "2026-08-17T09:00:00Z", "2026-08-17T09:00:00Z"); err != nil {
+		t.Fatalf("insert completed run: %v", err)
+	}
+	// A NEWER cancelled run (handoff cut) — its summary is platform noise.
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,status,role,attempt,result_summary,finished_at,queued_at,created_at)
+		 VALUES ('run-cut',?,?,?,?,?,?,?,?,?,?,?)`,
+		goalID, prevAgent.ID, "worker", "worker", "cancelled", "owner", 2,
+		"cancelled by platform", "2026-08-17T11:00:00Z", "2026-08-17T10:30:00Z", "2026-08-17T10:30:00Z"); err != nil {
+		t.Fatalf("insert cancelled run: %v", err)
+	}
+	q := &service.ClaimedRow{RunID: "run-new", GoalID: goalID, AgentID: agentID, Attempt: 1}
+	prompt := d.assemblePrompt(ctx, q, promptInputs{
+		runRole: "owner", goalTitle: "g",
+		handoff: "接手注册页",
+	})
+	if strings.Contains(prompt, "cancelled by platform") {
+		t.Fatalf("handoff prompt must NOT inject the cancelled run's platform-noise summary, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "登录页已完成，注册页待做") {
+		t.Fatalf("handoff prompt must carry the older completed run's real report (the cancelled run must not mask it), got:\n%s", prompt)
+	}
+}

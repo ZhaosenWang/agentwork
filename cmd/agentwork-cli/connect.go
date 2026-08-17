@@ -283,7 +283,12 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	// Periodic re-probe: an installed/uninstalled agent CLI changes the
 	// machine's capability set. When the signature drifts, push a fresh
 	// probe report — the platform marks vanished CLIs' runtimes absent.
-	probeTick := time.NewTicker(5 * time.Minute)
+	// 1-minute cadence: probeCLIs runs only --version checks (milliseconds),
+	// and probeSig suppresses the push when nothing changed — so a quiet
+	// machine stays quiet. A spawn failure re-probes immediately
+	// (reprobeAfterSpawnFailure); this tick only covers the silent-install
+	// case (a CLI added while connect is running).
+	probeTick := time.NewTicker(time.Minute)
 	defer probeTick.Stop()
 	for {
 		select {

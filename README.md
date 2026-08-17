@@ -22,7 +22,7 @@ state, in-process event bus, Go daemon + Next.js web UI.
   produce **Changes** with revisions the owner integrates — conflicts wake
   the assignee to rework automatically
 - **Four collaboration behaviors** — Comment / Consult / Handoff / Sub-goal,
-  exposed as MCP tools with owner-only permissions
+  exposed as the `agentwork` CLI with owner-only permissions enforced server-side
 - **Multi-protocol & transport** — ACP / JSONL / JSON-RPC over stdio / ws / tcp;
   agents can carry their own extra MCP servers
 - **Triggers** — Web, cron schedules, GitHub/GitCode issues (webhook + poll),
@@ -104,17 +104,20 @@ npm run build && npm start
 
 ## Collaboration (four behaviors)
 
-| Behavior | Tool | Who may |
+| Behavior | CLI command | Who may |
 |---|---|---|
-| **Comment** (say) | `comment_goal` | anyone |
-| **Consult** (ask) | `consult_agent` | the goal's owner |
-| **Handoff** (transfer) | `handoff_goal` | the goal's owner |
-| **Sub-goal** (split) | `create_sub_goal` / `cancel_sub_goal` | the goal's owner |
+| **Comment** (say) | `agentwork goal comment --text T` | anyone |
+| **Consult** (ask) | a mention in `goal comment`: `[@Name](mention://agent/<id>)` | the goal's owner |
+| **Handoff** (transfer) | `agentwork goal assign <to-agent-id> [--note N]` | the goal's owner |
+| **Sub-goal** (split) | `agentwork subgoal create --title T --assignee A` / `subgoal cancel <id>` | the goal's owner |
 
-Agents coordinate exclusively through the `agentwork` MCP tools advertised at
-every session (plus `verify_sub_goal`, `integrate_change`, `get_change`,
-`get_sub_goal`, `get_verification`, and the `*_list` tools). Full model in
-[Collaboration.v2.md](Collaboration.v2.md).
+Agents coordinate exclusively through the `agentwork` CLI (a shim of the
+daemon binary, on the agent's PATH at spawn). Every command carries the
+per-run token (`AGENTWORK_TOKEN`), which the daemon's `/rpc` endpoint
+resolves to the run's `(goal, agent, role)` — the token is the ONLY
+identity, self-reported ids are ignored, and the handoff owner check is
+enforced server-side. Plus `subgoal verify`, `change integrate`, and the
+`*_list` commands. Full model in [Collaboration.v2.md](Collaboration.v2.md).
 
 ## Architecture
 
@@ -137,8 +140,8 @@ every session (plus `verify_sub_goal`, `integrate_change`, `get_change`,
                                  ▼
                           agent CLI subprocess ◄── ACP frames relayed unparsed
                            (stdio/ws/tcp)
-                           └─ fs/terminal RPC + agentwork MCP
-                              (worktree, tools)
+                           └─ fs/terminal RPC + agentwork CLI (/rpc)
+                              (worktree, collaboration commands)
                  ┌───────────────┬─────────────────────────────┘
                  ▼               ▼
           machine verify /   review gate → deliver
@@ -160,7 +163,7 @@ every session (plus `verify_sub_goal`, `integrate_change`, `get_change`,
 ## CLI tool
 
 `agentwork` is the **machine executor** and a human debugging tool (agents
-use the MCP tools):
+use the `agentwork` CLI shim for collaboration):
 
 ```bash
 agentwork connect               # the machine side: pulls dispatches, runs them, hosts chats
