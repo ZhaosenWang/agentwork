@@ -2534,7 +2534,41 @@ type promptInputs struct {
 // (CLI 分支 Phase 2): the machine gets the SAME engineered context.
 func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in promptInputs) string {
 	var wakeWho, wakeAnchor, wakeContent string
+	// 决策 7-2: reject wake is distinguished from handoff wake BEFORE the
+	// handoff branch fires. A reject successor run carries: no trigger
+	// comment, no wake_note, no handoff_note (reject does not write it), and
+	// a wake_anchor pointing at the reject comment. The authoritative signal
+	// is the goal's latest gate_decision = reject|redirect — without it a
+	// bare owner spawn (no trigger/note/handoff) would fall through to the
+	// default assignment branch and the owner would start blind. isReject is
+	// the ONLY branch that may read "you were rejected" semantics; the
+	// handoff branch (in.handoff != "") is mutually exclusive because reject
+	// clears handoff_note.
+	isReject := false
+	if in.runRole == "owner" && in.triggerCommentID == "" && in.wakeNote == "" && in.handoff == "" && in.wakeAnchorID != "" {
+		var lastDecision string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT decision FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`,
+			q.GoalID).Scan(&lastDecision); err == nil && (lastDecision == "reject" || lastDecision == "redirect") {
+			isReject = true
+		}
+	}
 	switch {
+	case isReject:
+		// Reject wake (决策 7-2): the owner's previous round was rejected by
+		// the human — continue from the reject reason, do NOT start over. The
+		// wake anchor is the reject comment (passed as wake_anchor from
+		// ResolveReview); the content is the reject reason verbatim.
+		wakeWho = "the platform"
+		wakeAnchor = in.wakeAnchorID
+		var rejectContent string
+		_ = d.st.DB().QueryRowContext(ctx,
+			`SELECT content FROM comment WHERE id=?`, in.wakeAnchorID).Scan(&rejectContent)
+		if s := strings.TrimSpace(rejectContent); s != "" {
+			wakeContent = "> " + s
+		} else {
+			wakeContent = "Your previous round was rejected. Review the goal's comments for the reason."
+		}
 	case in.runRole == "owner" && in.triggerCommentID != "" && in.triggerAuthor == "human":
 		// A comment-triggered reopen (决策 4-1 修订): the human's follow-up
 		// comment IS this turn's ask — same mention shape as a consult.
@@ -2638,6 +2672,25 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 					who = prevAgentName
 				}
 				extras.WriteString("\nPrevious owner's last report (" + who + ", do NOT start over — continue from this):\n" + truncateIn(s, 2000) + "\n")
+			}
+		}
+	} else if isReject {
+		// Reject memory (决策 7-2): the owner's OWN previous round was
+		// rejected — inject that round's report so the owner fixes from it
+		// rather than restarting. The label is "Your previous round was
+		// REJECTED" (NOT "Previous owner" — the owner was never changed,
+		// only paused for review; the handoff label would mislead the owner
+		// into thinking a different agent owned the goal before them).
+		// Same query as handoff memory: the latest owner completed run's
+		// result_summary is the work context to continue from.
+		var prevSummary string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT r.result_summary FROM run r
+			  WHERE r.goal_id=? AND r.role='owner' AND r.status='completed' AND r.result_summary != ''
+			  ORDER BY r.finished_at DESC LIMIT 1`,
+			q.GoalID).Scan(&prevSummary); err == nil {
+			if s := strings.TrimSpace(prevSummary); s != "" {
+				extras.WriteString("\nYour previous round was REJECTED (fix from this — do NOT start over):\n" + truncateIn(s, 2000) + "\n")
 			}
 		}
 	}

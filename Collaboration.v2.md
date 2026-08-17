@@ -122,6 +122,12 @@ Goal Coordinator ──► DB Transaction
 - Sub-goal 状态机：`Pending → Running → Done → Verifying → Verified | Rejected → Running`（+ Cancelled / Failed）
 - 两道门不合并：Sub-goal Verification → Integration → Goal Final Verification
 - **Final Verification 触发 = Owner 决定**（结束 turn）：run 完成 → 域验证 → gates → 人审。**Coordinator 不自动进入**（它不理解"业务集成完成"）
+- **Review 进入门槛收紧（决策 7-1）**：review 是"机器已尽力、人做最后裁决"的关卡，**不是"机器无法判定所以甩给人"的兜底**。三类默认保守分支不得把"未完成的工作"塞进 review：
+  - **验收策略未冻结**（`checks_compiled_at == ""`）：人没确认验收策略 = 没有机器判定依据。owner run 完成时**不进 review**，而是平台拒绝将该 run 标记为 completed（run 保持非终态 / 标记 `blocked_on_policy`），并在评论 feed 写一条系统提醒"验收策略未冻结，无法判定完成——请先配置并冻结 domain 验收策略"。这把"domain 配置缺失"的代价还给配置层，不转嫁成"动不动要人审批"。
+  - **弱验证域无 gate**（`verification_strength == "weak"` 且 domain 无显式 gates）：自动判定不可靠 ≠ 需要人审。同上，**不进 review**，owner run 不标 completed，系统提醒"当前域验证强度 weak 且无 gate，平台无法自证合格——补充 verify 命令或显式 gate 后再完成"。
+  - **merge gate**：domain 显式配置 merge gate 是**人主动要求每次完成都审**的合法意图，保持现状（每次 completed run park 进 review）。
+  - **solo goal（无 squad）park 后**：收紧后 park 频率大幅下降（未冻结/弱验证已被卡住）。仍 park 的 solo goal 维持现状——`goal:review_ready` 直接人审，无 agent reviewer。不造默认 reviewer 机制（reviewer 是 squad 概念，强加到 solo goal 是概念污染）。
+  - 根因约束：**"run completed" 是 agent 结束 turn 的自声明，不是"任务完成度"判定**。平台不做任务完成度语义判定（工程量与当前问题不匹配）；用"驳回次数 / retry 兜底"对付 agent 提前 end turn 但 verify 碰巧通过的场景。
 
 # 7. Review 与 Verify（正式定义，二者不同）
 
@@ -133,6 +139,22 @@ Goal Coordinator ──► DB Transaction
 | 只读 | 是（ephemeral 写允许） | 是（同上） |
 | 产物 | 评论 | verification_result + summary + evidence |
 | 失败 | 意见仍在（guest 失败留痕，决策 4-3） | rejected → quality_iteration++ |
+
+## 7.1 Goal 级 Review 状态机与 Reject 语义（决策 7-2）
+
+Review 是 goal 的一个状态，approve / reject 是这个状态的两个**退出动作**——不是 agent 间的协作行为，不进入四原语体系（Comment/Consult/Handoff/Sub-goal）。Reject 是人对 goal 状态的裁决，语义上与 Handoff（所有权转移）严格区分：owner 进 review 时从未丢失所有权，只是被暂停；reject = 解除暂停 + 带理由重做，**不是所有权转移**。
+
+- **进入**：见 §6 末段收紧后的门槛（gate 命中 / handoff 循环 ≥8）。squad goal 进 review 时拉 reviewer run（§7 表格）；solo goal 直接人审。
+- **退出动作 approve**：record gate_decision(approve) → publish `goal:approved` → daemon 跑 deliver（merge + re-verify + push）→ MarkDelivered。owner 不重唤醒（任务到此终态）。
+- **退出动作 reject**：record gate_decision(reject) + 驳回理由 → goal `review → active` + `human_iterations++` + 清 `review_request` → **enqueue owner successor run**。reject 不是 handoff，因此：
+  - **不写 `goal.handoff_note`**（handoff_note 是交接专用字段；reject 复用它会导致"驳回被当交接"的语义错位 + 与真实 handoff 互相覆盖丢理由）。reject 理由走**独立的 reject wake 路径**。
+  - **不注入 "Previous owner's last report" 标签**（那是跨 agent 交接的记忆载体；reject 场景 owner 就是上轮那个 owner，不是"上一任"）。
+- **Owner successor run 的 reject 上下文契约**（assemblePrompt 独立 `case isReject:` 分支，不复用 `case in.handoff`）：
+  - wake line：`You were mentioned by the platform (comment <驳回评论id>):` + 驳回理由原文（引用前缀）。
+  - 记忆注入：owner 自己上一轮的 completed run 报告（`role='owner' AND status='completed'`，最新一条），标签为 **"Your previous round was REJECTED — fix from this, do NOT start over"**（不是 "Previous owner"）。这是让 owner 接着改而非重来的唯一记忆载体。
+  - 驳回评论 `author_type='human'`、`author_id=''`、`content="驳回：<reason>"`，在评论 feed 里全 agent 可见（§见 v2 §3 feed 开放）。owner 可通过 `agentwork goal comments` 拉到 reviewer 的审查意见（如果 squad review 产生过 reviewer 评论）。
+- **与 sub-goal 级 reject 的边界**：§6 的 verifier reject 是 sub-goal 级（`quality_iteration++`、assignee 新 run）；本节的 reject 是 goal 级（`human_iterations++`、owner successor run）。两个计数、两个 enqueue 路径，绝不混。
+- **Reject 的 wake 路径独立性硬约束**：`assemblePrompt` 的 switch 中，reject 分支必须在 handoff 分支之前判定（reject 不复用 handoff_note，否则 handoff_note 非空会劫持 reject 走交接分支）。实现上 reject wake 由独立信号触发（如 goal 最近一次状态转移 `review→active` 且有 reject gate_decision），不依赖 `handoff_note` 字段。
 
 # 8. Handoff 语义
 

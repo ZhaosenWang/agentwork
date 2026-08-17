@@ -278,3 +278,126 @@ func TestHandoffPromptSkipsCancelledRunSummary(t *testing.T) {
 		t.Fatalf("handoff prompt must carry the older completed run's real report (the cancelled run must not mask it), got:\n%s", prompt)
 	}
 }
+
+// TestRejectPromptWakeIsNotHandoff is the 决策 7-2 regression: a reject
+// successor run must NOT take the handoff wake branch (which injects
+// "Previous owner's last report" — wrong label, since the owner was never
+// changed, only paused for review). Reject has its own isReject branch:
+// wake line carries the reject reason, memory label is "Your previous round
+// was REJECTED". The precondition: goal's latest gate_decision = reject,
+// run has no trigger/note/handoff but a wake_anchor pointing at the reject
+// comment.
+func TestRejectPromptWakeIsNotHandoff(t *testing.T) {
+	d, st, goalID, agentID := seedCtx(t)
+	ctx := context.Background()
+
+	// The owner's previous completed run (the rejected work) — the memory
+	// source. Its report is what the owner must continue from.
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,status,role,attempt,result_summary,finished_at,queued_at,created_at)
+		 VALUES ('run-rej',?,?,?,?,?,?,?,?,?,?,?)`,
+		goalID, agentID, "worker", "worker", "completed", "owner", 1,
+		"登录页改了一半，注册页还没动", "2026-08-17T10:00:00Z", "2026-08-17T09:00:00Z", "2026-08-17T09:00:00Z"); err != nil {
+		t.Fatalf("insert rejected run: %v", err)
+	}
+
+	// The reject comment (human-authored) — this is the wake anchor.
+	rejectCommentID := "cmt-rej"
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,'',NULL,?,?)`,
+		rejectCommentID, goalID, "human", "驳回：方向不对，把 X 改成 Y 再看", "2026-08-17T11:00:00Z"); err != nil {
+		t.Fatalf("insert reject comment: %v", err)
+	}
+
+	// The gate_decision row — the authoritative isReject signal. Without it
+	// assemblePrompt falls through to the default assignment branch.
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO gate_decision (id,goal_id,run_id,gate_rule,decision,reason,decided_by,decided_at,review_duration)
+		 VALUES ('gd-1',?,?,?,?,?,?,?,?)`,
+		goalID, "run-rej", "merge", "reject", "方向不对，把 X 改成 Y 再看", "human", "2026-08-17T11:00:00Z", 120); err != nil {
+		t.Fatalf("insert gate_decision: %v", err)
+	}
+
+	// The reject successor run: no trigger, no wake_note, no handoff (reject
+	// does not write it), wake_anchor = reject comment. This is exactly the
+	// shape ResolveReview produces.
+	q := &service.ClaimedRow{RunID: "run-new", GoalID: goalID, AgentID: agentID, Attempt: 1}
+	prompt := d.assemblePrompt(ctx, q, promptInputs{
+		runRole: "owner", goalTitle: "g",
+		wakeAnchorID: rejectCommentID,
+		// triggerCommentID, wakeNote, handoff all "" — the reject signature
+	})
+
+	// The reject reason must reach the owner via the wake line.
+	if !strings.Contains(prompt, "驳回：方向不对，把 X 改成 Y 再看") {
+		t.Fatalf("reject prompt must carry the reject reason in the wake line, got:\n%s", prompt)
+	}
+	// The memory label is "Your previous round was REJECTED" — NOT the
+	// handoff label "Previous owner's last report".
+	if !strings.Contains(prompt, "Your previous round was REJECTED") {
+		t.Fatalf("reject prompt must use the REJECTED memory label (decision 7-2), got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Previous owner's last report") {
+		t.Fatalf("reject prompt must NOT use the handoff memory label — the owner was never changed, got:\n%s", prompt)
+	}
+	// The owner's own previous report must be injected (continue from it).
+	if !strings.Contains(prompt, "登录页改了一半，注册页还没动") {
+		t.Fatalf("reject prompt must inject the owner's previous completed run report, got:\n%s", prompt)
+	}
+}
+
+// TestRejectPromptFallsThroughWithoutGateDecision: if there is NO
+// gate_decision = reject (e.g. a bare owner spawn that happens to have no
+// trigger/note/handoff/anchor), the prompt must NOT misfire as reject — it
+// falls through to the default assignment branch. This guards against
+// isReject false-positives from the "all-empty" signature alone.
+func TestRejectPromptFallsThroughWithoutGateDecision(t *testing.T) {
+	d, _, goalID, agentID := seedCtx(t)
+	ctx := context.Background()
+	// No gate_decision, no reject comment — a bare owner spawn (first
+	// assignment shape, but with a wake_anchor). Must NOT take isReject.
+	q := &service.ClaimedRow{RunID: "run-bare", GoalID: goalID, AgentID: agentID, Attempt: 1}
+	prompt := d.assemblePrompt(ctx, q, promptInputs{
+		runRole: "owner", goalTitle: "g", desc: "do the thing",
+		// All empty except desc — default assignment branch fires.
+	})
+	if strings.Contains(prompt, "REJECTED") {
+		t.Fatalf("a non-reject owner spawn must NOT take the isReject branch, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "do the thing") {
+		t.Fatalf("bare spawn should fall through to default (desc as wake), got:\n%s", prompt)
+	}
+}
+
+// TestHandoffPromptUnaffectedByRejectChange: the handoff path must still
+// work after the reject refactor — handoff_note non-empty + owner role +
+// no trigger/note takes the handoff branch, NOT isReject (gate_decision
+// absent or not reject). This guards the mutual-exclusivity: reject clears
+// handoff_note, so a non-empty handoff_note means a real handoff.
+func TestHandoffPromptUnaffectedByRejectChange(t *testing.T) {
+	d, st, goalID, agentID := seedCtx(t)
+	ctx := context.Background()
+	// A previous owner completed run (handoff memory source).
+	var rtID string
+	_ = st.DB().QueryRowContext(ctx, `SELECT id FROM runtime LIMIT 1`).Scan(&rtID)
+	prevAgent, _ := service.NewAgentService(st, events.NewBus()).Create(ctx, service.Agent{Name: "Prev", RuntimeID: rtID})
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,status,role,attempt,result_summary,finished_at,queued_at,created_at)
+		 VALUES ('run-prev',?,?,?,?,?,?,?,?,?,?,?)`,
+		goalID, prevAgent.ID, "worker", "worker", "completed", "owner", 1,
+		"前一任的活干到这", "2026-08-17T10:00:00Z", "2026-08-17T09:00:00Z", "2026-08-17T09:00:00Z"); err != nil {
+		t.Fatalf("insert prev run: %v", err)
+	}
+	// NO gate_decision — this is a real handoff, not a reject.
+	q := &service.ClaimedRow{RunID: "run-h", GoalID: goalID, AgentID: agentID, Attempt: 1}
+	prompt := d.assemblePrompt(ctx, q, promptInputs{
+		runRole: "owner", goalTitle: "g",
+		handoff: "你来接手",
+	})
+	if !strings.Contains(prompt, "Previous owner's last report") {
+		t.Fatalf("handoff prompt must still use the handoff memory label, got:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Your previous round was REJECTED") {
+		t.Fatalf("handoff prompt must NOT take the reject branch, got:\n%s", prompt)
+	}
+}

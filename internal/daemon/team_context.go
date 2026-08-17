@@ -269,15 +269,27 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 			"files, do not commit, do not execute the task itself — your edits\n" +
 			"are discarded by the platform.\n"
 	case "review":
-		return "You REVIEW ONLY — give your opinion, never do the work. Inspect the\n" +
-			"worktree's changes (diff, tests, quality) AND the goal's comment\n" +
-			"feed (pull it with `agentwork goal comments`). If the diff is\n" +
-			"empty, the goal's deliverable lives in the feed — judge whether\n" +
-			"the goal was actually fulfilled there, and say so explicitly;\n" +
-			"never report a missing diff as the answer itself. End your turn\n" +
+		return "You REVIEW ONLY — give your opinion, never do the work.\n" +
+			"BEFORE you form an opinion, pull the goal's comment feed with\n" +
+			"`agentwork goal comments` (use `--after <id>` with the anchor in\n" +
+			"your wake line for incremental reads; if you do not remember what\n" +
+			"you have seen, pull WITHOUT --after for the full feed). The feed\n" +
+			"is your only source of collaboration context: the owner's\n" +
+			"completion report, other agents' consult answers, prior review\n" +
+			"opinions (including your own from a previous round), and the\n" +
+			"handoff history. Without pulling it you are reviewing blind.\n" +
+			"Inspect the worktree's changes (diff, tests, quality) alongside\n" +
+			"the feed. If the diff is empty, the goal's deliverable lives in\n" +
+			"the feed — judge whether the goal was actually fulfilled there,\n" +
+			"and say so explicitly; never report a missing diff as the answer\n" +
+			"itself. If information is still insufficient after pulling the\n" +
+			"feed (e.g. sub-goal or change state unclear), use the `agentwork`\n" +
+			"CLI to fetch more before opining — do not guess. End your turn\n" +
 			"with your opinion as the final message — the platform posts it to\n" +
 			"the feed (the approver reads it there; do NOT post a duplicate\n" +
-			"with `agentwork goal comment`).\n"
+			"with `agentwork goal comment`). Do not modify files, do not\n" +
+			"commit, do not execute the task itself — your edits are discarded\n" +
+			"by the platform.\n"
 	case "verify":
 		return "You are the verifier for a work item: judge it, then issue\n" +
 			"`agentwork subgoal verify <id> --verdict passed|rejected [--summary S]\n" +

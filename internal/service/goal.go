@@ -1452,12 +1452,25 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	logging.Infof("review: goal %q decision=%s by human%s", g.Title, decision, reasonSuffix)
 	// The decision's reason is the human's words — the comment feed is where
 	// the agent's next run reads recent human comments, so the reject reason
-	// must be there (not only in gate_decision / handoff_note).
-	if reason != "" {
+	// must be there (not only in gate_decision). 决策 7-2: reject/redirect
+	// ALWAYS leaves a comment (even with an empty reason — a bare "驳回") so
+	// the reject wake has an anchor (the comment id rides wake_anchor into the
+	// owner successor run). reject does NOT write goal.handoff_note (the
+	// handoff field is reserved for ownership transitions; reusing it caused
+	// "reject treated as handoff" semantic corruption and let a real handoff
+	// overwrite the reject reason). approve also leaves a comment for the
+	// audit feed (unchanged behavior when reason is non-empty).
+	decisionCommentID := ""
+	if decision == "reject" || decision == "redirect" || reason != "" {
 		verb := map[string]string{"approve": "批准", "reject": "驳回", "redirect": "改判"}[decision]
+		decisionCommentID = newID()
+		content := verb
+		if reason != "" {
+			content = verb + "：" + reason
+		}
 		if _, err := s.st.DB().ExecContext(ctx,
 			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,'',NULL,?,?)`,
-			newID(), goalID, "human", verb+"："+reason, ts); err != nil {
+			decisionCommentID, goalID, "human", content, ts); err != nil {
 			return nil, fmt.Errorf("insert decision comment: %w", err)
 		}
 	}
@@ -1502,10 +1515,14 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 			}})
 			break
 		}
-		note := "Review decision: " + decision
-		if reason != "" {
-			note += "\n" + reason
-		}
+		// 决策 7-2: reject does NOT write goal.handoff_note — that field is
+		// reserved for ownership transitions (handoff). Reusing it caused
+		// "reject treated as handoff" in assemblePrompt (the handoff wake
+		// branch fired, injecting "Previous owner's last report" — wrong
+		// label: the owner was never changed, only paused for review) and let
+		// a subsequent real handoff overwrite the reject reason. The reject
+		// reason rides the comment feed (the reject comment's id is the wake
+		// anchor for the owner successor run).
 		// P0-2 (决策 6-15②): the review → active transition and the successor
 		// run are born in ONE transaction — a crash between the UPDATE and
 		// the enqueue used to leave a run-less active goal that no startup
@@ -1514,9 +1531,13 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		if err != nil {
 			return nil, err
 		}
+		// Clear handoff_note on reject: a prior handoff's note must not leak
+		// into the reject wake (assemblePrompt's handoff branch checks
+		// handoff_note != ""). human_iterations is the reject counter
+		// (SEPARATE from run.attempt, DESIGN.md §4).
 		res, err := tx.ExecContext(ctx,
-			`UPDATE goal SET status='active', handoff_note=?, human_iterations=human_iterations+1, review_request='' WHERE id=? AND status='review'`,
-			note, goalID)
+			`UPDATE goal SET status='active', handoff_note='', human_iterations=human_iterations+1, review_request='' WHERE id=? AND status='review'`,
+			goalID)
 		if err != nil {
 			_ = tx.Rollback()
 			return nil, fmt.Errorf("reject review: %w", err)
@@ -1528,8 +1549,10 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 		// Continue on the current assignee (the unified owner-run spawn, P0.5).
 		// attempt resets to 1: a reject iteration is a fresh human-directed
 		// cycle, not a machine retry — the reject count lives in
-		// goal.human_iterations (DESIGN.md §4).
-		_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "", "", "active")
+		// goal.human_iterations (DESIGN.md §4). wake_anchor = the reject
+		// comment id (决策 7-2): assemblePrompt's isReject branch reads it as
+		// the wake anchor + fetches the reject reason from the comment.
+		_, runEv, err := s.enqueueOwnerIntentTx(ctx, tx, goalID, g.AssigneeType, g.AssigneeID, "active", "", decisionCommentID, "active")
 		if err != nil {
 			_ = tx.Rollback()
 			return nil, fmt.Errorf("enqueue after reject: %w", err)

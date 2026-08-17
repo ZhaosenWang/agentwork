@@ -119,8 +119,12 @@ func TestReviewApproveKeepsGoalParkedUntilDeliver(t *testing.T) {
 
 // TestReviewRejectSendsBackWithReason: reject records the decision, bumps
 // human_iterations (the reject counter — SEPARATE from run.attempt), moves
-// the goal back to active with the reason as handoff_note, and enqueues a new
-// run with attempt reset — the agent continues from the note.
+// the goal back to active, and enqueues a new run with attempt reset. 决策 7-2:
+// reject does NOT write goal.handoff_note (that field is reserved for
+// ownership transitions); the reject reason rides the comment feed as a
+// human-authored "驳回：<reason>" comment, and the owner successor run's
+// wake_anchor points at it. handoff_note must be CLEARED (a prior handoff's
+// note must not leak into the reject wake).
 func TestReviewRejectSendsBackWithReason(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
@@ -140,18 +144,45 @@ func TestReviewRejectSendsBackWithReason(t *testing.T) {
 	if got.HumanIterations != 1 {
 		t.Fatalf("expected human_iterations=1, got %d", got.HumanIterations)
 	}
-	if got.HandoffNote == "" {
-		t.Fatalf("reject reason must be carried as handoff_note")
+	// 决策 7-2: reject does NOT carry the reason as handoff_note. handoff_note
+	// must be empty — assemblePrompt's handoff wake branch checks handoff_note
+	// != "", and a non-empty value would hijack the reject wake into the
+	// handoff path ("Previous owner's last report" — wrong label).
+	if got.HandoffNote != "" {
+		t.Fatalf("reject must NOT write handoff_note (decision 7-2); got %q", got.HandoffNote)
 	}
 	if got.ReviewRequest != "" {
 		t.Fatalf("review_request must be cleared on reject")
 	}
+	// The reject reason rides the comment feed as a human-authored comment.
+	var rejectContent string
+	_ = st.DB().QueryRowContext(ctx,
+		`SELECT content FROM comment WHERE goal_id=? AND author_type='human' ORDER BY created_at DESC LIMIT 1`,
+		g.ID).Scan(&rejectContent)
+	if !strings.Contains(rejectContent, "方向不对，把 X 改成 Y 再看") {
+		t.Fatalf("reject reason must be in the comment feed, got %q", rejectContent)
+	}
 
-	// A fresh run was enqueued on the same assignee, attempt reset to 1.
+	// A fresh run was enqueued on the same assignee, attempt reset to 1. Its
+	// wake_anchor points at the reject comment (决策 7-2) — List() does not
+	// select wake_anchor, so read the run row directly.
 	runs, _ := rs.List(ctx, g.ID)
 	last := runs[len(runs)-1]
 	if last.Status != "queued" || last.Attempt != 1 {
 		t.Fatalf("expected fresh queued run attempt=1, got %s/%d", last.Status, last.Attempt)
+	}
+	var wakeAnchor string
+	_ = st.DB().QueryRowContext(ctx,
+		`SELECT wake_anchor FROM run WHERE id=?`, last.ID).Scan(&wakeAnchor)
+	if wakeAnchor == "" {
+		t.Fatalf("reject successor run must carry the reject comment id as wake_anchor (decision 7-2)")
+	}
+	// The wake_anchor must be the reject comment's id (the one carrying 驳回).
+	var anchorContent string
+	_ = st.DB().QueryRowContext(ctx,
+		`SELECT content FROM comment WHERE id=?`, wakeAnchor).Scan(&anchorContent)
+	if !strings.Contains(anchorContent, "驳回") {
+		t.Fatalf("wake_anchor must point at the reject comment, got content %q", anchorContent)
 	}
 }
 
