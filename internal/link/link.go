@@ -389,11 +389,17 @@ type RunClaimedParams struct {
 // RunEvent is one uploaded execution event. Kind mirrors the proto.Event
 // types the daemon already persists; Seq is per-run monotonic — the daemon
 // detects gaps and refills from the machine's transcript.
+//
+// CallID carries the ACP tool-call id for tool_use/tool_result events — the
+// daemon aggregates the multiple updates ACP emits per tool call (start,
+// input accumulation, completion) into ONE chat_message row keyed by it.
+// Empty for non-tool events.
 type RunEvent struct {
 	Seq    int64  `json:"seq"`
 	Kind   string `json:"kind"` // message|thought|tool_use|tool_result
 	Text   string `json:"text,omitempty"`
 	Tool   string `json:"tool,omitempty"`
+	CallID string `json:"call_id,omitempty"`
 	Input  string `json:"input,omitempty"`
 	Output string `json:"output,omitempty"`
 }

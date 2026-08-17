@@ -235,12 +235,43 @@ func (f *eventForwarder) OnToolCall(tc acp.ToolCallUpdate) {
 		Tool:   tc.Title,
 		CallID: tc.ToolCallID,
 		Input:  toJSONString(tc.RawInput),
-		Output: toJSONString(tc.RawOutput),
+		Output: extractOutput(tc.RawOutput),
 	}
 	if tc.Status == "completed" || tc.Status == "failed" {
 		ev.Type = proto.EventToolResult
 	}
 	f.push(ev)
+}
+
+// extractOutput pulls the tool's output text out of RawOutput. Agent CLIs
+// send rawOutput in shapes that duplicate the text — opencode sends
+// {"metadata":{"exit":0,"output":"<text>","truncated":false},"output":"<text>"}
+// (the text appears TWICE: once nested under metadata, once at the top).
+// toJSONString serialized the whole map, so the live stream rendered the
+// text twice. This unwraps to ONE copy: the top-level "output" string if
+// present (opencode's convenience field), else metadata.output, else the
+// raw value for shapes we don't recognize (string, other) — never losing
+// output, never doubling it.
+func extractOutput(raw any) string {
+	if raw == nil {
+		return ""
+	}
+	if s, ok := raw.(string); ok {
+		return s
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return toJSONString(raw)
+	}
+	if s, ok := m["output"].(string); ok && s != "" {
+		return s
+	}
+	if md, ok := m["metadata"].(map[string]any); ok {
+		if s, ok := md["output"].(string); ok && s != "" {
+			return s
+		}
+	}
+	return toJSONString(raw)
 }
 
 // toJSONString renders an arbitrary value as a JSON string (empty on nil/error).

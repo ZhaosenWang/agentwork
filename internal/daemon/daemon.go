@@ -152,7 +152,8 @@ type Daemon struct {
 	domainLocks map[string]*domainLock  // per-domain git lock (fetch + deliver)
 	// sessionPool is the persistent (agent, goal) session pool (决策 6-21).
 	// Its own mutex (sessionMu) guards it — see session_pool.go.
-	msgBuffers  map[string]*msgBuffer // runID → aggregated text row (persistEvent)
+	msgBuffers   map[string]*msgBuffer          // runID → aggregated text row (persistEvent)
+	toolBuffers  map[string]map[string]*toolRow // runID → CallID → aggregated tool row (persistEvent)
 	// runCancels maps runID → the run's prompt cancel (registered by runTask,
 	// used to terminate a running run when its goal changes hands — a handed
 	// off agent that keeps running deadlocks the new owner's queued run behind
@@ -226,6 +227,7 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		issueCloser:       issue.NewCloser(st),
 		workers:           make(map[string]*agentWorker),
 		msgBuffers:        make(map[string]*msgBuffer),
+		toolBuffers:       make(map[string]map[string]*toolRow),
 		runCancels:        make(map[string]context.CancelFunc),
 		runCancelReasons:  make(map[string]string),
 		reviewReadyTimers: make(map[string]*time.Timer),
@@ -2004,6 +2006,9 @@ func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event)
 			role = "thought"
 		}
 		d.mu.Lock()
+		if d.msgBuffers == nil {
+			d.msgBuffers = make(map[string]*msgBuffer)
+		}
 		b := d.msgBuffers[runID]
 		if b == nil || b.role != role {
 			d.flushMsgBuffer(ctx, runID)
@@ -2013,11 +2018,71 @@ func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event)
 		b.content += ev.Text
 		d.mu.Unlock()
 	case proto.EventToolUse, proto.EventToolResult:
+		// ACP emits MULTIPLE updates per tool call: a start (tool_call, maybe
+		// with partial/empty input), input-accumulation updates
+		// (tool_call_update), and a terminal update (status=completed/failed
+		// with RawOutput → EventToolResult). The pre-aggregation code
+		// INSERTed a new chat_message row per update — one tool call became
+		// 2–4 rows (the live "tool 出现两遍" symptom).
+		//
+		// Aggregate by CallID, but KEEP tool_use and tool_result as TWO
+		// separate rows: the feed renders them differently (tool_use → the
+		// call name + input; tool_result → the output), and collapsing them
+		// into one row (the first attempt) overwrote the tool_use row with
+		// the tool_result, so the live stream showed outputs with no call
+		// names ("tool 调用和输出到哪去了"). Each type aggregates its own
+		// updates: multiple tool_use updates (input growing) merge into one
+		// tool_use row; the tool_result update lands as its own row. A tool
+		// call with no CallID falls back to one-row-per-event. Text is
+		// flushed first so a tool call never lands ahead of the assistant
+		// text that announced it.
 		d.mu.Lock()
 		d.flushMsgBuffer(ctx, runID)
-		d.mu.Unlock()
+		if d.toolBuffers == nil {
+			d.toolBuffers = make(map[string]map[string]*toolRow)
+		}
+		tbl := d.toolBuffers[runID]
+		if tbl == nil {
+			tbl = make(map[string]*toolRow)
+			d.toolBuffers[runID] = tbl
+		}
+		// The buffer key separates use from result so they do not collide:
+		// CallID+":use" for tool_use, CallID+":result" for tool_result.
+		bufKey := ev.CallID
+		if bufKey != "" {
+			if ev.Type == proto.EventToolResult {
+				bufKey += ":result"
+			} else {
+				bufKey += ":use"
+			}
+		}
+		row := tbl[bufKey]
+		if row == nil {
+			// First update for this (call, type) — INSERT, then remember the
+			// row id so later updates target it. Released from under d.mu
+			// (the INSERT hits the DB; holding d.mu across it would serialize
+			// every run's tool stream on one lock).
+			if ev.CallID == "" {
+				d.mu.Unlock()
+				tc, _ := json.Marshal(ev)
+				d.insertChatMessage(ctx, runID, "tool", "", string(tc))
+				return
+			}
+			id := uuid.NewString()
+			tc, _ := json.Marshal(ev)
+			d.mu.Unlock()
+			d.insertChatMessageWithID(ctx, id, runID, "tool", "", string(tc))
+			d.mu.Lock()
+			tbl[bufKey] = &toolRow{id: id}
+			d.mu.Unlock()
+			return
+		}
+		// Subsequent update of the SAME type — rewrite the stored row's
+		// tool_calls JSON with the latest event (input grew on a tool_use;
+		// output may land in pieces on a tool_result).
 		tc, _ := json.Marshal(ev)
-		d.insertChatMessage(ctx, runID, "tool", "", string(tc))
+		d.mu.Unlock()
+		d.updateChatMessageToolCalls(ctx, row.id, string(tc))
 	default:
 		d.insertChatMessage(ctx, runID, "assistant", ev.Text, "[]")
 	}
@@ -2027,6 +2092,15 @@ func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event)
 type msgBuffer struct {
 	role    string
 	content string
+}
+
+// toolRow is the aggregated chat_message row for ONE tool call, keyed in
+// toolRow is the aggregated chat_message row for ONE (CallID, type) pair,
+// keyed in toolBuffers by "<callID>:use" / "<callID>:result" (see
+// persistEvent). id is the chat_message row id stamped on the first update
+// for that pair; subsequent updates of the same type rewrite it in place.
+type toolRow struct {
+	id string
 }
 
 // flushMsgBuffer writes the pending aggregated text row (if any) for a run.
@@ -2040,19 +2114,40 @@ func (d *Daemon) flushMsgBuffer(ctx context.Context, runID string) {
 	delete(d.msgBuffers, runID)
 }
 
-// flushRunMessages flushes and forgets a run's pending buffer (run end).
+// flushRunMessages flushes and forgets a run's pending buffers (run end).
+// Tool rows are already persisted (each update rewrote its row in place);
+// the toolBuffers map is just the in-memory index of row ids, dropped here.
 func (d *Daemon) flushRunMessages(ctx context.Context, runID string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.flushMsgBuffer(ctx, runID)
 	delete(d.msgBuffers, runID)
+	delete(d.toolBuffers, runID)
 }
 
 func (d *Daemon) insertChatMessage(ctx context.Context, runID, role, content, toolCalls string) {
+	d.insertChatMessageWithID(ctx, uuid.NewString(), runID, role, content, toolCalls)
+}
+
+// insertChatMessageWithID is insertChatMessage with a caller-supplied row id
+// — used by the tool aggregator so subsequent updates for the same tool call
+// can target the row (updateChatMessageToolCalls).
+func (d *Daemon) insertChatMessageWithID(ctx context.Context, id, runID, role, content, toolCalls string) {
 	if _, err := d.st.DB().ExecContext(ctx,
 		`INSERT INTO chat_message (id, run_id, role, content, tool_calls, created_at) VALUES (?,?,?,?,?,?)`,
-		uuid.NewString(), runID, role, content, toolCalls, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		id, runID, role, content, toolCalls, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		logging.Infof("daemon: persist event for run %s: %v", runID, err)
+	}
+}
+
+// updateChatMessageToolCalls rewrites a tool row's tool_calls JSON with the
+// latest event for that tool call (input grew, or the type flipped to
+// tool_result with output). The row id was stamped on the first update.
+func (d *Daemon) updateChatMessageToolCalls(ctx context.Context, id, toolCalls string) {
+	if _, err := d.st.DB().ExecContext(ctx,
+		`UPDATE chat_message SET tool_calls=? WHERE id=?`,
+		toolCalls, id); err != nil {
+		logging.Infof("daemon: update tool row %s: %v", id, err)
 	}
 }
 

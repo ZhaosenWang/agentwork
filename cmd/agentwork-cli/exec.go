@@ -363,7 +363,7 @@ loop:
 			seq++
 			buf = append(buf, link.RunEvent{
 				Seq: seq, Kind: string(ev.Type), Text: ev.Text,
-				Tool: ev.Tool, Input: ev.Input, Output: ev.Output,
+				Tool: ev.Tool, CallID: ev.CallID, Input: ev.Input, Output: ev.Output,
 			})
 			if len(buf) >= 64 {
 				flush()
