@@ -94,8 +94,10 @@ func (f *fakeQS) GoalDomainType(ctx context.Context, goalID string) (string, err
 func (f *fakeQS) GoalStatus(ctx context.Context, idPrefix string) (*GoalStatusView, error) {
 	return nil, nil
 }
-func (f *fakeQS) Agents(ctx context.Context) ([]NamedID, error)  { return nil, nil }
-func (f *fakeQS) Domains(ctx context.Context) ([]NamedID, error) { return nil, nil }
+func (f *fakeQS) Agents(ctx context.Context) ([]NamedID, error)    { return nil, nil }
+func (f *fakeQS) Domains(ctx context.Context) ([]NamedID, error)  { return nil, nil }
+func (f *fakeQS) Runtimes(ctx context.Context) ([]NamedID, error) { return nil, nil }
+func (f *fakeQS) Skills(ctx context.Context) ([]NamedID, error)   { return nil, nil }
 func (f *fakeQS) TerminalSince(ctx context.Context, since, until string) ([]GoalBrief, error) {
 	return nil, nil
 }

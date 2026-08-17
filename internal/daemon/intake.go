@@ -139,6 +139,27 @@ type intakeAction struct {
 		AssigneeID  string `json:"assignee_id"`
 		DomainID    string `json:"domain_id"`
 	} `json:"schedule"`
+	// Agent carries the create_agent fields. Technical config (env/model/
+	// mcp_servers/max_concurrent) is deliberately absent — NL builds a
+	// persona-bearing skeleton, the rest is filled in on the Web.
+	Agent struct {
+		Name            string   `json:"name"`
+		RuntimeID       string   `json:"runtime_id"`
+		Description     string   `json:"description"`
+		SystemPrompt    string   `json:"system_prompt"`
+		Skills          []string `json:"skills"`
+		SkillsSpecified bool     `json:"skills_specified"`
+	} `json:"agent"`
+	// Squad carries the create_squad fields. Members are added after Create
+	// via AddMember (role="member"); the leader is held in LeaderID, never in
+	// MemberIDs.
+	Squad struct {
+		Name         string   `json:"name"`
+		LeaderID     string   `json:"leader_id"`
+		Description  string   `json:"description"`
+		Instructions string   `json:"instructions"`
+		MemberIDs    []string `json:"member_ids"`
+	} `json:"squad"`
 }
 
 // replyIntake executes the parsed action and replies over IM. The run row is
@@ -158,8 +179,12 @@ func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed 
 		reply = d.intakeScheduleList(ctx)
 	case "schedule_stop":
 		reply = d.intakeScheduleStop(ctx, parsed)
+	case "create_agent":
+		reply = d.intakeCreateAgent(ctx, parsed)
+	case "create_squad":
+		reply = d.intakeCreateSquad(ctx, parsed)
 	default:
-		reply = "没听懂这条指令 😅 你可以这样问我：\n- “创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>”\n- “查看待审批”\n- “查询任务状态 <id>”\n- “每 1 个小时做 <任务>”\n- “查看定时任务”\n- “停掉定时任务 <名字>”"
+		reply = "没听懂这条指令 😅 你可以这样问我：\n- “创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>”\n- “查看待审批”\n- “查询任务状态 <id>”\n- “每 1 个小时做 <任务>”\n- “查看定时任务”\n- “停掉定时任务 <名字>”\n- “创建 agent <名字>，用 <运行时>，<人设描述>”\n- “创建 squad <名字>，leader 是 <agent>，成员有 <agent1> <agent2>”"
 	}
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
@@ -389,6 +414,178 @@ func (d *Daemon) intakeScheduleStop(ctx context.Context, parsed intakeAction) st
 		return "停用失败：" + err.Error()
 	}
 	return fmt.Sprintf("⏹ 已停用定时任务：%s（%s）", target.Name, target.CronExpression)
+}
+
+// intakeCreateAgent creates an agent (persona + runtime + optional skills)
+// through the service layer. Agents are platform-wide (no domain_id), so
+// unlike create_goal there is no domain clarification — but skills has its
+// own clarification: if the owner did not say whether the agent should get
+// platform skills AND the library is non-empty, the platform asks first.
+func (d *Daemon) intakeCreateAgent(ctx context.Context, parsed intakeAction) string {
+	a := parsed.Agent
+	// 1. Clarification turn: an agent-kind draft means the owner is replying
+	// to the skills question. Build from the draft's agent spec + this turn's
+	// parsed skills (empty is fine — a vague reply still creates the agent,
+	// no second ask).
+	if draft, ok := d.loadAgentDraft(ctx); ok {
+		created, err := d.agentSvc.Create(ctx, service.Agent{
+			Name:         draft.AgentName,
+			RuntimeID:    draft.AgentRuntimeID,
+			Description:  draft.AgentDescription,
+			SystemPrompt: draft.AgentSystemPrompt,
+			Skills:       a.Skills,
+		})
+		if d.intakeSvc != nil {
+			_ = d.intakeSvc.ClearDraft(ctx)
+		}
+		if err != nil {
+			return "创建 agent 失败：" + err.Error()
+		}
+		return fmt.Sprintf("✅ 已创建 agent：%s（%s）", created.Name, shortID(created.ID))
+	}
+	// 2. Fresh create.
+	if strings.TrimSpace(a.Name) == "" {
+		return "创建 agent 失败：缺少名称"
+	}
+	if strings.TrimSpace(a.RuntimeID) == "" {
+		return "请指定 agent 的运行时，当前可用：\n" + d.intakeRuntimeList(ctx)
+	}
+	// Skills clarification: the owner did not mention skills at all AND the
+	// platform has skills → ask once. Save the agent spec as a draft so the
+	// owner's reply only has to name skills, not re-send the whole agent.
+	if !a.SkillsSpecified && d.platformHasSkills(ctx) {
+		if d.intakeSvc != nil {
+			_ = d.intakeSvc.SaveDraft(ctx, notify.IntakeDraft{
+				Kind:              "agent",
+				AgentName:         a.Name,
+				AgentRuntimeID:    a.RuntimeID,
+				AgentDescription:  a.Description,
+				AgentSystemPrompt: a.SystemPrompt,
+				CreatedAt:         nowStr(),
+			})
+		}
+		return "平台有以下 skill，要给这个 agent 配吗？回复 skill 名字（空格分隔），或回复“不要”：\n" + d.intakeSkillList(ctx)
+	}
+	created, err := d.agentSvc.Create(ctx, service.Agent{
+		Name:         a.Name,
+		RuntimeID:    a.RuntimeID,
+		Description:  a.Description,
+		SystemPrompt: a.SystemPrompt,
+		Skills:       a.Skills,
+	})
+	if err != nil {
+		return "创建 agent 失败：" + err.Error()
+	}
+	return fmt.Sprintf("✅ 已创建 agent：%s（%s）", created.Name, shortID(created.ID))
+}
+
+// intakeCreateSquad creates a squad (leader + optional members) through the
+// service layer, then attaches the members. Squads are platform-wide and have
+// no skills field, so no clarification is needed. Members that fail to attach
+// (a hallucinated id) surface as a partial-success reply — the squad exists,
+// the owner is told which members did not make it.
+func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) string {
+	sq := parsed.Squad
+	if strings.TrimSpace(sq.Name) == "" {
+		return "创建 squad 失败：缺少名称"
+	}
+	if strings.TrimSpace(sq.LeaderID) == "" {
+		return "创建 squad 失败：没有可用的 leader agent（先通过 Web 创建 agent，或在消息里指明 leader 名字）"
+	}
+	created, err := d.squadSvc.Create(ctx, service.Squad{
+		Name:         sq.Name,
+		LeaderID:     sq.LeaderID,
+		Description:  sq.Description,
+		Instructions: sq.Instructions,
+	})
+	if err != nil {
+		return "创建 squad 失败：" + err.Error()
+	}
+	// Attach members (skip the leader — it is already squad.leader_id).
+	var failed []string
+	for _, mid := range sq.MemberIDs {
+		mid = strings.TrimSpace(mid)
+		if mid == "" || mid == sq.LeaderID {
+			continue
+		}
+		if _, err := d.squadSvc.AddMember(ctx, created.ID, "agent", mid, "member"); err != nil {
+			failed = append(failed, mid)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Sprintf("⚠️ 已创建 squad：%s（%s），但以下成员添加失败：%s", created.Name, shortID(created.ID), strings.Join(failed, "、"))
+	}
+	return fmt.Sprintf("✅ 已创建 squad：%s（%s）", created.Name, shortID(created.ID))
+}
+
+// loadAgentDraft returns the pending agent-kind clarification draft, if any.
+// A goal-kind draft (or none) is treated as no agent draft — the two flows
+// do not interfere.
+func (d *Daemon) loadAgentDraft(ctx context.Context) (*notify.IntakeDraft, bool) {
+	if d.intakeSvc == nil {
+		return nil, false
+	}
+	draft, ok := d.intakeSvc.LoadDraft(ctx)
+	if !ok || draft.Kind != "agent" {
+		return nil, false
+	}
+	return draft, true
+}
+
+// platformHasSkills reports whether the skill library is non-empty — the
+// skills clarification only fires when there is something to choose.
+func (d *Daemon) platformHasSkills(ctx context.Context) bool {
+	var n int
+	if err := d.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM skill`).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// intakeRuntimeList lists the active runtimes for the clarification ask.
+func (d *Daemon) intakeRuntimeList(ctx context.Context) string {
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM runtime WHERE status='active' ORDER BY name`)
+	if err != nil {
+		return "（当前没有可用运行时——先在 Web 配置 runtime）"
+	}
+	defer rows.Close()
+	var b strings.Builder
+	n := 0
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "- %s\n", name)
+		n++
+	}
+	if n == 0 {
+		return "（当前没有可用运行时——先在 Web 配置 runtime）"
+	}
+	return b.String()
+}
+
+// intakeSkillList lists the platform skill library for the clarification ask.
+func (d *Daemon) intakeSkillList(ctx context.Context) string {
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM skill ORDER BY name`)
+	if err != nil {
+		return "（查询 skill 失败）"
+	}
+	defer rows.Close()
+	var b strings.Builder
+	n := 0
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "- %s\n", name)
+		n++
+	}
+	if n == 0 {
+		return "（当前没有 skill）"
+	}
+	return b.String()
 }
 
 func shortID(id string) string {

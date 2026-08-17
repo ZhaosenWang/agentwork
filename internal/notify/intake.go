@@ -32,17 +32,30 @@ type IntakeService struct {
 // settings (intake_agent + digest_time; owned by the settings API).
 const intakeAgentKey = "platform.m3"
 
-// intakeDraft is the pending task-creation clarification (multi-domain):
-// when the parser cannot determine the domain (a required parameter), the
-// platform stores this draft and asks the owner to name the repo; the next
-// inbound message is parsed WITH the draft as context, so "test-repo" can
-// complete the pending task instead of becoming a new one. Single-slot
-// (single-user platform); expires after draftTTL.
+// intakeDraft is the pending clarification (single-slot, single-user
+// platform; expires after draftTTL). Two kinds share one slot:
+//
+//   - kind=""|"goal": a create_goal whose DOMAIN (a required parameter) the
+//     parser could not determine. The owner is asked to name the repo; the
+//     next inbound message is parsed WITH the draft as context, so a bare
+//     "test-repo" completes the pending task instead of becoming a new one.
+//
+//   - kind="agent": a create_agent awaiting the owner's skills choice. The
+//     owner is asked whether to select platform skills; the next message
+//     resolves the skills (or declines) and the agent is created from the
+//     draft's name/runtime/description/system_prompt — no need to re-send
+//     the whole agent spec.
 type IntakeDraft struct {
+	Kind        string `json:"kind"` // ""|"goal" | "agent"
 	Title       string `json:"title"`
 	Description string `json:"description"`
 	AssigneeID  string `json:"assignee_id"`
-	CreatedAt   string `json:"created_at"`
+	// agent-kind fields (kind=="agent").
+	AgentName         string `json:"agent_name"`
+	AgentRuntimeID    string `json:"agent_runtime_id"`
+	AgentDescription  string `json:"agent_description"`
+	AgentSystemPrompt string `json:"agent_system_prompt"`
+	CreatedAt         string `json:"created_at"`
 }
 
 const draftKey = "intake.draft"
@@ -68,31 +81,51 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 	}
 	var b strings.Builder
 	b.WriteString("你是 agentwork 的 IM 入站解析器。用户通过飞书向 agentwork 发了一条消息，请解析其意图并写入当前工作目录的 intake.json 文件（文件即结果，不要输出到 stdout）。\n\n")
-	// A pending clarification draft (multi-domain): the previous message
-	// created a task whose DOMAIN is a required parameter the user has not
-	// named yet — this message is parsed IN THAT CONTEXT, so a bare "test-repo"
-	// completes the pending task instead of becoming a new one.
+	// A pending clarification draft: the previous message created something
+	// whose required parameter the user has not supplied yet. This message is
+	// parsed IN THAT CONTEXT so a bare completion reply finishes the pending
+	// item instead of starting a new one. Two kinds share one slot.
 	if draft, ok := s.LoadDraft(ctx); ok {
-		b.WriteString("【上下文：用户在补全之前的一条任务创建】\n")
-		b.WriteString("之前解析出的任务（当时因未指定仓库而反问用户）：\n")
-		if draft.Title != "" {
-			b.WriteString("- 标题：" + draft.Title + "\n")
+		switch draft.Kind {
+		case "agent":
+			b.WriteString("【上下文：用户在回答之前 agent 创建的 skills 问题】\n")
+			b.WriteString("之前解析出的 agent（已确认 name/runtime/description/system_prompt，只差 skills 选择）：\n")
+			b.WriteString("- name：" + draft.AgentName + "\n")
+			b.WriteString("- runtime_id：" + draft.AgentRuntimeID + "\n")
+			if draft.AgentDescription != "" {
+				b.WriteString("- description：" + draft.AgentDescription + "\n")
+			}
+			if draft.AgentSystemPrompt != "" {
+				b.WriteString("- system_prompt：" + draft.AgentSystemPrompt + "\n")
+			}
+			b.WriteString("用户现在回复：\n\"" + text + "\"\n\n")
+			b.WriteString("请判断：这条回复是否在选 skills（从下面的 skill 名单里选）？\n")
+			b.WriteString("- 是（回复含 skill 名字）→ 输出 create_agent：name/runtime_id/description/system_prompt 照抄草稿，skills 填解析出的 id，skills_specified=true。\n")
+			b.WriteString("- 否（用户说「不要/不用」，或开始了一个全新请求）→ 输出 create_agent：照抄草稿字段，skills 留空，skills_specified=true（明确不要也算指定）。\n\n")
+		default: // "" | "goal"
+			b.WriteString("【上下文：用户在补全之前的一条任务创建】\n")
+			b.WriteString("之前解析出的任务（当时因未指定仓库而反问用户）：\n")
+			if draft.Title != "" {
+				b.WriteString("- 标题：" + draft.Title + "\n")
+			}
+			if draft.Description != "" {
+				b.WriteString("- 描述：" + draft.Description + "\n")
+			}
+			b.WriteString("用户现在回复：\n\"" + text + "\"\n\n")
+			b.WriteString("请判断：这条回复是否指定了仓库/域（从下面的域名名单里选）？\n")
+			b.WriteString("- 是（回复是仓库名，或「在 X 上执行」等）→ 输出 create_goal：用草稿的标题/描述/assignee，domain_id 填选中的仓库。\n")
+			b.WriteString("- 否（用户开始了一个全新任务——含「创建/做/加」等任务动词，或仍在闲聊）→ 按正常规则解析这条新消息。\n\n")
 		}
-		if draft.Description != "" {
-			b.WriteString("- 描述：" + draft.Description + "\n")
-		}
-		b.WriteString("用户现在回复：\n\"" + text + "\"\n\n")
-		b.WriteString("请判断：这条回复是否指定了仓库/域（从下面的域名名单里选）？\n")
-		b.WriteString("- 是（回复是仓库名，或「在 X 上执行」等）→ 输出 create_goal：用草稿的标题/描述/assignee，domain_id 填选中的仓库。\n")
-		b.WriteString("- 否（用户开始了一个全新任务——含「创建/做/加」等任务动词，或仍在闲聊）→ 按正常规则解析这条新消息。\n\n")
 	}
 	b.WriteString("用户消息：\n" + text + "\n\n")
 	b.WriteString(`intake.json 结构：
 {
-  "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|unknown",
+  "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|unknown",
   "goal": {"title": "", "description": "", "assignee_id": "", "domain_id": ""},
   "goal_id": "",
-  "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "domain_id": ""}
+  "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "domain_id": ""},
+  "agent": {"name": "", "runtime_id": "", "description": "", "system_prompt": "", "skills": [], "skills_specified": false},
+  "squad": {"name": "", "leader_id": "", "description": "", "instructions": "", "member_ids": []}
 }
 
 意图说明：
@@ -104,6 +137,10 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 - create_schedule：用户想创建定时任务/周期性任务（"每 1 个小时做 xxx"、"每天 9 点跑 xxx"、"每周一 xxx"）。schedule.name 填简短任务名；schedule.title 填每次触发时创建的任务标题；schedule.cron 把自然语言频率转成 5 段标准 cron 表达式；schedule.assignee_id 和 schedule.domain_id 从名单里选（必须真实存在）。
 - schedule_list：用户想查看定时任务/计划任务清单。不需要其他字段。
 - schedule_stop：用户想停掉/取消某个定时任务。schedule.name 填用户提到的定时任务名（照抄用户说的名字，可以不完全匹配）。
+- create_agent：用户想创建/配置一个 agent（含人设）。agent.name 必填（中文或英文短名）；agent.runtime_id 从下面的 runtime 名单里选 id（必填，必须真实存在）；agent.description 一句话描述（该 agent 做什么）；agent.system_prompt 是人设/角色说明（你是什么角色、怎么回答、有什么限制），用户没给也要塞一段合理默认值。
+  agent.skills 从下面的 skill 名单里选 id——用户明确说"不要 skills"则留空数组；用户完全没提 skills 时 skills 留空数组且 skills_specified=false（平台会反问是否要 skills）。用户指定了 skills（哪怕一个）或明确说不要时 skills_specified=true。
+  技术参数（env/model/mcp_servers/max_concurrent）不填（留空），用户后续在 Web 配置。
+- create_squad：用户想创建一个 squad（团队）。squad.name 必填；squad.leader_id 从下面的 agent 名单里选 id（必填，必须真实存在）；squad.description 一句话描述；squad.instructions 是团队协作指令/规则（给 leader 看的子目标拆分与委派规则，用户没给也要塞一段合理默认值）；squad.member_ids 是成员 agent id 数组（不含 leader——leader 单独在 leader_id 里）。
 - unknown：无法归入以上意图（闲聊、问候、无关话题）。
 
 cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时间 Asia/Shanghai）：
@@ -116,7 +153,7 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 - 每月 X 日 Y 点：Y X X * *
 - 无法可靠转换就 intent=unknown，别编造 cron。
 
-规则：intent 只能填上面七个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
+规则：intent 只能填上面九个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
 `)
 	b.WriteString("\n当前可用 agent（id: name）：\n")
 	if agents, err := s.qs.Agents(ctx); err == nil {
@@ -130,14 +167,33 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 			fmt.Fprintf(&b, "- %s: %s\n", d.ID, d.Name)
 		}
 	}
+	b.WriteString("\n当前可用 runtime（id: name）：\n")
+	if runtimes, err := s.qs.Runtimes(ctx); err == nil {
+		for _, r := range runtimes {
+			fmt.Fprintf(&b, "- %s: %s\n", r.ID, r.Name)
+		}
+	}
+	b.WriteString("\n当前可用 skill（id: name）：\n")
+	if skills, err := s.qs.Skills(ctx); err == nil {
+		for _, sk := range skills {
+			fmt.Fprintf(&b, "- %s: %s\n", sk.ID, sk.Name)
+		}
+	}
 	b.WriteString("\n完成后用一句话说明解析依据。")
 	return b.String(), nil
 }
 
-// Enqueue dispatches the intake parse run. msgID (the Feishu message id)
-// doubles as the coalesce key — the same message redelivered must not spawn
-// a second parse run.
+// Enqueue dispatches the intake parse run. The run is platform-level — it
+// has no owning domain (the parser works from the prompt alone) — so
+// domainID is "" and EnqueueProcessorRun coalesces on (run_type="intake",
+// domain_id="", agent_id): a backlog of intake messages on the same parser
+// agent folds into one queued run rather than duplicating. msgID (the Feishu
+// message id) is NOT a coalesce key here — the connector already deduplicates
+// inbound events, and stuffing msgID into the domain_id slot both broke
+// coalescing (every message has a different id → never folds) and tripped
+// nothing only because run.domain_id has no FK; semantically it was wrong.
 func (s *IntakeService) Enqueue(ctx context.Context, msgID, prompt string) (*service.Run, error) {
+	_ = msgID // retained in the signature for connector compatibility
 	if s.runSvc == nil {
 		return nil, errors.New("intake: runSvc not wired")
 	}
@@ -145,7 +201,7 @@ func (s *IntakeService) Enqueue(ctx context.Context, msgID, prompt string) (*ser
 	if err != nil {
 		return nil, err
 	}
-	return s.runSvc.EnqueueProcessorRun(ctx, "intake", msgID, agentID, prompt)
+	return s.runSvc.EnqueueProcessorRun(ctx, "intake", "", agentID, prompt)
 }
 
 // SaveDraft stores the pending clarification (multi-domain task creation).
@@ -178,8 +234,12 @@ func (s *IntakeService) LoadDraft(ctx context.Context) (*IntakeDraft, bool) {
 	return &d, true
 }
 
-// intakeAgent resolves the configured global parser agent (” + nil when
-// unset — the caller surfaces the setup hint).
+// intakeAgent resolves the configured global parser agent and verifies it
+// still exists. A deleted agent (id left over in platform.m3 after a teardown
+// or a re-seed) would otherwise fail at EnqueueProcessorRun with an opaque
+// FOREIGN KEY error — the owner sees "解析任务创建失败：FOREIGN KEY
+// constraint failed" and has no idea the configured agent is gone. Surface
+// the real cause here, with the setup hint.
 func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
 	raw, err := s.store.Get(ctx, intakeAgentKey)
 	if err != nil {
@@ -191,7 +251,15 @@ func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
 	}
 	if st.IntakeAgent == "" {
 		logging.Warnf("intake: platform.m3 intake_agent unset — inbound IM messages will be rejected (Settings → 全局解析 Agent)")
-		return "", errors.New("未配置任务解析 agent（设置页 → 全局解析 Agent）")
+		return "", errors.New("IM 解析 Agent 未配置或者已删除，请重新配置")
+	}
+	// The configured id must point at a live agent row — a stale config
+	// (agent deleted, DB re-seeded) is the one setup drift that produces an
+	// unreadable FK failure deep in EnqueueProcessorRun. AgentName returns
+	// ("", nil) on miss; "" means the id is gone.
+	if name, _ := s.qs.AgentName(ctx, st.IntakeAgent); name == "" {
+		logging.Warnf("intake: platform.m3 intake_agent %s not found in agent table — reconfigure (Settings → 全局解析 Agent)", st.IntakeAgent)
+		return "", errors.New("IM 解析 Agent 未配置或者已删除，请重新配置")
 	}
 	return st.IntakeAgent, nil
 }

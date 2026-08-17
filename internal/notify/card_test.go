@@ -301,7 +301,7 @@ func TestIntakeBuildPrompt(t *testing.T) {
 		t.Fatalf("prompt must carry roster + contract: %s", prompt)
 	}
 	// Unconfigured parser agent → Enqueue surfaces the setup hint.
-	if _, err := is.Enqueue(ctx, "msg1", prompt); err == nil || !strings.Contains(err.Error(), "解析 agent") {
+	if _, err := is.Enqueue(ctx, "msg1", prompt); err == nil || !strings.Contains(err.Error(), "IM 解析 Agent 未配置或者已删除") {
 		t.Fatalf("expected unconfigured-agent error, got %v", err)
 	}
 }
@@ -318,6 +318,52 @@ func seedAgentRow(t *testing.T, ctx context.Context, st *store.Store) {
 		`INSERT INTO agent (id,name,runtime_id,max_concurrent,created_at) VALUES ('a1','worker1','rt1',1,?)`,
 		time.Now().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestIntakeStaleAgentConfig: a platform.m3.intake_agent that points at an
+// agent row that no longer exists (deleted, or DB re-seeded) must surface a
+// human-readable setup hint at Enqueue — NOT an opaque FOREIGN KEY
+// constraint failure from EnqueueProcessorRun's INSERT. This is the setup
+// drift the live system hit ("解析任务创建失败：FOREIGN KEY constraint failed").
+func TestIntakeStaleAgentConfig(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	runSvc := service.NewRunService(st, events.NewBus())
+	seedAgentRow(t, ctx, st) // seeds 'a1'/'worker1'
+	qs := NewSQLQueryStore(st)
+	fake := &mapSettings{vals: map[string]string{}}
+	// Configure a parser agent id that does NOT exist in the agent table.
+	if err := fake.Set(ctx, "platform.m3", `{"intake_agent":"deadbeefdeadbeefdeadbeefdeadbeef"}`); err != nil {
+		t.Fatal(err)
+	}
+	is := NewIntakeService(qs, fake, runSvc)
+	_, err = is.Enqueue(ctx, "msg1", "prompt")
+	if err == nil {
+		t.Fatal("stale intake_agent must fail Enqueue")
+	}
+	if !strings.Contains(err.Error(), "IM 解析 Agent 未配置或者已删除") {
+		t.Fatalf("stale config must surface the setup hint, got %q", err.Error())
+	}
+	// And a live config must NOT fail at the existence check (it reaches
+	// EnqueueProcessorRun, which enqueues a real run row).
+	if err := fake.Set(ctx, "platform.m3", `{"intake_agent":"a1"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := is.Enqueue(ctx, "msg1", "prompt"); err != nil {
+		t.Fatalf("live intake_agent must enqueue, got %v", err)
+	}
+	// The run row is platform-level: domain_id is "" (not the msgID).
+	var domainID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT domain_id FROM run WHERE run_kind='processor' AND run_type='intake'`).Scan(&domainID); err != nil {
+		t.Fatalf("query intake run: %v", err)
+	}
+	if domainID != "" {
+		t.Fatalf("intake run domain_id must be empty (platform-level), got %q", domainID)
 	}
 }
 
@@ -380,5 +426,71 @@ func TestIntakeDraftClarification(t *testing.T) {
 	}
 	if _, ok := is.LoadDraft(ctx); ok {
 		t.Fatal("expired draft must be treated as absent")
+	}
+}
+
+// TestIntakeDraftAgentKind: an agent-kind draft (the skills-clarification
+// slot) surfaces in the next parser prompt as a skills-completion context —
+// the owner's bare skill-name reply then completes the pending agent instead
+// of starting a new one. The goal-kind branch is unchanged (regression).
+func TestIntakeDraftAgentKind(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	runSvc := service.NewRunService(st, events.NewBus())
+	seedAgentRow(t, ctx, st)
+	qs := NewSQLQueryStore(st)
+	fake := &mapSettings{vals: map[string]string{}}
+	is := NewIntakeService(qs, fake, runSvc)
+
+	// No agent draft → no skills-completion context.
+	p, err := is.BuildPrompt(ctx, "git-helper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(p, "回答之前 agent 创建的 skills 问题") {
+		t.Fatalf("no agent draft must not inject skills context: %s", p)
+	}
+
+	// Save an agent-kind draft → the next prompt carries the agent spec and
+	// the skills-completion framing.
+	if err := is.SaveDraft(ctx, IntakeDraft{
+		Kind: "agent", AgentName: "代码审查", AgentRuntimeID: "rt1",
+		AgentDescription: "审查 PR", AgentSystemPrompt: "你是审查员",
+		CreatedAt: time.Now().Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, err = is.BuildPrompt(ctx, "git-helper test-runner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"skills 问题", "代码审查", "rt1", "skills_specified=true"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("agent draft context must carry %q: %s", want, p)
+		}
+	}
+
+	// A goal-kind draft still uses the goal framing (regression guard).
+	if err := is.ClearDraft(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := is.SaveDraft(ctx, IntakeDraft{
+		Kind: "goal", Title: "修一下", AssigneeID: "a1",
+		CreatedAt: time.Now().Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, err = is.BuildPrompt(ctx, "test-repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(p, "补全之前的一条任务创建") {
+		t.Fatalf("goal-kind draft must keep the goal framing: %s", p)
+	}
+	if strings.Contains(p, "skills 问题") {
+		t.Fatalf("goal draft must not leak agent skills framing: %s", p)
 	}
 }

@@ -68,10 +68,14 @@ type QueryStore interface {
 	// GoalStatus resolves a goal by id OR id prefix (intake "状态 <id>"
 	// queries accept the short id).
 	GoalStatus(ctx context.Context, idPrefix string) (*GoalStatusView, error)
-	// Agents/Domains are the roster handed to the intake parser prompt so it
-	// can resolve assignee/domain names to ids.
+	// Agents/Domains/Runtimes/Skills are the roster handed to the intake
+	// parser prompt so it can resolve assignee/domain/runtime/skill names to
+	// ids (create_agent picks a runtime and selects skills; create_goal picks
+	// an assignee and a domain).
 	Agents(ctx context.Context) ([]NamedID, error)
 	Domains(ctx context.Context) ([]NamedID, error)
+	Runtimes(ctx context.Context) ([]NamedID, error)
+	Skills(ctx context.Context) ([]NamedID, error)
 	// TerminalSince lists goals whose last run reached a terminal status in
 	// [since, until) (RFC3339) — the daily digest's "yesterday" window.
 	TerminalSince(ctx context.Context, since, until string) ([]GoalBrief, error)
@@ -199,6 +203,45 @@ func (q *SQLQueryStore) Agents(ctx context.Context) ([]NamedID, error) {
 
 func (q *SQLQueryStore) Domains(ctx context.Context) ([]NamedID, error) {
 	rows, err := q.st.DB().QueryContext(ctx, `SELECT id, name FROM domain ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []NamedID{}
+	for rows.Next() {
+		var n NamedID
+		if err := rows.Scan(&n.ID, &n.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// Runtimes lists ACTIVE runtimes only — an absent runtime (the machine's
+// latest probe no longer sees the CLI) is kept as a row (agents reference
+// it) but must not be offered to the intake parser for new agents.
+func (q *SQLQueryStore) Runtimes(ctx context.Context) ([]NamedID, error) {
+	rows, err := q.st.DB().QueryContext(ctx, `SELECT id, name FROM runtime WHERE status='active' ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []NamedID{}
+	for rows.Next() {
+		var n NamedID
+		if err := rows.Scan(&n.ID, &n.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+// Skills lists the platform-managed skill library — agents SELECT these by
+// id (uploaded/created ahead of time), they are never created from NL.
+func (q *SQLQueryStore) Skills(ctx context.Context) ([]NamedID, error) {
+	rows, err := q.st.DB().QueryContext(ctx, `SELECT id, name FROM skill ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
