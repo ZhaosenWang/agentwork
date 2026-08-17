@@ -60,6 +60,9 @@ func main() {
 		changeCmd(os.Args[2:])
 	case "issue":
 		issueCmd(serverURL, goalID, os.Args[2:])
+	case "version":
+		versionCmd()
+		return
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -141,6 +144,8 @@ Subcommands:
   issue comment --text T                     reply to the issue behind the current goal
                                              (the platform owns the token; only for
                                              issue-sourced goals, M4-B)
+
+  version                                    print the CLI build version and exit
 
 Environment (injected by daemon):
   AGENTWORK_SERVER_URL   server base URL (default http://127.0.0.1:7373)
@@ -531,6 +536,10 @@ func postNoBody(url string, body any) {
 		rb, _ := io.ReadAll(resp.Body)
 		fail("POST %s: HTTP %d: %s", url, resp.StatusCode, rb)
 	}
+}
+
+func versionCmd() {
+	fmt.Fprintf(os.Stderr, "agentwork v%s\n", cliVersion)
 }
 
 func fail(format string, args ...any) {

@@ -135,6 +135,17 @@ func TestGoalListStatusLimitEndToEnd(t *testing.T) {
 	}
 }
 
+// TestVersionCmd: prints "agentwork v<cliVersion>" to stderr (stdout is the
+// data channel agents parse; version is meta output) using the build-stamped
+// variable (defaults to 0.0.1-beta.1 without -ldflags).
+func TestVersionCmd(t *testing.T) {
+	out := captureStderr(t, versionCmd)
+	want := "agentwork v" + cliVersion + "\n"
+	if string(out) != want {
+		t.Fatalf("version output = %q, want %q", out, want)
+	}
+}
+
 // TestRunsListURL: GET /goals/{id}/runs URL building.
 func TestRunsListURL(t *testing.T) {
 	cases := []struct {
@@ -248,6 +259,23 @@ func captureStdout(t *testing.T, fn func()) []byte {
 	fn()
 	_ = pw.Close()
 	os.Stdout = old
+	out, _ := io.ReadAll(pr)
+	return out
+}
+
+// captureStderr mirrors captureStdout for os.Stderr — used by meta commands
+// (version, usage) that deliberately avoid polluting the stdout data channel.
+func captureStderr(t *testing.T, fn func()) []byte {
+	t.Helper()
+	old := os.Stderr
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	os.Stderr = pw
+	fn()
+	_ = pw.Close()
+	os.Stderr = old
 	out, _ := io.ReadAll(pr)
 	return out
 }
