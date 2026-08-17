@@ -26,6 +26,14 @@ export interface PermissionRequest {
 export interface ChatEvent {
   kind: "user" | "agent" | "thought" | "tool";
   text: string;
+  // tool-only fields — let the chat panel pair a tool_call (use) with its
+  // tool_call_update (result) by callId, the same way the run-detail stream
+  // pairs chat_message rows. Without these, a tool call rendered as two
+  // unrelated bubbles (a "🔧 title" line + a "↳ output" line).
+  callId?: string;
+  toolName?: string;
+  output?: string;
+  isResult?: boolean;
 }
 
 export interface AcpChatCallbacks {
@@ -260,13 +268,15 @@ function updateToEvent(u: any): ChatEvent | null {
       return t ? { kind: "thought", text: t } : null;
     }
     case "tool_call": {
-      return { kind: "tool", text: `🔧 ${u.title ?? "tool"}` };
+      // Carry the callId + toolName so the panel pairs this use with its
+      // later result update — no emoji in the text (the renderer styles it).
+      return { kind: "tool", text: "", callId: u.toolCallId, toolName: u.title ?? "tool" };
     }
     case "tool_call_update": {
       const st = u.status ?? "";
       if (st !== "completed") return null;
       const out = typeof u.rawOutput === "string" ? u.rawOutput : JSON.stringify(u.rawOutput ?? "");
-      return { kind: "tool", text: out ? `  ↳ ${out.slice(0, 300)}` : "  ↳ done" };
+      return { kind: "tool", text: "", callId: u.toolCallId, output: out, isResult: true };
     }
     default:
       return null;

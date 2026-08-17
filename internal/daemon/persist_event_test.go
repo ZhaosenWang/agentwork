@@ -199,3 +199,56 @@ func TestPersistEventToolCallFlankedByText(t *testing.T) {
 		t.Fatalf("row order wrong, got %v", got)
 	}
 }
+
+// TestPersistEventWSBroadcastAggregation: persistEvent returns the event to
+// broadcast over WS run:event. The live panels (domains compile stream)
+// append every broadcast — without aggregation they saw each ACP update,
+// duplicating tool calls. The returned event must be: the FIRST tool_use
+// (call started), the tool_result (output), but NOT the input-accumulation
+// updates (same CallID, row already exists). Text/thought broadcast as-is.
+func TestPersistEventWSBroadcastAggregation(t *testing.T) {
+	d, st, goalID, agentID := seedCtx(t)
+	ctx := context.Background()
+	runID := insertTestRun(t, st, goalID, agentID)
+
+	callID := "call-ws"
+	var broadcasts []proto.EventType
+
+	// 1. first tool_use (start) → broadcast
+	b1 := d.persistEvent(ctx, runID, proto.Event{Type: proto.EventToolUse, CallID: callID, Tool: "ls"})
+	broadcasts = append(broadcasts, b1.Type)
+	// 2. tool_use input accumulation (same CallID) → NOT broadcast (zero)
+	b2 := d.persistEvent(ctx, runID, proto.Event{Type: proto.EventToolUse, CallID: callID, Tool: "ls", Input: `{"cwd":"/x"}`})
+	broadcasts = append(broadcasts, b2.Type)
+	// 3. tool_result (different bufKey, first of its kind) → broadcast
+	b3 := d.persistEvent(ctx, runID, proto.Event{Type: proto.EventToolResult, CallID: callID, Tool: "ls", Output: `{"exit":0}`})
+	broadcasts = append(broadcasts, b3.Type)
+
+	want := []proto.EventType{proto.EventToolUse, "", proto.EventToolResult}
+	if len(broadcasts) != len(want) {
+		t.Fatalf("broadcast count: got %d want %d (%v)", len(broadcasts), len(want), broadcasts)
+	}
+	for i, w := range want {
+		if broadcasts[i] != w {
+			t.Fatalf("broadcast[%d]: got %q want %q (full: %v)", i, broadcasts[i], w, broadcasts)
+		}
+	}
+}
+
+// TestPersistEventWSBroadcastTextStreams: text/thought chunks broadcast
+// every event (the live stream is the streaming surface — the DB aggregates
+// but the WS feed appends per chunk).
+func TestPersistEventWSBroadcastTextStreams(t *testing.T) {
+	d, st, goalID, agentID := seedCtx(t)
+	ctx := context.Background()
+	runID := insertTestRun(t, st, goalID, agentID)
+
+	b1 := d.persistEvent(ctx, runID, proto.Event{Type: proto.EventMessage, Text: "hello "})
+	b2 := d.persistEvent(ctx, runID, proto.Event{Type: proto.EventMessage, Text: "world"})
+	if b1.Type != proto.EventMessage || b2.Type != proto.EventMessage {
+		t.Fatalf("text chunks must broadcast, got %q %q", b1.Type, b2.Type)
+	}
+	if b1.Text != "hello " || b2.Text != "world" {
+		t.Fatalf("broadcast text must carry the chunk, got %q %q", b1.Text, b2.Text)
+	}
+}

@@ -255,10 +255,16 @@ func (d *Daemon) IngestRunEvents(ctx context.Context, mid string, p link.RunEven
 
 	for _, ev := range p.Events {
 		pev := proto.Event{Type: proto.EventType(ev.Kind), Text: ev.Text, Tool: ev.Tool, CallID: ev.CallID, Input: ev.Input, Output: ev.Output}
-		d.persistEvent(ctx, p.RunID, pev)
-		d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
-			"run_id": p.RunID, "event": pev,
-		}})
+		broadcast := d.persistEvent(ctx, p.RunID, pev)
+		// persistEvent returns a zero event when the update was an
+		// aggregated tool-accumulation chunk (already broadcast on its first
+		// update) — skip the WS push so the live stream does not duplicate
+		// tool calls. Text/thought/first-tool-use/tool-result broadcast.
+		if broadcast.Type != "" {
+			d.bus.Publish(ctx, events.Event{Topic: "run:event", Payload: map[string]any{
+				"run_id": p.RunID, "event": broadcast,
+			}})
+		}
 	}
 	return nil
 }

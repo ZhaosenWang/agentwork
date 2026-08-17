@@ -1994,11 +1994,19 @@ func (d *Daemon) trackToolInflight(n *atomic.Int32, ev proto.Event) {
 }
 
 // persistEvent stores one protocol event into chat_message (the run detail
-// view's data source). Consecutive text/thought chunks from the same role
-// are AGGREGATED into one row (an ACP stream emits per-token chunks — a raw
-// per-chunk insert produced 20k+ rows per run and destroyed transcript
-// replay quality); tool events flush the pending buffer first.
-func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event) {
+// view's data source) and returns the event to broadcast over WS run:event
+// (the live panels' real-time feed). Consecutive text/thought chunks from
+// the same role are AGGREGATED into one row (an ACP stream emits per-token
+// chunks — a raw per-chunk insert produced 20k+ rows per run and destroyed
+// transcript replay quality); tool events flush the pending buffer first.
+//
+// The returned event keeps the WS broadcast in sync with the DB aggregation:
+// a tool_use that is an input-accumulation update (same CallID, row already
+// exists) returns a zero event — the live stream already saw the call start,
+// and the growing input has no value to show mid-stream; only the FIRST
+// tool_use and the terminal tool_result broadcast. Without this the WS path
+// (domains compile stream) showed every update, duplicating tool calls.
+func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event) proto.Event {
 	switch ev.Type {
 	case proto.EventMessage, proto.EventThought:
 		role := "assistant"
@@ -2017,6 +2025,11 @@ func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event)
 		}
 		b.content += ev.Text
 		d.mu.Unlock()
+		// Text/thought chunks broadcast as-is — the live panels append them
+		// per chunk (the DB aggregates, but the WS feed is the streaming
+		// surface; a buffered append would add latency for no dedup gain
+		// since renderRunEvent already truncates each line).
+		return ev
 	case proto.EventToolUse, proto.EventToolResult:
 		// ACP emits MULTIPLE updates per tool call: a start (tool_call, maybe
 		// with partial/empty input), input-accumulation updates
@@ -2036,6 +2049,11 @@ func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event)
 		// call with no CallID falls back to one-row-per-event. Text is
 		// flushed first so a tool call never lands ahead of the assistant
 		// text that announced it.
+		//
+		// WS broadcast: only the FIRST tool_use (the call started) and the
+		// tool_result (the output) broadcast; input-accumulation updates
+		// return a zero event (the live stream dedups them — see the return
+		// at the bottom of this branch).
 		d.mu.Lock()
 		d.flushMsgBuffer(ctx, runID)
 		if d.toolBuffers == nil {
@@ -2061,12 +2079,13 @@ func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event)
 			// First update for this (call, type) — INSERT, then remember the
 			// row id so later updates target it. Released from under d.mu
 			// (the INSERT hits the DB; holding d.mu across it would serialize
-			// every run's tool stream on one lock).
+			// every run's tool stream on one lock). Broadcast this event
+			// (the call started, or a standalone result landed).
 			if ev.CallID == "" {
 				d.mu.Unlock()
 				tc, _ := json.Marshal(ev)
 				d.insertChatMessage(ctx, runID, "tool", "", string(tc))
-				return
+				return ev
 			}
 			id := uuid.NewString()
 			tc, _ := json.Marshal(ev)
@@ -2075,16 +2094,22 @@ func (d *Daemon) persistEvent(ctx context.Context, runID string, ev proto.Event)
 			d.mu.Lock()
 			tbl[bufKey] = &toolRow{id: id}
 			d.mu.Unlock()
-			return
+			return ev
 		}
 		// Subsequent update of the SAME type — rewrite the stored row's
 		// tool_calls JSON with the latest event (input grew on a tool_use;
-		// output may land in pieces on a tool_result).
+		// output may land in pieces on a tool_result). Do NOT broadcast:
+		// the live stream already saw this (call, type) on its first update,
+		// and the partial growth has no value mid-stream. The terminal
+		// tool_result is a DIFFERENT bufKey (":result"), so it still
+		// broadcasts on its own first insert above.
 		tc, _ := json.Marshal(ev)
 		d.mu.Unlock()
 		d.updateChatMessageToolCalls(ctx, row.id, string(tc))
+		return proto.Event{}
 	default:
 		d.insertChatMessage(ctx, runID, "assistant", ev.Text, "[]")
+		return ev
 	}
 }
 

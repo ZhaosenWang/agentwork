@@ -9,6 +9,7 @@ import { Badge, Empty } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Run } from "@/lib/types";
 import type { ChatMessage } from "@/lib/api";
+import { groupMessages, StreamCards } from "@/lib/run-messages";
 
 // useThrottled returns a throttled wrapper (leading + trailing edge): at
 // most one call per window, and a call landing inside an open window is
@@ -211,144 +212,20 @@ function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentNa
 
 // ── Run interaction stream: grouped + collapsible cards ──
 //
-// The flat chat_message rows (thought / tool_use / tool_result / assistant
-// text) are grouped into render units: a thought card, a tool card (use +
-// result paired by call_id), or a bare text line. Thought and tool cards
-// collapse on click; thought auto-collapses when its stream ends. Collapse
-// state rides a ref keyed by row identity so it survives the 1s throttled
-// refetch (the messages array is replaced each time — useState would reset).
-
-type RenderItem =
-  | { kind: "thought"; key: string; content: string; isStreaming: boolean }
-  | { kind: "tool"; key: string; toolName: string; input: string; output: string; hasResult: boolean }
-  | { kind: "text"; key: string; content: string };
-
-// groupMessages scans the flat chat_message stream in order and pairs each
-// tool_use with its same-call_id tool_result into one tool card. A tool_use
-// whose result has not arrived yet renders as a card with hasResult=false
-// (the tool is still running).
-function groupMessages(messages: ChatMessage[]): RenderItem[] {
-  const items: RenderItem[] = [];
-  const pendingTools = new Map<string, RenderItem & { kind: "tool" }>();
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i];
-    const key = `${m.created_at}|${m.role}|${i}`;
-    if (m.role === "tool" && m.tool_calls) {
-      try {
-        const tc = JSON.parse(m.tool_calls);
-        if (tc.type === "tool_use") {
-          const input = typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input ?? "");
-          const item: RenderItem & { kind: "tool" } = {
-            kind: "tool", key, toolName: tc.tool ?? "tool", input, output: "", hasResult: false,
-          };
-          if (tc.call_id) pendingTools.set(String(tc.call_id), item);
-          items.push(item);
-          continue;
-        }
-        if (tc.type === "tool_result") {
-          const out = typeof tc.output === "string" ? tc.output : JSON.stringify(tc.output ?? "");
-          const cid = tc.call_id ? String(tc.call_id) : "";
-          const paired = cid ? pendingTools.get(cid) : undefined;
-          if (paired) {
-            paired.output = out;
-            paired.hasResult = true;
-          } else {
-            // result with no preceding use (orphan) — render as a standalone tool card
-            items.push({ kind: "tool", key, toolName: tc.tool ?? "tool", input: "", output: out, hasResult: true });
-          }
-          continue;
-        }
-      } catch { /* not tool JSON — fall through to text */ }
-    }
-    if (m.role === "thought") {
-      // isStreaming: this thought is the last message and no non-thought row
-      // follows it — the agent is still thinking. Once a tool/text row lands
-      // after it, the thought is done and auto-collapses.
-      const isStreaming = i === messages.length - 1;
-      items.push({ kind: "thought", key, content: m.content, isStreaming });
-      continue;
-    }
-    // assistant / system / anything else → bare text
-    items.push({ kind: "text", key, content: m.content });
-  }
-  return items;
-}
+// RunMessages renders the interaction stream as collapsible cards (thought /
+// tool / text) via the shared StreamCards component — the same renderer the
+// timeline side card and the domains compile stream use, so every real-time
+// surface looks identical.
 
 // RunMessages renders the interaction stream as collapsible cards: thoughts
 // and tool calls fold on click; assistant text is always shown.
 function RunMessages({ messages }: { messages: ChatMessage[] }) {
-  // Collapse state keyed by RenderItem.key — a ref so it survives the 1s
-  // throttled refetch that swaps the messages array. A useState would reset
-  // every refresh. forceTick re-renders after a toggle.
-  const collapsedRef = useRef(new Map<string, boolean>());
-  const [, forceTick] = useState(0);
-  const force = () => forceTick((x) => x + 1);
-
   if (messages.length === 0) {
     return <div className="text-[11px] text-zinc-400 py-2">尚无交互记录…</div>;
   }
-  const items = groupMessages(messages);
-
-  const toggle = (key: string) => {
-    const cur = collapsedRef.current.get(key) ?? false;
-    collapsedRef.current.set(key, !cur);
-    force();
-  };
-
   return (
-    <div className="max-h-72 overflow-y-auto space-y-1.5">
-      {items.map((item) => {
-        if (item.kind === "thought") {
-          // Default: expanded while streaming, collapsed once done. A manual
-          // toggle (map has the key) wins over the default.
-          const collapsed = collapsedRef.current.get(item.key) ?? !item.isStreaming;
-          return (
-            <div key={item.key} className="text-[11px]">
-              <button
-                onClick={() => toggle(item.key)}
-                className="text-zinc-500 font-medium hover:text-zinc-700"
-              >
-                {collapsed ? "+" : "-"} thought
-              </button>
-              {!collapsed && (
-                <div className="mt-0.5 pl-2 italic text-zinc-400 whitespace-pre-wrap">
-                  {item.content}
-                </div>
-              )}
-            </div>
-          );
-        }
-        if (item.kind === "tool") {
-          const collapsed = collapsedRef.current.get(item.key) ?? false;
-          return (
-            <div key={item.key} className="text-[11px]">
-              <button
-                onClick={() => toggle(item.key)}
-                className="text-purple-600 font-medium hover:text-purple-700"
-              >
-                {collapsed ? "+" : "-"} {item.toolName}
-              </button>
-              {!collapsed && (
-                <div className="mt-0.5 pl-2 space-y-0.5">
-                  {item.input && (
-                    <div className="text-zinc-500 break-all">{item.input}</div>
-                  )}
-                  {item.hasResult ? (
-                    <div className="text-zinc-400 break-all whitespace-pre-wrap">{item.output}</div>
-                  ) : (
-                    <div className="text-zinc-400 italic">运行中…</div>
-                  )}
-                </div>
-              )}
-            </div>
-          );
-        }
-        return (
-          <div key={item.key} className="text-[11px] text-zinc-700 whitespace-pre-wrap">
-            {item.content}
-          </div>
-        );
-      })}
+    <div className="max-h-72 overflow-y-auto">
+      <StreamCards items={groupMessages(messages)} />
     </div>
   );
 }

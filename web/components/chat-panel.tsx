@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AcpChatClient, ChatEvent, PermissionRequest, SessionInfo } from "@/lib/acp";
 import { Button, Dialog, inputCls } from "@/components/ui";
+import { StreamCards } from "@/lib/run-messages";
 
 interface Msg extends ChatEvent {
   id: number;
@@ -51,6 +52,17 @@ export function ChatPanel({ agentId, agentName, onClose }: { agentId: string; ag
       const last = prev[prev.length - 1];
       if (last && last.kind === ev.kind && (ev.kind === "agent" || ev.kind === "thought")) {
         return [...prev.slice(0, -1), { ...last, text: last.text + ev.text }];
+      }
+      // A tool_result (isResult) merges into the preceding tool_use with the
+      // SAME callId — one card per tool call (request + response), not two.
+      if (ev.kind === "tool" && ev.isResult && ev.callId) {
+        const idx = prev.findLastIndex((m) => m.kind === "tool" && m.callId === ev.callId && !m.isResult);
+        if (idx >= 0) {
+          const target = prev[idx];
+          const next = [...prev];
+          next[idx] = { ...target, output: ev.output, isResult: true };
+          return next;
+        }
       }
       return [...prev, { ...ev, id: nextId }];
     });
@@ -144,7 +156,7 @@ export function ChatPanel({ agentId, agentName, onClose }: { agentId: string; ag
       // to duplicate. A turn that DID act before failing is a real work
       // failure — surface it instead of retrying.
       if (!agentActivity.current) {
-        push({ kind: "tool", text: "（会话历史已损坏——上次回合被中断，自动新建会话重试）" });
+        push({ kind: "agent", text: "（会话历史已损坏——上次回合被中断，自动新建会话重试）" });
         try {
           const sid = await client.newSession();
           setCurrent(sid);
@@ -191,23 +203,48 @@ export function ChatPanel({ agentId, agentName, onClose }: { agentId: string; ag
         {phase === "chat" && (
           <>
             <div className="flex-1 overflow-y-auto space-y-2 rounded-lg bg-zinc-50 border border-zinc-200 p-3">
-              {messages.map((m) => (
-                <div key={m.id} className={m.kind === "user" ? "text-right" : "text-left"}>
-                  <span
-                    className={`inline-block max-w-[85%] px-3 py-1.5 rounded-xl text-sm whitespace-pre-wrap break-words ${
-                      m.kind === "user"
-                        ? "bg-indigo-600 text-white"
-                        : m.kind === "thought"
-                          ? "bg-zinc-100 text-zinc-400 italic"
-                          : m.kind === "tool"
-                            ? "bg-purple-50 text-purple-700 text-xs"
-                            : "bg-white border border-zinc-200 text-zinc-800"
-                    }`}
-                  >
-                    {m.text}
-                  </span>
-                </div>
-              ))}
+              {messages.map((m) => {
+                // User + agent text stay as chat bubbles (the conversational
+                // surface). Thought + tool render as collapsible StreamCards
+                // (the agent's interaction stream) — same style as the
+                // run-detail live stream and the timeline side card.
+                if (m.kind === "thought") {
+                  return (
+                    <StreamCards
+                      key={m.id}
+                      items={[{ kind: "thought", key: String(m.id), content: m.text, isStreaming: busy }]}
+                    />
+                  );
+                }
+                if (m.kind === "tool") {
+                  return (
+                    <StreamCards
+                      key={m.id}
+                      items={[{
+                        kind: "tool",
+                        key: m.callId ?? String(m.id),
+                        toolName: m.toolName ?? "tool",
+                        input: "",
+                        output: m.output ?? "",
+                        hasResult: !!m.isResult,
+                      }]}
+                    />
+                  );
+                }
+                return (
+                  <div key={m.id} className={m.kind === "user" ? "text-right" : "text-left"}>
+                    <span
+                      className={`inline-block max-w-[85%] px-3 py-1.5 rounded-xl text-sm whitespace-pre-wrap break-words ${
+                        m.kind === "user"
+                          ? "bg-indigo-600 text-white"
+                          : "bg-white border border-zinc-200 text-zinc-800"
+                      }`}
+                    >
+                      {m.text}
+                    </span>
+                  </div>
+                );
+              })}
               {busy && (
                 <div className="flex items-center gap-3">
                   <p className="text-xs text-zinc-400">agent 思考中…</p>

@@ -7,14 +7,11 @@ import {
   useDomainCompileRun, useFreezeDomainChecks, useGoalEvents, useGateStats, qk,
 } from "@/lib/queries";
 import { listRunMessages, testDomainGit } from "@/lib/api";
+import type { ChatMessage } from "@/lib/api";
 import { useWSEvent } from "@/lib/ws";
 import { Button, Dialog, Field, inputCls, PageHeader, Empty, Badge } from "@/components/ui";
 import type { Domain, DomainGitTestResult, Checks, Guard, GateRule, Run } from "@/lib/types";
-
-// cutLine truncates one backfilled line for the compile progress box.
-function cutLine(t: string): string {
-  return t.length > 160 ? t.slice(0, 160) + "…" : t;
-}
+import { groupMessages, StreamCards } from "@/lib/run-messages";
 
 // GitTestButton probes UNSAVED form values (决策 6-24): repo URL + branch +
 // token read permission via `git ls-remote` on the daemon — a misconfigured
@@ -57,24 +54,6 @@ function GitTestButton({ gitUrl, defaultBranch, gitCredentials, onResult }: { gi
       )}
     </div>
   );
-}
-
-// renderRunEvent turns one WS run:event (proto.Event shape) into a single
-// line for the compile progress stream.
-function renderRunEvent(ev: { type?: string; text?: string; tool?: string; input?: string; output?: string }): string {
-  const cut = (t: string, n: number) => (t.length > n ? t.slice(0, n) + "…" : t);
-  switch (ev.type) {
-    case "thought":
-      return "💭 " + cut(ev.text ?? "", 160);
-    case "message":
-      return ev.text ?? "";
-    case "tool_use":
-      return "🔧 " + (ev.tool ?? "tool") + (ev.input ? " " + cut(ev.input, 80) : "");
-    case "tool_result":
-      return "· " + cut(ev.output ?? "", 140);
-    default:
-      return cut(ev.text ?? "", 160);
-  }
 }
 
 // deriveIssueSrc mirrors the backend's deriveIssueSource: the issue repo +
@@ -145,7 +124,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const [compiling, setCompiling] = useState(false);
   const [compileError, setCompileError] = useState<string | null>(null);
   const [compileRun, setCompileRun] = useState<Run | null>(null);
-  const [runLines, setRunLines] = useState<string[]>([]);
+  const [runEvents, setRunEvents] = useState<ChatMessage[]>([]);
   // 回显域已配置的处理器 agent（域创建时选的 / 已配过的），不必每次重选
   const [processorAgent, setProcessorAgent] = useState(d.processor_agent_id);
   // 手动编辑验收策略（决策 2-8 降级路径：不依赖模型编译；冻结后也可再编辑）
@@ -230,7 +209,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
       {
         onSuccess: (run) => {
           setCompileRun(run);
-          setRunLines([]);
+          setRunEvents([]);
         },
         onError: () => setCompiling(false),
       }
@@ -250,11 +229,20 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
     }
   });
   // The compile run's live stream — what the processor agent is doing right
-  // now (exploring the repo, installing deps, measuring the baseline).
+  // now (exploring the repo, installing deps, measuring the baseline). WS
+  // events accumulate as ChatMessage rows so groupMessages can pair tool_use
+  // + tool_result into one collapsible card (same renderer as the run-detail
+  // and timeline streams).
   useWSEvent("run:event", (p) => {
-    const pld = p as { run_id?: string; event?: { type?: string; text?: string; tool?: string; input?: string; output?: string } };
+    const pld = p as { run_id?: string; event?: { type?: string; text?: string; tool?: string; call_id?: string; input?: string; output?: string } };
     if (!compileRun || !pld.event || pld.run_id !== compileRun.id) return;
-    setRunLines((prev) => [...prev.slice(-40), renderRunEvent(pld.event!)]);
+    const ev = pld.event;
+    const role = ev.type === "thought" ? "thought" : ev.type === "tool_use" || ev.type === "tool_result" ? "tool" : "assistant";
+    const content = ev.type === "thought" || ev.type === "message" ? (ev.text ?? "") : "";
+    const toolCalls = ev.type === "tool_use" || ev.type === "tool_result"
+      ? JSON.stringify({ type: ev.type, tool: ev.tool, call_id: ev.call_id, input: ev.input, output: ev.output })
+      : "[]";
+    setRunEvents((prev) => [...prev.slice(-80), { role, content, tool_calls: toolCalls, created_at: new Date().toISOString() }]);
   });
   useWSEvent("domain:compile_failed", (p) => {
     const pld = p as { domain_id?: string; error?: string };
@@ -275,16 +263,10 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
     if (latestCompile.status === "queued" || latestCompile.status === "running") {
       setCompiling(true);
       setCompileRun(latestCompile);
-      // 回填进度框历史：只取 content（跳过 thought/reasoning 与 tool 行）
+      // 回填进度框历史：全量消息（thought/tool/text 都留，groupMessages
+      // 会配对 tool 并折叠）。
       listRunMessages(latestCompile.id)
-        .then((msgs) =>
-          setRunLines(
-            msgs
-              .filter((m) => m.role === "assistant" && m.content.trim() !== "")
-              .slice(-20)
-              .map((m) => cutLine(m.content.trim()))
-          )
-        )
+        .then((msgs) => setRunEvents(msgs.slice(-80)))
         .catch(() => {});
     } else if (latestCompile.status === "failed") {
       setCompileError((prev) => prev ?? (latestCompile.result_summary || "编译失败（未知原因）"));
@@ -471,13 +453,11 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
             <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
             {agents?.find((a) => a.id === compileRun.agent_id)?.name ?? compileRun.agent_id.slice(0, 8)} 正在探索项目、统计基线，请稍等......
           </div>
-          <div className="rounded bg-zinc-50 border border-zinc-200 p-2 max-h-44 overflow-y-auto space-y-0.5 font-mono text-[11px] text-zinc-600">
-            {runLines.length === 0 ? (
-              <span className="text-zinc-400">等待 agent 开始…</span>
+          <div className="rounded bg-zinc-50 border border-zinc-200 p-2 max-h-44 overflow-y-auto">
+            {runEvents.length === 0 ? (
+              <span className="text-[11px] text-zinc-400">等待 agent 开始…</span>
             ) : (
-              runLines.map((l, i) => (
-                <div key={i} className="whitespace-pre-wrap break-words">{l}</div>
-              ))
+              <StreamCards items={groupMessages(runEvents)} compact />
             )}
           </div>
         </div>

@@ -25,6 +25,7 @@ import { useGoalTimeline, useGoalRuns, useGoalRunMessages, useAgents, qk } from 
 import { useWSEvent } from "@/lib/ws";
 import { Badge, Button, Dialog } from "@/components/ui";
 import type { TimelineItem } from "@/lib/types";
+import { groupMessages, StreamCards } from "@/lib/run-messages";
 
 /** 1min ago → "1min"; 3h12m → "3h 12m"; 2d → "2d". */
 function dur(start: number, end: number): string {
@@ -500,38 +501,12 @@ function RunDetail({ goalId, runId, agentName }: {
         {showStream ? "收起交互流" : "查看交互流"}
       </button>
       {showStream && (
-        <div className="max-h-48 overflow-y-auto space-y-1 border-t border-zinc-100 pt-1.5">
-          {(messages ?? []).map((m, i) => {
-            if (m.role === "tool" && m.tool_calls && m.tool_calls !== "[]") {
-              try {
-                // tool_calls 可能是单个对象 {type:"tool_use",...} 或数组
-                const parsed = JSON.parse(m.tool_calls);
-                const tcs = Array.isArray(parsed) ? parsed : [parsed];
-                return (tcs as { type?: string; tool?: string; input?: unknown }[]).map((tc, j) => {
-                  if (tc.type === "tool_use") {
-                    const input = typeof tc.input === "string" ? tc.input : JSON.stringify(tc.input ?? "");
-                    return (
-                      <div key={`${i}-${j}`} className="text-[10px]">
-                        <span className="text-purple-600 font-medium">⚙ {tc.tool}</span>
-                        <span className="text-zinc-400 ml-1 break-all">{input.slice(0, 120)}</span>
-                      </div>
-                    );
-                  }
-                  return null;
-                });
-              } catch {
-                return null;
-              }
-            }
-            if (m.role === "thought") {
-              return <div key={i} className="text-[10px] text-zinc-400 italic">💭 {m.content.slice(0, 120)}</div>;
-            }
-            if (m.role === "assistant" && m.content) {
-              return <div key={i} className="text-[10px] text-zinc-700">{m.content.slice(0, 160)}</div>;
-            }
-            return null;
-          })}
-          {(messages ?? []).length === 0 && <div className="text-[10px] text-zinc-400">尚无交互记录…</div>}
+        <div className="max-h-48 overflow-y-auto border-t border-zinc-100 pt-1.5">
+          {(messages ?? []).length === 0 ? (
+            <div className="text-[10px] text-zinc-400">尚无交互记录…</div>
+          ) : (
+            <StreamCards items={groupMessages(messages ?? [])} compact />
+          )}
         </div>
       )}
     </div>
