@@ -843,6 +843,17 @@ func (d *Daemon) StopRun(goalID, runID string) error {
 		}})
 		return nil
 	}
+	// Terminal run (completed/failed/cancelled): the run is already stopped.
+	// Return success (idempotent) — the human's click is a no-op, not an
+	// error. Without this guard a stop on a completed run fell through to
+	// the running branch: enqueueMachineCancel leaked a cancel to the machine
+	// queue for an already-terminal run, and the UPDATE...WHERE status='running'
+	// matched nothing, surfacing a 400 "is no longer running" to the web (the
+	// "点取消没反应" symptom — the run had ended, but the goal stayed active
+	// under the ask-hold so the runs panel still showed it).
+	if status == "completed" || status == "failed" || status == "cancelled" {
+		return nil
+	}
 	// The claim→register window: the run was claimed but runTask has not
 	// registered its cancel yet — the in-memory cut would silently no-op and
 	// the human's stop click would do NOTHING while reporting success. The
@@ -880,6 +891,19 @@ func (d *Daemon) StopRun(goalID, runID string) error {
 	}
 	d.cancelRun(runID, "stopped")
 	return nil
+}
+
+// ContinueGoal resumes a paused goal (决策 4-12 延伸): the human stopped the
+// running run, the goal stayed active with no agent working. This enqueues a
+// fresh owner run carrying a pause-resume wake note so the owner picks up its
+// worktree state rather than restarting. The wake note is the ONLY signal —
+// the cancelled run's summary is platform noise ("cancelled"), not the
+// agent's work, so it is NOT injected (unlike handoff/reject memory); the
+// owner's persistent workdir + the feed are its real memory. Returns nil for
+// review/terminal/human goals (EnqueueOwnerRun's no-op contract).
+func (d *Daemon) ContinueGoal(goalID string) (*service.Run, error) {
+	const wakeNote = "You were paused by the user. Pick up your worktree state where you left it — pull the comment feed with `agentwork goal comments` if you need to recheck the latest coordination, then continue. Do NOT start over."
+	return d.goalSvc.EnqueueOwnerRun(d.ctx, goalID, wakeNote)
 }
 
 // cancelRun terminates a running run (if its cancel is registered), recording
@@ -1672,7 +1696,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			// easy to leave unconfigured).
 			issueSection = "## Source issue (public)\n" +
 				"This goal tracks a PUBLIC issue (" + issueRepo + "#" + issueNumber + ") on the git host. " +
-				"Comments you post there with `agentwork issue comment` are read by humans outside the platform — " +
+				"Comments you post there with `agentwork issue comment` are read by people outside the platform — " +
 				"write professionally and completely (current status / plan / blockers / conclusions), " +
 				"never mention platform-internal ids or process details.\n"
 		}
@@ -2694,21 +2718,30 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 			}
 		}
 	} else if in.runRole == "owner" && in.triggerAuthor == "human" && in.triggerCommentID != "" {
-		// Ask-reply memory (决策 7-3 延伸): the human replied to the owner's
+		// Ask-reply memory (决策 7-3 延伸): the user replied to the owner's
 		// previous comment (parent_id → an agent comment — the --ask question
-		// or a plain report). The wake line carries the human's reply, but
+		// or a plain report). The wake line carries the user's reply, but
 		// WITHOUT the agent's own previous words the reply is unmoored — "你
 		// 认为呢？" answers nothing the owner can see. Inject the parent
-		// comment (what the owner said that the human is replying to) so the
+		// comment (what the owner said that the user is replying to) so the
 		// owner picks up its own thread. This is the agent→human analogue of
 		// the reject memory above: the owner's own previous round, continued.
-		var parentContent string
+		//
+		// The comment id is injected as the anchor (comment <id>) so the owner
+		// can re-pull the full thread with `agentwork goal comments --after
+		// <id>` if it needs more context than the snippet. No truncation — an
+		// --ask question is short, and a report snippet that lost its tail
+		// with no way to fetch the full text was worse than a slightly longer
+		// prompt (the original truncateIn(s,2000) cut mid-content with no
+		// anchor).
+		var parentID, parentContent string
 		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT p.content FROM comment c JOIN comment p ON p.id = c.parent_id
+			`SELECT p.id, p.content FROM comment c JOIN comment p ON p.id = c.parent_id
 			  WHERE c.id=? AND c.parent_id != '' AND p.author_type='agent'`,
-			in.triggerCommentID).Scan(&parentContent); err == nil {
+			in.triggerCommentID).Scan(&parentID, &parentContent); err == nil {
 			if s := strings.TrimSpace(parentContent); s != "" {
-				extras.WriteString("\nYour previous comment (the human is replying to this):\n> " + truncateIn(s, 2000) + "\n")
+				extras.WriteString(fmt.Sprintf("\nYour previous comment (comment %s — the user is replying to this; pull `agentwork goal comments --after %s` for the full thread if needed):\n> %s\n",
+					parentID, parentID, s))
 			}
 		}
 	}

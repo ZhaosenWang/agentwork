@@ -83,6 +83,10 @@ export const resolveGoalReview = (
 ) => api<Goal>(`/goals/${id}/review`, { method: "POST", body: JSON.stringify(body) });
 export const activateGoal = (id: string) =>
   api<Goal>(`/goals/${id}/activate`, { method: "POST" });
+// Continue a paused goal (run stopped by the human, goal still active):
+// enqueue a fresh owner run with a pause-resume wake note.
+export const continueGoal = (id: string) =>
+  api<Run | null>(`/goals/${id}/continue`, { method: "POST" });
 
 // ── Sub-goal ──
 export const listSubGoals = (goalId: string) => api<import("./types").SubGoal[]>(`/goals/${goalId}/sub-goals`);

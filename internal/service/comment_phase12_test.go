@@ -329,6 +329,85 @@ func TestHumanReplyToAgentCommentOnSquadGoalWakesLeader(t *testing.T) {
 // _ keeps the strings import bound when a future edit drops a Contains call.
 var _ = strings.Contains
 
+// TestEnqueueOwnerRunCarriesWakeNote (决策 4-12 延伸): EnqueueOwnerRun with a
+// non-empty wakeNote enqueues an owner run whose wake_note column carries it
+// (the prompt's wakeNote branch renders it). The "continue after a human
+// stop" path relies on this — the owner wakes to a pause-resume note instead
+// of the bare goal-desc wake.
+func TestEnqueueOwnerRunCarriesWakeNote(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "owner")
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+
+	note := "You were paused by the human. Pick up your worktree state."
+	r, err := gs.EnqueueOwnerRun(ctx, g.ID, note)
+	if err != nil {
+		t.Fatalf("EnqueueOwnerRun: %v", err)
+	}
+	if r == nil {
+		t.Fatal("EnqueueOwnerRun returned nil for an active agent goal")
+	}
+	var wake string
+	if err := st.DB().QueryRowContext(ctx, `SELECT wake_note FROM run WHERE id=?`, r.ID).Scan(&wake); err != nil {
+		t.Fatalf("load wake_note: %v", err)
+	}
+	if wake != note {
+		t.Fatalf("wake_note = %q, want %q", wake, note)
+	}
+	_ = rs
+}
+
+// TestEnqueueOwnerRunBareSpawnWhenNoNote: EnqueueOwnerRun with wakeNote=""
+// keeps the bare-spawn behavior (no wake_note on the run row). Guards the
+// backward-compatible path — the default branch renders the goal desc as the
+// wake line, same as before the wakeNote parameter was added.
+func TestEnqueueOwnerRunBareSpawnWhenNoNote(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "owner")
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+
+	r, err := gs.EnqueueOwnerRun(ctx, g.ID, "")
+	if err != nil {
+		t.Fatalf("EnqueueOwnerRun: %v", err)
+	}
+	if r == nil {
+		t.Fatal("EnqueueOwnerRun returned nil for an active agent goal")
+	}
+	var wake string
+	if err := st.DB().QueryRowContext(ctx, `SELECT wake_note FROM run WHERE id=?`, r.ID).Scan(&wake); err != nil {
+		t.Fatalf("load wake_note: %v", err)
+	}
+	if wake != "" {
+		t.Fatalf("bare spawn wake_note = %q, want empty", wake)
+	}
+}
+
+// TestEnqueueOwnerRunNoopForTerminal: a terminal/review goal takes no fresh
+// owner run (EnqueueOwnerRun returns nil). The "继续" button is only shown
+// for active goals, but the service defends in depth — a review/terminal
+// goal must not silently birth a run.
+func TestEnqueueOwnerRunNoopForTerminal(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "owner")
+	domID := seedDomain(t, st)
+	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	if _, err := st.DB().ExecContext(ctx, `UPDATE goal SET status='done' WHERE id=?`, g.ID); err != nil {
+		t.Fatalf("force done: %v", err)
+	}
+	r, err := gs.EnqueueOwnerRun(ctx, g.ID, "note")
+	if err != nil {
+		t.Fatalf("EnqueueOwnerRun on terminal: %v", err)
+	}
+	if r != nil {
+		t.Fatalf("terminal goal must not enqueue an owner run, got %+v", r)
+	}
+}
+
 // TestAskHumanHoldsGoalActive (决策 7-3 延伸): an owner run that ends while
 // the agent has an UNANSWERED --ask question to the human must NOT park in
 // review or promote to done — the owner is mid-flight waiting for the human's

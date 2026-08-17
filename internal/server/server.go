@@ -651,6 +651,22 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
+	// Continue a paused goal (run stopped by the human, goal still active):
+	// enqueue a fresh owner run with a pause-resume wake note so the owner
+	// picks up its worktree state. No-op for review/terminal/human goals.
+	mux.HandleFunc("POST /goals/{goalID}/continue", func(w http.ResponseWriter, r *http.Request) {
+		run, err := s.d.ContinueGoal(r.PathValue("goalID"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if run == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(run)
+	})
 	// The domain git check tests UNSAVED form values (create/edit dialogs),
 	// so it carries the config in the body rather than a domain id.
 	mux.HandleFunc("POST /domains/test", func(w http.ResponseWriter, r *http.Request) {

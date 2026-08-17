@@ -22,6 +22,7 @@ import {
   resolveGoalReview,
   reopenGoal,
   activateGoal,
+  continueGoal,
   listGoalRuns,
   listGoalRunMessages,
   listGoalComments,
@@ -221,6 +222,19 @@ export function useActivateGoal() {
     onSuccess: (_data, id) => {
       qc.invalidateQueries({ queryKey: qk.goals });
       qc.invalidateQueries({ queryKey: qk.goal(id) });
+    },
+  });
+}
+// Continue a paused goal (run stopped, goal still active): enqueues a fresh
+// owner run. Invalidate runs + goal so the runs panel + the "正在执行" chip flip.
+export function useContinueGoal() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: continueGoal,
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: qk.goals });
+      qc.invalidateQueries({ queryKey: qk.goal(id) });
+      qc.invalidateQueries({ queryKey: ["goals", id, "runs"] });
     },
   });
 }

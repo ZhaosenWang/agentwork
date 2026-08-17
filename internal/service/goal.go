@@ -1774,7 +1774,7 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason, triggerComment
 // It is the conditional enqueue: active goals only, coalesced on the pending
 // (goal, agent) pair — idempotent under event storms (running it twice still
 // yields one run).
-func (s *GoalService) EnqueueOwnerRun(ctx context.Context, goalID string) (*Run, error) {
+func (s *GoalService) EnqueueOwnerRun(ctx context.Context, goalID, wakeNote string) (*Run, error) {
 	g, err := s.Get(ctx, goalID)
 	if err != nil {
 		return nil, err
@@ -1793,7 +1793,32 @@ func (s *GoalService) EnqueueOwnerRun(ctx context.Context, goalID string) (*Run,
 	if err != nil {
 		return nil, err
 	}
-	return s.runSvc.enqueue(ctx, goalID, agentID, 1, isLeader, squadID, "")
+	// wakeNote (决策 6-17) is the WHY this run was woken: "" = bare spawn
+	// (the default branch renders the goal desc as the wake line); a non-
+	// empty note rides the run row and the prompt's wakeNote branch renders
+	// it. The "continue after a human stop" path passes a pause-resume note
+	// so the owner picks up its worktree state rather than starting over.
+	// The transactional enqueue is required for a non-empty note: enqueueTx's
+	// coalesce path only stamps wake_note when it is non-empty.
+	if wakeNote == "" {
+		return s.runSvc.enqueue(ctx, goalID, agentID, 1, isLeader, squadID, "")
+	}
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	r, ev, err := s.runSvc.EnqueueExistingTx(ctx, tx, goalID, agentID, 1, isLeader, squadID, wakeNote, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	if ev != nil {
+		s.bus.Publish(ctx, *ev)
+	}
+	return r, nil
 }
 
 // enqueueOwnerIntentTx is the shared transactional owner-run spawn (P0-2,

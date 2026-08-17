@@ -47,11 +47,11 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 	b.WriteString("# Background & Requirements\n")
 	b.WriteString("You are working on agentwork — a multi-agent collaboration platform.\n")
 	b.WriteString("Goals are executed by agents; the platform judges completion (machine\n")
-	b.WriteString("verification + gates), and humans approve at checkpoints. You\n")
+	b.WriteString("verification + gates), and the user approves at checkpoints. You\n")
 	b.WriteString("coordinate ONLY through the `agentwork` CLI — structured side effects,\n")
 	b.WriteString("never shell, never file edits to communicate intent.\n")
 	b.WriteString("LANGUAGE: write every comment/report in the SAME language as the goal's\n")
-	b.WriteString("description and the human's messages.\n")
+	b.WriteString("description and the user's messages.\n")
 
 	b.WriteString("\n# Goal\n")
 	b.WriteString("- Title: " + goalTitle + "\n")
@@ -64,7 +64,7 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 		b.WriteString("This is a scratch project (no git repository): your artifacts live in\n")
 		b.WriteString("the project directory (" + scratchGoalDir(domainName, goalID) + ") and\n")
 		b.WriteString("survive between turns; the comment feed is only for coordination. The\n")
-		b.WriteString("PARENT directory is human-maintained shared material: READ-ONLY. Write\n")
+		b.WriteString("PARENT directory is user-maintained shared material: READ-ONLY. Write\n")
 		b.WriteString("only inside this goal's directory.\n")
 	}
 
@@ -234,11 +234,11 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 			"integrate with `agentwork change integrate <id>`). Ask teammates\n" +
 			"(read-only consult) by commenting a mention:\n" +
 			"`agentwork goal comment --text \"[@Name](mention://agent/<id>)\"`.\n" +
-			"Ask the human (the goal creator) a question with --ask:\n" +
+			"Ask the user (the goal creator) a question with --ask:\n" +
 			"`agentwork goal comment --text \"your question\" --ask` — the\n" +
 			"platform notifies them; their reply wakes you (NOT a consult), so\n" +
 			"your session and worktree persist across the round-trip. Use --ask\n" +
-			"only when you genuinely need the human's input to proceed.\n" +
+			"only when you genuinely need the user's input to proceed.\n" +
 			"Transfer ownership with `agentwork goal assign <agent-id>`. Members\n" +
 			"are NOT auto-dispatched — you delegate explicitly. Your final message becomes your run's report in the feed (the platform posts it). NEVER\n" +
 			"post your conclusions with `agentwork goal comment` and then\n" +
@@ -248,8 +248,8 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 			"dispatch-only turn keep the final message MINIMAL (one short\n" +
 			"sentence) — never repeat the dispatch, never write ids\n" +
 			"(goal/sub-goal/agent/squad ids are system handles, the feed is\n" +
-			"read by humans). Completion is JUDGED, not declared: the\n" +
-			"platform's machine verification + gates + the human's approval\n" +
+			"read by the user). Completion is JUDGED, not declared: the\n" +
+			"platform's machine verification + gates + the user's approval\n" +
 			"decide — never set the goal's status yourself.\n"
 		if leader {
 			s += "\nREVIEWER-ONLY RULE: members with role=\"reviewer\" REVIEW ONLY —\n" +

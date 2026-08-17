@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useAgents, useSquads, useAssignGoal, useCancelGoal,
-  useReopenGoal, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments, useActivateGoal, useDomains } from "@/lib/queries";
+  useReopenGoal, useDeleteGoal, useResolveGoalReview, useGoalRuns, useGoalComments, useActivateGoal, useContinueGoal, useDomains } from "@/lib/queries";
 import { Button, Dialog, Field, inputCls, ConfirmDialog, ReviewPhaseBadge } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Goal } from "@/lib/types";
@@ -13,15 +13,30 @@ export function GoalActions({ goal }: { goal: Goal }) {
   const deleteGoal = useDeleteGoal();
   const reopen = useReopenGoal();
   const activate = useActivateGoal();
+  const cont = useContinueGoal();
+  const { data: runs } = useGoalRuns(goal.id);
   const [showAssign, setShowAssign] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
 
   const isTerminal =
     goal.status === "done" || goal.status === "failed" || goal.status === "cancelled";
+  // A paused goal: active but no running/queued run (the human stopped the
+  // run). Show "继续" to re-trigger the owner. agent/squad goals only — a
+  // human-owned goal has no run to continue (its attention is the wake).
+  const hasLiveRun = (runs ?? []).some((r) => r.status === "running" || r.status === "queued");
+  const canContinue =
+    goal.status === "active" && !hasLiveRun &&
+    (goal.assignee_type === "agent" || goal.assignee_type === "squad");
 
   return (
     <div className="flex gap-2 flex-wrap items-center">
       <Button onClick={() => setShowAssign(true)}>分配</Button>
+
+      {canContinue && (
+        <Button onClick={() => cont.mutate(goal.id)} disabled={cont.isPending}>
+          {cont.isPending ? "继续中…" : "继续"}
+        </Button>
+      )}
 
       {goal.status === "backlog" && (
         <Button onClick={() => activate.mutate(goal.id)} disabled={activate.isPending}>
@@ -56,9 +71,9 @@ export function GoalActions({ goal }: { goal: Goal }) {
         />
       )}
 
-      {(assign.isError || cancel.isError || deleteGoal.isError) && (
+      {(assign.isError || cancel.isError || deleteGoal.isError || cont.isError) && (
         <p className="text-sm text-red-500 w-full">
-          {String(assign.error ?? cancel.error ?? deleteGoal.error)}
+          {String(assign.error ?? cancel.error ?? deleteGoal.error ?? cont.error)}
         </p>
       )}
     </div>

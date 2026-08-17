@@ -152,13 +152,20 @@ func TestOwnerReplyWakeupCarriesPreviousAsk(t *testing.T) {
 		t.Fatalf("owner reply wake must carry the human's reply, got:\n%s", prompt)
 	}
 	// The owner's own previous question is injected as context (the reply's
-	// parent — what the human is answering). Without this the owner cannot
-	// tell which of its questions the reply addresses.
-	if !strings.Contains(prompt, "Your previous comment (the human is replying to this)") {
-		t.Fatalf("owner reply wake must label the previous-comment context, got:\n%s", prompt)
+	// parent — what the user is answering). Without this the owner cannot
+	// tell which of its questions the reply addresses. The parent comment's
+	// id is injected as the anchor so the owner can re-pull the full thread
+	// via `agentwork goal comments --after <id>` if the snippet is not
+	// enough — no truncateIn (a cut snippet with no anchor was worse than a
+	// longer prompt).
+	if !strings.Contains(prompt, "Your previous comment (comment "+askID+" — the user is replying to this") {
+		t.Fatalf("owner reply wake must label the previous-comment context with the parent comment id, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "agentwork goal comments --after "+askID) {
+		t.Fatalf("owner reply wake must expose the parent comment id as a pull anchor, got:\n%s", prompt)
 	}
 	if !strings.Contains(prompt, askText) {
-		t.Fatalf("owner reply wake must inject the owner's previous ask text, got:\n%s", prompt)
+		t.Fatalf("owner reply wake must inject the owner's previous ask text in full (no truncation), got:\n%s", prompt)
 	}
 }
 
@@ -183,7 +190,7 @@ func TestOwnerReplyWakeupNoParentIsBare(t *testing.T) {
 		triggerCommentID: topID, triggerAuthor: "human",
 		triggerCommentContent: "开始干",
 	})
-	if strings.Contains(prompt, "Your previous comment (the human is replying to this)") {
+	if strings.Contains(prompt, "Your previous comment (the user is replying to this)") {
 		t.Fatalf("a top-level human trigger (no parent) must NOT inject a previous-comment block, got:\n%s", prompt)
 	}
 	if !strings.Contains(prompt, "开始干") {
