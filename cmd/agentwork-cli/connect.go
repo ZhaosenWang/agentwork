@@ -22,7 +22,7 @@ import (
 
 // cliVersion is the agentwork CLI build version, reported in register.
 // var (not const): the release build stamps the real version via
-// -ldflags "-X <pkg>.cliVersion=$AGENTWORK_COMPILE_VERSION" (build.sh) so
+// -ldflags "-X main.cliVersion=$AGENTWORK_COMPILE_VERSION" (build.sh) so
 // the CLI and the daemon ship one shared version — the register-time
 // version check depends on both being built from the same stamp.
 var cliVersion = "0.0.1-beta.1"

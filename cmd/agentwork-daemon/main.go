@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -31,6 +32,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "version" {
+		fmt.Fprintf(os.Stderr, "agentwork-daemon v%s\n", daemon.DaemonVersion)
+		return
+	}
 	addr := flag.String("addr", ":7373", "HTTP listen address")
 	dbPath := flag.String("db", "", "SQLite path (default ~/.agentwork/agentwork.db)")
 	flag.Parse()

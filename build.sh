@@ -11,7 +11,7 @@ set -e
 cd "$(dirname "$0")"
 
 VERSION="${AGENTWORK_COMPILE_VERSION:-0.0.1-beta.1}"
-LDFLAGS="-X github.com/eushing/agentwork/cmd/agentwork-cli.cliVersion=$VERSION \
+LDFLAGS="-X main.cliVersion=$VERSION \
 -X github.com/eushing/agentwork/internal/daemon.DaemonVersion=$VERSION"
 
 mkdir -p build
