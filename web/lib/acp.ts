@@ -147,15 +147,20 @@ export class AcpChatClient {
       const req = msg.params as PermissionRequest;
       const opts = req?.options ?? [];
       this.cb.onPermissionRequest?.(req, (outcome) => {
-        // Validate against the REQUEST's own options: a missing, empty,
-        // or foreign optionId would collapse to `{"outcome":{}}` on the
-        // wire, which agents read as a REJECTION — never let a bad option
-        // masquerade as an answer (live: approving external_directory
-        // still rejected the tool).
-        let oc = outcome;
-        if (outcome.optionId !== undefined) {
-          const known = opts.some((o) => o.optionId === outcome.optionId && o.optionId !== "");
-          if (!known) oc = { cancelled: true };
+        // The ACP outcome is a tagged union: {"outcome":"selected",
+        // "optionId":...} or {"outcome":"cancelled"} — the discriminant
+        // is REQUIRED (live: omitting it made opencode read our approvals
+        // as rejections; the VS Code client sends "selected" and works).
+        // Also validate against the request's own options: a foreign or
+        // empty optionId must not masquerade as a selection.
+        let oc: Record<string, unknown>;
+        if (
+          outcome.optionId !== undefined &&
+          opts.some((o) => o.optionId === outcome.optionId && o.optionId !== "")
+        ) {
+          oc = { outcome: "selected", optionId: outcome.optionId };
+        } else {
+          oc = { outcome: "cancelled" };
         }
         this.ws?.send(
           JSON.stringify({

@@ -624,11 +624,26 @@ type RequestPermissionResponse struct {
 	Outcome RequestPermissionOutcome `json:"outcome"`
 }
 
-// RequestPermissionOutcome is a union of possible permission outcomes.
+// PermissionOutcomeKind is the outcome discriminant — the field that picks
+// the union member per the ACP spec. REQUIRED on the wire: omitting it
+// made opencode read our approvals as REJECTIONS (live: the web sent
+// {"optionId":"once"} and the tool died "The user rejected permission";
+// the VS Code client sends "selected" and works).
+type PermissionOutcomeKind string
+
+const (
+	PermissionOutcomeSelected  PermissionOutcomeKind = "selected"
+	PermissionOutcomeCancelled PermissionOutcomeKind = "cancelled"
+)
+
+// RequestPermissionOutcome is a union of possible permission outcomes:
+//
+//	{"outcome": "selected", "optionId": "..."}  — one of the request's options
+//	{"outcome": "cancelled"}                    — the user dismissed the request
 type RequestPermissionOutcome struct {
-	Meta      map[string]any      `json:"_meta,omitempty"`
-	OptionID  *PermissionOptionId `json:"optionId,omitempty"` // present for "selected"
-	Cancelled bool                `json:"cancelled,omitempty"`
+	Meta     map[string]any       `json:"_meta,omitempty"`
+	Outcome  PermissionOutcomeKind `json:"outcome"`
+	OptionID *PermissionOptionId   `json:"optionId,omitempty"` // present when "selected"
 }
 
 // ── File system (Agent → Client RPC) ──

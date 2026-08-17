@@ -52,17 +52,25 @@ func (a *autopermit) HandleRequestPermission(ctx context.Context, req acp.Reques
 		case acp.PermissionAllowAlways:
 			id := o.OptionID
 			cliLogf("autopermit: approved allow_always (%s)", id)
-			return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{OptionID: &id}}, nil
+			return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
+				Outcome:  acp.PermissionOutcomeSelected,
+				OptionID: &id,
+			}}, nil
 		case acp.PermissionAllowOnce:
 			allowOnce = o.OptionID
 		}
 	}
 	if allowOnce != "" {
 		cliLogf("autopermit: approved allow_once (%s)", allowOnce)
-		return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{OptionID: &allowOnce}}, nil
+		return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
+			Outcome:  acp.PermissionOutcomeSelected,
+			OptionID: &allowOnce,
+		}}, nil
 	}
 	cliLogf("autopermit: no allow option offered — cancelling")
-	return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: true}}, nil
+	return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
+		Outcome: acp.PermissionOutcomeCancelled,
+	}}, nil
 }
 
 func (a *autopermit) HandleReadTextFile(ctx context.Context, req acp.ReadTextFileRequest) (*acp.ReadTextFileResponse, error) {

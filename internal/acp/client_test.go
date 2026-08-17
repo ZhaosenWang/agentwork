@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
@@ -113,5 +114,27 @@ func TestFailPendingCleanEOF(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Initialize did not return after clean EOF")
+	}
+}
+
+// TestPermissionOutcomeWire pins the outcome to the ACP spec's tagged
+// union — the "outcome" discriminant is REQUIRED (live: omitting it made
+// opencode read our approvals as rejections; the VS Code client sends
+// "selected" and works).
+func TestPermissionOutcomeWire(t *testing.T) {
+	id := PermissionOptionId("once")
+	sel, err := json.Marshal(RequestPermissionOutcome{Outcome: PermissionOutcomeSelected, OptionID: &id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(sel) != `{"outcome":"selected","optionId":"once"}` {
+		t.Fatalf("selected outcome wire = %s", sel)
+	}
+	can, err := json.Marshal(RequestPermissionOutcome{Outcome: PermissionOutcomeCancelled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(can) != `{"outcome":"cancelled"}` {
+		t.Fatalf("cancelled outcome wire = %s", can)
 	}
 }
