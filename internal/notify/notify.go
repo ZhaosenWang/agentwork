@@ -171,7 +171,7 @@ func (n *Notifier) onGoalAttentionNeeded(_ context.Context, e events.Event) {
 	if reason == "" {
 		reason = attention
 	}
-	n.sendMilestoneCard("👤", "purple", "需要你处理", fmt.Sprintf("**%s**  \n`goal %s`  \n%s", title, short(goalID), reason))
+	n.sendMilestoneCard("👤", "purple", "需要你处理", milestoneBody(title, reason))
 }
 
 // NOTE: the published event carries the PUBLISHER's ctx (often an HTTP
@@ -374,19 +374,11 @@ func (n *Notifier) onGoalDelivered(_ context.Context, e events.Event) {
 	if title == "" {
 		title = short(goalID)
 	}
-	body := fmt.Sprintf("**%s**  \n`goal %s`", title, short(goalID))
+	body := fmt.Sprintf("**%s**", title)
 	if s := strings.TrimSpace(note); s != "" {
 		body += "  \n" + s
 	}
-	if len(commits) > 0 {
-		body += "  \n\n提交："
-		for i, c := range commits {
-			if i >= 5 {
-				break
-			}
-			body += "  \n- `" + truncate(c, 90) + "`"
-		}
-	}
+	body += formatCommits(commits)
 	// A scratch delivery has nothing merged — the note carries the semantics.
 	if strings.Contains(note, "无仓库交付") {
 		n.sendMilestoneCard("✅", "green", "任务完成", body)
@@ -408,7 +400,7 @@ func (n *Notifier) onGoalDeliverFailed(_ context.Context, e events.Event) {
 	if title == "" {
 		title = short(goalID)
 	}
-	n.sendMilestoneCard("⚠️", "red", "合入失败", fmt.Sprintf("**%s**  \n`goal %s`  \n%s", title, short(goalID), truncate(note, 300)))
+	n.sendMilestoneCard("⚠️", "red", "合入失败", milestoneBody(title, truncate(note, 300)))
 }
 
 // NOTE: the published event carries the PUBLISHER's ctx (often an HTTP
@@ -430,13 +422,13 @@ func (n *Notifier) onGoalFinished(_ context.Context, e events.Event) {
 		// The agent's full report (markdown) travels with the completion —
 		// the card renders it (lark_md), so Feishu shows what the web
 		// comment feed shows, not a bare title.
-		body := fmt.Sprintf("**%s**  \n`goal %s`", title, short(goalID))
+		body := fmt.Sprintf("**%s**", title)
 		if s := strings.TrimSpace(summary); s != "" {
 			body += "  \n\n" + truncate(s, 2000)
 		}
 		n.sendMilestoneCard("🏁", "green", "完成", body)
 	case "failed":
-		n.sendMilestoneCard("❌", "red", "失败", fmt.Sprintf("**%s**  \n`goal %s`  \n%s", title, short(goalID), truncate(summary, 200)))
+		n.sendMilestoneCard("❌", "red", "失败", milestoneBody(title, truncate(summary, 200)))
 	}
 }
 
@@ -461,7 +453,7 @@ func (n *Notifier) onRunCancelled(_ context.Context, e events.Event) {
 	if title == "" {
 		title = short(goalID)
 	}
-	n.sendMilestoneCard("⏱", "red", "任务中断", fmt.Sprintf("**%s**  \n`goal %s`  \n%s  \n\ngoal 保持 active，需人工处理", title, short(goalID), truncate(reason, 200)))
+	n.sendMilestoneCard("⏱", "red", "任务中断", milestoneBody(title, truncate(reason, 200)+"  \n\ngoal 保持 active，需人工处理"))
 }
 
 // goalTitle resolves a goal's title for milestone cards (best-effort; ” when
@@ -639,6 +631,36 @@ func escapeJSON(s string) string {
 		"\r", `\r`,
 		"\t", `\t`,
 	).Replace(s)
+}
+
+const (
+	maxCommitDisplay   = 5
+	commitSubjectLimit = 80
+	commitBodyLimit    = 200
+)
+
+func milestoneBody(title, detail string) string {
+	return fmt.Sprintf("**%s**  \n%s", title, detail)
+}
+
+func formatCommits(commits []string) string {
+	if len(commits) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("  \n  \n提交：")
+	for i, c := range commits {
+		if i >= maxCommitDisplay {
+			break
+		}
+		sha, rest, _ := strings.Cut(c, " ")
+		subj, commitBody, _ := strings.Cut(rest, "\n")
+		b.WriteString("  \n- " + short(sha) + " " + truncate(subj, commitSubjectLimit))
+		if cb := strings.TrimSpace(commitBody); cb != "" {
+			b.WriteString("  \n  " + strings.ReplaceAll(truncate(cb, commitBodyLimit), "\n", "\n  "))
+		}
+	}
+	return b.String()
 }
 
 func short(id string) string {
