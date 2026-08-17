@@ -6,12 +6,12 @@ import { Target, Bot, Terminal, Users, Clock, Boxes, Settings, ScrollText, Monit
 import { cn } from "@/lib/utils";
 
 const NAV_ITEMS = [
+  { href: "/domains", label: "Project", icon: Boxes },
   { href: "/goals", label: "Goal", icon: Target },
   { href: "/agents", label: "Agent", icon: Bot },
   { href: "/runtimes", label: "Runtime", icon: Terminal },
   { href: "/squads", label: "Squad", icon: Users },
   { href: "/schedules", label: "Schedule", icon: Clock },
-  { href: "/domains", label: "Project", icon: Boxes },
   { href: "/machines", label: "Machine", icon: Monitor },
   { href: "/skills", label: "Skills", icon: Sparkles },
   { href: "/logs", label: "Logs", icon: ScrollText },

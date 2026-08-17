@@ -79,7 +79,7 @@ export default function DomainsPage() {
     <div>
       <PageHeader title="项目" />
       <p className="text-sm text-gray-500 -mt-3 mb-4">
-        项目 = 共享仓库 + 验收策略（NL 意图 → 编译检查 → 卡点）。agent 执行的 Goal 必须属于某个项目。
+        项目是 goal 的归属地：一个共享代码仓库 + 一套"怎么算干完了"的验收标准。goal 必须挂在某个项目下。
       </p>
       <div className="mb-4">
         <Button onClick={() => setShowCreate(true)}>新建项目</Button>
@@ -300,11 +300,11 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
 
       {showEdit && <EditDomainDialog domain={d} onClose={() => setShowEdit(false)} />}
 
-      <div className="text-xs text-gray-600 space-y-1">
-        <p><span className="font-medium">验收策略（NL）：</span>{d.policy_text || "（未填写——用一句话描述这个项目怎么算“干对了”）"}</p>
+      <div className="text-xs text-gray-600 space-y-1.5">
+        <p><span className="font-medium">验收要求：</span>{d.policy_text || "（未填写）"}</p>
         {d.metrics_baseline && d.metrics_baseline !== "{}" && d.metrics_baseline !== "" && (
           <p>
-            <span className="font-medium">演进基线（决策 2-15）：</span>
+            <span className="font-medium">基线：</span>
             {(() => {
               try {
                 const m = JSON.parse(d.metrics_baseline);
@@ -316,10 +316,14 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
           </p>
         )}
         {hasChecks && (
-          <p>
-            <span className="font-medium">编译产物：</span>
-            verify=[{d.checks.verify?.join(", ") || "无"}] guards=[{d.checks.guards?.map((g) => `${g.type}(${g.pattern ?? g.min_delta})`).join(", ") || "无"}] gates=[{d.checks.gates?.map((g) => g.name).join(", ") || "无"}]
-          </p>
+          <details open={compiled} className="rounded bg-zinc-50 border border-zinc-200 px-2.5 py-1.5">
+            <summary className="cursor-pointer font-medium text-gray-600 select-none">验收命令</summary>
+            <div className="mt-1.5 space-y-1 font-mono text-[11px] text-zinc-600 break-all">
+              <p><span className="text-zinc-400">验证命令：</span>{d.checks.verify?.length ? d.checks.verify.join("，") : "无"}</p>
+              <p><span className="text-zinc-400">保护规则：</span>{d.checks.guards?.length ? d.checks.guards.map((g) => `${g.type}(${g.pattern ?? g.min_delta})`).join("，") : "无"}</p>
+              <p><span className="text-zinc-400">卡点：</span>{d.checks.gates?.length ? d.checks.gates.map((g) => g.name).join("，") : "无"}</p>
+            </div>
+          </details>
         )}
       </div>
 
@@ -329,7 +333,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
             // Confirmation card: what the processor agent compiled, human
             // decides — and can edit (产物可见、可改、可审).
             <div className="rounded bg-amber-50 border border-amber-200 p-3 space-y-2">
-              <p className="text-sm font-medium text-amber-900">处理器 agent 已编译验收策略——检查后可编辑，确认后冻结？</p>
+              <p className="text-sm font-medium text-amber-900">验收命令已生成——检查后可编辑，确认后冻结？</p>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                 <Field label="setup（验证前环境准备，幂等，每行一条）" hint="依赖安装，如 cd web && npm install">
                   <textarea
@@ -374,7 +378,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                       try {
                         JSON.parse(e.target.value);
                       } catch {
-                        setJsonError("JSON 格式错误——冻结将使用编译产物");
+                        setJsonError("JSON 格式错误——冻结将使用已生成的命令");
                       }
                     }}
                     className="mt-1 w-full rounded border border-amber-300 bg-amber-100 px-2 py-1.5 text-xs font-mono"
@@ -383,7 +387,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                   {jsonError && <p className="text-xs text-red-600">{jsonError}</p>}
                 </details>
               </div>
-              <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-end gap-3 flex-wrap">
                 <Field label="验证强度">
                   <select value={strength} onChange={(e) => setStrength(e.target.value)} className={inputCls}>
                     <option value="strong">strong</option>
@@ -401,17 +405,17 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
             </div>
           ) : (
             <div className="space-y-2">
-              <Field label="自然语言验收要求" hint="例如：测试必须通过，改动要带测试，不能动 config/ 下的文件">
+              <Field label="验收要求" hint="用一句话说清楚这个项目怎么算干完了">
                 <textarea
                   value={policyText}
                   onChange={(e) => setPolicyText(e.target.value)}
                   className={inputCls}
                   rows={3}
-                  placeholder="用一句话描述这个项目怎么算“干对了”…"
+                  placeholder="比如：测试必须通过，改动要带测试用例，不能动 config/ 目录"
                 />
               </Field>
-              <div className="flex items-center gap-3 flex-wrap">
-                <Field label="处理器 agent（编译验收策略）">
+              <div className="flex items-end gap-3 flex-wrap">
+                <Field label="用哪个 agent 生成验收命令">
                   <select value={processorAgent} onChange={(e) => setProcessorAgent(e.target.value)} className={inputCls}>
                     <option value="">选择…</option>
                     {agents?.map((a) => (
@@ -420,7 +424,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                   </select>
                 </Field>
                 <Button onClick={startCompile} disabled={compiling || !policyText.trim() || !processorAgent}>
-                  {compiling ? "编译中…" : "编译验收策略"}
+                  {compiling ? "生成中…" : "生成验收命令"}
                 </Button>
                 <Button variant="outline" onClick={openChecksEditor}>
                   手动编辑
@@ -434,7 +438,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
       {compiled && (
         <div className="flex gap-2 border-t border-gray-100 pt-3">
           <Button variant="outline" onClick={() => startCompile()} disabled={compiling}>
-            {compiling ? "编译中…" : "重新编译"}
+            {compiling ? "生成中…" : "重新生成"}
           </Button>
           <Button variant="outline" onClick={openChecksEditor}>
             编辑策略
@@ -451,7 +455,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
         <div className="border-t border-gray-100 pt-2">
           <div className="flex items-center gap-2 text-xs text-amber-700 mb-1.5" title={compileRun.id}>
             <span className="inline-block w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
-            {agents?.find((a) => a.id === compileRun.agent_id)?.name ?? compileRun.agent_id.slice(0, 8)} 正在探索项目、统计基线，请稍等......
+            {agents?.find((a) => a.id === compileRun.agent_id)?.name ?? compileRun.agent_id.slice(0, 8)} 正在分析项目、生成验收命令，请稍等……
           </div>
           <div className="rounded bg-zinc-50 border border-zinc-200 p-2 max-h-44 overflow-y-auto">
             {runEvents.length === 0 ? (
@@ -581,7 +585,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
             </Field>
             )}
             {d.type !== "scratch" && (
-            <Field label="卡点规则 gates（何时必须停给人审批）">
+            <Field label="卡点（哪些情况必须停下来等人审批）">
               <div className="space-y-2">
                 {dlgGates.map((g, i) => (
                   <div key={i} className="flex items-start gap-2">
@@ -648,8 +652,9 @@ function GateHealthTable() {
   const { data: stats } = useGateStats();
   if (!stats?.length) return null;
   return (
-    <div className="mt-8">
-      <h3 className="text-sm font-medium mb-2">卡点健康度</h3>
+    <div className="mt-8 border-t border-zinc-200 pt-6">
+      <h3 className="text-sm font-medium mb-1">卡点统计</h3>
+      <p className="text-xs text-zinc-400 mb-2">所有项目的卡点审批记录</p>
       <div className="rounded-lg border border-gray-200 overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-gray-50 text-left text-xs text-gray-500">
@@ -765,14 +770,14 @@ function EditDomainDialog({ domain, onClose }: { domain: Domain; onClose: () => 
             <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
           </Field>
         </div>
-        <Field label="平台令牌（git_credentials，远程操作身份）">
+        <Field label="平台令牌（clone/push 用）">
           <input value={gitCredentials} onChange={(e) => { setGitCredentials(e.target.value); setGitTestPassed(null); }} className={inputCls} type="password" placeholder="bot 账号的 token" />
         </Field>
         <GitTestButton gitUrl={gitUrl} defaultBranch={defaultBranch} gitCredentials={gitCredentials} onResult={(r) => setGitTestPassed(r.ok && r.branch_exists)} />
         {gitGateBlocks && (
           <p className="text-xs text-amber-600">⚠ git 配置已改动，需重新通过「测试连接」才能保存</p>
         )}
-        <Field label="Issue 追踪（M4-B）" hint="open issue 自动变成任务，处理完自动 close">
+        <Field label="Issue 追踪" hint="仓库的新 issue 自动变成任务，处理完自动 close">
           <input value={issueRepo} onChange={(e) => setIssueRepo(e.target.value)} className={inputCls} placeholder="owner/repo" />
           <div className="mt-2 flex gap-2 items-center">
             <label className="text-xs text-gray-500">平台：</label>
@@ -816,7 +821,7 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const { data: agents } = useAgents();
   const { data: squads } = useSquads();
   const [name, setName] = useState("");
-  const [domainType, setDomainType] = useState<"repo" | "scratch">("repo");
+  const [domainType, setDomainType] = useState<"repo" | "scratch">("scratch");
   const [gitUrl, setGitUrl] = useState("");
   const [defaultBranch, setDefaultBranch] = useState("");
   const [policyText, setPolicyText] = useState("");
@@ -863,13 +868,13 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
         </Field>
         <Field label="项目类型">
           <div className="flex gap-2">
-            <label className={`flex-1 flex items-center gap-2 rounded-lg border px-3 py-2 cursor-pointer text-sm ${domainType === "repo" ? "border-indigo-400 bg-indigo-50 text-indigo-700" : "border-zinc-200 text-zinc-600"}`}>
-              <input type="radio" className="accent-indigo-500" checked={domainType === "repo"} onChange={() => setDomainType("repo")} />
-              代码仓库
-            </label>
             <label className={`flex-1 flex items-center gap-2 rounded-lg border px-3 py-2 cursor-pointer text-sm ${domainType === "scratch" ? "border-indigo-400 bg-indigo-50 text-indigo-700" : "border-zinc-200 text-zinc-600"}`}>
               <input type="radio" className="accent-indigo-500" checked={domainType === "scratch"} onChange={() => setDomainType("scratch")} />
               无仓库项目
+            </label>
+            <label className={`flex-1 flex items-center gap-2 rounded-lg border px-3 py-2 cursor-pointer text-sm ${domainType === "repo" ? "border-indigo-400 bg-indigo-50 text-indigo-700" : "border-zinc-200 text-zinc-600"}`}>
+              <input type="radio" className="accent-indigo-500" checked={domainType === "repo"} onChange={() => setDomainType("repo")} />
+              代码仓库
             </label>
           </div>
           {domainType === "scratch" && (
@@ -894,10 +899,10 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
                 <input value={gitIdentity} onChange={(e) => setGitIdentity(e.target.value)} className={inputCls} placeholder="agentwork[bot] <bot@local>" />
               </Field>
             )}
-            <Field label="自然语言验收要求（可选，创建后可再编译）" hint="例如：测试必须通过，改动要带测试">
-              <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="用一句话描述这个项目怎么算“干对了”…" />
+            <Field label="验收要求（可选，创建后可再生成）" hint="用一句话说清楚这个项目怎么算干完了">
+              <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="比如：测试必须通过，改动要带测试用例" />
             </Field>
-            <Field label="处理器 agent（可选）">
+            <Field label="用哪个 agent 生成验收命令（可选）">
               <select value={processorAgent} onChange={(e) => setProcessorAgent(e.target.value)} className={inputCls}>
                 <option value="">选择…</option>
                 {agents?.map((a) => (
