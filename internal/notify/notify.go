@@ -108,6 +108,44 @@ func (n *Notifier) Subscribe(bus *events.Bus) {
 	// v2 (决策 6-8): a human-owned goal needs its owner's attention — the
 	// goal has no agent run to spawn, so the IM push IS the wakeup.
 	bus.Subscribe("goal.attention_needed", n.onGoalAttentionNeeded)
+	// 决策 7-3: an agent asked the human a question (--ask comment) — push a
+	// Feishu card so the human notices and replies (their reply wakes the
+	// owner run via parent_id routing, not a consult).
+	bus.Subscribe("comment:agent_question", n.onAgentQuestion)
+}
+
+// onAgentQuestion pushes an "agent is asking you" Feishu card (决策 7-3).
+// The platform is single-user: the receive target is the one connected chat,
+// so no per-goal recipient resolution — the question always reaches the goal
+// creator (who is the Feishu-connected owner). The card carries a reply form
+// (buildAskCard) so the human answers inline — no web hop.
+func (n *Notifier) onAgentQuestion(_ context.Context, e events.Event) {
+	ctx := context.Background()
+	m, _ := e.Payload.(map[string]any)
+	goalID, _ := m["goal_id"].(string)
+	commentID, _ := m["comment_id"].(string)
+	agentID, _ := m["agent_id"].(string)
+	question, _ := m["question"].(string)
+	if goalID == "" || strings.TrimSpace(question) == "" {
+		return
+	}
+	goalTitle := n.goalTitle(ctx, goalID)
+	if goalTitle == "" {
+		goalTitle = short(goalID)
+	}
+	agentName := ""
+	if n.qs != nil {
+		agentName, _ = n.qs.AgentName(ctx, agentID)
+	}
+	if agentName == "" {
+		agentName = short(agentID)
+	}
+	card, err := buildAskCard(agentName, goalTitle, question, goalID, commentID)
+	if err != nil {
+		n.asyncSend(fmt.Sprintf("❓ %s 有问题问你：%s", agentName, question))
+		return
+	}
+	n.asyncSendCard(card)
 }
 
 // onGoalAttentionNeeded pushes the "owner attention" card for a human-owned

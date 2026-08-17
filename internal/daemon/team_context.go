@@ -234,6 +234,11 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 			"integrate with `agentwork change integrate <id>`). Ask teammates\n" +
 			"(read-only consult) by commenting a mention:\n" +
 			"`agentwork goal comment --text \"[@Name](mention://agent/<id>)\"`.\n" +
+			"Ask the human (the goal creator) a question with --ask:\n" +
+			"`agentwork goal comment --text \"your question\" --ask` — the\n" +
+			"platform notifies them; their reply wakes you (NOT a consult), so\n" +
+			"your session and worktree persist across the round-trip. Use --ask\n" +
+			"only when you genuinely need the human's input to proceed.\n" +
 			"Transfer ownership with `agentwork goal assign <agent-id>`. Members\n" +
 			"are NOT auto-dispatched — you delegate explicitly. Your final message becomes your run's report in the feed (the platform posts it). NEVER\n" +
 			"post your conclusions with `agentwork goal comment` and then\n" +

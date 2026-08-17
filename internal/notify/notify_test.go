@@ -87,6 +87,7 @@ func (f *fakeQS) PendingReviewers(ctx context.Context, goalID string) ([]string,
 	return f.pendingReviewers, nil
 }
 func (f *fakeQS) GoalTitle(ctx context.Context, goalID string) (string, error) { return "g", nil }
+func (f *fakeQS) AgentName(ctx context.Context, agentID string) (string, error) { return "PM", nil }
 func (f *fakeQS) GoalDomainType(ctx context.Context, goalID string) (string, error) {
 	return "repo", nil
 }

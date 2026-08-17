@@ -1132,12 +1132,33 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			rc.GoalID, rc.AgentID).Scan(&pendingConsults); err != nil {
 			return fmt.Errorf("count pending consults: %w", err)
 		}
-		if pendingSG > 0 || pendingChanges > 0 || pendingConsults > 0 {
+		// 决策 7-3 延伸: an agent's --ask question to the human is a WAIT the
+		// owner is mid-flight on — the owner run ends its turn asking, and the
+		// goal must NOT park in review / promote to done before the human
+		// replies (their reply wakes the owner via parent_id routing). A
+		// pending ask = an agent-authored ask_human comment with NO human reply
+		// threading under it. Once the human replies (parent_id → ask comment,
+		// author human) the ask is answered and no longer holds — the owner's
+		// reply-triggered successor run reaches the gate normally when IT ends.
+		// This mirrors the consult hold above but for the agent→human channel
+		// (which has no consult_request row — decision 7-3 D).
+		var pendingAskHuman int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM comment ask
+			 WHERE ask.goal_id=? AND ask.ask_human=1 AND ask.author_type='agent'
+			   AND NOT EXISTS (
+			     SELECT 1 FROM comment rep
+			     WHERE rep.parent_id = ask.id AND rep.author_type='human'
+			   )`,
+			rc.GoalID).Scan(&pendingAskHuman); err != nil {
+			return fmt.Errorf("count pending ask-human: %w", err)
+		}
+		if pendingSG > 0 || pendingChanges > 0 || pendingConsults > 0 || pendingAskHuman > 0 {
 			// A WAIT is open: the run ended but the goal holds active until
 			// the pending work lands — log the hold (otherwise a finished
 			// run with no advancement looks like a hang).
-			logging.Infof("goal: %q run %s done but finalization guard holds (sub-goals=%d changes=%d consults=%d) — no gate yet",
-				g.Title, rc.RunID, pendingSG, pendingChanges, pendingConsults)
+			logging.Infof("goal: %q run %s done but finalization guard holds (sub-goals=%d changes=%d consults=%d ask-human=%d) — no gate yet",
+				g.Title, rc.RunID, pendingSG, pendingChanges, pendingConsults, pendingAskHuman)
 			break // stay active — the attention loop owns the next step
 		}
 		// A completed run that passed machine verification has reached the

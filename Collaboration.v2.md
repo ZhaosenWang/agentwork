@@ -156,6 +156,19 @@ Review 是 goal 的一个状态，approve / reject 是这个状态的两个**退
 - **与 sub-goal 级 reject 的边界**：§6 的 verifier reject 是 sub-goal 级（`quality_iteration++`、assignee 新 run）；本节的 reject 是 goal 级（`human_iterations++`、owner successor run）。两个计数、两个 enqueue 路径，绝不混。
 - **Reject 的 wake 路径独立性硬约束**：`assemblePrompt` 的 switch 中，reject 分支必须在 handoff 分支之前判定（reject 不复用 handoff_note，否则 handoff_note 非空会劫持 reject 走交接分支）。实现上 reject wake 由独立信号触发（如 goal 最近一次状态转移 `review→active` 且有 reject gate_decision），不依赖 `handoff_note` 字段。
 
+## 7.2 Agent consults human + 人回复回 owner（决策 7-3）
+
+平台此前没把"人↔agent 对话"建模成对等关系：人→agent 有 consult 机制（mention→guest run），agent→人没有（`mention://human` 是 no-op 空壳），且 owner 被人回复时错误降级成 guest。本节定义 agent→人 的 consult 闭环 + 人回复回 owner 的路由。
+
+- **agent 问人 = 向 goal 创建者提问**：单机单用户模型下，飞书 receive target 是单一 chat（连接飞书的那个人），不需要 recipient 路由。agent 不需要知道人是谁（无 human id 寻址）——只管发问，平台路由给 goal 创建者（=唯一连接飞书的人）。
+- **信号机制**：`goal comment --ask` flag 是显式信号（不靠自动检测评论里的疑问句——太脆弱）。落库写 `comment.ask_human=1`（持久化，供 web 渲染样式 + 未来"未答提问"统计）+ 发 `comment:agent_question` 事件（dedicated event，不复用 `comment:created`——避免 notify 耦合每条评论）。notify 订阅 → `sendMilestoneCard("❓","blue","Agent 有问题问你")` 推飞书卡片。
+- **人回复 → 唤醒 owner run（核心路由修复）**：人回复时 web 带 `parent_id` 指向被回复的评论。comment.go `create` 判定：`c.AuthorType=="human" && c.ParentID!=""` 且 parent 评论 `author_type=="agent"` → 这是"人回答/回应 agent"，走 `EnqueueForMentionRole(role="owner")`（复用 review 的显式 role override），trigger=人的回复评论，**return 跳过 mention dispatch**（避免 web 回复同时带 mention link 时重复 enqueue consult）。owner role → `priorSessionFor` 恢复 session + 持久 workdir——**上下文不丢、workdir 不空**。assemblePrompt 命中既有的 `case owner && triggerCommentID!="" && triggerAuthor=="human"` 分支。
+- **不要求 parent 必须是 `--ask` 提问评论**：人回复任何 agent 评论都当"继续 owner 工作"（回复汇报/意见也该回 owner，不只限回答提问）。`--ask` 只管"通知人"，回复路由由 `parent_id→agent` 决定，两者解耦。
+- **terminal goal 边界**：人回复 agent 评论时若 goal 已终态（done/failed/cancelled），先 Reopen 再 enqueue owner（复用既有 reopen 逻辑）。
+- **review 状态边界**：goal 在 review + 人回复 agent 评论 → enqueue owner run 排队（Claim gate 因 goal 非 active 拒绝 claim），等 review 由 approve/reject 退出后再接——可接受（review 期回复是补充信息）。
+- **consult_request 不扩展**：agent→human 不记 consult_request 表（该表是 agent→agent 的恢复锚点；agent→human 的"恢复"由 parent_id→owner run 路由承载）。
+- **与 §5 Consult 的关系**：§5 的 Consult 是人/agent→agent（guest run，只读，答完回 requester）。本节是 agent→人（飞书通知，人回复回 owner）。两者是"问"的两个方向，语义对称但机制不同（agent 有 run 概念可被唤醒，人没有 run 只能被通知）。
+
 # 8. Handoff 语义
 
 - Handoff 只换 Goal Owner；**既有 sub-goal 的 assignee/verifier/run/change 全部不变**；新 owner 获得管理权，不自动成为任何 sub-goal 的 assignee

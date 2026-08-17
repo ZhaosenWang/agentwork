@@ -96,8 +96,11 @@ func main() {
 
 	// M3 IM: the approval-card callbacks resolve through the goal layer; the
 	// owner's inbound messages become intake parse runs on the configured
-	// global parser agent (app_settings platform.intake_agent).
+	// global parser agent (app_settings platform.intake_agent). The ask-card
+	// reply form (决策 7-3) posts the human's reply through the comment layer
+	// (parent_id → owner wake).
 	imConn.SetGoalService(goalSvc)
+	imConn.SetCommentService(commentSvc)
 	intakeSvc := notify.NewIntakeService(qs, settingsSvc, runSvc)
 	imConn.SetIntakeService(intakeSvc)
 

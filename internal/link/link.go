@@ -149,6 +149,10 @@ type GoalCommentParams struct {
 	RPCToken
 	Text     string `json:"text"`
 	ParentID string `json:"parent_id,omitempty"`
+	// AskHuman (决策 7-3): true = this comment is a question to the goal
+	// creator. The platform notifies them (Feishu card) and their reply
+	// wakes this owner run (not a consult). See Collaboration.v2.md §7.2.
+	AskHuman bool `json:"ask_human,omitempty"`
 }
 
 // GoalCommentsParams pulls the run's goal comment feed (the shared

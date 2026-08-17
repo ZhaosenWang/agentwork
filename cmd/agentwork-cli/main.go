@@ -325,6 +325,7 @@ func goalComment(goalID string, args []string) {
 	fs := flag.NewFlagSet("goal comment", flag.ExitOnError)
 	text := fs.String("text", "", "comment text (required; may contain a structured mention)")
 	parent := fs.String("parent", "", "parent comment id (optional — replies thread under it)")
+	ask := fs.Bool("ask", false, "this comment is a question to the human (goal creator) — the platform notifies them and their reply wakes you (决策 7-3)")
 	fs.Parse(args)
 	if *text == "" {
 		fail("--text is required")
@@ -336,6 +337,7 @@ func goalComment(goalID string, args []string) {
 		RPCToken: rpcToken(),
 		Text:     *text,
 		ParentID: *parent,
+		AskHuman: *ask,
 	}, &res); err != nil {
 		fail("%v", err)
 	}

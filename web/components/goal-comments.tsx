@@ -103,7 +103,11 @@ export function GoalComments({ goalId }: { goalId: string }) {
                     回复 {parentAuthor}：{parentText}
                   </div>
                 )}
-                <Markdown content={c.content} agentName={agentName} className="text-zinc-600" />
+                <Markdown
+                  content={c.ask_human ? `[@你](mention://human/ui) ${c.content}` : c.content}
+                  agentName={agentName}
+                  className="text-zinc-600"
+                />
               </div>
             );
           })

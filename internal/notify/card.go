@@ -105,6 +105,68 @@ func buildMilestoneCard(emoji, template, title, body string) (string, error) {
 	})
 }
 
+// buildAskCard is the agent-question card (决策 7-3): an agent asked the human
+// a question via `goal comment --ask`. The card carries a structured body
+// (the goal title + the question) and a FORM the human fills inline — the
+// reply submits over the long connection as a card.action.trigger with
+// form_value, and onCardAction turns it into a human comment threading under
+// the ask (parent_id routing wakes the owner). No web hop: the whole round-
+// trip stays in Feishu.
+//
+// The title names the questioning agent (❓ {agentName}) so a glance tells the
+// human WHO is asking before they open the card. comment_id is the ask
+// comment — the reply's parent_id (the owner-wake routing key).
+func buildAskCard(agentName, goalTitle, question, goalID, commentID string) (string, error) {
+	if agentName == "" {
+		agentName = "Agent"
+	}
+	body := fmt.Sprintf("**任务：**\n%s\n\n**%s 询问：**\n%s", goalTitle, agentName, question)
+	askCard := map[string]any{
+		"schema": "2.0",
+		"config": map[string]any{"update_multi": true},
+		"header": map[string]any{
+			"template": "blue",
+			"title":    map[string]any{"tag": "plain_text", "content": "❓ " + agentName},
+		},
+		"body": map[string]any{
+			"direction": "vertical",
+			"elements": []map[string]any{
+				{"tag": "markdown", "content": body},
+				{"tag": "hr"},
+				// The reply form: an input the human fills + a submit button. On
+				// submit the card.action.trigger callback carries form_value
+				// {reply_text: "..."} alongside the button's value (action/
+				// goal_id/comment_id) — onCardAction reads both, posts the reply
+				// as a human comment threading under the ask. The container tag
+				// is "form" (NOT "form_container" — Feishu's im/v1 interactive
+				// API rejects the latter as "not support tag").
+				{
+					"tag":  "form",
+					"name": "reply_form",
+					"elements": []map[string]any{
+						{
+							"tag":         "input",
+							"name":        "reply_text",
+							"placeholder": map[string]any{"tag": "plain_text", "content": "输入回复…"},
+							"width":       "fill",
+						},
+						{
+							"tag":    "button",
+							"text":   map[string]any{"tag": "plain_text", "content": "回复"},
+							"type":   "primary",
+							"name":   "submit_reply",
+							"action_type": "form_submit",
+							"value":  map[string]any{"action": "reply_ask", "goal_id": goalID, "comment_id": commentID},
+						},
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(askCard)
+	return string(raw), err
+}
+
 // buildProcessedCard replaces the approval card after a button decision: the
 // buttons are gone, the outcome is stamped (M3-1, the Message.Update path).
 func buildProcessedCard(goalID, decision string, scratch bool) (string, error) {

@@ -364,6 +364,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			c, err := s.commentSvc.Create(ctx, service.Comment{
 				GoalID: id.GoalID, AuthorType: "agent", AuthorID: id.AgentID,
 				Content: p.Text, ParentID: p.ParentID, RunID: id.RunID,
+				AskHuman: p.AskHuman,
 			})
 			if err != nil {
 				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}

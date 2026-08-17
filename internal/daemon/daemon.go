@@ -2693,6 +2693,24 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 				extras.WriteString("\nYour previous round was REJECTED (fix from this — do NOT start over):\n" + truncateIn(s, 2000) + "\n")
 			}
 		}
+	} else if in.runRole == "owner" && in.triggerAuthor == "human" && in.triggerCommentID != "" {
+		// Ask-reply memory (决策 7-3 延伸): the human replied to the owner's
+		// previous comment (parent_id → an agent comment — the --ask question
+		// or a plain report). The wake line carries the human's reply, but
+		// WITHOUT the agent's own previous words the reply is unmoored — "你
+		// 认为呢？" answers nothing the owner can see. Inject the parent
+		// comment (what the owner said that the human is replying to) so the
+		// owner picks up its own thread. This is the agent→human analogue of
+		// the reject memory above: the owner's own previous round, continued.
+		var parentContent string
+		if err := d.st.DB().QueryRowContext(ctx,
+			`SELECT p.content FROM comment c JOIN comment p ON p.id = c.parent_id
+			  WHERE c.id=? AND c.parent_id != '' AND p.author_type='agent'`,
+			in.triggerCommentID).Scan(&parentContent); err == nil {
+			if s := strings.TrimSpace(parentContent); s != "" {
+				extras.WriteString("\nYour previous comment (the human is replying to this):\n> " + truncateIn(s, 2000) + "\n")
+			}
+		}
 	}
 	if n, err := d.agentTriggeredRunCount(ctx, q.GoalID); err == nil && n > service.MaxMentionHints {
 		extras.WriteString(fmt.Sprintf("\n⚠️ Collaboration warning: agents have handed this task back and forth %d times. Do NOT hand it off again — finish the remaining work yourself, or end your turn and leave it for a human.\n", n))

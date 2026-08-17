@@ -53,6 +53,9 @@ export default function AgentsPage() {
                     <button onClick={() => setEditing(a)} className="font-medium text-zinc-900 hover:text-indigo-600 hover:underline" title="点击编辑 agent">
                       {a.name}
                     </button>
+                    {a.description && (
+                      <div className="text-xs text-zinc-400 mt-0.5 line-clamp-1">{a.description}</div>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-zinc-600">{runtimeName(a.runtime_id)}</td>
                   <td className="px-4 py-3 text-zinc-600">{a.model || "-"}</td>

@@ -54,6 +54,7 @@ export interface McpServer {
 export interface Agent {
   id: string;
   name: string;
+  description?: string; // human-facing one-liner (shown in the web list); distinct from system_prompt
   runtime_id: string;
   system_prompt: string;
   model: string;
@@ -190,6 +191,7 @@ export interface Comment {
   content: string;
   created_at: string;
   run_id?: string; // the run whose product this comment is ('' = trigger/context)
+  ask_human?: boolean; // 决策 7-3: agent's --ask question to the human (goal creator)
 }
 
 export interface Squad {

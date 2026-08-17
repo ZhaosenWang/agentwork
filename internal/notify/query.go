@@ -62,6 +62,9 @@ type QueryStore interface {
 	GoalDomainType(ctx context.Context, goalID string) (string, error)
 	// GoalTitle resolves one goal's title (milestone cards carry it).
 	GoalTitle(ctx context.Context, goalID string) (string, error)
+	// AgentName resolves one agent's name (the ask card's title names the
+	// questioning agent — 决策 7-3).
+	AgentName(ctx context.Context, agentID string) (string, error)
 	// GoalStatus resolves a goal by id OR id prefix (intake "状态 <id>"
 	// queries accept the short id).
 	GoalStatus(ctx context.Context, idPrefix string) (*GoalStatusView, error)
@@ -149,6 +152,21 @@ func (q *SQLQueryStore) GoalTitle(ctx context.Context, goalID string) (string, e
 	var t string
 	err := q.st.DB().QueryRowContext(ctx, `SELECT title FROM goal WHERE id=?`, goalID).Scan(&t)
 	return t, err
+}
+
+// AgentName resolves one agent's name (the ask card's title names the
+// questioning agent — 决策 7-3). Returns ("", nil) on miss (the card falls
+// back to the id prefix); GoalTitle/GoalStatus use the same return-err shape
+// and the callers treat "" as "not found".
+func (q *SQLQueryStore) AgentName(ctx context.Context, agentID string) (string, error) {
+	var n string
+	err := q.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, agentID).Scan(&n)
+	if err != nil {
+		// sql.ErrNoRows → the agent row is gone (deleted mid-flight); the card
+		// falls back to the id prefix. Swallow only that one, surface the rest.
+		return "", nil
+	}
+	return n, nil
 }
 
 func (q *SQLQueryStore) GoalStatus(ctx context.Context, idPrefix string) (*GoalStatusView, error) {

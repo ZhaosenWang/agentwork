@@ -53,6 +53,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
   const update = useUpdateAgent();
   const { data: runtimes } = useRuntimes();
   const [name, setName] = useState(agent?.name ?? "");
+  const [description, setDescription] = useState(agent?.description ?? "");
   const [runtimeId, setRuntimeId] = useState(agent?.runtime_id ?? "");
   const [systemPrompt, setSystemPrompt] = useState(agent?.system_prompt ?? "");
   const [model, setModel] = useState(agent?.model ?? "");
@@ -72,6 +73,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
     }
     const body = {
       name,
+      description,
       runtime_id: runtimeId,
       system_prompt: systemPrompt,
       model,
@@ -107,6 +109,10 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
       <form id="agent-form" onSubmit={handleSubmit} className="space-y-4">
         <Field label="名称">
           <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required />
+        </Field>
+
+        <Field label="描述" hint="一句话说明这个 agent 干什么（列表里展示）；和 System Prompt 不同，这是给人看的">
+          <input value={description} onChange={(e) => setDescription(e.target.value)} className={inputCls} placeholder="如：前端实现 + UI 审查" />
         </Field>
 
         <Field label="Runtime">

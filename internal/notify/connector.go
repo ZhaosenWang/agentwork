@@ -87,9 +87,10 @@ type Connector struct {
 
 	store     SettingsStore
 	bus       *events.Bus
-	qs        QueryStore           // M3: card evidence + digest queries (may be nil)
-	goalSvc   *service.GoalService // M3: approval-card callbacks resolve here
-	intakeSvc *IntakeService       // M3: inbound message pipeline (may be nil)
+	qs        QueryStore               // M3: card evidence + digest queries (may be nil)
+	goalSvc   *service.GoalService     // M3: approval-card callbacks resolve here
+	commentSvc *service.CommentService // 决策 7-3: ask-card reply form posts the human's reply here
+	intakeSvc *IntakeService           // M3: inbound message pipeline (may be nil)
 	notify    *Notifier            // milestone pusher, armed once connected
 	stop      context.CancelFunc
 }
@@ -108,6 +109,11 @@ func (c *Connector) SetQueryStore(qs QueryStore) { c.qs = qs }
 // call back over the long connection; the decisions go through the goal
 // layer's ResolveReview — the same arbitration as the Web approval panel.
 func (c *Connector) SetGoalService(gs *service.GoalService) { c.goalSvc = gs }
+
+// SetCommentService wires the ask-card reply resolver (决策 7-3). The ask
+// card's reply form submits over the long connection; the reply text becomes
+// a human comment threading under the ask (parent_id → owner wake).
+func (c *Connector) SetCommentService(cs *service.CommentService) { c.commentSvc = cs }
 
 // SetIntakeService wires the inbound pipeline (M3). The owner's messages
 // become parse runs on the configured global parser agent.
@@ -406,12 +412,10 @@ func (c *Connector) onCardAction(ctx context.Context, event *callback.CardAction
 	goalID, _ := act.Value["goal_id"].(string)
 	runID, _ := act.Value["run_id"].(string)
 	decision, _ := act.Value["action"].(string)
-	if goalID == "" || (decision != "approve" && decision != "reject") {
-		return nil, nil
-	}
-	// Single-user guard: only the owner (the scanned app's owner) may
-	// decide. The card is delivered to the owner only, so this is a cheap
-	// defense-in-depth, not the authorization model.
+	// Single-user guard: only the owner (the scanned app's owner) may act.
+	// The card is delivered to the owner only, so this is a cheap
+	// defense-in-depth, not the authorization model. Applies to BOTH the
+	// approval decision and the ask-card reply (决策 7-3).
 	op := ""
 	if event.Event.Operator != nil {
 		op = event.Event.Operator.OpenID
@@ -421,6 +425,44 @@ func (c *Connector) onCardAction(ctx context.Context, event *callback.CardAction
 		return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
 			Type: "warning", Content: "无权操作",
 		}}, nil
+	}
+	// 决策 7-3: the ask card's reply form. The human fills the input and
+	// submits; the callback carries form_value {reply_text} + the button's
+	// value (goal_id/comment_id). Post the reply as a HUMAN comment threading
+	// under the ask — the comment service's parent_id→owner routing wakes the
+	// owner with the reply (the same path a web reply takes).
+	if decision == "reply_ask" {
+		commentID, _ := act.Value["comment_id"].(string)
+		if goalID == "" || commentID == "" || c.commentSvc == nil {
+			return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+				Type: "error", Content: "平台未就绪，请在网页评论区回复",
+			}}, nil
+		}
+		replyText := ""
+		if fv := act.FormValue; fv != nil {
+			if v, ok := fv["reply_text"].(string); ok {
+				replyText = strings.TrimSpace(v)
+			}
+		}
+		if replyText == "" {
+			return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+				Type: "warning", Content: "请输入回复内容",
+			}}, nil
+		}
+		if _, err := c.commentSvc.Create(ctx, service.Comment{
+			GoalID: goalID, AuthorType: "human", AuthorID: "ui",
+			ParentID: commentID, Content: replyText,
+		}); err != nil {
+			return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+				Type: "error", Content: "回复失败，请稍后重试或到网页回复",
+			}}, nil
+		}
+		return &callback.CardActionTriggerResponse{Toast: &callback.Toast{
+			Type: "success", Content: "已回复，agent 将继续",
+		}}, nil
+	}
+	if goalID == "" || (decision != "approve" && decision != "reject") {
+		return nil, nil
 	}
 	if c.goalSvc == nil {
 		return &callback.CardActionTriggerResponse{Toast: &callback.Toast{

@@ -29,6 +29,12 @@ type Comment struct {
 	// by run ownership (DESIGN.md 决策 4-4). Also used to thread an agent
 	// comment as a REPLY to its run's trigger comment.
 	RunID string `json:"run_id,omitempty"`
+	// AskHuman (决策 7-3): true when the agent posted this comment via
+	// `goal comment --ask` — an explicit question to the goal creator. The
+	// platform publishes comment:agent_question so notify pushes a Feishu
+	// card; the flag persists so the web can render a "❓ question" style
+	// after refresh. Reply routing is by parent_id→agent, NOT this flag.
+	AskHuman bool `json:"ask_human,omitempty"`
 }
 
 type CommentService struct {
@@ -161,8 +167,8 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 		parentID = c.ParentID
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,?,?,?,?)`,
-		c.ID, c.GoalID, c.AuthorType, c.AuthorID, parentID, c.Content, c.CreatedAt, c.RunID); err != nil {
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id,ask_human) VALUES (?,?,?,?,?,?,?,?,?)`,
+		c.ID, c.GoalID, c.AuthorType, c.AuthorID, parentID, c.Content, c.CreatedAt, c.RunID, c.AskHuman); err != nil {
 		return nil, fmt.Errorf("insert comment: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -175,6 +181,19 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 	}
 
 	s.bus.Publish(ctx, events.Event{Topic: "comment:created", Payload: c})
+
+	// 决策 7-3: an agent's --ask comment is a question to the goal creator.
+	// Publish a dedicated event (not comment:created) so notify can push a
+	// Feishu card without coupling to every comment. Only agent-authored
+	// questions fire this — a human cannot ask themselves.
+	if c.AskHuman && c.AuthorType == "agent" {
+		s.bus.Publish(ctx, events.Event{Topic: "comment:agent_question", Payload: map[string]any{
+			"goal_id":    c.GoalID,
+			"comment_id": c.ID,
+			"agent_id":   c.AuthorID,
+			"question":   c.Content,
+		}})
+	}
 
 	if !dispatch {
 		return &c, nil // pure comment — no reopen, no mention-triggered runs
@@ -216,6 +235,57 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 			if g2, err := s.goalSvc.Get(ctx, c.GoalID); err == nil {
 				g = g2
 			}
+		}
+	}
+	// 决策 7-3: a HUMAN reply to an AGENT comment (parent_id → agent-authored
+	// comment) continues the owner's work — it is NOT a consult. Without this
+	// routing, a web reply (which auto-inserts a mention://agent link) would
+	// fall into the consult dispatch below, enqueuing a guest run (fresh empty
+	// workdir, no session, no owner wake) — the agent would see "working
+	// directory is empty, no context" and the task would end. Instead, wake
+	// the goal's current owner with role='owner' (persistent workdir + session
+	// resume via priorSessionFor) and the reply comment as the trigger.
+	if c.AuthorType == "human" && c.ParentID != "" && s.runSvc != nil && s.goalSvc != nil {
+		var parentAuthor string
+		if err := s.st.DB().QueryRowContext(ctx,
+			`SELECT author_type FROM comment WHERE id=?`, c.ParentID).Scan(&parentAuthor); err == nil && parentAuthor == "agent" {
+			// Terminal goal + a reply to an agent comment: reopen first (the
+			// reopen above only fired for action-mention replies; a plain-text
+			// reply to an agent comment must also reopen a terminal goal).
+			if isTerminal && !reopened {
+				if _, err := s.goalSvc.Reopen(ctx, c.GoalID, "", c.ID); err == nil {
+					reopened = true
+					if g2, err := s.goalSvc.Get(ctx, c.GoalID); err == nil {
+						g = g2
+					}
+				}
+			}
+			// Resolve the goal's current owner agent (squad → leader).
+			ownerAgentID := ""
+			if g.AssigneeType == "agent" {
+				ownerAgentID = g.AssigneeID
+			} else if g.AssigneeType == "squad" {
+				// resolveLeaderTx takes a *sql.Tx (nil panics on its tx.Query);
+				// query the leader directly — the comment path holds no tx here
+				// (the comment row was committed before dispatch).
+				_ = s.st.DB().QueryRowContext(ctx,
+					`SELECT leader_id FROM squad WHERE id=?`, g.AssigneeID).Scan(&ownerAgentID)
+			}
+			if ownerAgentID != "" && (g.Status == "active" || reopened) {
+				if _, err := s.runSvc.EnqueueForMentionRole(ctx, c.GoalID, ownerAgentID, c.ID, "owner"); err != nil {
+					logging.Errorf("comment: human→agent reply owner wake goal=%s: %v", c.GoalID, err)
+				} else {
+					logging.Infof("comment: human reply to agent → owner wake goal=%q (%s) agent=%s (trigger comment %s)",
+						g.Title, c.GoalID, ownerAgentID, c.ID)
+				}
+				// Return BEFORE the status guard + mention dispatch — the owner
+				// wake is done; a co-present mention link must NOT also enqueue
+				// a consult run (double-trigger).
+				return &c, nil
+			}
+			// ownerAgentID empty (human-owned goal, or squad leader unresolved):
+			// fall through — the reply lands as a comment, no run (human owner
+			// has no agent to wake; squad leader resolution failed gracefully).
 		}
 	}
 	if HasMentionAll(c.Content) || (g.Status != "active" && g.Status != "review") {
@@ -398,11 +468,11 @@ func (s *CommentService) ListAfter(ctx context.Context, goalID, afterID string, 
 	var err error
 	if afterID == "" {
 		rows, err = s.st.DB().QueryContext(ctx,
-			`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id FROM comment WHERE goal_id=? ORDER BY created_at LIMIT ?`,
+			`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id,ask_human FROM comment WHERE goal_id=? ORDER BY created_at LIMIT ?`,
 			goalID, limit)
 	} else {
 		rows, err = s.st.DB().QueryContext(ctx,
-			`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id FROM comment
+			`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id,ask_human FROM comment
 			 WHERE goal_id=? AND created_at > (SELECT created_at FROM comment WHERE id=?)
 			 ORDER BY created_at LIMIT ?`,
 			goalID, afterID, limit)
@@ -415,7 +485,7 @@ func (s *CommentService) ListAfter(ctx context.Context, goalID, afterID string, 
 	for rows.Next() {
 		var c Comment
 		var parentID sql.NullString
-		if err := rows.Scan(&c.ID, &c.GoalID, &c.AuthorType, &c.AuthorID, &parentID, &c.Content, &c.CreatedAt, &c.RunID); err != nil {
+		if err := rows.Scan(&c.ID, &c.GoalID, &c.AuthorType, &c.AuthorID, &parentID, &c.Content, &c.CreatedAt, &c.RunID, &c.AskHuman); err != nil {
 			return nil, err
 		}
 		c.ParentID = parentID.String
@@ -426,7 +496,7 @@ func (s *CommentService) ListAfter(ctx context.Context, goalID, afterID string, 
 
 func (s *CommentService) List(ctx context.Context, goalID string) ([]Comment, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id FROM comment WHERE goal_id=? ORDER BY created_at`, goalID)
+		`SELECT id,goal_id,author_type,author_id,parent_id,content,created_at,run_id,ask_human FROM comment WHERE goal_id=? ORDER BY created_at`, goalID)
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +505,7 @@ func (s *CommentService) List(ctx context.Context, goalID string) ([]Comment, er
 	for rows.Next() {
 		var c Comment
 		var parentID sql.NullString
-		if err := rows.Scan(&c.ID, &c.GoalID, &c.AuthorType, &c.AuthorID, &parentID, &c.Content, &c.CreatedAt, &c.RunID); err != nil {
+		if err := rows.Scan(&c.ID, &c.GoalID, &c.AuthorType, &c.AuthorID, &parentID, &c.Content, &c.CreatedAt, &c.RunID, &c.AskHuman); err != nil {
 			return nil, err
 		}
 		c.ParentID = parentID.String

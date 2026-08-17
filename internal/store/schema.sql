@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS runtime (
 CREATE TABLE IF NOT EXISTS agent (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
+    description     TEXT NOT NULL DEFAULT '',  -- human-facing one-liner (shown in the web list); distinct from system_prompt (the persona)
     runtime_id      TEXT NOT NULL REFERENCES runtime(id),
     system_prompt   TEXT NOT NULL DEFAULT '',
     model           TEXT NOT NULL DEFAULT '',  -- optional override
@@ -370,7 +371,8 @@ CREATE TABLE IF NOT EXISTS comment (
     parent_id   TEXT REFERENCES comment(id), -- one level of threading
     content     TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    run_id      TEXT NOT NULL DEFAULT ''   -- the run whose product this comment is ('' = trigger/context rows)
+    run_id      TEXT NOT NULL DEFAULT '',  -- the run whose product this comment is ('' = trigger/context rows)
+    ask_human   INTEGER NOT NULL DEFAULT 0  -- 决策 7-3: 1 = agent's question to the human (goal creator); notify pushes a Feishu card. Reply routing is by parent_id→agent, not this flag.
 );
 
 CREATE INDEX IF NOT EXISTS idx_comment_goal ON comment(goal_id, created_at);

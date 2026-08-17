@@ -19,6 +19,11 @@ import (
 type Agent struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
+	// Description is a human-facing one-liner shown in the web list — what
+	// this agent does in a glance. Distinct from SystemPrompt (the persona
+	// shipped to the model): description is for the operator browsing agents,
+	// not the agent itself.
+	Description  string            `json:"description"`
 	RuntimeID    string            `json:"runtime_id"`
 	SystemPrompt string            `json:"system_prompt"`
 	Model        string            `json:"model"`
@@ -75,9 +80,9 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 	mcpJSON, _ := json.Marshal(a.McpServers)
 	skillsJSON, _ := json.Marshal(a.Skills)
 	_, err = s.st.DB().ExecContext(ctx,
-		`INSERT INTO agent (id,name,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		a.ID, a.Name, a.RuntimeID, a.SystemPrompt, a.Model, string(envJSON), string(mcpJSON), skillsJSON, a.MaxConcurrent, a.CreatedAt)
+		`INSERT INTO agent (id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, string(envJSON), string(mcpJSON), skillsJSON, a.MaxConcurrent, a.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert agent: %w", err)
 	}
@@ -105,8 +110,8 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 	mcpJSON, _ := json.Marshal(a.McpServers)
 	skillsJSON, _ := json.Marshal(a.Skills)
 	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE agent SET name=?, system_prompt=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
-		a.Name, a.SystemPrompt, a.MaxConcurrent, string(envJSON), string(mcpJSON), string(skillsJSON), id); err != nil {
+		`UPDATE agent SET name=?, description=?, system_prompt=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
+		a.Name, a.Description, a.SystemPrompt, a.MaxConcurrent, string(envJSON), string(mcpJSON), string(skillsJSON), id); err != nil {
 		return nil, fmt.Errorf("update agent: %w", err)
 	}
 	return s.Get(ctx, id)
@@ -114,7 +119,7 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
 		 FROM agent ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -124,7 +129,7 @@ func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	for rows.Next() {
 		var a Agent
 		var envJSON, mcpJSON, skillsJSON string
-		if err := rows.Scan(&a.ID, &a.Name, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(envJSON), &a.Env)
@@ -139,9 +144,9 @@ func (s *AgentService) Get(ctx context.Context, id string) (*Agent, error) {
 	var a Agent
 	var envJSON, mcpJSON, skillsJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
 		 FROM agent WHERE id=?`, id).
-		Scan(&a.ID, &a.Name, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt)
+		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
