@@ -119,12 +119,15 @@ func usage() {
 and remote-machine sidecar (register this host to agentwork-daemon).
 
 Subcommands:
-  connect [--server URL] [--token T] [--name N] [--scan DIR|GLOB ...]
+  connect [--server URL] [--token T] [--name N] [--scan DIR|GLOB ...] [--agents FILE]
                                              connect this machine to agentwork-daemon (default
                                              127.0.0.1:7373, no auth), probe its agent CLIs and
                                              register them; --scan adds a directory to search for
                                              agent CLIs not on PATH (repeatable; ~ expanded);
-                                             heartbeats until interrupted
+                                             --agents points to a YAML config (default
+                                             ~/.agentwork/agents.yaml) whose entries ADD new agent
+                                             CLIs or OVERRIDE builtins by name; heartbeats until
+                                             interrupted
   status                                     show the persisted connection state (machine id,
                                              server, last heartbeat, probed agent CLIs)
   goal list [--limit N] [--status S] [--json]  list goals (JSON — the default format; --json requests

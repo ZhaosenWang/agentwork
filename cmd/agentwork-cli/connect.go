@@ -37,6 +37,17 @@ func stateFile() string {
 	return filepath.Join(dir, ".agentwork", "agentwork-cli-state.json")
 }
 
+// defaultAgentsConfigPath is the auto-discovered agents.yaml location
+// (~/.agentwork/agents.yaml) — mirrors stateFile's convention. The file is
+// optional; its absence means the builtin probe table is used as-is.
+func defaultAgentsConfigPath() string {
+	dir, err := os.UserHomeDir()
+	if err != nil {
+		return "agents.yaml"
+	}
+	return filepath.Join(dir, ".agentwork", "agents.yaml")
+}
+
 type cliState struct {
 	MachineID   string    `json:"machine_id"`
 	Name        string    `json:"name"`
@@ -83,9 +94,22 @@ func connectCmd(args []string) {
 	server := fs.String("server", defaultServerURL, "agentwork-daemon address")
 	token := fs.String("token", "", "register token (daemon-side platform.worker_token; empty = none)")
 	name := fs.String("name", "", "machine display name (default: hostname)")
+	agentsCfg := fs.String("agents", "", "path to agents YAML config (default: ~/.agentwork/agents.yaml — adds/overrides probed agent CLIs)")
 	var scanDirs scanDirsFlag
 	fs.Var(&scanDirs, "scan", "extra directory (or glob, e.g. /opt/*/ or /opt/**/) to scan for agent CLIs not on PATH (repeatable; ~ expanded)")
 	fs.Parse(args)
+
+	// Load the agents config (adds new CLIs or overrides builtins by name)
+	// BEFORE the first probe. A missing file is normal (builtins only); a
+	// parse error warns and falls back to builtins — connect never fails on
+	// a bad config.
+	cfgPath := *agentsCfg
+	if cfgPath == "" {
+		cfgPath = defaultAgentsConfigPath()
+	}
+	if err := setMergedProbeTable(cfgPath); err != nil {
+		cliLogf("agents config: %v — using builtin probe table only", err)
+	}
 
 	hostname, _ := os.Hostname()
 	if *name == "" {
@@ -128,7 +152,7 @@ func connectCmd(args []string) {
 
 	backoff := time.Second
 	for {
-		if err := runLink(ctx, wsURL, st, *name, hostname, []string(scanDirs)); err != nil {
+		if err := runLink(ctx, wsURL, st, *name, hostname, []string(scanDirs), cfgPath); err != nil {
 			cliLogf("connect: %v — reconnecting in %s", err, backoff)
 		}
 		select {
@@ -146,7 +170,7 @@ func connectCmd(args []string) {
 // runLink holds one connection: register → heartbeat loop → drain until
 // the link dies or ctx is cancelled. Returns the exit error for the
 // reconnect loop (nil on ctx cancellation — that is a clean shutdown).
-func runLink(ctx context.Context, wsURL string, st cliState, name, hostname string, scanDirs []string) error {
+func runLink(ctx context.Context, wsURL string, st cliState, name, hostname string, scanDirs []string, agentsCfgPath string) error {
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		cliLogf("link: dial %s: %v", wsURL, err)
@@ -300,6 +324,14 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 			st.ConnectedAt = time.Now()
 			saveState(st)
 		case <-probeTick.C:
+			// Re-read the agents config so edits to ~/.agentwork/agents.yaml
+			// take effect without restarting connect. A missing or empty file
+			// clears the cached table (falls back to builtins); a parse error
+			// keeps the previously loaded table so a half-edited file doesn't
+			// drop a working config. Never fatal.
+			if err := setMergedProbeTable(agentsCfgPath); err != nil {
+				cliLogf("agents config: %v — using previous probe table", err)
+			}
 			fresh := probeCLIs(ctx, scanDirs)
 			if probeSig(fresh) != probeSig(clis) {
 				clis = fresh
