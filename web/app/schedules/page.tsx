@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { useSchedules, useAgents, useSquads, useDomains, useCreateSchedule, useDeleteSchedule, useSetScheduleEnabled, useGoalEvents, useScheduleRuns } from "@/lib/queries";
+import { useSchedules, useAgents, useSquads, useDomains, useCreateSchedule, useUpdateSchedule, useDeleteSchedule, useSetScheduleEnabled, useGoalEvents, useScheduleRuns } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls, ConfirmDialog, Badge } from "@/components/ui";
 import type { Schedule } from "@/lib/types";
 
@@ -18,6 +18,7 @@ export default function SchedulesPage() {
   const [showForm, setShowForm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [detail, setDetail] = useState<Schedule | null>(null);
+  const [editTarget, setEditTarget] = useState<Schedule | null>(null);
 
   const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
   const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? sid;
@@ -106,6 +107,16 @@ export default function SchedulesPage() {
           squadName={squadName}
           domainName={domainName}
           onClose={() => setDetail(null)}
+          onEdit={() => { setEditTarget(detail); setDetail(null); }}
+        />
+      )}
+      {editTarget && (
+        <EditScheduleDialog
+          schedule={editTarget}
+          agents={agents}
+          squads={squads}
+          domains={domains}
+          onClose={() => setEditTarget(null)}
         />
       )}
       {deleteTarget && (
@@ -130,12 +141,14 @@ function ScheduleDetail({
   squadName,
   domainName,
   onClose,
+  onEdit,
 }: {
   schedule: Schedule;
   agentName: (id: string) => string;
   squadName: (id: string) => string;
   domainName: (id: string) => string;
   onClose: () => void;
+  onEdit: () => void;
 }) {
   const { data: runs, isLoading } = useScheduleRuns(schedule.id);
   const assigneeLabel =
@@ -145,7 +158,12 @@ function ScheduleDetail({
     <Dialog
       title={`定时任务：${schedule.name}`}
       onClose={onClose}
-      footer={<Button variant="outline" onClick={onClose}>关闭</Button>}
+      footer={
+        <>
+          <Button variant="outline" onClick={onEdit}>编辑</Button>
+          <Button variant="outline" onClick={onClose}>关闭</Button>
+        </>
+      }
     >
       <div className="space-y-3">
         {/* Template config */}
@@ -198,6 +216,87 @@ function ScheduleDetail({
   );
 }
 
+// ScheduleFormFields is the shared field set for create + edit. It receives
+// the form state + setters from the parent (the parent owns submission).
+function ScheduleFormFields({
+  form,
+  set,
+  agents,
+  squads,
+  domains,
+}: {
+  form: ScheduleFormState;
+  set: (patch: Partial<ScheduleFormState>) => void;
+  agents?: { id: string; name: string }[];
+  squads?: { id: string; name: string }[];
+  domains?: { id: string; name: string }[];
+}) {
+  return (
+    <>
+      <Field label="名称" hint="必填">
+        <input value={form.name} onChange={(e) => set({ name: e.target.value })} className={inputCls} required placeholder="定时任务名称…" />
+      </Field>
+      <Field label="标题模板" hint="必填，每次触发时使用此模板创建 Goal 标题">
+        <input value={form.title_template} onChange={(e) => set({ title_template: e.target.value })} className={inputCls} required placeholder="每日站会 {{date}}" />
+      </Field>
+      <Field label="描述">
+        <textarea value={form.description} onChange={(e) => set({ description: e.target.value })} className={inputCls} rows={2} />
+      </Field>
+      <Field label="负责人类型">
+        <select value={form.assignee_type} onChange={(e) => { set({ assignee_type: e.target.value, assignee_id: "" }); }} className={inputCls}>
+          <option value="agent">Agent</option>
+          <option value="squad">Squad</option>
+        </select>
+      </Field>
+      {form.assignee_type === "agent" && (
+        <Field label="选择 Agent" hint="必填">
+          <select value={form.assignee_id} onChange={(e) => set({ assignee_id: e.target.value })} className={inputCls} required>
+            <option value="">选择…</option>
+            {agents?.map((a) => (
+              <option key={a.id} value={a.id}>{a.name}</option>
+            ))}
+          </select>
+        </Field>
+      )}
+      {form.assignee_type === "squad" && (
+        <Field label="选择 Squad" hint="必填">
+          <select value={form.assignee_id} onChange={(e) => set({ assignee_id: e.target.value })} className={inputCls} required>
+            <option value="">选择…</option>
+            {squads?.map((s) => (
+              <option key={s.id} value={s.id}>{s.name}</option>
+            ))}
+          </select>
+        </Field>
+      )}
+      <Field label="所属项目" hint="必填，每次触发时在此项目的仓库上执行（验收策略 + worktree 来自该项目）">
+        <select value={form.domain_id} onChange={(e) => set({ domain_id: e.target.value })} className={inputCls} required>
+          <option value="">选择…</option>
+          {domains?.map((d) => (
+            <option key={d.id} value={d.id}>{d.name}</option>
+          ))}
+        </select>
+      </Field>
+      <Field label="Cron 表达式" hint="5 字段 cron: 分 时 日 月 星期（必填）">
+        <input value={form.cron_expression} onChange={(e) => set({ cron_expression: e.target.value })} className={`${inputCls} font-mono`} required placeholder="0 9 * * 1-5" />
+      </Field>
+      <Field label="时区">
+        <input value={form.timezone} onChange={(e) => set({ timezone: e.target.value })} className={inputCls} placeholder="UTC" />
+      </Field>
+    </>
+  );
+}
+
+type ScheduleFormState = {
+  name: string;
+  title_template: string;
+  description: string;
+  assignee_type: string;
+  assignee_id: string;
+  domain_id: string;
+  cron_expression: string;
+  timezone: string;
+};
+
 function NewScheduleForm({
   agents,
   squads,
@@ -210,21 +309,16 @@ function NewScheduleForm({
   onClose: () => void;
 }) {
   const createSchedule = useCreateSchedule();
-  const [name, setName] = useState("");
-  const [titleTemplate, setTitleTemplate] = useState("");
-  const [description, setDescription] = useState("");
-  const [assigneeType, setAssigneeType] = useState("agent");
-  const [assigneeId, setAssigneeId] = useState("");
-  const [domainId, setDomainId] = useState("");
-  const [cronExpression, setCronExpression] = useState("");
-  const [timezone, setTimezone] = useState("UTC");
+  const [form, setForm] = useState<ScheduleFormState>({
+    name: "", title_template: "", description: "",
+    assignee_type: "agent", assignee_id: "", domain_id: "",
+    cron_expression: "", timezone: "UTC",
+  });
+  const set = (patch: Partial<ScheduleFormState>) => setForm((f) => ({ ...f, ...patch }));
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    createSchedule.mutate(
-      { name, title_template: titleTemplate, description, assignee_type: assigneeType, assignee_id: assigneeId, domain_id: domainId, cron_expression: cronExpression, timezone },
-      { onSuccess: onClose }
-    );
+    createSchedule.mutate(form, { onSuccess: onClose });
   };
 
   return (
@@ -241,57 +335,74 @@ function NewScheduleForm({
       }
     >
       <form id="schedule-form" onSubmit={handleSubmit} className="space-y-4">
-        <Field label="名称" hint="必填">
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required placeholder="定时任务名称…" />
-        </Field>
-        <Field label="标题模板" hint="必填，每次触发时使用此模板创建 Goal 标题">
-          <input value={titleTemplate} onChange={(e) => setTitleTemplate(e.target.value)} className={inputCls} required placeholder="每日站会 {{date}}" />
-        </Field>
-        <Field label="描述">
-          <textarea value={description} onChange={(e) => setDescription(e.target.value)} className={inputCls} rows={2} />
-        </Field>
-        <Field label="负责人类型">
-          <select value={assigneeType} onChange={(e) => { setAssigneeType(e.target.value); setAssigneeId(""); }} className={inputCls}>
-            <option value="agent">Agent</option>
-            <option value="squad">Squad</option>
-          </select>
-        </Field>
-        {assigneeType === "agent" && (
-          <Field label="选择 Agent" hint="必填">
-            <select value={assigneeId} onChange={(e) => setAssigneeId(e.target.value)} className={inputCls} required>
-              <option value="">选择…</option>
-              {agents?.map((a) => (
-                <option key={a.id} value={a.id}>{a.name}</option>
-              ))}
-            </select>
-          </Field>
-        )}
-        {assigneeType === "squad" && (
-          <Field label="选择 Squad" hint="必填">
-            <select value={assigneeId} onChange={(e) => setAssigneeId(e.target.value)} className={inputCls} required>
-              <option value="">选择…</option>
-              {squads?.map((s) => (
-                <option key={s.id} value={s.id}>{s.name}</option>
-              ))}
-            </select>
-          </Field>
-        )}
-        <Field label="所属项目" hint="必填，每次触发时在此项目的仓库上执行（验收策略 + worktree 来自该项目）">
-          <select value={domainId} onChange={(e) => setDomainId(e.target.value)} className={inputCls} required>
-            <option value="">选择…</option>
-            {domains?.map((d) => (
-              <option key={d.id} value={d.id}>{d.name}</option>
-            ))}
-          </select>
-        </Field>
-        <Field label="Cron 表达式" hint="5 字段 cron: 分 时 日 月 星期（必填）">
-          <input value={cronExpression} onChange={(e) => setCronExpression(e.target.value)} className={`${inputCls} font-mono`} required placeholder="0 9 * * 1-5" />
-        </Field>
-        <Field label="时区">
-          <input value={timezone} onChange={(e) => setTimezone(e.target.value)} className={inputCls} placeholder="UTC" />
-        </Field>
+        <ScheduleFormFields form={form} set={set} agents={agents} squads={squads} domains={domains} />
         {createSchedule.isError && (
           <p className="text-sm text-red-500">{String(createSchedule.error)}</p>
+        )}
+      </form>
+    </Dialog>
+  );
+}
+
+// EditScheduleDialog预填当前 schedule 的值，提交调 updateSchedule。
+// 改 assignee/domain 只影响后续触发——用提示说明，后端不限制。
+function EditScheduleDialog({
+  schedule,
+  agents,
+  squads,
+  domains,
+  onClose,
+}: {
+  schedule: Schedule;
+  agents?: { id: string; name: string }[];
+  squads?: { id: string; name: string }[];
+  domains?: { id: string; name: string }[];
+  onClose: () => void;
+}) {
+  const updateSchedule = useUpdateSchedule();
+  const [form, setForm] = useState<ScheduleFormState>({
+    name: schedule.name,
+    title_template: schedule.title_template,
+    description: schedule.description,
+    assignee_type: schedule.assignee_type || "agent",
+    assignee_id: schedule.assignee_id,
+    domain_id: schedule.domain_id,
+    cron_expression: schedule.cron_expression,
+    timezone: schedule.timezone || "UTC",
+  });
+  const set = (patch: Partial<ScheduleFormState>) => setForm((f) => ({ ...f, ...patch }));
+
+  // assignee/domain 与原值不同时显示"仅影响后续触发"提示。
+  const assigneeChanged = form.assignee_id !== schedule.assignee_id || form.assignee_type !== schedule.assignee_type;
+  const domainChanged = form.domain_id !== schedule.domain_id;
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    updateSchedule.mutate({ id: schedule.id, ...form }, { onSuccess: onClose });
+  };
+
+  return (
+    <Dialog
+      title={`编辑：${schedule.name}`}
+      onClose={onClose}
+      footer={
+        <>
+          <Button variant="outline" onClick={onClose}>取消</Button>
+          <Button type="submit" form="schedule-edit-form" disabled={updateSchedule.isPending}>
+            {updateSchedule.isPending ? "保存中…" : "保存"}
+          </Button>
+        </>
+      }
+    >
+      <form id="schedule-edit-form" onSubmit={handleSubmit} className="space-y-4">
+        <ScheduleFormFields form={form} set={set} agents={agents} squads={squads} domains={domains} />
+        {(assigneeChanged || domainChanged) && (
+          <p className="text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+            改动负责人或项目仅影响<strong>后续触发</strong>，已派生的 goal 保持原值不变。
+          </p>
+        )}
+        {updateSchedule.isError && (
+          <p className="text-sm text-red-500">{String(updateSchedule.error)}</p>
         )}
       </form>
     </Dialog>

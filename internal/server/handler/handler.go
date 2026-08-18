@@ -93,6 +93,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /schedules/{id}", h.getSchedule)
 	mux.HandleFunc("GET /schedules/{id}/runs", h.listScheduleRuns)
 	mux.HandleFunc("DELETE /schedules/{id}", h.deleteSchedule)
+	mux.HandleFunc("PUT /schedules/{id}", h.updateSchedule)
 	mux.HandleFunc("PUT /schedules/{id}/enabled", h.setScheduleEnabled)
 
 	mux.HandleFunc("GET /domains", h.listDomains)
@@ -416,6 +417,15 @@ func (h *Handlers) createSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out, err := h.Schedule.Create(r.Context(), sch)
+	writeJSON(w, out, err)
+}
+func (h *Handlers) updateSchedule(w http.ResponseWriter, r *http.Request) {
+	var sch service.Schedule
+	if err := json.NewDecoder(r.Body).Decode(&sch); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.Schedule.Update(r.Context(), r.PathValue("id"), sch)
 	writeJSON(w, out, err)
 }
 func (h *Handlers) listSchedules(w http.ResponseWriter, r *http.Request) {

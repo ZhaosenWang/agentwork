@@ -43,15 +43,21 @@ func NewScheduleService(st *store.Store, bus *events.Bus) *ScheduleService {
 
 // Create validates the cron expression, computes the first next_run_at, and
 // inserts the schedule.
-func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, error) {
+// validateSchedule runs the shared field checks (Create and Update both use
+// it): required fields, assignee_type + existence, domain existence, cron
+// legality. It normalizes defaults (assignee_type, timezone) and recomputes
+// next_run_at into sch — the caller persists the result. Returns ErrNotFound
+// only indirectly via mustExist for assignee/domain; the schedule's own
+// existence is checked by Update's caller path.
+func (s *ScheduleService) validateSchedule(ctx context.Context, sch *Schedule) error {
 	if sch.Name == "" {
-		return nil, NewValidationError("name is required")
+		return NewValidationError("name is required")
 	}
 	if sch.TitleTemplate == "" {
-		return nil, NewValidationError("title_template is required")
+		return NewValidationError("title_template is required")
 	}
 	if sch.AssigneeID == "" {
-		return nil, NewValidationError("assignee_id is required")
+		return NewValidationError("assignee_id is required")
 	}
 	if sch.AssigneeType == "" {
 		sch.AssigneeType = "agent"
@@ -59,41 +65,47 @@ func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, 
 	switch sch.AssigneeType {
 	case "agent":
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, sch.AssigneeID, "assignee agent"); err != nil {
-			return nil, err
+			return err
 		}
 	case "squad":
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, sch.AssigneeID, "assignee squad"); err != nil {
-			return nil, err
+			return err
 		}
 	default:
-		return nil, NewValidationError("assignee_type must be agent or squad")
+		return NewValidationError("assignee_type must be agent or squad")
 	}
 	// v2 (M1): unattended goals need a domain (acceptance policy + worktree +
 	// deliver). Require it for agent/squad assignees.
 	if sch.DomainID == "" {
-		return nil, NewValidationError("domain_id is required — unattended goals need the domain's acceptance policy")
+		return NewValidationError("domain_id is required — unattended goals need the domain's acceptance policy")
 	}
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM domain WHERE id=?`, sch.DomainID, "domain"); err != nil {
-		return nil, err
+		return err
 	}
 	if sch.CronExpression == "" {
-		return nil, NewValidationError("cron_expression is required")
+		return NewValidationError("cron_expression is required")
 	}
 	if sch.Timezone == "" {
 		sch.Timezone = "UTC"
 	}
 	if err := ValidateCron(sch.CronExpression, sch.Timezone); err != nil {
+		return err
+	}
+	next, err := ComputeNextRun(sch.CronExpression, sch.Timezone, time.Now())
+	if err != nil {
+		return err
+	}
+	sch.NextRunAt = next.Format(time.RFC3339Nano)
+	return nil
+}
+
+func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, error) {
+	if err := s.validateSchedule(ctx, &sch); err != nil {
 		return nil, err
 	}
 	sch.ID = newID()
 	sch.CreatedAt = now()
 	sch.Enabled = true
-
-	next, err := ComputeNextRun(sch.CronExpression, sch.Timezone, time.Now())
-	if err != nil {
-		return nil, err
-	}
-	sch.NextRunAt = next.Format(time.RFC3339Nano)
 
 	enabled := 0
 	if sch.Enabled {
@@ -107,6 +119,36 @@ func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, 
 	}
 
 	s.bus.Publish(ctx, events.Event{Topic: "schedule:created", Payload: sch})
+	return &sch, nil
+}
+
+// Update applies partial edits to a schedule's mutable fields (name,
+// title_template, description, assignee, domain, cron, timezone). enabled,
+// last_run_at, created_at, and the id are preserved. Changing cron/timezone
+// recomputes next_run_at; changing assignee/domain only affects FUTURE
+// firings — already-derived goals keep their original assignment. The
+// caller-supplied sch carries the new field values; fields left zero
+// (empty string) are still subject to the required-field checks, so the
+// caller must send the full intended value set, not a partial patch.
+func (s *ScheduleService) Update(ctx context.Context, id string, sch Schedule) (*Schedule, error) {
+	existing, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err // ErrNotFound propagates
+	}
+	// Carry the immutable fields forward from the existing row.
+	sch.ID = existing.ID
+	sch.CreatedAt = existing.CreatedAt
+	sch.Enabled = existing.Enabled
+	sch.LastRunAt = existing.LastRunAt
+	if err := s.validateSchedule(ctx, &sch); err != nil {
+		return nil, err
+	}
+	if _, err := s.st.DB().ExecContext(ctx,
+		`UPDATE schedule SET name=?,title_template=?,description=?,assignee_type=?,assignee_id=?,domain_id=?,cron_expression=?,timezone=?,next_run_at=? WHERE id=?`,
+		sch.Name, sch.TitleTemplate, sch.Description, sch.AssigneeType, sch.AssigneeID, sch.DomainID, sch.CronExpression, sch.Timezone, sch.NextRunAt, sch.ID); err != nil {
+		return nil, fmt.Errorf("update schedule: %w", err)
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "schedule:updated", Payload: sch})
 	return &sch, nil
 }
 

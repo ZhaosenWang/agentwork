@@ -37,6 +37,7 @@ import {
   removeSquadMember,
   listSchedules,
   createSchedule,
+  updateSchedule,
   deleteSchedule,
   setScheduleEnabled,
   listScheduleRuns,
@@ -478,6 +479,14 @@ export function useCreateSchedule() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: createSchedule,
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.schedules }),
+  });
+}
+export function useUpdateSchedule() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...body }: Parameters<typeof updateSchedule>[1] & { id: string }) =>
+      updateSchedule(id, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.schedules }),
   });
 }

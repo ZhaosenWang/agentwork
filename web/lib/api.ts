@@ -258,6 +258,16 @@ export const createSchedule = (body: {
   cron_expression: string;
   timezone?: string;
 }) => api<Schedule>("/schedules", { method: "POST", body: JSON.stringify(body) });
+export const updateSchedule = (id: string, body: {
+  name: string;
+  title_template: string;
+  description?: string;
+  assignee_type?: string;
+  assignee_id: string;
+  domain_id: string;
+  cron_expression: string;
+  timezone?: string;
+}) => api<Schedule>(`/schedules/${id}`, { method: "PUT", body: JSON.stringify(body) });
 export const deleteSchedule = (id: string) =>
   api<void>(`/schedules/${id}`, { method: "DELETE" });
 export const listScheduleRuns = (id: string) =>
