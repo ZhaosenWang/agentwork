@@ -196,10 +196,19 @@ func (e *executor) execute(p link.RunDispatchParams) {
 	if !p.Proc {
 		pushedProfile = syncAgentProfile(p.AgentID, workdir)
 		if p.RunProfile != "" {
+			// Merge RunProfile into the workdir's AGENTS.md. If the agent
+			// had no pushed system prompt, syncAgentProfile wrote nothing
+			// and the file may not exist yet — in that case CREATE it with
+			// RunProfile alone (the squad instructions / team playbook ride
+			// here when the leader agent has no persona of its own).
+			// Previously a missing file silently dropped RunProfile, losing
+			// the squad instructions entirely.
 			if b, err := os.ReadFile(filepath.Join(workdir, "AGENTS.md")); err == nil {
 				pushedProfile = string(b) + "\n\n" + p.RunProfile
-				_ = os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(pushedProfile), 0o644)
+			} else {
+				pushedProfile = p.RunProfile
 			}
+			_ = os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(pushedProfile), 0o644)
 		}
 		// Skills ride the workdir too (project-level): staged from the
 		// pushed dir under their ORIGINAL names — the user's own global
