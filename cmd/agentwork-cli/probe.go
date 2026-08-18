@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
-	"gopkg.in/yaml.v3"
 	"github.com/eushing/agentwork/internal/link"
+	"gopkg.in/yaml.v3"
 )
 
 // probeTimeout bounds a single probe command (a hung version check must
@@ -61,12 +61,52 @@ var builtinProbeTable = []probeEntry{
 		ProfileFiles:     []string{"AGENTS.md"},
 	},
 	{
-		Name:             "openagent",
-		ProbeCmd:         "openagent --version",
-		ACPSpawn:         []string{"openagent", "serve", "--acp"},
+		Name:             "hwcloud",
+		ProbeCmd:         "hwcloud --version",
+		ACPSpawn:         []string{"hwcloud", "serve", "--acp"},
 		SkillsDir:        "~/.openagent/skills",
 		ProjectSkillsDir: ".agents/skills", // the AgentSkills standard (npx skills add)
 		ProfileFiles:     []string{"SOUL.md", "SYSTEM.md", "AGENTS.md"},
+	},
+	{
+		Name:             "kimi",
+		ProbeCmd:         "kimi --version",
+		ACPSpawn:         []string{"kimi", "acp"},
+		SkillsDir:        "~/.kimi/skills",
+		ProjectSkillsDir: ".kimi/skills",
+		ProfileFiles:     []string{"AGENTS.md"},
+	},
+	{
+		Name:             "hermes",
+		ProbeCmd:         "hermes-acp --version",
+		ACPSpawn:         []string{"hermes-acp"},
+		SkillsDir:        "~/.hermes/skills",
+		ProjectSkillsDir: "",
+		ProfileFiles:     []string{"AGENTS.md"},
+	},
+	{
+		Name:             "openclaw",
+		ProbeCmd:         "/root/runtime/openclaw/openclaw.mjs --version",
+		ACPSpawn:         []string{"/root/runtime/openclaw/node/bin/node", "/root/runtime/openclaw/openclaw.mjs", "acp"},
+		SkillsDir:        "~/.openclaw/skills",
+		ProjectSkillsDir: ".agents/skills",
+		ProfileFiles:     []string{"AGENTS.md"},
+	},
+	{
+		Name:             "jiuwenswarm",
+		ProbeCmd:         "jiuwenswarm-acp --help",
+		ACPSpawn:         []string{"jiuwenswarm-acp"},
+		SkillsDir:        "~/.jiuwenswarm/service_default/agent_default/jiuwenswarm_workspace/skills",
+		ProjectSkillsDir: "",
+		ProfileFiles:     []string{"AGENTS.md"},
+	},
+	{
+		Name:             "codearts",
+		ProbeCmd:         "codearts --version",
+		ACPSpawn:         []string{"codearts", "acp"},
+		SkillsDir:        "~/.codeartsdoer/skills",
+		ProjectSkillsDir: ".codeartsdoer/skills",
+		ProfileFiles:     []string{"AGENTS.md"},
 	},
 }
 
