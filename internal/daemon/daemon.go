@@ -194,6 +194,11 @@ type Daemon struct {
 	machinePendingMu sync.Mutex
 	machinePending   map[string][]*pendingRun // machineID → queued dispatches
 	machineCancels   map[string][]link.RunCancelParams
+	// machinePollWake is the long-poll wake signal per machine: a chan closed
+	// (and replaced) when a dispatch or cancel is enqueued, so a held
+	// DequeueMachineDispatchWait returns immediately instead of waiting out
+	// the 30s timeout. Guarded by machinePendingMu.
+	machinePollWake map[string]chan struct{}
 
 	// chat is the ACP chat relay (Phase 6): web sockets ↔ machine chat
 	// channels, frames unparsed.
@@ -237,6 +242,7 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		machineRunMachine: make(map[string]string),
 		machinePending:    make(map[string][]*pendingRun),
 		machineCancels:    make(map[string][]link.RunCancelParams),
+		machinePollWake:   make(map[string]chan struct{}),
 		machineLastEvent:  make(map[string]time.Time),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)

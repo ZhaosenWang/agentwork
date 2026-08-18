@@ -231,8 +231,9 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			}
 			// The machine's identity is the CONNECTION's registered id —
 			// a self-reported machine_id in the params must not steal
-			// another machine's dispatch.
-			return s.d.DequeueMachineDispatch(id), nil
+			// another machine's dispatch. ctx carries the connection's
+			// lifetime: a dropped link cancels the hold (no leaked waiters).
+			return s.d.DequeueMachineDispatchWait(ctx, id), nil
 		})
 		peer.Handle(link.MethodRunClaimed, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 			var p link.RunClaimedParams

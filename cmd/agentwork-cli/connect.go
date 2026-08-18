@@ -269,28 +269,31 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	// Heartbeat every 5s until the link dies or we're interrupted.
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
-	// Work poll (PULL model) runs on its OWN goroutine: every second the
-	// machine asks the daemon for the next dispatch and any queued cancels
-	// — the daemon never pushes. A lost response is retried by the next
-	// tick (at-least-once; the daemon re-serves, the executor dedupes).
-	// A stalled poll response must NEVER block the heartbeat/reconnect
-	// loop — it did once (live: the Call hung on a lost response, the
-	// main loop froze, heartbeats stopped, the machine went offline; the
-	// SIGUSR1 dump caught the main goroutine in the Call), so the poll
-	// has both its own goroutine AND a per-call timeout.
+	// Work poll (PULL model) runs on its OWN goroutine: the machine asks the
+	// daemon for the next dispatch and any queued cancels — the daemon never
+	// pushes. LONG POLL: the daemon holds an empty request up to 30s, returning
+	// the instant a dispatch or cancel is queued — so the loop sends the next
+	// poll immediately after the previous returns (no ticker). Idle RPC volume
+	// drops ~30× vs the old 1s tick, with sub-second dispatch latency.
+	// A lost response is retried by the next loop iteration (at-least-once;
+	// the daemon re-serves, the executor dedupes). A stalled poll response
+	// must NEVER block the heartbeat/reconnect loop — it did once (live: the
+	// Call hung on a lost response, the main loop froze, heartbeats stopped,
+	// the machine went offline; the SIGUSR1 dump caught the main goroutine in
+	// the Call), so the poll has both its own goroutine AND a per-call timeout
+	// (35s = 30s hold + 5s margin). On poll error a 1s backoff prevents a
+	// tight retry loop against a failing daemon.
 	go func() {
-		tick := time.NewTicker(time.Second)
-		defer tick.Stop()
 		pollErrLogged := false
 		for {
 			select {
-			case <-tick.C:
 			case <-peer.Done():
 				return
 			case <-ctx.Done():
 				return
+			default:
 			}
-			pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			pollCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
 			var res link.RunPollResult
 			if err := peer.Call(pollCtx, link.MethodRunPoll, link.RunPollParams{}, &res); err != nil {
 				if !pollErrLogged {
@@ -298,6 +301,14 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 					pollErrLogged = true
 				}
 				cancel()
+				// Back off before retrying so a dead daemon doesn't get hammered.
+				select {
+				case <-time.After(time.Second):
+				case <-peer.Done():
+					return
+				case <-ctx.Done():
+					return
+				}
 				continue
 			}
 			cancel()

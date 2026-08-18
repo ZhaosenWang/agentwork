@@ -71,6 +71,14 @@ type pendingRun struct {
 // fast on a dead link.
 const pickupTimeout = 60 * time.Second
 
+// pollHoldTimeout is how long DequeueMachineDispatchWait holds an empty poll
+// before returning: long enough to slash idle-poll RPC volume (~30× fewer
+// than 1s ticking), short enough that a lost connection is re-detected
+// within the heartbeat window. Must be < pickupTimeout so a held poll can't
+// mask a dispatch expiry, and < the CLI's per-call timeout (35s) so the
+// response always lands inside the client window.
+const pollHoldTimeout = 30 * time.Second
+
 // dispatchToMachine QUEUES an assembled run for the machine's poll
 // (PULL model — multica-style: the daemon never writes the dispatch over
 // the link; the push direction kept dying in one-way link stalls). The
@@ -97,6 +105,7 @@ func (d *Daemon) dispatchToMachine(ctx context.Context, q *service.ClaimedRow, p
 	d.machinePendingMu.Lock()
 	d.machinePending[machineID] = append(d.machinePending[machineID], &pendingRun{runID: q.RunID, params: p, enqAt: time.Now()})
 	d.machinePendingMu.Unlock()
+	d.wakeMachinePoll(machineID)
 	logging.Infof("dispatch: run %s queued for machine %s (role=%s, attempt=%d — poll pickup)", q.RunID, machineID, p.Role, q.Attempt)
 	// Unpicked dispatch must not hang the run: expire it after the
 	// pickup window (covers a machine that never polls again). The
@@ -128,21 +137,21 @@ func (d *Daemon) dispatchToMachine(ctx context.Context, q *service.ClaimedRow, p
 	}()
 }
 
-// DequeueMachineDispatch serves the machine's run.poll: the oldest queued
-// dispatch — re-served until run.claimed acknowledges delivery
-// (at-least-once; the executor dedupes on an in-flight run id) — plus the
-// queued cancels. Expired entries are failed here too (the poll is the
-// machine's heartbeat for the queue).
-func (d *Daemon) DequeueMachineDispatch(machineID string) link.RunPollResult {
+// tryDequeue is the lock-held, non-blocking core of run.poll: sweep expired
+// entries (failing them), keep the rest, and return the oldest dispatch +
+// queued cancels if any. Returns the result and whether it is non-empty
+// (Run != nil OR Cancels present) — the caller uses that to decide whether
+// to hold for the long-poll wake or return immediately. The mu is taken
+// inside; failRun is called with mu released (it may hit the DB / bus).
+func (d *Daemon) tryDequeue(machineID string) (link.RunPollResult, bool) {
 	var res link.RunPollResult
 	d.machinePendingMu.Lock()
 	defer d.machinePendingMu.Unlock()
 	var kept []*pendingRun
+	var expired []*pendingRun
 	for _, pr := range d.machinePending[machineID] {
 		if time.Since(pr.enqAt) > pickupTimeout {
-			d.machinePendingMu.Unlock()
-			d.failRun(context.Background(), &service.ClaimedRow{RunID: pr.runID}, "the machine did not pick up the dispatch (60s poll timeout)")
-			d.machinePendingMu.Lock()
+			expired = append(expired, pr)
 			continue
 		}
 		kept = append(kept, pr)
@@ -153,7 +162,71 @@ func (d *Daemon) DequeueMachineDispatch(machineID string) link.RunPollResult {
 	}
 	res.Cancels = d.machineCancels[machineID]
 	d.machineCancels[machineID] = nil
-	return res
+	// Fail expired entries with mu released (failRun may publish to the bus).
+	d.machinePendingMu.Unlock()
+	for _, pr := range expired {
+		d.failRun(context.Background(), &service.ClaimedRow{RunID: pr.runID}, "the machine did not pick up the dispatch (60s poll timeout)")
+	}
+	// Re-acquire for the deferred unlock (the deferred unlock runs on return,
+	// so the mutex state must be "held" at this point — re-lock).
+	d.machinePendingMu.Lock()
+	nonEmpty := res.Run != nil || len(res.Cancels) > 0
+	return res, nonEmpty
+}
+
+// wakeMachinePoll closes the machine's current wake chan (unblocking any
+// held DequeueMachineDispatchWait) and installs a fresh chan for the next
+// wait. Called after a dispatch or cancel is enqueued. Guarded by
+// machinePendingMu.
+func (d *Daemon) wakeMachinePoll(machineID string) {
+	d.machinePendingMu.Lock()
+	defer d.machinePendingMu.Unlock()
+	if ch, ok := d.machinePollWake[machineID]; ok && ch != nil {
+		close(ch)
+	}
+	d.machinePollWake[machineID] = make(chan struct{})
+}
+
+// pollWakeChan returns the machine's current wake chan, creating one if
+// absent. The caller holds the chan reference and selects on it; a
+// wakeMachinePoll call will close it. Guarded by machinePendingMu.
+func (d *Daemon) pollWakeChan(machineID string) chan struct{} {
+	d.machinePendingMu.Lock()
+	defer d.machinePendingMu.Unlock()
+	ch, ok := d.machinePollWake[machineID]
+	if !ok || ch == nil {
+		ch = make(chan struct{})
+		d.machinePollWake[machineID] = ch
+	}
+	return ch
+}
+
+// DequeueMachineDispatchWait serves the machine's run.poll with a long-poll
+// hold: if nothing is queued, block up to pollHoldTimeout (30s) for a
+// dispatch/cancel to arrive — woken immediately by wakeMachinePoll. The
+// request ctx cancels the hold on connection loss (no leaked goroutines).
+// Protocol-compatible with the old DequeueMachineDispatch: an old CLI that
+// polls every 1s gets immediate empty returns (tryDequeue is non-blocking);
+// a new CLI gets the hold.
+func (d *Daemon) DequeueMachineDispatchWait(ctx context.Context, machineID string) link.RunPollResult {
+	if res, nonEmpty := d.tryDequeue(machineID); nonEmpty {
+		return res
+	}
+	// Nothing queued — hold for the wake signal, ctx cancel, or timeout.
+	wake := d.pollWakeChan(machineID)
+	timer := time.NewTimer(pollHoldTimeout)
+	defer timer.Stop()
+	select {
+	case <-wake:
+		// A dispatch or cancel was enqueued — try again (may still be empty
+		// on a rare race where another poller grabbed it first; return empty).
+		res, _ := d.tryDequeue(machineID)
+		return res
+	case <-ctx.Done():
+		return link.RunPollResult{}
+	case <-timer.C:
+		return link.RunPollResult{}
+	}
 }
 
 // enqueueMachineCancel queues a run.cancel for the machine's next poll
@@ -162,6 +235,7 @@ func (d *Daemon) enqueueMachineCancel(machineID string, c link.RunCancelParams) 
 	d.machinePendingMu.Lock()
 	d.machineCancels[machineID] = append(d.machineCancels[machineID], c)
 	d.machinePendingMu.Unlock()
+	d.wakeMachinePoll(machineID)
 }
 
 // IngestRunClaimed — the machine's run.claimed ack: publish the bus event
