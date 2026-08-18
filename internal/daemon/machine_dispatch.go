@@ -665,20 +665,22 @@ func (d *Daemon) PushAgentSkills(ctx context.Context, agentID string) {
 	}
 	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	promptLen := len(systemPrompt)
+	logging.Infof("machine: config.push %s: dispatching prompt=%d bytes, %d skill(s)", agentID, promptLen, len(pushes))
 	var res link.ConfigPushResult
 	if err := peer.Call(callCtx, link.MethodConfigPush, link.ConfigPushParams{
 		AgentID:      agentID,
 		SystemPrompt: systemPrompt,
 		Skills:       pushes,
 	}, &res); err != nil {
-		logging.Infof("machine: skills push %s: %v", agentID, err)
+		logging.Infof("machine: config.push %s: rpc error: %v", agentID, err)
 		return
 	}
 	if len(res.Errors) > 0 {
-		logging.Infof("machine: skills push %s: %d error(s): %v", agentID, len(res.Errors), res.Errors)
+		logging.Infof("machine: config.push %s: %d error(s): %v", agentID, len(res.Errors), res.Errors)
 		return
 	}
-	logging.Infof("machine: skills push %s: %d skill(s) installed", agentID, len(res.Written))
+	logging.Infof("machine: config.push %s: ok — %d skill(s) installed", agentID, len(res.Written))
 }
 
 // projectSkillsDirFor resolves a run's CLI's project-level skills

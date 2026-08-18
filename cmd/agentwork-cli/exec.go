@@ -203,12 +203,15 @@ func (e *executor) execute(p link.RunDispatchParams) {
 			// here when the leader agent has no persona of its own).
 			// Previously a missing file silently dropped RunProfile, losing
 			// the squad instructions entirely.
-			if b, err := os.ReadFile(filepath.Join(workdir, "AGENTS.md")); err == nil {
+			agentsMD := filepath.Join(workdir, "AGENTS.md")
+			if b, err := os.ReadFile(agentsMD); err == nil {
 				pushedProfile = string(b) + "\n\n" + p.RunProfile
+				cliLogf("exec: run %s RunProfile merged (%d bytes) into existing AGENTS.md → %s", p.RunID, len(p.RunProfile), agentsMD)
 			} else {
 				pushedProfile = p.RunProfile
+				cliLogf("exec: run %s RunProfile created AGENTS.md (%d bytes, no agent persona) → %s", p.RunID, len(p.RunProfile), agentsMD)
 			}
-			_ = os.WriteFile(filepath.Join(workdir, "AGENTS.md"), []byte(pushedProfile), 0o644)
+			_ = os.WriteFile(agentsMD, []byte(pushedProfile), 0o644)
 		}
 		// Skills ride the workdir too (project-level): staged from the
 		// pushed dir under their ORIGINAL names — the user's own global
@@ -546,8 +549,10 @@ func writeAgentProfile(agentID, systemPrompt string) error {
 // as-is instead of appending a duplicate. Returns the content so the
 // commit step can recognize the platform-written suffix.
 func syncAgentProfile(agentID, workdir string) string {
-	b, err := os.ReadFile(filepath.Join(agentProfileDir(agentID), "AGENTS.md"))
+	staging := filepath.Join(agentProfileDir(agentID), "AGENTS.md")
+	b, err := os.ReadFile(staging)
 	if err != nil {
+		cliLogf("exec: syncAgentProfile agent=%s: no staging AGENTS.md at %s (agent has no persona)", agentID, staging)
 		return ""
 	}
 	persona := string(b)
@@ -555,13 +560,16 @@ func syncAgentProfile(agentID, workdir string) string {
 	existing, err := os.ReadFile(path)
 	if err == nil && strings.TrimSpace(string(existing)) != "" {
 		if strings.Contains(string(existing), persona) {
+			cliLogf("exec: syncAgentProfile agent=%s: already present in %s (skip)", agentID, path)
 			return string(existing) // already staged — never duplicate
 		}
 		merged := string(existing) + "\n\n" + persona
 		_ = os.WriteFile(path, []byte(merged), 0o644)
+		cliLogf("exec: syncAgentProfile agent=%s: merged %d bytes into existing %s", agentID, len(persona), path)
 		return merged
 	}
 	_ = os.WriteFile(path, []byte(persona), 0o644)
+	cliLogf("exec: syncAgentProfile agent=%s: wrote %d bytes → %s", agentID, len(persona), path)
 	return persona
 }
 
@@ -599,9 +607,18 @@ func copyAgentSkills(agentID, workdir, subdir string, wipe bool) {
 	root := machineSkillRoot(agentID)
 	entries, err := os.ReadDir(root)
 	if err != nil {
+		cliLogf("exec: copyAgentSkills agent=%s: no staging dir %s (no skills pushed)", agentID, root)
 		return // no skills pushed — nothing to stage
 	}
+	// count skill subdirs (skip files)
+	var skillDirs []string
+	for _, ent := range entries {
+		if ent.IsDir() {
+			skillDirs = append(skillDirs, ent.Name())
+		}
+	}
 	target := filepath.Join(workdir, subdir)
+	cliLogf("exec: copyAgentSkills agent=%s: %d skill(s) %v → %s (wipe=%v)", agentID, len(skillDirs), skillDirs, target, wipe)
 	if wipe {
 		_ = os.RemoveAll(target)
 	}

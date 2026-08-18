@@ -212,8 +212,14 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 		// per-agent config dir — the runtime's profile resolver loads it
 		// natively from the workdir; the per-run role contract stays in the
 		// prompt.
+		profilePath := filepath.Join(agentProfileDir(p.AgentID), "AGENTS.md")
 		if err := writeAgentProfile(p.AgentID, p.SystemPrompt); err != nil {
 			res.Errors = append(res.Errors, fmt.Sprintf("AGENTS.md: %v", err))
+			cliLogf("config.push: agent %s AGENTS.md write FAILED: %v", p.AgentID, err)
+		} else if len(p.SystemPrompt) > 0 {
+			cliLogf("config.push: agent %s AGENTS.md written (%d bytes) → %s", p.AgentID, len(p.SystemPrompt), profilePath)
+		} else {
+			cliLogf("config.push: agent %s AGENTS.md removed (empty prompt)", p.AgentID)
 		}
 		root := machineSkillRoot(p.AgentID)
 		_ = os.RemoveAll(root)
@@ -233,7 +239,7 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 			}
 			res.Written = append(res.Written, sk.Name)
 		}
-		cliLogf("config.push: installed %d skill(s) for agent %s into %s", len(res.Written), p.AgentID, root)
+		cliLogf("config.push: agent %s skills → %d installed, %d error(s) into %s", p.AgentID, len(res.Written), len(res.Errors), root)
 		return res, nil
 	})
 
