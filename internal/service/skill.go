@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/eushing/agentwork/internal/store"
 	"github.com/eushing/agentwork/internal/zipx"
 )
@@ -36,28 +38,70 @@ func skillDir(skillID string) string {
 	return filepath.Join(RunsRoot(), "skills", skillID)
 }
 
-// Create stores a skill package: the file map is written to disk
-// (path → content; SKILL.md is required — a skill without instructions is
-// a file dump, not a skill).
-func (s *SkillService) Create(ctx context.Context, name, description string, files map[string]string) (*Skill, error) {
+// Create stores a skill package from a text-block file map (the legacy JSON
+// upload mode). The skill's name/description are PARSED from the files'
+// SKILL.md — the caller does not supply them. SKILL.md is required; a map
+// without it (or without a name in its frontmatter) is not a skill package.
+func (s *SkillService) Create(ctx context.Context, files map[string]string) (*Skill, error) {
 	// Text-block mode builds the SAME archive shape a zip upload
 	// produces — the push layer sends the original archive either way.
 	zipData, err := zipx.Build(files)
 	if err != nil {
 		return nil, NewValidationError(err.Error())
 	}
-	return s.createFromArchive(ctx, name, description, files, zipData)
+	return s.createFromArchive(ctx, files, zipData)
 }
 
-// CreateFromZip uploads a skill as a ZIP archive (SKILL.md + scripts /
-// references / binary assets) — the archive is validated, extracted into
-// the skill's library dir, and KEPT for push (the machine receives the
-// original bytes and extracts them itself).
-func (s *SkillService) CreateFromZip(ctx context.Context, name, description string, zipData []byte) (*Skill, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return nil, NewValidationError("name is required")
+// CreateFromZip uploads a skill as a ZIP archive. The skill's name and
+// description are PARSED from the archive's SKILL.md frontmatter — the
+// caller does NOT supply them. A zip without a valid SKILL.md (or whose
+// SKILL.md has no name in its frontmatter) is not a skill package and is
+// rejected. The archive is validated, extracted into the skill's library
+// dir, and KEPT for push (the machine receives the original bytes).
+func (s *SkillService) CreateFromZip(ctx context.Context, zipData []byte) (*Skill, error) {
+	// One zip = one skill. A multi-skill bundle (several subdirectories each
+	// with their own SKILL.md) is rejected with a clear message — the user
+	// should upload skills one at a time.
+	skillMDs := zipx.FindSkillMDs(zipData)
+	if len(skillMDs) == 0 {
+		return nil, NewValidationError("这不是一个 skill 包：缺少 SKILL.md")
 	}
+	if len(skillMDs) > 1 {
+		return nil, NewValidationError("一个 zip 只能包含一个 skill——检测到多个 SKILL.md，请每个 skill 单独打包上传")
+	}
+	content, ok := zipx.ReadFile(zipData, "SKILL.md")
+	if !ok {
+		return nil, NewValidationError("这不是一个 skill 包：缺少 SKILL.md")
+	}
+	name, description := parseSkillMarkdown(content)
+	if strings.TrimSpace(name) == "" {
+		return nil, NewValidationError("这不是一个 skill 包：SKILL.md 缺少 name（frontmatter 里需有 `name: <skill 名>`）")
+	}
+	return s.createSkillFromArchive(ctx, name, description, zipData, nil)
+}
+
+// createFromArchive is the legacy text-block upload path: the caller supplies
+// files (path→content) which the platform archives into a zip. The skill's
+// name/description are STILL parsed from the files' SKILL.md — the caller
+// does not supply them either.
+func (s *SkillService) createFromArchive(ctx context.Context, files map[string]string, zipData []byte) (*Skill, error) {
+	content, ok := files["SKILL.md"]
+	if !ok || strings.TrimSpace(content) == "" {
+		return nil, NewValidationError("这不是一个 skill 包：缺少 SKILL.md")
+	}
+	name, description := parseSkillMarkdown(content)
+	if strings.TrimSpace(name) == "" {
+		return nil, NewValidationError("这不是一个 skill 包：SKILL.md 缺少 name（frontmatter 里需有 `name: <skill 名>`）")
+	}
+	return s.createSkillFromArchive(ctx, name, description, zipData, files)
+}
+
+// createSkillFromArchive is the shared DB insert + storage path. It receives
+// the PARSED name/description (from SKILL.md). When files is non-nil the
+// files are written from the map (text-block mode); otherwise the zip is
+// extracted (zip-upload mode).
+func (s *SkillService) createSkillFromArchive(ctx context.Context, name, description string, zipData []byte, files map[string]string) (*Skill, error) {
+	name = strings.TrimSpace(name)
 	var n int
 	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM skill WHERE name=?`, name).Scan(&n); err != nil {
 		return nil, fmt.Errorf("check skill name: %w", err)
@@ -72,65 +116,101 @@ func (s *SkillService) CreateFromZip(ctx context.Context, name, description stri
 		return nil, fmt.Errorf("insert skill: %w", err)
 	}
 	dir := skillDir(sk.ID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if files != nil {
+		if err := s.writeFiles(sk.ID, files); err != nil {
+			_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
+			return nil, err
+		}
+	} else {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
+			return nil, fmt.Errorf("mkdir skill dir: %w", err)
+		}
+		if err := zipx.Extract(zipData, dir); err != nil {
+			_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
+			return nil, NewValidationError(err.Error())
+		}
+	}
+	// Normalize: store the archive as a FLAT zip (no top-level wrapper
+	// directory), rebuilt from the extracted dir. Regardless of whether the
+	// upload had a top-level skill/ folder, the stored package.zip is always
+	// flat — so config.push → CLI Extract sees one format and never re-detects
+	// a wrapper. The text-block path is already flat (files map keys are
+	// flat); the zip-upload path's Extract already stripped any wrapper, so
+	// the dir is flat either way — BuildFromDir just re-archives it.
+	archive, err := zipx.BuildFromDir(dir, "package.zip")
+	if err != nil {
 		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
-		return nil, fmt.Errorf("mkdir skill dir: %w", err)
+		return nil, fmt.Errorf("normalize skill archive: %w", err)
 	}
-	if err := zipx.Extract(zipData, dir); err != nil {
-		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
-		return nil, NewValidationError(err.Error())
-	}
-	if _, err := os.Stat(filepath.Join(dir, "SKILL.md")); err != nil {
-		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
-		return nil, NewValidationError("SKILL.md is required (the skill's instructions)")
-	}
-	if err := os.WriteFile(filepath.Join(dir, "package.zip"), zipData, 0o644); err != nil {
-		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
-		return nil, fmt.Errorf("store skill archive: %w", err)
-	}
-	return sk, nil
-}
-
-// createFromArchive shares the DB insert + validation between the two
-// upload modes (the text-block mode has no pre-validated zip yet).
-func (s *SkillService) createFromArchive(ctx context.Context, name, description string, files map[string]string, zipData []byte) (*Skill, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return nil, NewValidationError("name is required")
-	}
-	if _, ok := files["SKILL.md"]; !ok || strings.TrimSpace(files["SKILL.md"]) == "" {
-		return nil, NewValidationError("SKILL.md is required (the skill's instructions)")
-	}
-	var n int
-	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM skill WHERE name=?`, name).Scan(&n); err != nil {
-		return nil, fmt.Errorf("check skill name: %w", err)
-	}
-	if n > 0 {
-		return nil, NewValidationError(fmt.Sprintf("skill %q already exists", name))
-	}
-	sk := &Skill{ID: newID(), Name: name, Description: description, CreatedAt: now()}
-	if _, err := s.st.DB().ExecContext(ctx,
-		`INSERT INTO skill (id,name,description,created_at) VALUES (?,?,?,?)`,
-		sk.ID, sk.Name, sk.Description, sk.CreatedAt); err != nil {
-		return nil, fmt.Errorf("insert skill: %w", err)
-	}
-	if err := s.writeFiles(sk.ID, files); err != nil {
-		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
-		return nil, err
-	}
-	// Keep the archive for push (the machine extracts the original bytes).
-	if err := os.WriteFile(filepath.Join(skillDir(sk.ID), "package.zip"), zipData, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "package.zip"), archive, 0o644); err != nil {
 		_, _ = s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, sk.ID)
 		return nil, fmt.Errorf("store skill archive: %w", err)
 	}
 	return sk, nil
 }
 
-// PackageZip returns the skill's ORIGINAL archive for config.push — the
-// machine receives the bytes and extracts them into the agent's staging
-// dir (zipx.Extract on both ends). Skills created before the zip pipeline
-// have no stored archive: rebuild one from the extracted files once (and
-// persist it) so every skill pushes the same way.
+// parseSkillMarkdown extracts the skill name and description from a
+// SKILL.md's YAML frontmatter (the `---`-delimited block at the top). The
+// frontmatter is the Anthropic skill convention:
+//
+//	---
+//	name: code-review-checklist
+//	description: One-line summary
+//	---
+//	<instructions body>
+//
+// The frontmatter may carry OTHER fields beyond name/description — those are
+// part of the skill's contract but not stored on the platform row; they ride
+// along in SKILL.md (pushed verbatim to the machine). Only name and
+// description are extracted here. Uses gopkg.in/yaml.v3 for robust parsing
+// (quoted values, multi-line, lists, comments) rather than a fragile
+// line-scanner. Mirrors openagent-go/skill/fs/loader.go's parseFrontmatter
+// handling: CRLF normalization, EOF without a trailing newline.
+// Returns ("", "") when there is no frontmatter or no name — the caller
+// rejects that as "not a skill".
+func parseSkillMarkdown(content string) (name, description string) {
+	// Normalize CRLF → LF so Windows-authored SKILL.md files parse the same.
+	text := strings.ReplaceAll(content, "\r\n", "\n")
+	// A leading BOM (some editors add it) would break the "---\n" prefix
+	// check; strip it.
+	text = strings.TrimPrefix(text, "\ufeff")
+	if !strings.HasPrefix(text, "---\n") && text != "---" {
+		return "", ""
+	}
+	// Opening delimiter is "---\n" (4 bytes) — find the closing "\n---\n".
+	rest := text[4:]
+	idx := strings.Index(rest, "\n---\n")
+	if idx == -1 {
+		// Closing separator at EOF without a trailing newline ("...\n---"):
+		// the body after it is empty.
+		if strings.HasSuffix(rest, "\n---") {
+			idx = len(rest) - 4
+		} else {
+			return "", "" // unclosed frontmatter
+		}
+	}
+	yamlBlock := rest[:idx]
+	var fm map[string]any
+	if err := yaml.Unmarshal([]byte(yamlBlock), &fm); err != nil {
+		return "", ""
+	}
+	if n, ok := fm["name"].(string); ok {
+		name = n
+	}
+	if d, ok := fm["description"].(string); ok {
+		description = d
+	}
+	return name, description
+}
+
+// PackageZip returns the skill's NORMALIZED (flat) archive for config.push
+// — the machine extracts it into the agent's staging dir with zipx.Extract.
+// The stored package.zip is always flat (no top-level wrapper directory):
+// createSkillFromArchive rebuilds it from the extracted dir, so every
+// consumer sees one format. Skills created before this normalization have
+// no stored archive: rebuild one from the extracted files once (flat) and
+// persist it, so every skill pushes the same way.
 func (s *SkillService) PackageZip(ctx context.Context, id string) ([]byte, error) {
 	b, err := os.ReadFile(filepath.Join(skillDir(id), "package.zip"))
 	if err == nil {

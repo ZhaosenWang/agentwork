@@ -27,10 +27,8 @@ export const listSkills = () => api<import("./types").Skill[]>("/skills");
 // Skills upload as a ZIP archive (SKILL.md + scripts/binary assets) via
 // multipart form — the platform keeps the original archive and pushes it
 // to the machines.
-export const createSkill = (body: { name: string; description: string; file: File }) => {
+export const createSkill = (body: { file: File }) => {
   const fd = new FormData();
-  fd.append("name", body.name);
-  fd.append("description", body.description);
   fd.append("file", body.file);
   return api<import("./types").Skill>("/skills", { method: "POST", body: fd });
 };

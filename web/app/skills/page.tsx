@@ -53,20 +53,20 @@ export default function SkillsPage() {
   );
 }
 
-// CreateSkillDialog uploads a skill package as a ZIP archive — SKILL.md
-// plus scripts/references/binary assets, packaged however the user likes.
-// The platform keeps the original archive and pushes it to the machines.
+// CreateSkillDialog uploads a skill package as a ZIP archive. The skill's
+// name and description are PARSED by the platform from the archive's
+// SKILL.md frontmatter — the user only picks the zip. A zip without a valid
+// SKILL.md (or without a name in its frontmatter) is rejected as "not a
+// skill package".
 function CreateSkillDialog({ onClose }: { onClose: () => void }) {
   const create = useCreateSkill();
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
   const [file, setFile] = useState<File | null>(null);
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!file) return;
     create.mutate(
-      { name, description, file },
+      { file },
       { onSuccess: onClose }
     );
   };
@@ -79,20 +79,14 @@ function CreateSkillDialog({ onClose }: { onClose: () => void }) {
       footer={
         <>
           <Button variant="outline" onClick={onClose}>取消</Button>
-          <Button type="submit" form="skill-form" disabled={create.isPending || !name.trim()}>
+          <Button type="submit" form="skill-form" disabled={create.isPending || !file}>
             {create.isPending ? "上传中…" : "上传"}
           </Button>
         </>
       }
     >
       <form id="skill-form" onSubmit={submit} className="space-y-4">
-        <Field label="名称" hint="agent 看到的名字；原名装入 run 工作目录的项目级 skills">
-          <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required placeholder="code-review-checklist" />
-        </Field>
-        <Field label="描述（可选）">
-          <input value={description} onChange={(e) => setDescription(e.target.value)} className={inputCls} placeholder="一句话说明这个 skill 干什么" />
-        </Field>
-        <Field label="Skill 包（.zip）" hint="包含 SKILL.md（必填）+ 脚本/参考文件/图片等；平台原样下发到机器解压。">
+        <Field label="Skill 包（.zip）" hint="包内必须有 SKILL.md，且其 frontmatter 含 name（可选 description）。平台解析 SKILL.md 自动回填名称与描述，原样下发到机器解压。">
           <input
             type="file"
             accept=".zip"
@@ -102,6 +96,14 @@ function CreateSkillDialog({ onClose }: { onClose: () => void }) {
           />
           {file && <p className="text-xs text-zinc-500">已选择：{file.name}（{(file.size / 1024).toFixed(0)} KB）</p>}
         </Field>
+        <p className="text-xs text-zinc-500">
+          SKILL.md 示例：<br />
+          <code className="font-mono">{"---"}</code><br />
+          <code className="font-mono">name: code-review-checklist</code><br />
+          <code className="font-mono">description: 一句话说明这个 skill 干什么</code><br />
+          <code className="font-mono">{"---"}</code><br />
+          （以下是 skill 指令正文）
+        </p>
         {create.isError && <p className="text-sm text-red-500">{String(create.error)}</p>}
       </form>
     </Dialog>

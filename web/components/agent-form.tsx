@@ -129,10 +129,10 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
         </Field>
 
         <Field label="Skills（平台技能库）" hint="勾选的 skill 会下发到该 agent 所在机器，run 时按原名装入工作目录的项目级 skills">
-          {skillLib && skillLib.length > 0 ? (
-            <div className="space-y-1">
-              {skillLib.map((sk) => (
-                <label key={sk.id} className="flex items-center gap-2 text-sm">
+          <div className="border border-zinc-200 rounded-lg divide-y divide-zinc-100 max-h-48 overflow-y-auto">
+            {skillLib && skillLib.length > 0 ? (
+              skillLib.map((sk) => (
+                <label key={sk.id} className="flex items-center gap-2 px-3 py-2 text-sm cursor-pointer hover:bg-zinc-50">
                   <input
                     type="checkbox"
                     checked={skills.includes(sk.id)}
@@ -145,11 +145,11 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
                   <span className="font-medium">{sk.name}</span>
                   {sk.description && <span className="text-xs text-zinc-500">— {sk.description}</span>}
                 </label>
-              ))}
-            </div>
-          ) : (
-            <p className="text-xs text-zinc-400">技能库为空——在「Skills」页面上传 skill 包</p>
-          )}
+              ))
+            ) : (
+              <p className="px-3 py-2 text-xs text-zinc-400">暂无技能——在「Skills」页面上传 skill 包后可在此勾选</p>
+            )}
+          </div>
         </Field>
 
         <Field label="Model" hint="留空用 runtime 默认">

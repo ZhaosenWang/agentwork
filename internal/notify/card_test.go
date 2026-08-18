@@ -399,19 +399,27 @@ func TestIntakeDraftClarification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(p, "补全") {
+	if strings.Contains(p, "补全之前的一个创建请求") {
 		t.Fatal("no draft must not inject clarification context")
 	}
-	// Save a draft → the next prompt carries it.
-	if err := is.SaveDraft(ctx, IntakeDraft{Title: "修一下", AssigneeID: "a1", CreatedAt: time.Now().Format(time.RFC3339Nano)}); err != nil {
+	// Save a goal-kind draft (title known, domain missing) → the next prompt
+	// carries the known field + the missing field under the generalized
+	// "补全之前的一个创建请求" framing.
+	if err := is.SaveDraft(ctx, IntakeDraft{
+		Kind: "goal", Payload: `{"title":"修一下","assignee_id":"a1"}`,
+		CreatedAt: time.Now().Format(time.RFC3339Nano),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	p, err = is.BuildPrompt(ctx, "test-repo")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(p, "补全") || !strings.Contains(p, "修一下") {
+	if !strings.Contains(p, "补全之前的一个创建请求") || !strings.Contains(p, "修一下") {
 		t.Fatalf("draft context must be injected: %s", p)
+	}
+	if !strings.Contains(p, "项目/仓库") {
+		t.Fatalf("draft context must list the missing domain field: %s", p)
 	}
 	if err := is.ClearDraft(ctx); err != nil {
 		t.Fatal(err)
@@ -421,7 +429,10 @@ func TestIntakeDraftClarification(t *testing.T) {
 		t.Fatal("cleared draft must be gone")
 	}
 	// Expired draft → treated as absent.
-	if err := is.SaveDraft(ctx, IntakeDraft{Title: "旧任务", CreatedAt: time.Now().Add(-30 * time.Minute).Format(time.RFC3339Nano)}); err != nil {
+	if err := is.SaveDraft(ctx, IntakeDraft{
+		Kind: "goal", Payload: `{"title":"旧任务"}`,
+		CreatedAt: time.Now().Add(-30 * time.Minute).Format(time.RFC3339Nano),
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := is.LoadDraft(ctx); ok {
@@ -429,10 +440,12 @@ func TestIntakeDraftClarification(t *testing.T) {
 	}
 }
 
-// TestIntakeDraftAgentKind: an agent-kind draft (the skills-clarification
-// slot) surfaces in the next parser prompt as a skills-completion context —
-// the owner's bare skill-name reply then completes the pending agent instead
-// of starting a new one. The goal-kind branch is unchanged (regression).
+// TestIntakeDraftAgentKind: an agent-kind draft surfaces in the next parser
+// prompt under the generalized completion framing — the known agent fields
+// (name/runtime) are listed as "已知字段", the still-missing bits (skills when
+// unspecified) as "缺失字段". The goal-kind draft uses the same framing
+// (regression: both kinds share one generalized block, no per-kind special
+// case).
 func TestIntakeDraftAgentKind(t *testing.T) {
 	st, err := store.Open(":memory:")
 	if err != nil {
@@ -445,20 +458,20 @@ func TestIntakeDraftAgentKind(t *testing.T) {
 	fake := &mapSettings{vals: map[string]string{}}
 	is := NewIntakeService(qs, fake, runSvc)
 
-	// No agent draft → no skills-completion context.
+	// No agent draft → no completion context.
 	p, err := is.BuildPrompt(ctx, "git-helper")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(p, "回答之前 agent 创建的 skills 问题") {
-		t.Fatalf("no agent draft must not inject skills context: %s", p)
+	if strings.Contains(p, "补全之前的一个创建请求") {
+		t.Fatalf("no agent draft must not inject completion context: %s", p)
 	}
 
-	// Save an agent-kind draft → the next prompt carries the agent spec and
-	// the skills-completion framing.
+	// Save an agent-kind draft (name+runtime known, skills unspecified) → the
+	// next prompt carries the known fields + lists skills as missing.
 	if err := is.SaveDraft(ctx, IntakeDraft{
-		Kind: "agent", AgentName: "代码审查", AgentRuntimeID: "rt1",
-		AgentDescription: "审查 PR", AgentSystemPrompt: "你是审查员",
+		Kind: "agent",
+		Payload: `{"name":"代码审查","runtime_id":"rt1","description":"审查 PR","system_prompt":"你是审查员","skills":[],"skills_specified":false}`,
 		CreatedAt: time.Now().Format(time.RFC3339Nano),
 	}); err != nil {
 		t.Fatal(err)
@@ -467,18 +480,21 @@ func TestIntakeDraftAgentKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"skills 问题", "代码审查", "rt1", "skills_specified=true"} {
+	for _, want := range []string{
+		"补全之前的一个创建请求", "代码审查", "rt1", "skills",
+	} {
 		if !strings.Contains(p, want) {
 			t.Fatalf("agent draft context must carry %q: %s", want, p)
 		}
 	}
 
-	// A goal-kind draft still uses the goal framing (regression guard).
+	// A goal-kind draft uses the SAME generalized framing (regression guard —
+	// no per-kind special case leaks).
 	if err := is.ClearDraft(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := is.SaveDraft(ctx, IntakeDraft{
-		Kind: "goal", Title: "修一下", AssigneeID: "a1",
+		Kind: "goal", Payload: `{"title":"修一下","assignee_id":"a1"}`,
 		CreatedAt: time.Now().Format(time.RFC3339Nano),
 	}); err != nil {
 		t.Fatal(err)
@@ -487,10 +503,7 @@ func TestIntakeDraftAgentKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(p, "补全之前的一条任务创建") {
-		t.Fatalf("goal-kind draft must keep the goal framing: %s", p)
-	}
-	if strings.Contains(p, "skills 问题") {
-		t.Fatalf("goal draft must not leak agent skills framing: %s", p)
+	if !strings.Contains(p, "补全之前的一个创建请求") || !strings.Contains(p, "create_goal") {
+		t.Fatalf("goal-kind draft must use the same generalized framing: %s", p)
 	}
 }

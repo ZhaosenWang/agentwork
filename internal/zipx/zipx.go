@@ -138,6 +138,80 @@ func stripSingleTopDir(files []*zip.File) string {
 	return top + "/"
 }
 
+// FindSkillMDs returns the paths of every SKILL.md entry in the archive,
+// AFTER applying stripSingleTopDir (so a single-skill zip with a top-level
+// wrapper folder yields one "SKILL.md"; a multi-skill bundle — several
+// skill subdirectories each with their own SKILL.md — yields several
+// "<name>/SKILL.md" paths). The platform rejects multi-skill bundles: one
+// zip = one skill.
+func FindSkillMDs(data []byte) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil
+	}
+	prefix := stripSingleTopDir(zr.File)
+	var out []string
+	for _, f := range zr.File {
+		entry := f.Name
+		if prefix != "" {
+			if !strings.HasPrefix(entry, prefix) {
+				continue
+			}
+			entry = strings.TrimPrefix(entry, prefix)
+		}
+		if entry == "" || f.FileInfo().IsDir() {
+			continue
+		}
+		// A SKILL.md anywhere in the tree (root or a subdir). The base name
+		// check is case-sensitive per the skill convention.
+		if filepath.Base(entry) == "SKILL.md" {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// ReadFile reads one file's content out of a skill zip without extracting
+// the whole archive. It honors stripSingleTopDir so a SKILL.md nested under
+// a single top-level folder (the `zip -r skill.zip myskill/` shape) is still
+// found. Returns ("", false) when the file is absent.
+func ReadFile(data []byte, name string) (string, bool) {
+	if len(data) == 0 {
+		return "", false
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", false
+	}
+	prefix := stripSingleTopDir(zr.File)
+	for _, f := range zr.File {
+		entry := f.Name
+		if prefix != "" {
+			if !strings.HasPrefix(entry, prefix) {
+				continue
+			}
+			entry = strings.TrimPrefix(entry, prefix)
+		}
+		if entry != name || f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return "", false
+		}
+		defer rc.Close()
+		out, err := io.ReadAll(rc)
+		if err != nil {
+			return "", false
+		}
+		return string(out), true
+	}
+	return "", false
+}
+
 // Build assembles a skill zip from a path→content map (the platform's
 // text-block upload mode produces the same archive shape as a real zip).
 func Build(files map[string]string) ([]byte, error) {
@@ -154,6 +228,66 @@ func Build(files map[string]string) ([]byte, error) {
 		if _, err := io.WriteString(w, content); err != nil {
 			return nil, err
 		}
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// BuildFromDir walks a directory tree and produces a FLAT zip (entries are
+// relative paths under root — no top-level wrapper directory). This is the
+// platform's NORMALIZED skill archive shape: regardless of whether the
+// uploaded zip had a top-level skill/ folder, the stored package.zip is
+// always flat, so every consumer (config.push → CLI Extract) sees one
+// format and never has to re-detect a wrapper directory.
+//
+// exclude names files NOT to include (e.g. "package.zip" itself when
+// rebuilding in place). Symlinks are skipped (a skill package is real files).
+func BuildFromDir(root string, exclude ...string) ([]byte, error) {
+	cleanRoot := filepath.Clean(root)
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	excluded := make(map[string]bool, len(exclude))
+	for _, e := range exclude {
+		excluded[filepath.Clean(e)] = true
+	}
+	err := filepath.Walk(cleanRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(cleanRoot, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains(rel, "..") {
+			return fmt.Errorf("unsafe path %q", rel)
+		}
+		if excluded[filepath.Clean(rel)] {
+			return nil
+		}
+		w, err := zw.Create(rel)
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(w, f)
+		return err
+	})
+	if err != nil {
+		zw.Close()
+		return nil, err
 	}
 	if err := zw.Close(); err != nil {
 		return nil, err

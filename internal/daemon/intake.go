@@ -120,17 +120,16 @@ func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summa
 }
 
 // intakeAction is the parser's output contract (see notify/intake.go's
-// BuildPrompt for the shape the parser is instructed to produce).
+// BuildPrompt for the shape the parser is instructed to produce). The create
+// sub-structs are NAMED types so the draft-merge helpers can take them as
+// parameters (an anonymous struct can't be a func arg) and the draft can
+// round-trip a sub-struct as JSON via a concrete type.
 type intakeAction struct {
 	Intent string `json:"intent"`
-	Goal   struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
-	} `json:"goal"`
-	GoalID string `json:"goal_id"`
+	Goal   goalAction `json:"goal"`
+	GoalID string     `json:"goal_id"`
 	// Schedule carries the parsed定时任务 fields (create_schedule / schedule_stop).
+	// Kept anonymous — it does not participate in the create-draft/merge flow.
 	Schedule struct {
 		Name        string `json:"name"`
 		Title       string `json:"title"`
@@ -139,27 +138,39 @@ type intakeAction struct {
 		AssigneeID  string `json:"assignee_id"`
 		DomainID    string `json:"domain_id"`
 	} `json:"schedule"`
-	// Agent carries the create_agent fields. Technical config (env/model/
-	// mcp_servers/max_concurrent) is deliberately absent — NL builds a
-	// persona-bearing skeleton, the rest is filled in on the Web.
-	Agent struct {
-		Name            string   `json:"name"`
-		RuntimeID       string   `json:"runtime_id"`
-		Description     string   `json:"description"`
-		SystemPrompt    string   `json:"system_prompt"`
-		Skills          []string `json:"skills"`
-		SkillsSpecified bool     `json:"skills_specified"`
-	} `json:"agent"`
-	// Squad carries the create_squad fields. Members are added after Create
-	// via AddMember (role="member"); the leader is held in LeaderID, never in
-	// MemberIDs.
-	Squad struct {
-		Name         string   `json:"name"`
-		LeaderID     string   `json:"leader_id"`
-		Description  string   `json:"description"`
-		Instructions string   `json:"instructions"`
-		MemberIDs    []string `json:"member_ids"`
-	} `json:"squad"`
+	Agent agentAction  `json:"agent"`
+	Squad squadAction  `json:"squad"`
+}
+
+// goalAction is the create_goal sub-struct.
+type goalAction struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	AssigneeID  string `json:"assignee_id"`
+	DomainID    string `json:"domain_id"`
+}
+
+// agentAction carries the create_agent fields. Technical config (env/model/
+// mcp_servers/max_concurrent) is deliberately absent — NL builds a
+// persona-bearing skeleton, the rest is filled in on the Web.
+type agentAction struct {
+	Name            string   `json:"name"`
+	RuntimeID       string   `json:"runtime_id"`
+	Description     string   `json:"description"`
+	SystemPrompt    string   `json:"system_prompt"`
+	Skills          []string `json:"skills"`
+	SkillsSpecified bool     `json:"skills_specified"`
+}
+
+// squadAction carries the create_squad fields. Members are added after Create
+// via AddMember (role="member"); the leader is held in LeaderID, never in
+// MemberIDs.
+type squadAction struct {
+	Name         string   `json:"name"`
+	LeaderID     string   `json:"leader_id"`
+	Description  string   `json:"description"`
+	Instructions string   `json:"instructions"`
+	MemberIDs    []string `json:"member_ids"`
 }
 
 // replyIntake executes the parsed action and replies over IM. The run row is
@@ -202,30 +213,44 @@ func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed 
 // intakeCreateGoal creates the goal (active → first run enqueued) through the
 // service layer — the goal layer validates assignee/domain, so a parser
 // hallucinating an id fails here with the validator's message, not a
-// platform crash.
+// platform crash. Two-branch ask-once structure: merge-from-draft on the
+// clarification turn, else collect ALL missing fields and ask once.
 func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) string {
 	g := parsed.Goal
+	hasAgents := d.platformHasAgents(ctx)
+	if draft, ok := d.loadDraftOfKind(ctx, "goal"); ok {
+		merged := mergeGoal(draft.Payload, g)
+		if d.intakeSvc != nil {
+			_ = d.intakeSvc.ClearDraft(ctx)
+		}
+		return d.doCreateGoal(ctx, merged, hasAgents)
+	}
+	if missing := goalMissingFields(g, hasAgents); len(missing) > 0 {
+		// No agents at all → there is nothing to ask about (the assignee slot
+		// is empty and the roster is empty); surface the setup hint, not an ask.
+		if !hasAgents && strings.TrimSpace(g.AssigneeID) == "" {
+			return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
+		}
+		return d.collectAndAsk(ctx, "goal", mustMarshal(g), missing)
+	}
+	return d.doCreateGoal(ctx, g, hasAgents)
+}
+
+// doCreateGoal calls the service layer and returns the reply. P0-2
+// (决策 6-15②): the active goal's first run is born in Create's transaction
+// — no separate enqueue. hasAgents gates the assignee check: a merge that
+// still lacks an assignee (vague reply) fails here only when agents exist
+// (otherwise the goal layer would reject it; we surface the clearer message).
+func (d *Daemon) doCreateGoal(ctx context.Context, g goalAction, hasAgents bool) string {
 	if strings.TrimSpace(g.Title) == "" {
 		return "创建任务失败：缺少标题"
 	}
 	if strings.TrimSpace(g.DomainID) == "" {
-		// Domain is a REQUIRED parameter (multi-domain): the parser was told
-		// not to guess. Save the draft and ask the owner to name the repo —
-		// the next inbound message is parsed with the draft as context, so a
-		// bare repo name completes this task.
-		if d.intakeSvc != nil {
-			_ = d.intakeSvc.SaveDraft(ctx, notify.IntakeDraft{
-				Title: g.Title, Description: g.Description, AssigneeID: g.AssigneeID,
-				CreatedAt: nowStr(),
-			})
-		}
-		return "这个任务需要在哪个项目执行？请回复项目名：\n" + d.intakeDomainList(ctx)
+		return "创建任务失败：缺少项目/仓库"
 	}
-	if strings.TrimSpace(g.AssigneeID) == "" {
+	if hasAgents && strings.TrimSpace(g.AssigneeID) == "" {
 		return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
 	}
-	// P0-2 (决策 6-15②): the active goal's first run is born in Create's
-	// transaction — no separate enqueue.
 	created, err := d.goalSvc.Create(ctx, service.Goal{
 		Title:         g.Title,
 		Description:   g.Description,
@@ -237,10 +262,6 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 	})
 	if err != nil {
 		return "创建任务失败：" + err.Error()
-	}
-	// The pending clarification (if any) is resolved — the task exists now.
-	if d.intakeSvc != nil {
-		_ = d.intakeSvc.ClearDraft(ctx)
 	}
 	return fmt.Sprintf("✅ 已创建任务：%s（goal %s），agent 开始执行", created.Title, shortID(created.ID))
 }
@@ -417,55 +438,33 @@ func (d *Daemon) intakeScheduleStop(ctx context.Context, parsed intakeAction) st
 }
 
 // intakeCreateAgent creates an agent (persona + runtime + optional skills)
-// through the service layer. Agents are platform-wide (no domain_id), so
-// unlike create_goal there is no domain clarification — but skills has its
-// own clarification: if the owner did not say whether the agent should get
-// platform skills AND the library is non-empty, the platform asks first.
+// through the service layer. Two branches:
+//   - Clarification turn (agent-kind draft exists): merge draft + this turn's
+//     parsed fields, clear the draft, and commit — the "ask at most once"
+//     guarantee means a vague reply still goes to Create (which validates);
+//     it never re-asks.
+//   - Fresh create: collect ALL missing required fields at once, save the
+//     parser's partial output as a draft, and ask in ONE message.
 func (d *Daemon) intakeCreateAgent(ctx context.Context, parsed intakeAction) string {
 	a := parsed.Agent
-	// 1. Clarification turn: an agent-kind draft means the owner is replying
-	// to the skills question. Build from the draft's agent spec + this turn's
-	// parsed skills (empty is fine — a vague reply still creates the agent,
-	// no second ask).
-	if draft, ok := d.loadAgentDraft(ctx); ok {
-		created, err := d.agentSvc.Create(ctx, service.Agent{
-			Name:         draft.AgentName,
-			RuntimeID:    draft.AgentRuntimeID,
-			Description:  draft.AgentDescription,
-			SystemPrompt: draft.AgentSystemPrompt,
-			Skills:       a.Skills,
-		})
+	if draft, ok := d.loadDraftOfKind(ctx, "agent"); ok {
+		merged := mergeAgent(draft.Payload, a)
 		if d.intakeSvc != nil {
 			_ = d.intakeSvc.ClearDraft(ctx)
 		}
-		if err != nil {
-			return "创建 agent 失败：" + err.Error()
-		}
-		return fmt.Sprintf("✅ 已创建 agent：%s（%s）", created.Name, shortID(created.ID))
+		return d.doCreateAgent(ctx, merged)
 	}
-	// 2. Fresh create.
-	if strings.TrimSpace(a.Name) == "" {
-		return "创建 agent 失败：缺少名称"
+	if missing := agentMissingFields(a, d.platformHasSkills(ctx)); len(missing) > 0 {
+		return d.collectAndAsk(ctx, "agent", mustMarshal(a), missing)
 	}
-	if strings.TrimSpace(a.RuntimeID) == "" {
-		return "请指定 agent 的运行时，当前可用：\n" + d.intakeRuntimeList(ctx)
-	}
-	// Skills clarification: the owner did not mention skills at all AND the
-	// platform has skills → ask once. Save the agent spec as a draft so the
-	// owner's reply only has to name skills, not re-send the whole agent.
-	if !a.SkillsSpecified && d.platformHasSkills(ctx) {
-		if d.intakeSvc != nil {
-			_ = d.intakeSvc.SaveDraft(ctx, notify.IntakeDraft{
-				Kind:              "agent",
-				AgentName:         a.Name,
-				AgentRuntimeID:    a.RuntimeID,
-				AgentDescription:  a.Description,
-				AgentSystemPrompt: a.SystemPrompt,
-				CreatedAt:         nowStr(),
-			})
-		}
-		return "平台有以下 skill，要给这个 agent 配吗？回复 skill 名字（空格分隔），或回复“不要”：\n" + d.intakeSkillList(ctx)
-	}
+	return d.doCreateAgent(ctx, a)
+}
+
+// doCreateAgent calls the service layer and returns the reply — no
+// validation, no draft logic. The service validates name/runtime_id and the
+// runtime's existence; a hallucinated or still-empty id fails here with the
+// validator's message (a terminal error, not a re-ask).
+func (d *Daemon) doCreateAgent(ctx context.Context, a agentAction) string {
 	created, err := d.agentSvc.Create(ctx, service.Agent{
 		Name:         a.Name,
 		RuntimeID:    a.RuntimeID,
@@ -479,19 +478,27 @@ func (d *Daemon) intakeCreateAgent(ctx context.Context, parsed intakeAction) str
 	return fmt.Sprintf("✅ 已创建 agent：%s（%s）", created.Name, shortID(created.ID))
 }
 
-// intakeCreateSquad creates a squad (leader + optional members) through the
-// service layer, then attaches the members. Squads are platform-wide and have
-// no skills field, so no clarification is needed. Members that fail to attach
-// (a hallucinated id) surface as a partial-success reply — the squad exists,
-// the owner is told which members did not make it.
+// intakeCreateSquad creates a squad (leader + optional members). Same
+// two-branch ask-once structure as the agent handler.
 func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) string {
 	sq := parsed.Squad
-	if strings.TrimSpace(sq.Name) == "" {
-		return "创建 squad 失败：缺少名称"
+	if draft, ok := d.loadDraftOfKind(ctx, "squad"); ok {
+		merged := mergeSquad(draft.Payload, sq)
+		if d.intakeSvc != nil {
+			_ = d.intakeSvc.ClearDraft(ctx)
+		}
+		return d.doCreateSquad(ctx, merged)
 	}
-	if strings.TrimSpace(sq.LeaderID) == "" {
-		return "创建 squad 失败：没有可用的 leader agent（先通过 Web 创建 agent，或在消息里指明 leader 名字）"
+	if missing := squadMissingFields(sq); len(missing) > 0 {
+		return d.collectAndAsk(ctx, "squad", mustMarshal(sq), missing)
 	}
+	return d.doCreateSquad(ctx, sq)
+}
+
+// doCreateSquad creates the squad then attaches members (skipping the leader,
+// which is already squad.leader_id). Hallucinated members surface as a
+// partial-success reply.
+func (d *Daemon) doCreateSquad(ctx context.Context, sq squadAction) string {
 	created, err := d.squadSvc.Create(ctx, service.Squad{
 		Name:         sq.Name,
 		LeaderID:     sq.LeaderID,
@@ -501,7 +508,6 @@ func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) str
 	if err != nil {
 		return "创建 squad 失败：" + err.Error()
 	}
-	// Attach members (skip the leader — it is already squad.leader_id).
 	var failed []string
 	for _, mid := range sq.MemberIDs {
 		mid = strings.TrimSpace(mid)
@@ -518,25 +524,201 @@ func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) str
 	return fmt.Sprintf("✅ 已创建 squad：%s（%s）", created.Name, shortID(created.ID))
 }
 
-// loadAgentDraft returns the pending agent-kind clarification draft, if any.
-// A goal-kind draft (or none) is treated as no agent draft — the two flows
-// do not interfere.
-func (d *Daemon) loadAgentDraft(ctx context.Context) (*notify.IntakeDraft, bool) {
+// collectAndAsk builds ONE clarification message listing all missing required
+// fields + the relevant rosters, saves the parser's partial output as a draft,
+// and returns the message. The rosters included depend on kind and which
+// fields are missing.
+func (d *Daemon) collectAndAsk(ctx context.Context, kind, payloadJSON string, missing []string) string {
+	var b strings.Builder
+	switch kind {
+	case "goal":
+		b.WriteString("创建任务还需要以下信息：\n")
+	case "agent":
+		b.WriteString("创建 agent 还需要以下信息：\n")
+	case "squad":
+		b.WriteString("创建 squad 还需要以下信息：\n")
+	}
+	for _, f := range missing {
+		b.WriteString("- " + f + "\n")
+	}
+	b.WriteString("\n")
+	// Rosters relevant to the kind.
+	switch kind {
+	case "goal":
+		b.WriteString("当前可用项目：\n" + d.intakeDomainList(ctx))
+		if d.platformHasAgents(ctx) {
+			b.WriteString("当前可用 agent：\n" + d.intakeAgentList(ctx))
+		}
+	case "agent":
+		b.WriteString("当前可用运行时：\n" + d.intakeRuntimeList(ctx))
+		if d.platformHasSkills(ctx) {
+			b.WriteString("\n平台 skill（选配，回复里带上要配的 skill 名，或明确回复“不要”）：\n" + d.intakeSkillList(ctx))
+		}
+	case "squad":
+		b.WriteString("当前可用 agent：\n" + d.intakeAgentList(ctx))
+	}
+	b.WriteString("\n请一条消息回复所有信息。")
+	if d.intakeSvc != nil {
+		_ = d.intakeSvc.SaveDraft(ctx, notify.IntakeDraft{
+			Kind: kind, Payload: payloadJSON, CreatedAt: nowStr(),
+		})
+	}
+	return b.String()
+}
+
+// loadDraftOfKind returns the pending draft if its Kind matches. Other kinds
+// (or none) are treated as absent — the flows do not interfere.
+func (d *Daemon) loadDraftOfKind(ctx context.Context, kind string) (*notify.IntakeDraft, bool) {
 	if d.intakeSvc == nil {
 		return nil, false
 	}
 	draft, ok := d.intakeSvc.LoadDraft(ctx)
-	if !ok || draft.Kind != "agent" {
+	if !ok || draft.Kind != kind {
 		return nil, false
 	}
 	return draft, true
 }
 
-// platformHasSkills reports whether the skill library is non-empty — the
-// skills clarification only fires when there is something to choose.
+// mergeAgent merges a clarification reply onto a draft: the reply's non-empty
+// fields override the draft's. Skills is taken from the reply only when
+// SkillsSpecified is true (the reply explicitly selected or declined skills);
+// otherwise the draft's skills/specified state is preserved.
+func mergeAgent(draftPayload string, reply agentAction) agentAction {
+	var draft agentAction
+	_ = json.Unmarshal([]byte(draftPayload), &draft)
+	if strings.TrimSpace(reply.Name) != "" {
+		draft.Name = reply.Name
+	}
+	if strings.TrimSpace(reply.RuntimeID) != "" {
+		draft.RuntimeID = reply.RuntimeID
+	}
+	if strings.TrimSpace(reply.Description) != "" {
+		draft.Description = reply.Description
+	}
+	if strings.TrimSpace(reply.SystemPrompt) != "" {
+		draft.SystemPrompt = reply.SystemPrompt
+	}
+	if reply.SkillsSpecified {
+		draft.Skills = reply.Skills
+		draft.SkillsSpecified = true
+	}
+	return draft
+}
+
+// mergeSquad merges a clarification reply onto a draft.
+func mergeSquad(draftPayload string, reply squadAction) squadAction {
+	var draft squadAction
+	_ = json.Unmarshal([]byte(draftPayload), &draft)
+	if strings.TrimSpace(reply.Name) != "" {
+		draft.Name = reply.Name
+	}
+	if strings.TrimSpace(reply.LeaderID) != "" {
+		draft.LeaderID = reply.LeaderID
+	}
+	if strings.TrimSpace(reply.Description) != "" {
+		draft.Description = reply.Description
+	}
+	if strings.TrimSpace(reply.Instructions) != "" {
+		draft.Instructions = reply.Instructions
+	}
+	if len(reply.MemberIDs) > 0 {
+		draft.MemberIDs = reply.MemberIDs
+	}
+	return draft
+}
+
+// mergeGoal merges a clarification reply onto a draft.
+func mergeGoal(draftPayload string, reply goalAction) goalAction {
+	var draft goalAction
+	_ = json.Unmarshal([]byte(draftPayload), &draft)
+	if strings.TrimSpace(reply.Title) != "" {
+		draft.Title = reply.Title
+	}
+	if strings.TrimSpace(reply.Description) != "" {
+		draft.Description = reply.Description
+	}
+	if strings.TrimSpace(reply.AssigneeID) != "" {
+		draft.AssigneeID = reply.AssigneeID
+	}
+	if strings.TrimSpace(reply.DomainID) != "" {
+		draft.DomainID = reply.DomainID
+	}
+	return draft
+}
+
+// agentMissingFields returns human names of required agent fields that are
+// empty, plus skills when the library is non-empty and the owner did not
+// mention skills (SkillsSpecified=false).
+func agentMissingFields(a agentAction, hasSkills bool) []string {
+	var out []string
+	if strings.TrimSpace(a.Name) == "" {
+		out = append(out, "名称")
+	}
+	if strings.TrimSpace(a.RuntimeID) == "" {
+		out = append(out, "运行时")
+	}
+	if hasSkills && !a.SkillsSpecified {
+		out = append(out, "skills（选配，或明确回复不要）")
+	}
+	return out
+}
+
+// squadMissingFields returns human names of required squad fields that are
+// empty.
+func squadMissingFields(sq squadAction) []string {
+	var out []string
+	if strings.TrimSpace(sq.Name) == "" {
+		out = append(out, "名称")
+	}
+	if strings.TrimSpace(sq.LeaderID) == "" {
+		out = append(out, "leader agent")
+	}
+	return out
+}
+
+// goalMissingFields returns human names of required goal fields that are
+// empty. assignee_id is only required when the platform has at least one
+// agent (otherwise there is nothing to ask — the platform is not configured,
+// a hard error).
+func goalMissingFields(g goalAction, hasAgents bool) []string {
+	var out []string
+	if strings.TrimSpace(g.Title) == "" {
+		out = append(out, "标题")
+	}
+	if strings.TrimSpace(g.DomainID) == "" {
+		out = append(out, "项目/仓库")
+	}
+	if hasAgents && strings.TrimSpace(g.AssigneeID) == "" {
+		out = append(out, "执行的 agent")
+	}
+	return out
+}
+
+// mustMarshal serializes a value to JSON, returning "{}" on error (should not
+// happen for these struct types, but a draft must never fail to save).
+func mustMarshal(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+// platformHasSkills reports whether the skill library is non-empty.
 func (d *Daemon) platformHasSkills(ctx context.Context) bool {
 	var n int
 	if err := d.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM skill`).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// platformHasAgents reports whether at least one agent exists — a goal needs
+// an assignee, and if none exist the platform is not configured (hard error,
+// not an ask).
+func (d *Daemon) platformHasAgents(ctx context.Context) bool {
+	var n int
+	if err := d.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM agent`).Scan(&n); err != nil {
 		return false
 	}
 	return n > 0
@@ -584,6 +766,29 @@ func (d *Daemon) intakeSkillList(ctx context.Context) string {
 	}
 	if n == 0 {
 		return "（当前没有 skill）"
+	}
+	return b.String()
+}
+
+// intakeAgentList lists the agents for the squad-leader / goal-assignee ask.
+func (d *Daemon) intakeAgentList(ctx context.Context) string {
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM agent ORDER BY name`)
+	if err != nil {
+		return "（当前没有可用 agent——先在 Web 配置 agent）"
+	}
+	defer rows.Close()
+	var b strings.Builder
+	n := 0
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "- %s\n", name)
+		n++
+	}
+	if n == 0 {
+		return "（当前没有可用 agent——先在 Web 配置 agent）"
 	}
 	return b.String()
 }

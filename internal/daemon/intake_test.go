@@ -77,12 +77,7 @@ func TestIntakeCreateGoal(t *testing.T) {
 	ctx := context.Background()
 	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
 
-	reply := d.intakeCreateGoal(ctx, intakeAction{Goal: struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
-	}{Title: "从飞书建的任务", DomainID: domID, AssigneeID: "a1"}})
+	reply := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("从飞书建的任务", "", "a1", domID)})
 	if !strings.Contains(reply, "已创建任务") {
 		t.Fatalf("expected creation reply, got %q", reply)
 	}
@@ -95,21 +90,22 @@ func TestIntakeCreateGoal(t *testing.T) {
 		t.Fatalf("first run must be queued for execution, got %q", runStatus)
 	}
 
-	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
-	}{Title: "", DomainID: domID, AssigneeID: "a1"}}); !strings.Contains(r, "缺少标题") {
-		t.Fatalf("missing title must surface, got %q", r)
+	// Missing title → the ask lists 标题 (the first call saved a goal draft
+	// for "从飞书建的任务"; clear it so this case asks fresh).
+	_ = d.intakeSvc.ClearDraft(ctx)
+	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("", "", "a1", domID)}); !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "标题") {
+		t.Fatalf("missing title must ask with 标题, got %q", r)
 	}
-	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
-	}{Title: "x", DomainID: "nonexistent", AssigneeID: "a1"}}); !strings.Contains(r, "创建任务失败") {
+	// Hallucinated domain → service-layer validator message (all required
+	// fields present, so it goes straight to Create).
+	_ = d.intakeSvc.ClearDraft(ctx)
+	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("x", "", "a1", "nonexistent")}); !strings.Contains(r, "创建任务失败") {
 		t.Fatalf("hallucinated domain must fail via the validator, got %q", r)
+	}
+	// Missing domain (title present) → the ask lists 项目/仓库 + the domain roster.
+	_ = d.intakeSvc.ClearDraft(ctx)
+	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("修一下", "", "a1", "")}); !strings.Contains(r, "项目/仓库") {
+		t.Fatalf("missing domain must ask with 项目/仓库, got %q", r)
 	}
 }
 
@@ -215,41 +211,26 @@ func firstID(t *testing.T, ctx context.Context, d *Daemon, q string) string {
 	return id
 }
 
-// agentSub is the anonymous-struct shape of intakeAction.Agent (kept here so
-// each test call site does not re-declare the 6-field struct literal).
-func agentSub(Name, RuntimeID, Description, SystemPrompt string, Skills []string, SkillsSpecified bool) struct {
-	Name            string   `json:"name"`
-	RuntimeID       string   `json:"runtime_id"`
-	Description     string   `json:"description"`
-	SystemPrompt    string   `json:"system_prompt"`
-	Skills          []string `json:"skills"`
-	SkillsSpecified bool     `json:"skills_specified"`
-} {
-	return struct {
-		Name            string   `json:"name"`
-		RuntimeID       string   `json:"runtime_id"`
-		Description     string   `json:"description"`
-		SystemPrompt    string   `json:"system_prompt"`
-		Skills          []string `json:"skills"`
-		SkillsSpecified bool     `json:"skills_specified"`
-	}{Name, RuntimeID, Description, SystemPrompt, Skills, SkillsSpecified}
+// agentSub builds an agentAction for test call sites (so each test does not
+// re-declare the full struct literal).
+func agentSub(Name, RuntimeID, Description, SystemPrompt string, Skills []string, SkillsSpecified bool) agentAction {
+	return agentAction{
+		Name: Name, RuntimeID: RuntimeID, Description: Description,
+		SystemPrompt: SystemPrompt, Skills: Skills, SkillsSpecified: SkillsSpecified,
+	}
 }
 
-// squadSub is the anonymous-struct shape of intakeAction.Squad.
-func squadSub(Name, LeaderID, Description, Instructions string, MemberIDs []string) struct {
-	Name         string   `json:"name"`
-	LeaderID     string   `json:"leader_id"`
-	Description  string   `json:"description"`
-	Instructions string   `json:"instructions"`
-	MemberIDs    []string `json:"member_ids"`
-} {
-	return struct {
-		Name         string   `json:"name"`
-		LeaderID     string   `json:"leader_id"`
-		Description  string   `json:"description"`
-		Instructions string   `json:"instructions"`
-		MemberIDs    []string `json:"member_ids"`
-	}{Name, LeaderID, Description, Instructions, MemberIDs}
+// goalSub builds a goalAction for test call sites.
+func goalSub(Title, Description, AssigneeID, DomainID string) goalAction {
+	return goalAction{Title: Title, Description: Description, AssigneeID: AssigneeID, DomainID: DomainID}
+}
+
+// squadSub builds a squadAction for test call sites.
+func squadSub(Name, LeaderID, Description, Instructions string, MemberIDs []string) squadAction {
+	return squadAction{
+		Name: Name, LeaderID: LeaderID, Description: Description,
+		Instructions: Instructions, MemberIDs: MemberIDs,
+	}
 }
 
 // TestIntakeCreateAgent: the platform executes create_agent through the
@@ -276,20 +257,56 @@ func TestIntakeCreateAgent(t *testing.T) {
 		t.Fatalf("agent with no skills must store []: got %q", agentSkills)
 	}
 
-	// Missing name.
+	// Each missing-field case saves a draft; the daemon is shared across
+	// these cases, so clear the draft between them (or a later case would
+	// merge onto the earlier case's draft instead of asking fresh).
+	clearIntakeDraft := func() { _ = d.intakeSvc.ClearDraft(ctx) }
+
+	// Missing name → the ask lists 名称 (no hard "缺少名称" anymore).
+	clearIntakeDraft()
 	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"", "rt1", "x", "y", nil, true)}); !strings.Contains(r, "缺少名称") {
-		t.Fatalf("missing name must surface, got %q", r)
+		"", "rt1", "x", "y", nil, true)}); !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "名称") {
+		t.Fatalf("missing name must ask with 名称, got %q", r)
 	}
-	// Missing runtime_id → ask for a runtime.
+	// Missing runtime_id → the ask lists 运行时 + the runtime roster.
+	clearIntakeDraft()
 	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"无运行时", "", "x", "y", nil, true)}); !strings.Contains(r, "请指定 agent 的运行时") {
-		t.Fatalf("missing runtime must ask, got %q", r)
+		"无运行时", "", "x", "y", nil, true)}); !strings.Contains(r, "运行时") || !strings.Contains(r, "rt1") {
+		t.Fatalf("missing runtime must ask with the runtime roster, got %q", r)
 	}
-	// Hallucinated runtime_id → service-layer validator message.
+	// Missing BOTH name and runtime → one ask listing both (not two round-trips).
+	clearIntakeDraft()
+	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
+		"", "", "", "", nil, true)}); !strings.Contains(r, "名称") || !strings.Contains(r, "运行时") {
+		t.Fatalf("missing name+runtime must ask for both at once, got %q", r)
+	}
+	// Hallucinated runtime_id → service-layer validator message (all fields
+	// present, so it goes straight to Create, which rejects the bad id).
+	clearIntakeDraft()
 	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
 		"坏runtime", "nope", "x", "y", nil, true)}); !strings.Contains(r, "创建 agent 失败") {
 		t.Fatalf("hallucinated runtime must fail via the validator, got %q", r)
+	}
+
+	// Ask-at-most-once: after a draft is saved, a VAGUE reply that still
+	// misses required fields must NOT re-ask — it merges, clears the draft,
+	// and fails at the service layer (terminal error). No second ask.
+	clearIntakeDraft()
+	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
+		"", "", "", "", nil, true)}); !strings.Contains(r, "还需要以下信息") {
+		t.Fatalf("setup: missing name+runtime must ask, got %q", r)
+	}
+	// Draft is now saved. Vague reply supplies nothing useful.
+	vague := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
+		"", "", "", "", nil, true)})
+	if strings.Contains(vague, "还需要以下信息") {
+		t.Fatalf("vague reply must NOT re-ask (ask-at-most-once), got %q", vague)
+	}
+	if !strings.Contains(vague, "创建 agent 失败") {
+		t.Fatalf("vague reply must fail at the service layer, got %q", vague)
+	}
+	if _, ok := d.loadDraftOfKind(ctx, "agent"); ok {
+		t.Fatal("draft must be cleared after the clarification turn (even on failure)")
 	}
 
 	// --- Skills on the platform + owner did not mention skills → clarify. ---
@@ -301,20 +318,22 @@ func TestIntakeCreateAgent(t *testing.T) {
 	}
 	reply = d2.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
 		"带skill的agent", "rt1", "x", "y", nil, false)})
-	if !strings.Contains(reply, "要给这个 agent 配吗") || !strings.Contains(reply, "git-helper") {
-		t.Fatalf("must ask for skills and list them, got %q", reply)
+	if !strings.Contains(reply, "还需要以下信息") || !strings.Contains(reply, "skills") || !strings.Contains(reply, "git-helper") {
+		t.Fatalf("must ask for skills (listed as missing) and show the skill, got %q", reply)
 	}
 	// The draft is saved — the clarification turn must build from it.
-	if _, ok := d2.loadAgentDraft(ctx); !ok {
+	if _, ok := d2.loadDraftOfKind(ctx, "agent"); !ok {
 		t.Fatal("agent-kind draft must be saved for the clarification")
 	}
-	// Clarification turn: owner picks skills → agent created from the draft.
+	// Clarification turn: owner picks skills → agent created from the draft
+	// (the draft carried name/runtime/description/system_prompt; the reply
+	// supplies only skills).
 	reply = d2.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
 		"", "", "", "", []string{"sk1"}, true)})
 	if !strings.Contains(reply, "已创建 agent") {
 		t.Fatalf("clarification turn must create the agent, got %q", reply)
 	}
-	if _, ok := d2.loadAgentDraft(ctx); ok {
+	if _, ok := d2.loadDraftOfKind(ctx, "agent"); ok {
 		t.Fatal("draft must be cleared after the agent is created")
 	}
 	var skillsJSON string
@@ -359,17 +378,27 @@ func TestIntakeCreateSquad(t *testing.T) {
 		t.Fatalf("created squad must exist: %v", err)
 	}
 
-	// Missing name.
+	// Missing name → the ask lists 名称 (clear the draft between cases —
+	// each missing case saves a squad draft on the shared daemon).
+	_ = d.intakeSvc.ClearDraft(ctx)
 	if r := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"", "a1", "x", "y", nil)}); !strings.Contains(r, "缺少名称") {
-		t.Fatalf("missing name must surface, got %q", r)
+		"", "a1", "x", "y", nil)}); !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "名称") {
+		t.Fatalf("missing name must ask with 名称, got %q", r)
 	}
-	// Missing leader_id.
+	// Missing leader_id → the ask lists leader agent + the agent roster.
+	_ = d.intakeSvc.ClearDraft(ctx)
 	if r := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"无leader", "", "x", "y", nil)}); !strings.Contains(r, "没有可用的 leader agent") {
-		t.Fatalf("missing leader must ask, got %q", r)
+		"无leader", "", "x", "y", nil)}); !strings.Contains(r, "leader agent") || !strings.Contains(r, "worker1") {
+		t.Fatalf("missing leader must ask with the agent roster, got %q", r)
+	}
+	// Missing BOTH name and leader → one ask listing both.
+	_ = d.intakeSvc.ClearDraft(ctx)
+	if r := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
+		"", "", "x", "y", nil)}); !strings.Contains(r, "名称") || !strings.Contains(r, "leader agent") {
+		t.Fatalf("missing name+leader must ask for both at once, got %q", r)
 	}
 	// Hallucinated leader_id → service-layer validator message.
+	_ = d.intakeSvc.ClearDraft(ctx)
 	if r := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
 		"坏leader", "nope", "x", "y", nil)}); !strings.Contains(r, "创建 squad 失败") {
 		t.Fatalf("hallucinated leader must fail via the validator, got %q", r)

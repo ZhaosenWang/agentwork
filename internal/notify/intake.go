@@ -33,29 +33,27 @@ type IntakeService struct {
 const intakeAgentKey = "platform.m3"
 
 // intakeDraft is the pending clarification (single-slot, single-user
-// platform; expires after draftTTL). Two kinds share one slot:
+// platform; expires after draftTTL). A create_X intent whose required
+// fields the parser could not fully resolve stores the parser's partial
+// output here as a JSON payload; the next inbound message is parsed WITH
+// the draft as context so a bare completion reply finishes the pending
+// item instead of starting a new one.
 //
-//   - kind=""|"goal": a create_goal whose DOMAIN (a required parameter) the
-//     parser could not determine. The owner is asked to name the repo; the
-//     next inbound message is parsed WITH the draft as context, so a bare
-//     "test-repo" completes the pending task instead of becoming a new one.
+// The draft stores the WHOLE sub-struct the parser produced (not
+// cherry-picked fields), so the merge on the clarification turn is a
+// uniform field-by-field union (reply's non-empty fields override the
+// draft's) regardless of which fields were missing. Kind discriminates
+// goal|agent|squad and selects which sub-struct shape Payload holds.
 //
-//   - kind="agent": a create_agent awaiting the owner's skills choice. The
-//     owner is asked whether to select platform skills; the next message
-//     resolves the skills (or declines) and the agent is created from the
-//     draft's name/runtime/description/system_prompt — no need to re-send
-//     the whole agent spec.
+// "Ask at most once" is structural: the only SaveDraft path is the
+// fresh-create branch (no draft present) of a create handler; the
+// clarification-turn branch clears the draft before calling Create, so a
+// vague reply that still misses required fields fails at the service
+// layer (a terminal error) rather than re-asking.
 type IntakeDraft struct {
-	Kind        string `json:"kind"` // ""|"goal" | "agent"
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	AssigneeID  string `json:"assignee_id"`
-	// agent-kind fields (kind=="agent").
-	AgentName         string `json:"agent_name"`
-	AgentRuntimeID    string `json:"agent_runtime_id"`
-	AgentDescription  string `json:"agent_description"`
-	AgentSystemPrompt string `json:"agent_system_prompt"`
-	CreatedAt         string `json:"created_at"`
+	Kind      string `json:"kind"`       // "goal" | "agent" | "squad"
+	Payload   string `json:"payload"`    // JSON of the create_X sub-struct
+	CreatedAt string `json:"created_at"`
 }
 
 const draftKey = "intake.draft"
@@ -81,41 +79,31 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 	}
 	var b strings.Builder
 	b.WriteString("你是 agentwork 的 IM 入站解析器。用户通过飞书向 agentwork 发了一条消息，请解析其意图并写入当前工作目录的 intake.json 文件（文件即结果，不要输出到 stdout）。\n\n")
-	// A pending clarification draft: the previous message created something
-	// whose required parameter the user has not supplied yet. This message is
-	// parsed IN THAT CONTEXT so a bare completion reply finishes the pending
-	// item instead of starting a new one. Two kinds share one slot.
-	if draft, ok := s.LoadDraft(ctx); ok {
-		switch draft.Kind {
-		case "agent":
-			b.WriteString("【上下文：用户在回答之前 agent 创建的 skills 问题】\n")
-			b.WriteString("之前解析出的 agent（已确认 name/runtime/description/system_prompt，只差 skills 选择）：\n")
-			b.WriteString("- name：" + draft.AgentName + "\n")
-			b.WriteString("- runtime_id：" + draft.AgentRuntimeID + "\n")
-			if draft.AgentDescription != "" {
-				b.WriteString("- description：" + draft.AgentDescription + "\n")
-			}
-			if draft.AgentSystemPrompt != "" {
-				b.WriteString("- system_prompt：" + draft.AgentSystemPrompt + "\n")
-			}
-			b.WriteString("用户现在回复：\n\"" + text + "\"\n\n")
-			b.WriteString("请判断：这条回复是否在选 skills（从下面的 skill 名单里选）？\n")
-			b.WriteString("- 是（回复含 skill 名字）→ 输出 create_agent：name/runtime_id/description/system_prompt 照抄草稿，skills 填解析出的 id，skills_specified=true。\n")
-			b.WriteString("- 否（用户说「不要/不用」，或开始了一个全新请求）→ 输出 create_agent：照抄草稿字段，skills 留空，skills_specified=true（明确不要也算指定）。\n\n")
-		default: // "" | "goal"
-			b.WriteString("【上下文：用户在补全之前的一条任务创建】\n")
-			b.WriteString("之前解析出的任务（当时因未指定仓库而反问用户）：\n")
-			if draft.Title != "" {
-				b.WriteString("- 标题：" + draft.Title + "\n")
-			}
-			if draft.Description != "" {
-				b.WriteString("- 描述：" + draft.Description + "\n")
-			}
-			b.WriteString("用户现在回复：\n\"" + text + "\"\n\n")
-			b.WriteString("请判断：这条回复是否指定了仓库/域（从下面的域名名单里选）？\n")
-			b.WriteString("- 是（回复是仓库名，或「在 X 上执行」等）→ 输出 create_goal：用草稿的标题/描述/assignee，domain_id 填选中的仓库。\n")
-			b.WriteString("- 否（用户开始了一个全新任务——含「创建/做/加」等任务动词，或仍在闲聊）→ 按正常规则解析这条新消息。\n\n")
+	// A pending clarification draft: the previous message created a create_X
+	// intent whose required fields the parser could not fully resolve. This
+	// message is parsed IN THAT CONTEXT so a bare completion reply finishes
+	// the pending item instead of starting a new one. The draft carries the
+	// parser's whole sub-struct; the platform merges (reply's non-empty
+	// fields override) so the parser here only needs to extract whatever the
+	// reply supplies for the still-missing fields.
+	if draft, ok := s.LoadDraft(ctx); ok && draft.Kind != "" {
+		intent := "create_" + draft.Kind
+		b.WriteString("【上下文：你在补全之前的一个创建请求】\n")
+		b.WriteString("之前解析出的意图：" + intent + "\n")
+		if known := knownFieldsBody(draft.Kind, draft.Payload); known != "" {
+			b.WriteString("已知字段（保持不变，照抄进输出）：\n" + known)
 		}
+		if missing := missingFields(draft.Kind, draft.Payload); len(missing) > 0 {
+			b.WriteString("缺失字段（请从下面的用户回复中提取这些字段的值）：\n")
+			for _, f := range missing {
+				b.WriteString("- " + f + "\n")
+			}
+		}
+		b.WriteString("\n用户现在回复：\n\"" + text + "\"\n\n")
+		b.WriteString("请从回复中提取缺失字段的值，已知字段保持不变，输出完整的 " + intent + "。\n")
+		b.WriteString("- 若回复在补缺失字段 → 输出 " + intent + "：已知字段照抄草稿，缺失字段填回复里解析出的值。\n")
+		b.WriteString("- 若用户说「不要/不用」（针对 skills 这类选配字段）→ 该字段留空、对应 specified 标志置 true。\n")
+		b.WriteString("- 若用户开始了一个全新请求（与之前创建无关）→ 按正常规则解析这条新消息。\n\n")
 	}
 	b.WriteString("用户消息：\n" + text + "\n\n")
 	b.WriteString(`intake.json 结构：
@@ -232,6 +220,134 @@ func (s *IntakeService) LoadDraft(ctx context.Context) (*IntakeDraft, bool) {
 		return nil, false
 	}
 	return &d, true
+}
+
+// requiredFields are the create_X sub-struct fields the platform requires.
+// agent's skills is handled separately (it is conditional on the library
+// being non-empty and SkillsSpecified being false) — it is NOT in this map;
+// the daemon-side collector adds it to the ask when applicable. The notify
+// side (BuildPrompt context) lists skills as missing only when the draft's
+// skills_specified is false, which missingFields checks inline.
+var requiredFields = map[string][]string{
+	"goal":  {"title", "domain_id", "assignee_id"},
+	"agent": {"name", "runtime_id"},
+	"squad": {"name", "leader_id"},
+}
+
+// payloadMap unmarshals a draft payload into a generic map. The draft payload
+// is a daemon-side sub-struct (goalAction/agentAction/squadAction) serialized
+// to JSON; notify cannot import those types (daemon imports notify), so the
+// field presence check works off the generic map. Returns nil on any error
+// (a malformed draft is treated as having no known fields).
+func payloadMap(payload string) map[string]any {
+	if payload == "" {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(payload), &m); err != nil {
+		return nil
+	}
+	return m
+}
+
+// strField reads a string field from the payload map; non-string or absent
+// values return "".
+func strField(m map[string]any, key string) string {
+	v, ok := m[key]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// missingFields returns the human names of required fields that are empty in
+// the draft payload. Used by BuildPrompt to tell the parser what to extract
+// from the clarification reply. skills is appended for agent drafts where
+// skills_specified is false (the platform will ask about skills once).
+func missingFields(kind, payload string) []string {
+	m := payloadMap(payload)
+	if m == nil {
+		return nil
+	}
+	var out []string
+	for _, f := range requiredFields[kind] {
+		if strings.TrimSpace(strField(m, f)) == "" {
+			out = append(out, fieldName(kind, f))
+		}
+	}
+	if kind == "agent" {
+		if specified, _ := m["skills_specified"].(bool); !specified {
+			out = append(out, "skills（选配，或明确回复不要）")
+		}
+	}
+	return out
+}
+
+// knownFieldsBody builds the "已知字段" markdown for the BuildPrompt context
+// — the non-empty fields from the draft payload, so the parser knows what to
+// preserve verbatim. Returns "" if nothing known.
+func knownFieldsBody(kind, payload string) string {
+	m := payloadMap(payload)
+	if m == nil {
+		return ""
+	}
+	var b strings.Builder
+	switch kind {
+	case "goal":
+		if v := strField(m, "title"); v != "" {
+			fmt.Fprintf(&b, "- title：%s\n", v)
+		}
+		if v := strField(m, "description"); v != "" {
+			fmt.Fprintf(&b, "- description：%s\n", v)
+		}
+		if v := strField(m, "assignee_id"); v != "" {
+			fmt.Fprintf(&b, "- assignee_id：%s\n", v)
+		}
+	case "agent":
+		if v := strField(m, "name"); v != "" {
+			fmt.Fprintf(&b, "- name：%s\n", v)
+		}
+		if v := strField(m, "runtime_id"); v != "" {
+			fmt.Fprintf(&b, "- runtime_id：%s\n", v)
+		}
+		if v := strField(m, "description"); v != "" {
+			fmt.Fprintf(&b, "- description：%s\n", v)
+		}
+		if v := strField(m, "system_prompt"); v != "" {
+			fmt.Fprintf(&b, "- system_prompt：%s\n", v)
+		}
+	case "squad":
+		if v := strField(m, "name"); v != "" {
+			fmt.Fprintf(&b, "- name：%s\n", v)
+		}
+		if v := strField(m, "leader_id"); v != "" {
+			fmt.Fprintf(&b, "- leader_id：%s\n", v)
+		}
+		if v := strField(m, "description"); v != "" {
+			fmt.Fprintf(&b, "- description：%s\n", v)
+		}
+		if v := strField(m, "instructions"); v != "" {
+			fmt.Fprintf(&b, "- instructions：%s\n", v)
+		}
+	}
+	return b.String()
+}
+
+// fieldName maps a kind+json-key to the human name shown in the
+// "缺失字段" list. Falls back to the key itself.
+func fieldName(kind, key string) string {
+	names := map[string]map[string]string{
+		"goal":  {"title": "标题", "domain_id": "项目/仓库", "assignee_id": "执行的 agent"},
+		"agent": {"name": "名称", "runtime_id": "运行时"},
+		"squad": {"name": "名称", "leader_id": "leader agent"},
+	}
+	if ks, ok := names[kind]; ok {
+		if n, ok := ks[key]; ok {
+			return n
+		}
+	}
+	return key
 }
 
 // intakeAgent resolves the configured global parser agent and verifies it

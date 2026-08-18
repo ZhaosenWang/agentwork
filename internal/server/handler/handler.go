@@ -526,15 +526,15 @@ func (h *Handlers) createSkill(w http.ResponseWriter, r *http.Request) {
 	// Two upload modes: a multipart form carrying the skill as a ZIP
 	// archive (scripts + binary assets — the way the web UI uploads), or
 	// the legacy JSON body of text files (=== blocks) which the service
-	// archives the same way.
+	// archives the same way. The skill's name/description are PARSED from
+	// the archive's SKILL.md by the service — the caller does not supply
+	// them. A zip without a valid SKILL.md is rejected as "not a skill".
 	ct := r.Header.Get("Content-Type")
 	if strings.HasPrefix(ct, "multipart/form-data") {
 		if err := r.ParseMultipartForm(32 << 20); err != nil {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		name := strings.TrimSpace(r.FormValue("name"))
-		description := r.FormValue("description")
 		file, _, err := r.FormFile("file")
 		if err != nil {
 			writeErr(w, http.StatusBadRequest, fmt.Errorf("file is required: %w", err))
@@ -546,20 +546,18 @@ func (h *Handlers) createSkill(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
-		out, err := h.Skills.CreateFromZip(r.Context(), name, description, zipData)
+		out, err := h.Skills.CreateFromZip(r.Context(), zipData)
 		writeJSON(w, out, err)
 		return
 	}
 	var body struct {
-		Name        string            `json:"name"`
-		Description string            `json:"description"`
-		Files       map[string]string `json:"files"`
+		Files map[string]string `json:"files"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	out, err := h.Skills.Create(r.Context(), body.Name, body.Description, body.Files)
+	out, err := h.Skills.Create(r.Context(), body.Files)
 	writeJSON(w, out, err)
 }
 
