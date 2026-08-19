@@ -64,7 +64,7 @@ var builtinProbeTable = []probeEntry{
 		Name:             "hwcloud",
 		ProbeCmd:         "hwcloud --version",
 		ACPSpawn:         []string{"hwcloud", "serve", "--acp"},
-		SkillsDir:        "~/.openagent/skills",
+		SkillsDir:        "~/.agents/skills",
 		ProjectSkillsDir: ".agents/skills", // the AgentSkills standard (npx skills add)
 		ProfileFiles:     []string{"SOUL.md", "SYSTEM.md", "AGENTS.md"},
 	},
