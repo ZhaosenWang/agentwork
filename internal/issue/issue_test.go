@@ -185,6 +185,128 @@ func TestCloserClosesIssueOnDelivered(t *testing.T) {
 	}
 }
 
+// TestCloserOnTerminalRelaysAgentSummary: a failed issue-sourced goal posts
+// the agent's own summary verbatim as a comment and does NOT close the issue
+// (the work was not delivered). An empty summary (the run was cut before the
+// agent produced output) posts nothing — silence, not a content-free banner.
+func TestCloserOnTerminalRelaysAgentSummary(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	bus := events.NewBus()
+	ds := service.NewDomainService(st, bus)
+	dom, err := ds.Create(ctx, service.Domain{Name: "d1", GitURL: "https://e.com/d1.git", GitCredentials: "tok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := service.NewGoalService(st, bus)
+	issueGoal, err := gs.Create(ctx, service.Goal{
+		Title: "x", DomainID: dom.ID, AssigneeType: "human",
+		SourceRef: "github:x/y#7",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, calls := mockGitHub(t)
+	defer srv.Close()
+	c := NewCloser(st)
+	c.newProvider = func(provider, token string) (Provider, error) {
+		cl := NewClient(token)
+		cl.http = srv.Client()
+		cl.baseURL = srv.URL
+		return cl, nil
+	}
+
+	// Non-empty agent summary: relayed verbatim, issue left open.
+	c.OnTerminal(ctx, issueGoal.ID, "我查了代码，乱码根因在闭源的 libcodec.so，源码层无法修复。")
+	joined := strings.Join(*calls, " ")
+	if !strings.Contains(joined, "POST /repos/x/y/issues/7/comments") {
+		t.Fatalf("agent summary must be posted as a comment, calls: %s", joined)
+	}
+	if !strings.Contains(joined, "BODY: 我查了代码，乱码根因在闭源的 libcodec.so，源码层无法修复。") {
+		t.Fatalf("comment body must be the agent's summary verbatim (no platform branding), calls: %s", joined)
+	}
+	if strings.Contains(joined, "PATCH /repos/x/y/issues/7") {
+		t.Fatalf("a failed goal must NOT close its issue, calls: %s", joined)
+	}
+
+	// Empty summary: nothing posted (a launch/watchdog cut — no agent output).
+	*calls = nil
+	c.OnTerminal(ctx, issueGoal.ID, "")
+	if len(*calls) != 0 {
+		t.Fatalf("empty summary must post nothing, calls: %v", *calls)
+	}
+}
+
+// TestCloserOnAgentQuestionMirrorsToIssue: an agent's --ask question on an
+// issue-sourced goal is mirrored verbatim onto the issue; a non-issue goal
+// (no source_ref) is untouched; an empty question posts nothing.
+func TestCloserOnAgentQuestionMirrorsToIssue(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	bus := events.NewBus()
+	ds := service.NewDomainService(st, bus)
+	dom, err := ds.Create(ctx, service.Domain{Name: "d1", GitURL: "https://e.com/d1.git", GitCredentials: "tok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gs := service.NewGoalService(st, bus)
+	issueGoal, err := gs.Create(ctx, service.Goal{
+		Title: "x", DomainID: dom.ID, AssigneeType: "human",
+		SourceRef: "github:x/y#7",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainGoal, err := gs.Create(ctx, service.Goal{Title: "p", DomainID: dom.ID, AssigneeType: "human"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, calls := mockGitHub(t)
+	defer srv.Close()
+	c := NewCloser(st)
+	c.newProvider = func(provider, token string) (Provider, error) {
+		cl := NewClient(token)
+		cl.http = srv.Client()
+		cl.baseURL = srv.URL
+		return cl, nil
+	}
+
+	// Issue-sourced goal: the agent's question is mirrored verbatim.
+	c.OnAgentQuestion(ctx, issueGoal.ID, "我在此仓库中未找到登录页代码，登录页是否在另一个仓库？")
+	joined := strings.Join(*calls, " ")
+	if !strings.Contains(joined, "POST /repos/x/y/issues/7/comments") {
+		t.Fatalf("agent question must be mirrored to the issue, calls: %s", joined)
+	}
+	if !strings.Contains(joined, "BODY: 我在此仓库中未找到登录页代码，登录页是否在另一个仓库？") {
+		t.Fatalf("comment body must be the agent's question verbatim (no branding), calls: %s", joined)
+	}
+	if strings.Contains(joined, "PATCH /repos/x/y/issues/7") {
+		t.Fatalf("a question must NOT close the issue, calls: %s", joined)
+	}
+
+	// Non-issue goal: untouched (no source_ref to resolve).
+	*calls = nil
+	c.OnAgentQuestion(ctx, plainGoal.ID, "some question")
+	if len(*calls) != 0 {
+		t.Fatalf("non-issue goal must not trigger any issue API call, calls: %v", *calls)
+	}
+
+	// Empty question: nothing posted.
+	*calls = nil
+	c.OnAgentQuestion(ctx, issueGoal.ID, "")
+	if len(*calls) != 0 {
+		t.Fatalf("empty question must post nothing, calls: %v", *calls)
+	}
+}
+
 // TestVerifySignature: correct secret verifies, wrong secret and missing
 // signature fail (constant-time compare).
 func TestVerifySignature(t *testing.T) {

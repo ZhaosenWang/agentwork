@@ -308,6 +308,54 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 			d.issueCloser.OnDelivered(context.Background(), goalID, note, commits)
 		}
 	})
+	// M4-B: a failed issue-sourced goal relays the agent's own terminal
+	// summary as a comment on its issue (NOT a close — the work was not
+	// delivered, the issue stays open). Without this the issue's author sees
+	// the issue sit open forever with no signal: success closed + commented,
+	// failure was silent. The comment carries the agent's words verbatim — no
+	// platform branding, no goal id; the bot account's display name is the
+	// identity on the host, the way a developer replies on an issue.
+	// agent_ran (true only when the failing run actually started an agent
+	// session) gates the writeback: a launch/infra failure produced a
+	// platform diagnostic, not agent output — relaying it would dump machine
+	// log on the issue's author, who cannot act on it. Silence there is
+	// honest; the infra side is visible in daemon logs. done is NOT handled
+	// here — a delivered issue-sourced goal goes through goal:delivered above
+	// (close + commit links), and a finished-done without a deliver has no
+	// merge to point at.
+	bus.Subscribe("goal:finished", func(_ context.Context, e events.Event) {
+		m, ok := e.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		goalID, _ := m["goal_id"].(string)
+		status, _ := m["status"].(string)
+		summary, _ := m["summary"].(string)
+		agentRan, _ := m["agent_ran"].(bool)
+		if goalID == "" {
+			return
+		}
+		if status == "failed" && agentRan {
+			d.issueCloser.OnTerminal(context.Background(), goalID, summary)
+		}
+	})
+	// M4-B: an agent's --ask question on an issue-sourced goal is mirrored
+	// onto the issue so the author sees it on the git host (where they live),
+	// not only inside agentwork. The agent's question is relayed verbatim —
+	// the same as a developer commenting "I need X to proceed" on an issue.
+	// Non-issue goals no-op (Closer.resolveIssueTarget returns false). The
+	// notify subscription (Feishu card) runs independently for platform users.
+	bus.Subscribe("comment:agent_question", func(_ context.Context, e events.Event) {
+		m, ok := e.Payload.(map[string]any)
+		if !ok {
+			return
+		}
+		goalID, _ := m["goal_id"].(string)
+		question, _ := m["question"].(string)
+		if goalID != "" {
+			d.issueCloser.OnAgentQuestion(context.Background(), goalID, question)
+		}
+	})
 	return d
 }
 

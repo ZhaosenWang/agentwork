@@ -63,6 +63,12 @@ type goalRunContext struct {
 	Attempt          int
 	Summary          string
 	TriggerCommentID string // mention/协作来源（guest run 失败留痕用）
+	// SessionID is the agent's ACP session id ('' when the run was cut before
+	// the agent ever ran — a launch failure, a watchdog/timeout before the
+	// backend started). The issue writeback uses it to tell an agent-authored
+	// summary (relay it to the issue) from a platform-authored one (a machine
+	// diagnostic the issue's author cannot act on — stay silent).
+	SessionID string
 	// Sub-goal runs (决策 6-1/6-9): the sub-goal this run executes and the
 	// Change revision refs the daemon stamped at run end.
 	Role      string
@@ -1287,6 +1293,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			// card fires once, not once per failed attempt (决策 5-10).
 			pendingEvents = append(pendingEvents, events.Event{Topic: "goal:finished", Payload: map[string]any{
 				"goal_id": rc.GoalID, "status": "failed", "summary": rc.Summary,
+				"agent_ran": rc.SessionID != "",
 			}})
 		}
 	case "cancelled":
@@ -1533,6 +1540,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 			}
 			s.bus.Publish(ctx, events.Event{Topic: "goal:finished", Payload: map[string]any{
 				"goal_id": goalID, "status": "failed", "summary": loopNote,
+				"agent_ran": false,
 			}})
 			break
 		}

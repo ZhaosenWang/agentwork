@@ -285,30 +285,53 @@ func NewCloser(st *store.Store) *Closer {
 	return &Closer{st: st, newProvider: NewProvider}
 }
 
-// OnDelivered is the bus handler for goal:delivered. commits ("<full sha>
-// <title>", structured from the deliver — never parsed from the note text)
-// become clickable fix links, the way an open-source maintainer closes an
-// issue.
-func (c *Closer) OnDelivered(ctx context.Context, goalID, note string, commits []string) {
+// issueTarget is a resolved issue-sourced goal's outbound identity: the
+// provider client (holds the bot token) + the issue coordinates. resolve
+// returns ok=false when the goal is not issue-sourced (no source_ref) or the
+// domain/token is missing — the caller silently no-ops, same as OnDelivered
+// always has.
+type issueTarget struct {
+	client   Provider
+	provider string // "github" | "gitcode" — log/diagnostic only
+	repo     string
+	number   int
+}
+
+// resolveIssueTarget loads the goal's source_ref + the domain's bot token and
+// builds the provider client. Shared by every issue writeback path (delivered
+// close, failed/cancelled notice) so they all route through one lookup.
+func (c *Closer) resolveIssueTarget(ctx context.Context, goalID string) (issueTarget, bool) {
 	var ref, token string
 	err := c.st.DB().QueryRowContext(ctx,
 		`SELECT g.source_ref, d.git_credentials FROM goal g JOIN domain d ON d.id=g.domain_id WHERE g.id=?`, goalID).
 		Scan(&ref, &token)
 	if err != nil || ref == "" {
-		return // no domain or not issue-sourced
+		return issueTarget{}, false // no domain or not issue-sourced
 	}
 	provider, repo, number, ok := ParseSourceRef(ref)
 	if !ok {
-		return
+		return issueTarget{}, false
 	}
 	client, err := c.newProvider(provider, token)
 	if err != nil {
+		return issueTarget{}, false
+	}
+	return issueTarget{client: client, provider: provider, repo: repo, number: number}, true
+}
+
+// OnDelivered is the bus handler for goal:delivered. commits ("<full sha>
+// <title>", structured from the deliver — never parsed from the note text)
+// become clickable fix links, the way an open-source maintainer closes an
+// issue.
+func (c *Closer) OnDelivered(ctx context.Context, goalID, note string, commits []string) {
+	t, ok := c.resolveIssueTarget(ctx, goalID)
+	if !ok {
 		return
 	}
-	if err := client.CloseIssue(ctx, repo, number); err != nil {
+	if err := t.client.CloseIssue(ctx, t.repo, t.number); err != nil {
 		// Closing is best-effort: the work IS delivered; the issue closing can
 		// be retried by hand. Log only — never fail the deliver.
-		fmt.Printf("issue: close %s:%s#%d: %v\n", provider, repo, number, err)
+		fmt.Printf("issue: close %s:%s#%d: %v\n", t.provider, t.repo, t.number, err)
 		return
 	}
 	comment := fmt.Sprintf("✅ 已由 agentwork 修复并合入（goal %s）。", short(goalID))
@@ -319,10 +342,57 @@ func (c *Closer) OnDelivered(ctx context.Context, goalID, note string, commits [
 		if len(line) >= 40 && isHexSHA(line[:40]) {
 			sha := line[:40]
 			title, _, _ := strings.Cut(strings.TrimSpace(line[40:]), "\n")
-			comment += fmt.Sprintf("\n- [%s %s](%s)", sha[:8], title, client.CommitURL(repo, sha))
+			comment += fmt.Sprintf("\n- [%s %s](%s)", sha[:8], title, t.client.CommitURL(t.repo, sha))
 		}
 	}
-	_ = client.CreateComment(ctx, repo, number, comment)
+	_ = t.client.CreateComment(ctx, t.repo, t.number, comment)
+}
+
+// OnTerminal is the bus handler for goal:finished status=failed where the
+// failing run actually ran an agent session (agent_ran=true). Unlike
+// OnDelivered it does NOT close the issue — the work was not delivered, so
+// the issue stays open for the human. It posts the agent's own terminal
+// summary verbatim as the issue comment: the author hears from the agent
+// that tried, not a branded system notice (the bot account's display name is
+// the identity on the host, the way a developer replies on an issue). The
+// comment carries NO goal id / platform branding. summary is the agent's
+// result_summary from the run; an empty one is silently dropped (the caller
+// already gated on agent_ran, but a run that started yet produced no text
+// still has nothing worth saying).
+func (c *Closer) OnTerminal(ctx context.Context, goalID, summary string) {
+	agentSaid := strings.TrimSpace(summary)
+	if agentSaid == "" {
+		return
+	}
+	t, ok := c.resolveIssueTarget(ctx, goalID)
+	if !ok {
+		return
+	}
+	if err := t.client.CreateComment(ctx, t.repo, t.number, agentSaid); err != nil {
+		fmt.Printf("issue: terminal comment %s:%s#%d: %v\n", t.provider, t.repo, t.number, err)
+	}
+}
+
+// OnAgentQuestion is the bus handler for comment:agent_question: an agent
+// posted an --ask comment on the goal's feed, asking the human a question.
+// For an issue-sourced goal the question is mirrored onto the issue so the
+// author sees it where they live (the git host), not only inside agentwork.
+// The question is relayed verbatim — it is the agent's own words, the same as
+// a developer commenting "I need X to proceed" on an issue. No platform
+// branding, no goal id; the bot account's display name is the identity.
+// Non-issue goals no-op (resolveIssueTarget returns false).
+func (c *Closer) OnAgentQuestion(ctx context.Context, goalID, question string) {
+	q := strings.TrimSpace(question)
+	if q == "" {
+		return
+	}
+	t, ok := c.resolveIssueTarget(ctx, goalID)
+	if !ok {
+		return
+	}
+	if err := t.client.CreateComment(ctx, t.repo, t.number, q); err != nil {
+		fmt.Printf("issue: agent question %s:%s#%d: %v\n", t.provider, t.repo, t.number, err)
+	}
 }
 
 // isHexSHA reports whether s looks like a full git sha.
