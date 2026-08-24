@@ -84,6 +84,9 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, string(envJSON), string(mcpJSON), skillsJSON, a.MaxConcurrent, a.CreatedAt)
 	if err != nil {
+		if ve := dupNameError(err, a.Name); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("insert agent: %w", err)
 	}
 	// Notify the daemon that an agent exists (it rebuilds per-agent workers on
@@ -112,9 +115,26 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 	if _, err := s.st.DB().ExecContext(ctx,
 		`UPDATE agent SET name=?, description=?, system_prompt=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
 		a.Name, a.Description, a.SystemPrompt, a.MaxConcurrent, string(envJSON), string(mcpJSON), string(skillsJSON), id); err != nil {
+		if ve := dupNameError(err, a.Name); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("update agent: %w", err)
 	}
 	return s.Get(ctx, id)
+}
+
+// dupNameError returns a 400 validation error ("agent %q already exists")
+// when err is a SQLite UNIQUE-name conflict, or nil otherwise. Identified by
+// the driver's extended error code SQLITE_CONSTRAINT_UNIQUE (2067) via
+// errors.As — precise (excludes NOT NULL / FK / other constraints) and
+// driver-typed. Callers return it directly on hit, else wrap the original
+// err for a 500.
+func dupNameError(err error, name string) error {
+	var se interface{ Code() int }
+	if errors.As(err, &se) && se.Code() == 2067 {
+		return NewValidationError(fmt.Sprintf("agent %q already exists", name))
+	}
+	return nil
 }
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
