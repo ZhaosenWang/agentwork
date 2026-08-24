@@ -206,4 +206,33 @@ func (d *Daemon) onGoalFinished(_ context.Context, e events.Event) {
 		logging.Infof("daemon: goal cancelled — stopping run %s", id)
 		d.cancelRun(id, "stopped")
 	}
+	// Cleanup the goal's feat branch (决策 7-4): cancelled is terminal — no
+	// cancelled→active transition — so the branch is garbage. The goal title
+	// and domain git config are loaded for the cleanup logs and the remote
+	// delete. A scratch domain (git_url="") has no branch to clean; a missing
+	// domain row (deleted first) is a no-op.
+	go d.cleanupCancelledGoalBranches(goalID)
+}
+
+// cleanupCancelledGoalBranches loads a cancelled goal's domain git config and
+// hands off to cleanupGoalBranches. Run in its own goroutine so the event
+// handler returns immediately — git ops (fetch/lock/delete) can take seconds.
+// Acquires the per-domain lock itself: this goroutine is NOT inside a
+// deliverGoal section, so cleanupGoalBranches (which no longer locks — 决策
+// 7-4 LOCK CONTRACT) relies on the caller here.
+func (d *Daemon) cleanupCancelledGoalBranches(goalID string) {
+	ctx := d.ctx
+	var goalTitle, domainID, gitURL, gitCredentials string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT g.title, d.id, d.git_url, d.git_credentials FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
+		Scan(&goalTitle, &domainID, &gitURL, &gitCredentials)
+	if err != nil {
+		// Goal row gone (deleted concurrently) or domain missing — nothing to
+		// clean. Not an error worth surfacing.
+		logging.Infof("git: cleanup cancelled %s: load domain: %v", goalID, err)
+		return
+	}
+	unlock := d.lockDomain(domainID)
+	defer unlock()
+	d.cleanupGoalBranches(ctx, goalID, goalTitle, domainID, gitURL, gitCredentials)
 }

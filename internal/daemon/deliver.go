@@ -3,7 +3,9 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -193,7 +195,12 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 		// approval IS the outcome — closing done is correct, not a failure.
 		// (A real task that produced nothing surfaces through verification
 		// and the human's own review of the evidence before approving.)
+		// 决策 7-4: this is still a deliver-SUCCESS outcome, so the (possibly
+		// empty) feat branch is garbage — clean it before finishing, same as
+		// the merged and already-merged paths. cleanupGoalBranches tolerates
+		// a missing local/remote ref (the zero-commit case often has none).
 		logging.Infof("daemon: deliver %q (%s): branch has no commits — approving as-is", goalTitle, goalID)
+		d.cleanupGoalBranches(ctx, goalID, goalTitle, domainID, gitURL, gitCredentials)
 		d.finishDeliver(ctx, goalID, true, "no changes to deliver — approved as-is")
 		return
 	}
@@ -201,8 +208,17 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	// Idempotency: already merged (crash between merge and push)?
 	if _, err := gitRunCtx(ctx, repo, "merge-base", "--is-ancestor", branchName, "origin/"+defaultBranch); err == nil {
 		// Branch already in origin/default — nothing to merge; the push is a
-		// no-op and MarkDelivered closes.
+		// no-op and MarkDelivered closes. This is a deliver-SUCCESS outcome
+		// (the code IS on default; the resume just detected the no-op), so
+		// 决策 7-4 applies the same as the normal success path: delete the
+		// now-disposable feat branch before finishing. The original code
+		// returned here WITHOUT cleanup, leaking feat-<id> on both local and
+		// remote for every goal resumed through this path (实测: goal
+		// 25d31d96, feat branch survived on both sides after the resume).
+		// Runs inside deliverGoal's held domain lock; cleanupGoalBranches
+		// does not re-lock (决策 7-4 LOCK CONTRACT) — no deadlock.
 		logging.Infof("daemon: deliver %q (%s): branch already merged (resume after crash?)", goalTitle, goalID)
+		d.cleanupGoalBranches(ctx, goalID, goalTitle, domainID, gitURL, gitCredentials)
 		d.finishDeliver(ctx, goalID, true, "already merged; nothing to push")
 		return
 	}
@@ -285,11 +301,13 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	}
 	logging.Infof("git: deliver %q (%s): push done (%s)", goalTitle, goalID, time.Since(start).Round(time.Second))
 
-	// Cleanup: the 中转 branch on the remote (machine-executed goals push
-	// agentwork/<branch>) is disposable once merged — best-effort delete.
-	if out, derr := exec.CommandContext(ctx, "git", "-C", repo, "push", "origin", ":refs/heads/agentwork/"+branchName).CombinedOutput(); derr != nil {
-		logging.Infof("git: deliver %q (%s): cleanup remote branch agentwork/%s: %v %s", goalTitle, goalID, branchName, derr, strings.TrimSpace(string(out)))
-	}
+	// Cleanup (决策 7-4): the goal's feat branch is disposable once merged —
+	// delete both the remote 中转 ref (agentwork/<branch>, machine-executed
+	// goals) and the local feat-<id> ref. Best-effort + fault-tolerant inside
+	// cleanupGoalBranches. The domain git creds (loaded at the top of
+	// deliverGoal) are passed so the remote delete can authenticate, though
+	// the bare repo's origin config already carries them.
+	d.cleanupGoalBranches(ctx, goalID, goalTitle, domainID, gitURL, gitCredentials)
 
 	// The delivered note carries the merge info; the fix commits travel
 	// STRUCTURED to the delivered event (the close comment links them).
@@ -318,4 +336,67 @@ func gitRunCtx(ctx context.Context, dir string, args ...string) (string, error) 
 		return strings.TrimSpace(out), fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// cleanupGoalBranches removes a goal's feat branch at every terminal path
+// EXCEPT deliver failure (决策 7-4). The branch is goalID-derived
+// (goalBranchName) and shared by every run of the goal, so it must survive a
+// failed deliver — reject→active→new run continues from the branch HEAD
+// (§7:294, 决策 7-2); deleting it would discard the agent's committed work.
+// It is garbage on three other terminal paths:
+//   - deliver SUCCESS (merged into default, branch disposable)
+//   - goal CANCEL (cancelled is terminal — no cancelled→active transition)
+//   - goal DELETE (the row is gone)
+//
+// Both refs are best-effort + fault-tolerant: a missing ref or a failed
+// delete logs and moves on (the same posture as the inline delete it
+// replaces). gitCredentials is needed because the remote delete pushes, and
+// the bare repo's origin config already carries the credentialed URL from
+// ensureSharedRepo — but passing it keeps the helper self-contained when the
+// repo was set up by an earlier process.
+//
+// LOCK CONTRACT (决策 7-4 补充, 2026-08): this function does NOT acquire the
+// per-domain git lock. The callers split into two lock states: the THREE
+// deliver-success call sites inside deliverGoal (already-merged resume,
+// no-changes-as-is, and the normal merged-then-pushed path) all run INSIDE
+// deliverGoal's already-held lockDomain section, while the cancel and delete
+// paths run in their own goroutines WITHOUT it. lockDomain uses a
+// non-reentrant sync.Mutex, so re-locking from any deliver path
+// self-deadlocks (the live goal 25d31d96 stalled exactly here on the normal
+// success path: push succeeded, then the goroutine blocked forever waiting
+// for a lock it already held, finishDeliver never ran, goal stuck in review
+// with code already on main). The lock is the CALLER's responsibility: the
+// deliver paths hold it (no extra acquire), cancel/delete acquire it before
+// calling.
+func (d *Daemon) cleanupGoalBranches(ctx context.Context, goalID, goalTitle, domainID, gitURL, gitCredentials string) {
+	branchName := goalBranchName(goalID)
+	repo := domainRepoPath(domainID)
+	if _, err := os.Stat(filepath.Join(repo, "HEAD")); err != nil {
+		// No bare repo on disk (scratch domain, or the domain was never
+		// used) — nothing to clean. Not an error.
+		return
+	}
+	// No lockDomain here — see the LOCK CONTRACT above. The caller serializes
+	// against concurrent fetch/deliver (决策 2-10); the two ref deletes below
+	// are immediate and need no extra protection.
+
+	// Remote 中转 ref: agentwork/feat-<id> (machine-executed goals push here,
+	// 决策 6-25). Deleted by pushing an empty ref. Missing is the common case
+	// for daemon-executed goals (they never publish a transfer ref) — git
+	// returns an error, logged and ignored.
+	if out, err := exec.CommandContext(ctx, "git", "-C", repo, "push", "origin", ":refs/heads/agentwork/"+branchName).CombinedOutput(); err != nil {
+		logging.Infof("git: cleanup %q (%s): remote agentwork/%s: %v %s", goalTitle, goalID, branchName, err, strings.TrimSpace(string(out)))
+	} else {
+		logging.Infof("git: cleanup %q (%s): deleted remote agentwork/%s", goalTitle, goalID, branchName)
+	}
+	// Local feat-<id> ref. -D forces the delete (the branch may have unmerged
+	// commits relative to default — that is expected: a cancelled goal's WIP
+	// is being discarded by the terminal transition, not preserved). Missing
+	// is normal for machine-executed goals (no local branch, only the remote
+	// transfer ref was adopted at deliver time).
+	if out, err := gitRun(ctx, repo, "branch", "-D", branchName); err != nil {
+		logging.Infof("git: cleanup %q (%s): local %s: %v %s", goalTitle, goalID, branchName, err, strings.TrimSpace(out))
+	} else {
+		logging.Infof("git: cleanup %q (%s): deleted local %s", goalTitle, goalID, branchName)
+	}
 }

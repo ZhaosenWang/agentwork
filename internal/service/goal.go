@@ -751,10 +751,14 @@ func (s *GoalService) Cancel(ctx context.Context, goalID string) (*Goal, error) 
 // whose rows no longer exist. The domain identity ALSO travels: a scratch
 // goal's persistent project directory must be removed with the row.
 func (s *GoalService) Delete(ctx context.Context, goalID string) error {
-	var domainType, domainName string
+	// Load the goal title + domain identity BEFORE the cascade deletes the
+	// rows. The deleted event carries these so the daemon can clean the goal's
+	// git branch (决策 7-4) and scratch dir — by the time the handler runs the
+	// rows are gone. git_url/git_credentials feed the remote branch delete.
+	var goalTitle, domainID, domainType, domainName, gitURL, gitCredentials string
 	_ = s.st.DB().QueryRowContext(ctx,
-		`SELECT COALESCE(d.type,''), COALESCE(d.name,'') FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
-		Scan(&domainType, &domainName)
+		`SELECT g.title, d.id, COALESCE(d.type,''), COALESCE(d.name,''), COALESCE(d.git_url,''), COALESCE(d.git_credentials,'') FROM goal g JOIN domain d ON d.id = g.domain_id WHERE g.id=?`, goalID).
+		Scan(&goalTitle, &domainID, &domainType, &domainName, &gitURL, &gitCredentials)
 	runningRows, err := s.st.DB().QueryContext(ctx,
 		`SELECT id FROM run WHERE goal_id=? AND status='running'`, goalID)
 	if err != nil {
@@ -805,7 +809,9 @@ func (s *GoalService) Delete(ctx context.Context, goalID string) error {
 	}
 	s.bus.Publish(ctx, events.Event{Topic: "goal:deleted", Payload: map[string]any{
 		"goal_id": goalID, "run_ids": runningRunIDs,
-		"domain_type": domainType, "domain_name": domainName,
+		"goal_title": goalTitle,
+		"domain_id": domainID, "domain_type": domainType, "domain_name": domainName,
+		"git_url": gitURL, "git_credentials": gitCredentials,
 	}})
 	return nil
 }

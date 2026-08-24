@@ -718,17 +718,31 @@ func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
 		logging.Infof("daemon: goal deleted — stopping run %s", id)
 		d.cancelRun(id, "stopped")
 	}
+	goalID, _ := m["goal_id"].(string)
 	// A scratch goal's persistent project directory dies with the row (the
 	// domain identity travels in the payload — the rows are already gone).
 	if t, _ := m["domain_type"].(string); t == "scratch" {
-		if name, _ := m["domain_name"].(string); name != "" {
-			if goalID, _ := m["goal_id"].(string); goalID != "" {
-				dir := service.ScratchGoalDir(name, goalID)
-				if err := os.RemoveAll(dir); err != nil {
-					logging.Infof("daemon: remove scratch goal dir %s: %v", dir, err)
-				}
+		if name, _ := m["domain_name"].(string); name != "" && goalID != "" {
+			dir := service.ScratchGoalDir(name, goalID)
+			if err := os.RemoveAll(dir); err != nil {
+				logging.Infof("daemon: remove scratch goal dir %s: %v", dir, err)
 			}
 		}
+	}
+	// Cleanup the goal's feat branch (决策 7-4): the row is gone, the branch
+	// is garbage. The domain git config travels in the payload (the rows are
+	// gone by the time the handler runs). Best-effort: a missing repo dir or a
+	// failed delete logs and moves on. The per-domain lock is acquired here —
+	// this handler is NOT inside a deliverGoal section, and cleanupGoalBranches
+	// no longer locks itself (决策 7-4 LOCK CONTRACT).
+	domainID, _ := m["domain_id"].(string)
+	if domainID != "" && goalID != "" {
+		goalTitle, _ := m["goal_title"].(string)
+		gitURL, _ := m["git_url"].(string)
+		gitCredentials, _ := m["git_credentials"].(string)
+		unlock := d.lockDomain(domainID)
+		defer unlock()
+		d.cleanupGoalBranches(d.ctx, goalID, goalTitle, domainID, gitURL, gitCredentials)
 	}
 }
 
