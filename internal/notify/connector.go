@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -50,6 +51,25 @@ type QRInfo struct {
 	ExpiresAt int64  `json:"expires_at"` // unix seconds
 }
 
+// Registration-loop tuning. The SDK's RegisterApp is a one-shot blocking call
+// that issues ONE QR (OnQRCode, once) and returns ExpiredError when that QR's
+// ExpireIn window lapses — it never refreshes on its own, and begin/poll are
+// package-private so the loop can't be reassembled outside the SDK. To keep
+// the owner in waiting_qr without a manual "重新连接" click, the connector
+// loops RegisterApp: each round owns a fresh regCtx (registrationTimeout),
+// and within a round each ticket (QR) is cancelled ticketMargin before its
+// real expiry so a new QR is issued while the old one is still valid. After
+// maxRegRounds (~30 min) of no scan, the flow gives up → failed.
+const (
+	registrationTimeout = 10 * time.Minute // single round's regCtx
+	ticketMargin        = 30 * time.Second // cancel a QR this long before its real expiry
+	maxRegRounds        = 3                // total rounds before giving up (~30 min)
+	// defaultQRExpireIn matches the SDK's normalizedExpireIn default (600s)
+	// — used for the FIRST ticket of a round, before OnQRCode has fired with
+	// the observed value. The round's regCtx bounds it regardless.
+	defaultQRExpireIn = 600
+)
+
 // FeishuConfig is the persisted connection state (app_settings key
 // "im.feishu").
 type FeishuConfig struct {
@@ -85,14 +105,21 @@ type Connector struct {
 	connectID string
 	config    FeishuConfig
 
-	store     SettingsStore
-	bus       *events.Bus
-	qs        QueryStore               // M3: card evidence + digest queries (may be nil)
-	goalSvc   *service.GoalService     // M3: approval-card callbacks resolve here
+	// lastQRExpireIn is the ExpireIn the SDK reported via the most recent
+	// OnQRCode callback. The registration loop reads it to compute the next
+	// ticket's preemption deadline (real ExpireIn − ticketMargin) instead of
+	// guessing the SDK default. 0 until the first QR of a round fires.
+	lastQRExpireIn int
+
+	store      SettingsStore
+	bus        *events.Bus
+	qs         QueryStore              // M3: card evidence + digest queries (may be nil)
+	goalSvc    *service.GoalService    // M3: approval-card callbacks resolve here
 	commentSvc *service.CommentService // 决策 7-3: ask-card reply form posts the human's reply here
-	intakeSvc *IntakeService           // M3: inbound message pipeline (may be nil)
-	notify    *Notifier            // milestone pusher, armed once connected
-	stop      context.CancelFunc
+	intakeSvc  *IntakeService          // M3: inbound message pipeline (may be nil)
+	notify     *Notifier               // milestone pusher, armed once connected
+	stop       context.CancelFunc
+	regCancel  context.CancelFunc // registration-loop canceller (stops the QR loop on Disconnect)
 }
 
 // NewConnector creates the connection manager. store persists the Feishu
@@ -138,8 +165,10 @@ func (c *Connector) Status() map[string]any {
 // ── Registration flow (Web-driven) ──
 
 // StartRegistration issues the QR code for the SDK one-click app
-// registration. The flow runs in a goroutine (blocking until scan or the
-// 10-minute timeout); the frontend polls Status() while it completes.
+// registration. The flow runs in a goroutine that loops RegisterApp: each QR
+// is refreshed ticketMargin before its real expiry, so the owner stays in
+// waiting_qr without a manual "重新连接" click; after maxRegRounds (~30 min)
+// of no scan it gives up → failed. The frontend polls Status() while it runs.
 func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, error) {
 	c.mu.Lock()
 	if c.status == StatusConnected {
@@ -155,88 +184,220 @@ func (c *Connector) StartRegistration(ctx context.Context) (string, QRInfo, erro
 	c.connectID = uuid.NewString()
 	c.mu.Unlock()
 
-	regCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
-	go func() {
+	// The registration loop owns its own canceller (per-round regCtx is
+	// created inside it). ctx here is the handler's context.Background() and
+	// never expires; the loop's lifetime is bounded by maxRegRounds, and
+	// Disconnect cancels it via c.regCancel.
+	loopCtx, cancel := context.WithCancel(ctx)
+	c.mu.Lock()
+	c.regCancel = cancel
+	c.mu.Unlock()
+	go c.runRegistrationLoop(loopCtx)
+	return c.connectID, c.qr, nil
+}
+
+// registrationOptions builds the SDK options for one RegisterApp call. The
+// preset/addons are identical across tickets; only OnQRCode (which caches the
+// fresh QR) fires per call.
+func (c *Connector) registrationOptions() *registration.Options {
+	return &registration.Options{
+		AppPreset: &registration.AppPreset{
+			Name: "agentwork-bot",
+			Desc: "agentwork butler: your AI workflow steward — work goes to me, checkpoints come to you",
+		},
+		Addons: &registration.AppAddons{
+			Scopes: registration.AppAddonsScopes{
+				Tenant: []string{"im:message", "im:message:send_as_bot"},
+			},
+			Events: registration.AppAddonsEvents{
+				Items: registration.AppAddonsEventItems{
+					// im.message.receive_v1: inbound messages (M1 receive
+					// target capture; M3 inbound task creation).
+					// card.action.trigger: approval-card button callbacks
+					// (M3) — the long connection is the event channel, no
+					// public callback URL.
+					Tenant: []string{"im.message.receive_v1", "card.action.trigger"},
+				},
+			},
+		},
+		OnQRCode: func(info *registration.QRCodeInfo) {
+			c.cacheQR(info)
+		},
+	}
+}
+
+// runRegistrationLoop drives the multi-round QR refresh. The SDK's
+// RegisterApp is one-shot: it issues a single QR (OnQRCode once) and returns
+// ExpiredError when that QR lapses. To keep waiting_qr alive the loop calls
+// RegisterApp again — each call issues a fresh QR, which the frontend picks
+// up on its 3s poll. A ticket is cancelled ticketMargin before its real
+// expiry (the SDK's ExpireIn) so the next QR is issued while the previous is
+// still scannable; when a round's regCtx lapses, a new round starts, up to
+// maxRegRounds.
+func (c *Connector) runRegistrationLoop(parent context.Context) {
+	c.mu.Lock()
+	cancel := c.regCancel
+	c.mu.Unlock()
+	if cancel != nil {
 		defer cancel()
-		result, err := registration.RegisterApp(regCtx, &registration.Options{
-			AppPreset: &registration.AppPreset{
-				Name: "agentwork-bot",
-				Desc: "agentwork butler: your AI workflow steward — work goes to me, checkpoints come to you",
-			},
-			Addons: &registration.AppAddons{
-				Scopes: registration.AppAddonsScopes{
-					Tenant: []string{"im:message", "im:message:send_as_bot"},
-				},
-				Events: registration.AppAddonsEvents{
-					Items: registration.AppAddonsEventItems{
-						// im.message.receive_v1: inbound messages (M1 receive
-						// target capture; M3 inbound task creation).
-						// card.action.trigger: approval-card button callbacks
-						// (M3) — the long connection is the event channel, no
-						// public callback URL.
-						Tenant: []string{"im.message.receive_v1", "card.action.trigger"},
-					},
-				},
-			},
-			OnQRCode: func(info *registration.QRCodeInfo) {
-				c.cacheQR(info)
-			},
-		})
-		if err != nil {
+	}
+
+	opts := c.registrationOptions
+	for round := 1; round <= maxRegRounds; round++ {
+		// A round's regCtx bounds one 10-min window. If the owner never
+		// scans, the round lapses and the outer loop starts the next — up to
+		// maxRegRounds total.
+		roundCtx, roundCancel := context.WithTimeout(parent, registrationTimeout)
+		scanned := false
+		for {
+			// Don't issue a ticket if the round (or parent) is already done —
+			// a clamped previous ticket can leave only seconds, and a fresh
+			// RegisterApp call there is wasted work (it would fail with
+			// DeadlineExceeded and re-enter this check anyway).
+			if roundCtx.Err() != nil || parent.Err() != nil {
+				break
+			}
+			// lastQRExpireIn is set by cacheQR's OnQRCode callback during the
+			// previous ticket. The first ticket of a round has no observation
+			// yet (0) — ticketDuration falls back to the SDK default.
+			c.mu.Lock()
+			observedExpireIn := c.lastQRExpireIn
+			c.mu.Unlock()
+			ticketCtx, ticketCancel := context.WithTimeout(roundCtx,
+				ticketDuration(observedExpireIn, roundCtx))
+			result, err := registration.RegisterApp(ticketCtx, opts())
+			ticketCancel()
+
+			if err == nil {
+				c.handleRegistrationSuccess(result)
+				scanned = true
+				break
+			}
+			var expiredErr *registration.ExpiredError
+			if errors.As(err, &expiredErr) || errors.Is(err, context.DeadlineExceeded) {
+				// QR expired, or the ticket was cancelled ticketMargin before
+				// its real expiry to refresh — the expected "swap the QR"
+				// path. Continue to the next ticket unless the round (or
+				// parent) is done.
+				if roundCtx.Err() != nil || parent.Err() != nil {
+					break
+				}
+				logging.Infof("notify: feishu QR refreshed (round %d/%d)", round, maxRegRounds)
+				continue
+			}
+			// A real failure (access_denied, network, etc.) — not an
+			// expiry. Surface it and stop.
 			c.mu.Lock()
 			c.status = StatusFailed
 			c.lastErr = "registration: " + err.Error()
 			c.mu.Unlock()
 			logging.Errorf("notify: feishu registration failed: %v", err)
+			roundCancel()
 			return
 		}
+		roundCancel()
+		if scanned {
+			return
+		}
+		// Between rounds: if the owner navigated away or Disconnect'd, the
+		// status is no longer waiting_qr — stop refreshing.
 		c.mu.Lock()
-		c.config.AppID = result.ClientID
-		c.config.AppSecret = result.ClientSecret
+		stillWaiting := c.status == StatusWaitingQR
+		c.mu.Unlock()
+		if !stillWaiting || parent.Err() != nil {
+			return
+		}
+		if round < maxRegRounds {
+			logging.Infof("notify: feishu round %d/%d elapsed — starting next round", round, maxRegRounds)
+		}
+	}
+	// Exhausted all rounds without a scan.
+	c.mu.Lock()
+	if c.status == StatusWaitingQR {
+		c.status = StatusFailed
+		c.lastErr = "registration: 扫码超时，请重新发起连接"
+	}
+	c.mu.Unlock()
+	logging.Infof("notify: feishu registration timed out after %d rounds", maxRegRounds)
+}
+
+// ticketDuration picks the next ticket's lifetime: the QR's ExpireIn minus
+// ticketMargin (so RegisterApp is cancelled and a fresh QR issued WHILE the
+// old one is still scannable), clamped to the round's remaining budget. The
+// first ticket of a round has no observed ExpireIn yet — use the SDK default
+// (600s); the round's regCtx still bounds it.
+func ticketDuration(observedExpireIn int, roundCtx context.Context) time.Duration {
+	expireIn := observedExpireIn
+	if expireIn <= 0 {
+		expireIn = defaultQRExpireIn
+	}
+	d := time.Duration(expireIn)*time.Second - ticketMargin
+	if d <= 0 {
+		d = time.Duration(expireIn) * time.Second
+	}
+	if deadline, ok := roundCtx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 && remaining < d {
+			d = remaining
+		}
+	}
+	if d <= 0 {
+		d = time.Second
+	}
+	return d
+}
+
+// handleRegistrationSuccess applies a successful RegisterApp result: store
+// the credentials, resolve the owner (the scan IS the authorization — the
+// app's owner is whoever scanned), persist, and start the long connection on
+// a background context (NEVER the registration context — a cancelled regCtx
+// would kill the WS and its auto-reconnect minutes after the scan, the M4
+// regression where the UI kept showing "connected" while messages died).
+func (c *Connector) handleRegistrationSuccess(result *registration.RegisterAppResult) {
+	c.mu.Lock()
+	c.config.AppID = result.ClientID
+	c.config.AppSecret = result.ClientSecret
+	c.status = StatusWaitingMessage
+	c.mu.Unlock()
+	// Resolve the push target from the AUTHORIZATION itself: the app's
+	// owner is whoever scanned the QR, and GetApplication returns their
+	// open_id. No "send a message" step — scanning IS the connection.
+	// (If the owner lookup fails, fall back to waiting_message: the first
+	// bot message then captures the target instead.)
+	ownerOpenID, ownerErr := resolveOwnerOpenID(result.ClientID, result.ClientSecret)
+	c.mu.Lock()
+	if ownerErr == nil {
+		// The owner is the platform's single user (M3 authority). The
+		// receive target can still be re-captured as a chat by the first
+		// inbound message — the owner identity is kept separate.
+		c.config.OwnerOpenID = ownerOpenID
+		c.config.ReceiveID = ownerOpenID
+		c.config.ReceiveType = "open_id"
+		c.status = StatusConnected
+	} else {
 		c.status = StatusWaitingMessage
-		c.mu.Unlock()
-		// Resolve the push target from the AUTHORIZATION itself: the app's
-		// owner is whoever scanned the QR, and GetApplication returns their
-		// open_id. No "send a message" step — scanning IS the connection.
-		// (If the owner lookup fails, fall back to waiting_message: the first
-		// bot message then captures the target instead.)
-		ownerOpenID, ownerErr := resolveOwnerOpenID(result.ClientID, result.ClientSecret)
-		c.mu.Lock()
-		if ownerErr == nil {
-			// The owner is the platform's single user (M3 authority). The
-			// receive target can still be re-captured as a chat by the first
-			// inbound message — the owner identity is kept separate.
-			c.config.OwnerOpenID = ownerOpenID
-			c.config.ReceiveID = ownerOpenID
-			c.config.ReceiveType = "open_id"
-			c.status = StatusConnected
-		} else {
-			c.status = StatusWaitingMessage
+	}
+	cfg := c.config
+	c.mu.Unlock()
+	// Persist the credentials IMMEDIATELY — a daemon restart before the
+	// receive target is known must not lose the app (previously
+	// credentials only landed on captureReceive).
+	if raw, err := json.Marshal(cfg); err == nil {
+		if err := c.store.Set(context.Background(), settingsKey, string(raw)); err != nil {
+			logging.Errorf("notify: persist feishu app credentials: %v", err)
 		}
-		cfg := c.config
-		c.mu.Unlock()
-		// Persist the credentials IMMEDIATELY — a daemon restart before the
-		// receive target is known must not lose the app (previously
-		// credentials only landed on captureReceive).
-		if raw, err := json.Marshal(cfg); err == nil {
-			if err := c.store.Set(context.Background(), settingsKey, string(raw)); err != nil {
-				logging.Errorf("notify: persist feishu app credentials: %v", err)
-			}
-		}
-		if ownerErr != nil {
-			logging.Infof("notify: feishu app created (%s), owner lookup failed (%v) — waiting for first message", result.ClientID, ownerErr)
-		} else {
-			logging.Infof("notify: feishu connected to app owner %s", ownerOpenID)
-		}
-		// The long connection must NOT ride on regCtx: that context carries a
-		// 10-minute registration timeout, and a cancelled context kills the
-		// WS (and its auto-reconnect) 10 minutes after the scan — the
-		// connection silently died and the UI kept showing "connected"
-		// (regression found in M4). A background context keeps the
-		// connection alive; Disconnect stops it via c.stop.
-		c.connectWithCurrent(context.Background())
-	}()
-	return c.connectID, c.qr, nil
+	}
+	if ownerErr != nil {
+		logging.Infof("notify: feishu app created (%s), owner lookup failed (%v) — waiting for first message", result.ClientID, ownerErr)
+	} else {
+		logging.Infof("notify: feishu connected to app owner %s", ownerOpenID)
+	}
+	// The long connection must NOT ride on regCtx: that context carries a
+	// 10-minute registration timeout, and a cancelled context kills the
+	// WS (and its auto-reconnect) 10 minutes after the scan — the
+	// connection silently died and the UI kept showing "connected"
+	// (regression found in M4). A background context keeps the
+	// connection alive; Disconnect stops it via c.stop.
+	c.connectWithCurrent(context.Background())
 }
 
 func (c *Connector) cacheQR(info *registration.QRCodeInfo) {
@@ -251,6 +412,7 @@ func (c *Connector) cacheQR(info *registration.QRCodeInfo) {
 		ImgBase64: base64.StdEncoding.EncodeToString(png),
 		ExpiresAt: time.Now().Unix() + int64(info.ExpireIn),
 	}
+	c.lastQRExpireIn = int(info.ExpireIn)
 	c.mu.Unlock()
 }
 
@@ -681,6 +843,10 @@ func (c *Connector) Disconnect(ctx context.Context) error {
 	c.mu.Lock()
 	if c.stop != nil {
 		c.stop()
+	}
+	if c.regCancel != nil {
+		c.regCancel() // stop any in-flight registration loop (QR refresh)
+		c.regCancel = nil
 	}
 	c.status = StatusIdle
 	c.config = FeishuConfig{}
