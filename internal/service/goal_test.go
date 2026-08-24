@@ -274,6 +274,83 @@ func TestReopenFailedGoal(t *testing.T) {
 	}
 }
 
+// TestReopenClearsStaleGateDecision: a done goal reached review, was approved
+// (a gate_decision row), and delivered to done. Reopening it for a new cycle
+// MUST delete that superseded approve — otherwise three readers treat the goal
+// as "already approved" of the OLD cycle: ResolveReview's duplicate-decision
+// guard (the human re-clicks the stale card whose button carries the old
+// evidence run_id, so lastRunID==runID holds → "already approved"),
+// maybeFireReviewReady's `decided>0` gate (suppresses the new cycle's
+// review-window-ready, so the card never patches), and deliver's latest-row
+// lookup. This is the live regression behind goal 009aa8159a242edb.
+func TestReopenClearsStaleGateDecision(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomain(t, st)
+
+	g, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Simulate the first review cycle: goal parked in review, the human
+	// approved (a gate_decision row with the old evidence run_id), then the
+	// goal delivered to done. We model the cycle's end state directly — the
+	// gate_decision row is what matters, not how it got there.
+	oldRunID := "run-oldcycle-evidence"
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='review' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO gate_decision (id,goal_id,run_id,gate_rule,decision,reason,decided_by,decided_at,review_duration) VALUES (?,?,?,?,?,?,?,?,0)`,
+		"gd-1", g.ID, oldRunID, "diff_contains", "approve", "", "human", now()); err != nil {
+		t.Fatalf("seed gate_decision: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='done' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen for a new cycle.
+	if _, err := gs.Reopen(ctx, g.ID, "下一轮", ""); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+
+	// The superseded approve MUST be gone — no row for this goal at all.
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM gate_decision WHERE goal_id=?`, g.ID).Scan(&n); err != nil {
+		t.Fatalf("count gate_decision: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("reopen must clear the prior cycle's gate_decision rows, got %d", n)
+	}
+
+	// The new cycle's approve must not be rejected as "already approved" —
+	// the guard finds no lastDecision, so the approve records cleanly. Put
+	// the goal back in review (the new cycle's park) and approve on the new
+	// evidence run.
+	newRunID := "run-newcycle-evidence"
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE goal SET status='review' WHERE id=?`, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gs.ResolveReview(ctx, g.ID, newRunID, "approve", ""); err != nil {
+		t.Fatalf("new cycle approve after reopen: %v", err)
+	}
+	// And the new approve is now the only row, on the new evidence run.
+	var gotRunID, gotDecision string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT run_id, decision FROM gate_decision WHERE goal_id=? ORDER BY decided_at DESC LIMIT 1`, g.ID).
+		Scan(&gotRunID, &gotDecision); err != nil {
+		t.Fatalf("read new gate_decision: %v", err)
+	}
+	if gotRunID != newRunID || gotDecision != "approve" {
+		t.Fatalf("new cycle approve did not record on the new evidence run, got run=%q decision=%q", gotRunID, gotDecision)
+	}
+}
+
 // TestClaimPerGoalSerialization: a queued run of a goal is NOT claimed while
 // another run of the same goal is running (the worktree is exclusive); it
 // becomes claimable once the running run finishes. Processor runs (no goal)

@@ -1739,6 +1739,25 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason, triggerComment
 		note, goalID); err != nil {
 		return nil, fmt.Errorf("reopen goal: %w", err)
 	}
+	// Clear the prior cycle's gate_decision rows. A done goal reached review,
+	// was approved (gate_decision), and delivered; a failed/cancelled goal may
+	// have parked in review with a recorded decision too. Those rows are
+	// SUPERSEDED by the reopen — the next review is a fresh cycle with a fresh
+	// evidence run, and leaving the old approve in place breaks three readers:
+	//   - ResolveReview's duplicate-decision guard (the lastDecision lookup)
+	//     would reject the new cycle's approve as "already approved" when the
+	//     human re-clicks the still-visible old card (whose button carries the
+	//     OLD evidence run_id, so lastRunID == runID holds).
+	//   - maybeFireReviewReady's `decided > 0` gate would suppress the second
+	//     cycle's review-window-ready notification, so the card never patches
+	//     to the new run and the human is stuck on the stale card.
+	//   - deliver's "latest gate_decision" lookup would read the stale approve.
+	// Deleting here (same as the full-goal Delete cascade at ~L788) makes the
+	// new cycle's gate_decision the only/latest row once the human decides.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM gate_decision WHERE goal_id=?`, goalID); err != nil {
+		return nil, fmt.Errorf("clear gate_decision on reopen: %w", err)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'reopened',?,?)`,
 		newID(), goalID, "human", "", "{}", now()); err != nil {
