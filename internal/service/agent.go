@@ -96,12 +96,24 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 	return &a, nil
 }
 
-// Update edits an agent's identity/persona (name, system_prompt,
-// max_concurrent, env). A changed system_prompt takes effect on the agent's
-// NEXT run — in-flight runs keep their snapshot.
+// Update edits an agent's mutable fields: name, description, runtime_id,
+// system_prompt, model, max_concurrent, env, mcp_servers, skills. A changed
+// system_prompt/runtime_id/model takes effect on the agent's NEXT run —
+// in-flight runs keep their snapshot.
 func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, error) {
 	if a.Name == "" {
 		return nil, NewValidationError("name is required")
+	}
+	if a.RuntimeID == "" {
+		return nil, NewValidationError("runtime_id is required")
+	}
+	// Verify the target runtime exists (FK guard) — same as Create.
+	var rtID string
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT id FROM runtime WHERE id=?`, a.RuntimeID).Scan(&rtID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("check runtime: %w", err)
 	}
 	if a.MaxConcurrent < 1 {
 		a.MaxConcurrent = 1
@@ -113,8 +125,8 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 	mcpJSON, _ := json.Marshal(a.McpServers)
 	skillsJSON, _ := json.Marshal(a.Skills)
 	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE agent SET name=?, description=?, system_prompt=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
-		a.Name, a.Description, a.SystemPrompt, a.MaxConcurrent, string(envJSON), string(mcpJSON), string(skillsJSON), id); err != nil {
+		`UPDATE agent SET name=?, description=?, runtime_id=?, system_prompt=?, model=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
+		a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, a.MaxConcurrent, string(envJSON), string(mcpJSON), string(skillsJSON), id); err != nil {
 		if ve := dupNameError(err, a.Name); ve != nil {
 			return nil, ve
 		}
