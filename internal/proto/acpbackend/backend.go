@@ -128,6 +128,22 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 		// goal layer can fold it into a child-summary / run-detail without
 		// requiring the daemon to replay the event stream. Collected by the
 		// eventForwarder during the turn.
+		// Zero-event guard: Prompt succeeding only proves the subprocess sent a
+		// success response for session/prompt, not that the agent did any work.
+		// Zero session/update notifications means the agent exited silently
+		// (e.g. a broken model config: the LLM call failed but it still
+		// returned a success response). Report failed rather than completed —
+		// otherwise the empty result is fabricated as work by commitAndPush
+		// and the goal wrongly advances to review.
+		if !fwd.hasEvents() {
+			_ = conn.Close()
+			results <- proto.Result{
+				Status:    proto.StatusFailed,
+				Output:    proto.AppendStderr("agent exited without responding (zero session/update notifications)", conn.Stderr),
+				SessionID: string(newResp.SessionID),
+			}
+			return
+		}
 		results <- proto.Result{Status: proto.StatusCompleted, Output: fwd.lastAssistantText(), SessionID: string(newResp.SessionID)}
 		fwd.close()
 	}()
@@ -150,12 +166,13 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 // (the old select-default push silently dropped events AND raced the
 // close — a real panic window).
 type eventForwarder struct {
-	events   chan<- proto.Event
-	mu       sync.Mutex
-	queue    []proto.Event
-	closed   bool
-	msg      strings.Builder
-	truncate int
+	events     chan<- proto.Event
+	mu         sync.Mutex
+	queue      []proto.Event
+	closed     bool
+	msg        strings.Builder
+	truncate   int
+	eventCount int // total events received this turn (monotonic, never reset by pump draining)
 }
 
 const assistantOutputCap = 8 * 1024 // keep Result.Output from growing unbounded
@@ -169,7 +186,20 @@ func (f *eventForwarder) push(e proto.Event) {
 		return
 	}
 	f.queue = append(f.queue, e)
+	f.eventCount++
 	f.mu.Unlock()
+}
+
+// hasEvents reports whether this turn received at least one session/update
+// notification. Used by the zero-event guard after Prompt returns nil: zero
+// events means the agent exited silently (e.g. a broken model config that
+// still returns a success response). Checked against the monotonic counter
+// rather than len(queue) — the pump drains queue, so an empty queue at
+// Prompt-return time does not imply no events ever flowed.
+func (f *eventForwarder) hasEvents() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.eventCount > 0
 }
 
 // close marks the forwarder closed; the pump drains the remaining queue and

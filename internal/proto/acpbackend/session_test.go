@@ -30,6 +30,13 @@ type fakeAgent struct {
 	// instead of racing an immediate response, which flaked under full-suite
 	// load).
 	hold chan struct{}
+	// silent, when set, makes OnPrompt return a success response WITHOUT
+	// calling SendAgentMessage — simulating an agent that acknowledges
+	// session/prompt but emits zero session/update notifications (e.g.
+	// OpenClaw with a broken model config: the LLM call failed but it still
+	// returned a success response). The zero-event guard must surface this
+	// as a failed turn, not a false completed.
+	silent bool
 }
 
 func (f *fakeAgent) OnInitialize(ctx context.Context, req acp.InitializeRequest) (*acp.InitializeResponse, error) {
@@ -66,6 +73,11 @@ func (f *fakeAgent) OnPrompt(ctx context.Context, req acp.PromptRequest, s acp.S
 	f.mu.Unlock()
 	if f.hold != nil {
 		<-f.hold
+	}
+	// silent: return success WITHOUT emitting any session/update notification
+	// — a broken agent that acknowledges the prompt but does no work.
+	if f.silent {
+		return &acp.PromptResponse{StopReason: "end_turn"}, nil
 	}
 	if err := s.SendAgentMessage("answer: " + textOf(req.Prompt)); err != nil {
 		return nil, err
@@ -142,6 +154,44 @@ func TestSessionBackendMultiPrompt(t *testing.T) {
 	f.mu.Unlock()
 	if n != 2 {
 		t.Fatalf("the fake agent must see BOTH prompts on one session, got %d", n)
+	}
+}
+
+// TestSessionBackendZeroEventsFails: a "silent" agent — one that returns a
+// success response for session/prompt WITHOUT emitting any session/update
+// notification — must surface as a FAILED turn, not a false completed. This is
+// the OpenClaw broken-config failure mode: the LLM call fails but the agent
+// still acknowledges the prompt. Without the zero-event guard the backend
+// would report StatusCompleted with an empty output, commitAndPush would
+// fabricate work, and the goal would wrongly advance to review.
+func TestSessionBackendZeroEventsFails(t *testing.T) {
+	f := &fakeAgent{silent: true}
+	s := openTestSession(t, f)
+	ctx := context.Background()
+
+	run, err := s.Prompt(ctx, "are you there?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := <-run.Result
+
+	if res.Status != proto.StatusFailed {
+		t.Fatalf("a silent prompt (zero session/update notifications) must report failed, got %v (err %v)", res.Status, res.Err)
+	}
+	if !strings.Contains(res.Output, "zero session/update notifications") {
+		t.Fatalf("output should explain the silent-exit failure, got: %s", res.Output)
+	}
+	if res.Output != "" && strings.TrimSpace(res.Output) == "answer: are you there?" {
+		t.Fatalf("a silent agent must not be reported as completed with the canned answer")
+	}
+
+	// The fake still saw the prompt (it acknowledged it) — only the work was
+	// absent. This distinguishes "silent exit" from "never reached the agent".
+	f.mu.Lock()
+	n := len(f.prompts)
+	f.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("the silent fake must still have seen the prompt, got %d", n)
 	}
 }
 
