@@ -160,6 +160,22 @@ func (s *session) Prompt(ctx context.Context, prompt string) (*proto.Run, error)
 			results <- proto.Result{Status: status, Output: proto.AppendStderr("prompt: "+err.Error(), s.conn.Stderr), Err: err, SessionID: s.sessionID}
 			return
 		}
+		// Zero-event guard: Prompt succeeding only proves the subprocess sent a
+		// success response for session/prompt, not that the agent did any work.
+		// Zero session/update notifications means the agent exited silently
+		// (e.g. a broken model config: the LLM call failed but it still
+		// returned a success response). Report failed rather than completed —
+		// otherwise the empty result is fabricated as work by commitAndPush
+		// and the goal wrongly advances to review.
+		if !fwd.hasEvents() {
+			_ = s.conn.Close()
+			results <- proto.Result{
+				Status:    proto.StatusFailed,
+				Output:    proto.AppendStderr("agent exited without responding (zero session/update notifications)", s.conn.Stderr),
+				SessionID: s.sessionID,
+			}
+			return
+		}
 		results <- proto.Result{Status: proto.StatusCompleted, Output: fwd.lastAssistantText(), SessionID: s.sessionID}
 	}()
 
