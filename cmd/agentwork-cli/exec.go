@@ -247,7 +247,12 @@ func (e *executor) execute(p link.RunDispatchParams) {
 		// platform judges the OUTCOME, not individual tool calls (live:
 		// an unhandled permission request came back as "The user rejected
 		// permission" and killed the agent's work).
-		sess, err := backend.OpenSession(ctx, proto.SessionSpec{Conn: conn, Cwd: workdir, ClientHandler: newAutopermit(workdir)})
+		sess, err := backend.OpenSession(ctx, proto.SessionSpec{
+			Conn:          conn,
+			Cwd:           workdir,
+			ClientHandler: newAutopermit(workdir),
+			McpServers:    p.McpServers,
+		})
 		if err != nil {
 			_ = conn.Close()
 			return nil, fmt.Errorf("session: %w", err)

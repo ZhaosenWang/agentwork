@@ -8,7 +8,11 @@
 // method/params, notifications without id, string request ids).
 package link
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/eushing/agentwork/internal/acp"
+)
 
 // Methods. Two surfaces share the JSON-RPC wire:
 //
@@ -305,6 +309,13 @@ type RunDispatchParams struct {
 	PriorSessionID string `json:"prior_session_id,omitempty"`
 	PriorWorkDir   string `json:"prior_workdir,omitempty"`
 	Env      map[string]string `json:"env,omitempty"`      // runtime env + agent env (merged daemon-side)
+	// McpServers are the agent's configured EXTRA MCP servers — the
+	// agent's own tools (browser, database, an external ACP agent via an
+	// MCP bridge, ...). The daemon loads them from agent.mcp_servers and
+	// dispatches them here so the machine's executor can advertise them
+	// at ACP session/new. Empty = no extra servers (the runtime sees
+	// mcpServers: []).
+	McpServers []acp.McpServer `json:"mcp_servers,omitempty"`
 }
 
 // RunCancelParams is the run.cancel notification (daemon → machine): stop
