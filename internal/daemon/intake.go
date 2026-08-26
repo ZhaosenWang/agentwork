@@ -72,6 +72,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 			Prompt: prompt, Proc: true, Scratch: true,
 			ArtifactFiles: []string{"intake.json"},
 			ACPSpawn: args, Env: dispatchEnv,
+			McpServers: d.extraMcpServers(ctx, q.AgentID),
 		}, intakeMachineID)
 		return
 	}

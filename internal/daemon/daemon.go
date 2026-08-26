@@ -1841,6 +1841,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			RunProfile:       d.buildRunProfile(ctx, q.GoalID, q.AgentID, agentName, runRole, goalTitle, policyText, domainType, domainName, issueSection),
 			PriorSessionID:   priorSession,
 			PriorWorkDir:     priorWorkdir,
+			McpServers:       d.extraMcpServers(ctx, q.AgentID),
 		}, runtimeMachineID)
 		return
 	}
@@ -1917,6 +1918,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 			ArtifactFiles: []string{"checks.json", "strength.txt", "metrics.json"},
 			DomainID: domainID, GitURL: gitURL, GitCredentials: gitCredentials, DefaultBranch: defaultBranch,
 			ACPSpawn: args, Env: dispatchEnv,
+			McpServers: d.extraMcpServers(ctx, q.AgentID),
 		}, procMachineID)
 		return
 	}
@@ -2246,8 +2248,9 @@ func (d *Daemon) updateChatMessageToolCalls(ctx context.Context, id, toolCalls s
 
 // extraMcpServers loads the agent's configured EXTRA MCP servers — the
 // agent's own tools (browser, database, an external ACP agent via an MCP
-// bridge, ...). The platform's workspace server is always advertised first;
-// a config typo is logged and skipped, never fatal to the run.
+// bridge, ...). These ride the dispatch payload and are advertised to the
+// runtime at ACP session/new; a config typo is logged and skipped, never
+// fatal to the run.
 func (d *Daemon) extraMcpServers(ctx context.Context, agentID string) []acp.McpServer {
 	var raw string
 	if err := d.st.DB().QueryRowContext(ctx,
