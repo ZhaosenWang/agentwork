@@ -448,3 +448,198 @@ func TestIntakeCreateSquad(t *testing.T) {
 		t.Fatalf("leader must not be attached as a member, got %d", memberCount)
 	}
 }
+
+// TestIntakeRegistryIntents documents the fixed IM-intent set. With the
+// switch eliminated (dispatch derives from this registry), there is no
+// parallel structure to drift from — this test is now pure documentation
+// of the expected surface, not a sync guard.
+func TestIntakeRegistryIntents(t *testing.T) {
+	want := map[string]bool{
+		"create_goal": true, "review_list": true, "goal_status": true,
+		"create_schedule": true, "schedule_list": true, "schedule_stop": true,
+		"create_agent": true, "create_squad": true,
+		"squad_list": true, "squad_detail": true, "squad_update": true,
+		"squad_add_member": true, "squad_remove_member": true, "squad_delete": true,
+	}
+	got := make(map[string]bool)
+	for _, c := range intakeReg.cmds {
+		got[c.intent] = true
+	}
+	for w := range want {
+		if !got[w] {
+			t.Errorf("intakeReg missing intent %q", w)
+		}
+	}
+	if len(got) != len(want) {
+		t.Errorf("intakeReg has %d entries, want %d", len(got), len(want))
+	}
+}
+
+// TestIntakeDispatchUnknownReturnsFallback verifies the not-found path of
+// dispatch — an intent absent from the registry yields the fallback prompt,
+// not a panic or empty string.
+func TestIntakeDispatchUnknownReturnsFallback(t *testing.T) {
+	d, _ := newIntakeDaemon(t)
+	ctx := context.Background()
+	reply := intakeReg.dispatch(d, ctx, intakeAction{Intent: "totally_bogus"})
+	if !strings.Contains(reply, "没听懂") {
+		t.Fatalf("unknown intent must return fallback, got %q", reply)
+	}
+}
+
+// TestIntakeSquadListDetail: list shows all squads; detail shows the roster.
+func TestIntakeSquadListDetail(t *testing.T) {
+	d, _ := newIntakeDaemon(t)
+	ctx := context.Background()
+
+	// Empty list.
+	if r := d.intakeSquadList(ctx); !strings.Contains(r, "没有 squad") {
+		t.Fatalf("empty list, got %q", r)
+	}
+
+	// Create a squad with a member.
+	d2, st2 := newIntakeDaemon(t)
+	if _, err := st2.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,runtime_id,max_concurrent,created_at) VALUES ('a2','worker2','rt1',1,?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	d2.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
+		"审查组", "a1", "PR 审查", "leader 拆分委派", []string{"a2"})})
+
+	list := d2.intakeSquadList(ctx)
+	if !strings.Contains(list, "审查组") || !strings.Contains(list, "worker1") {
+		t.Fatalf("list must show squad name + leader name, got %q", list)
+	}
+	if !strings.Contains(list, "成员 1") {
+		t.Fatalf("list must show member count, got %q", list)
+	}
+
+	detail := d2.intakeSquadDetail(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)})
+	if !strings.Contains(detail, "审查组") || !strings.Contains(detail, "worker1") || !strings.Contains(detail, "worker2") {
+		t.Fatalf("detail must show squad + leader + member, got %q", detail)
+	}
+	if !strings.Contains(detail, "leader 拆分委派") {
+		t.Fatalf("detail must show instructions, got %q", detail)
+	}
+
+	// Detail on non-existent squad.
+	if r := d2.intakeSquadDetail(ctx, intakeAction{Squad: squadSub("不存在", "", "", "", nil)}); !strings.Contains(r, "没找到") {
+		t.Fatalf("detail on missing squad must say so, got %q", r)
+	}
+
+	// Detail without name.
+	if r := d2.intakeSquadDetail(ctx, intakeAction{}); !strings.Contains(r, "需要名字") {
+		t.Fatalf("detail without name must ask, got %q", r)
+	}
+}
+
+// TestIntakeSquadUpdate: partial update changes only the specified field.
+func TestIntakeSquadUpdate(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,runtime_id,max_concurrent,created_at) VALUES ('a2','worker2','rt1',1,?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
+		"审查组", "a1", "PR 审查", "leader 拆分委派", nil)})
+
+	// Change leader a1 → a2.
+	reply := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("审查组", "a2", "", "", nil)})
+	if !strings.Contains(reply, "已更新") {
+		t.Fatalf("update leader must succeed, got %q", reply)
+	}
+	var leaderID string
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT leader_id FROM squad WHERE name=?`, "审查组").Scan(&leaderID); err != nil {
+		t.Fatal(err)
+	}
+	if leaderID != "a2" {
+		t.Fatalf("leader must be a2 after update, got %q", leaderID)
+	}
+	// No fields specified → ask what to change.
+	if r := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)}); !strings.Contains(r, "需要指定") {
+		t.Fatalf("update with no changes must ask, got %q", r)
+	}
+	// Non-existent squad.
+	if r := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("不存在", "a1", "", "", nil)}); !strings.Contains(r, "没找到") {
+		t.Fatalf("update on missing squad must say so, got %q", r)
+	}
+}
+
+// TestIntakeSquadAddRemoveMember: add then remove a member from an existing squad.
+func TestIntakeSquadAddRemoveMember(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,runtime_id,max_concurrent,created_at) VALUES ('a2','worker2','rt1',1,?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
+		"审查组", "a1", "PR 审查", "拆分委派", nil)})
+
+	// Add a2.
+	reply := d.intakeSquadAddMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})})
+	if !strings.Contains(reply, "已添加") {
+		t.Fatalf("add member must succeed, got %q", reply)
+	}
+	var count int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM squad_member WHERE squad_id=(SELECT id FROM squad WHERE name=?)`, "审查组").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("squad must have 1 member after add, got %d", count)
+	}
+
+	// Remove a2.
+	reply = d.intakeSquadRemoveMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})})
+	if !strings.Contains(reply, "已从") || !strings.Contains(reply, "移除") {
+		t.Fatalf("remove member must succeed, got %q", reply)
+	}
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM squad_member WHERE squad_id=(SELECT id FROM squad WHERE name=?)`, "审查组").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("squad must have 0 members after remove, got %d", count)
+	}
+
+	// Remove a member not in the squad.
+	if r := d.intakeSquadRemoveMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})}); !strings.Contains(r, "不在") {
+		t.Fatalf("removing a non-member must report it, got %q", r)
+	}
+
+	// Add without specifying member.
+	if r := d.intakeSquadAddMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)}); !strings.Contains(r, "需要指定") {
+		t.Fatalf("add without member must ask, got %q", r)
+	}
+}
+
+// TestIntakeSquadDelete: delete removes the squad.
+func TestIntakeSquadDelete(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
+		"审查组", "a1", "PR 审查", "拆分委派", nil)})
+
+	reply := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)})
+	if !strings.Contains(reply, "已删除") {
+		t.Fatalf("delete must succeed, got %q", reply)
+	}
+	var count int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM squad WHERE name=?`, "审查组").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("squad must be deleted, got %d rows", count)
+	}
+
+	// Delete non-existent.
+	if r := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("不存在", "", "", "", nil)}); !strings.Contains(r, "没找到") {
+		t.Fatalf("delete on missing squad must say so, got %q", r)
+	}
+}

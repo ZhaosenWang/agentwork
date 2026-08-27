@@ -108,7 +108,7 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 	b.WriteString("用户消息：\n" + text + "\n\n")
 	b.WriteString(`intake.json 结构：
 {
-  "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|unknown",
+  "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|unknown",
   "goal": {"title": "", "description": "", "assignee_id": "", "domain_id": ""},
   "goal_id": "",
   "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "domain_id": ""},
@@ -129,6 +129,12 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
   agent.skills 从下面的 skill 名单里选 id——用户明确说"不要 skills"则留空数组；用户完全没提 skills 时 skills 留空数组且 skills_specified=false（平台会反问是否要 skills）。用户指定了 skills（哪怕一个）或明确说不要时 skills_specified=true。
   技术参数（env/model/mcp_servers/max_concurrent）不填（留空），用户后续在 Web 配置。
 - create_squad：用户想创建一个 squad（团队）。squad.name 必填；squad.leader_id 从下面的 agent 名单里选 id（必填，必须真实存在）；squad.description 一句话描述；squad.instructions 是团队协作指令/规则（给 leader 看的子目标拆分与委派规则，用户没给也要塞一段合理默认值）；squad.member_ids 是成员 agent id 数组（不含 leader——leader 单独在 leader_id 里）。
+- squad_list：用户想查看所有 squad（团队）列表。不需要其他字段。
+- squad_detail：用户想查看某个 squad 的详情（成员、leader、协作规则）。squad.name 填用户提到的 squad 名字（照抄用户说的名字）。
+- squad_update：用户想修改某个 squad 的属性（换 leader、改描述、改协作规则）。squad.name 填要修改的 squad 名字（照抄）；squad.leader_id/description/instructions 填用户指定的新值（用户没提到的字段留空字符串——平台只改用户指定的字段）。squad.name 不作为修改对象（改名请走 Web）。
+- squad_add_member：用户想给某个 squad 加成员。squad.name 填 squad 名字（照抄）；squad.member_ids 填要加的 agent id 数组（从名单里选，必须真实存在，不含 leader）。
+- squad_remove_member：用户想从某个 squad 移除成员。squad.name 填 squad 名字（照抄）；squad.member_ids 填要移除的 agent id 数组（从名单里选）。
+- squad_delete：用户想删除某个 squad。squad.name 填要删除的 squad 名字（照抄）。
 - unknown：无法归入以上意图（闲聊、问候、无关话题）。
 
 cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时间 Asia/Shanghai）：
@@ -141,7 +147,7 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 - 每月 X 日 Y 点：Y X X * *
 - 无法可靠转换就 intent=unknown，别编造 cron。
 
-规则：intent 只能填上面九个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
+规则：intent 只能填上面十五个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
 `)
 	b.WriteString("\n当前可用 agent（id: name）：\n")
 	if agents, err := s.qs.Agents(ctx); err == nil {
