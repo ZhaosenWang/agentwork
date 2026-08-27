@@ -174,30 +174,91 @@ type squadAction struct {
 	MemberIDs    []string `json:"member_ids"`
 }
 
+// intakeHandler is the uniform dispatch signature: each intake intent's
+// adapter closure conforms to it, absorbing the handlers' non-uniform
+// actual signatures (some take parsed, some take GoalID, some take nothing).
+type intakeHandler func(d *Daemon, ctx context.Context, parsed intakeAction) string
+
+// intakeCommand describes one IM intent: its hint text (for the fallback
+// prompt) and its handler (for dispatch). One structure drives both —
+// adding an intent means one entry here, and both dispatch and hint are
+// covered. There is no parallel switch to drift from.
+type intakeCommand struct {
+	intent string
+	hint   func() string
+	handle intakeHandler
+}
+
+// intakeRegistry wraps the fixed IM-intent roster and owns both dispatch
+// (find + call handler) and the fallback prompt assembly. Mirrors
+// openagent's slash.Registry (cmds slice + a method that iterates to build
+// the help text), extended with dispatch.
+type intakeRegistry struct {
+	cmds []intakeCommand
+}
+
+// intakeReg is the singleton. Order fixes the display order of the hint
+// list and the scan order of dispatch (irrelevant for correctness —
+// intents are mutually exclusive strings).
+var intakeReg = &intakeRegistry{cmds: []intakeCommand{
+	{"create_goal", func() string { return "创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateGoal(ctx, p) }},
+	{"review_list", func() string { return "查看待审批" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeReviewList(ctx) }},
+	{"goal_status", func() string { return "查询任务状态 <id>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeGoalStatus(ctx, p.GoalID) }},
+	{"create_schedule", func() string { return "每 1 个小时做 <任务>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateSchedule(ctx, p) }},
+	{"schedule_list", func() string { return "查看定时任务" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeScheduleList(ctx) }},
+	{"schedule_stop", func() string { return "停掉定时任务 <名字>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeScheduleStop(ctx, p) }},
+	{"create_agent", func() string { return "创建 agent <名字>，用 <运行时>，<人设描述>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateAgent(ctx, p) }},
+	{"create_squad", func() string { return "创建 squad <名字>，leader 是 <agent>，成员有 <agent1> <agent2>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateSquad(ctx, p) }},
+	{"squad_list", func() string { return "查看 squad 列表" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadList(ctx) }},
+	{"squad_detail", func() string { return "查看 squad <名字>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadDetail(ctx, p) }},
+	{"squad_update", func() string { return "修改 squad <名字>，leader 换成 <agent> / 描述改成 <描述>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadUpdate(ctx, p) }},
+	{"squad_add_member", func() string { return "给 squad <名字> 加成员 <agent>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadAddMember(ctx, p) }},
+	{"squad_remove_member", func() string { return "从 squad <名字> 移除成员 <agent>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadRemoveMember(ctx, p) }},
+	{"squad_delete", func() string { return "删除 squad <名字>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadDelete(ctx, p) }},
+}}
+
+// dispatch finds the intent in the registry and calls its handler; if not
+// found (parser returned unknown or a hallucinated intent), returns the
+// fallback prompt. This replaces the former switch in replyIntake — the
+// registry is now the single source of truth for both routing and hint.
+func (r *intakeRegistry) dispatch(d *Daemon, ctx context.Context, parsed intakeAction) string {
+	for _, c := range r.cmds {
+		if c.intent == parsed.Intent {
+			return c.handle(d, ctx, parsed)
+		}
+	}
+	return r.fallbackReply()
+}
+
+// fallbackReply assembles the "didn't understand" prompt by iterating the
+// registry's hint providers. Byte-identical to the former single-string
+// literal (header + \n-joined items, no trailing \n).
+func (r *intakeRegistry) fallbackReply() string {
+	lines := make([]string, len(r.cmds))
+	for i, c := range r.cmds {
+		lines[i] = fmt.Sprintf("- “%s”", c.hint())
+	}
+	return "没听懂这条指令 😅 你可以这样问我：\n" + strings.Join(lines, "\n")
+}
+
 // replyIntake executes the parsed action and replies over IM. The run row is
 // stamped completed here (the daemon owns processor-run finishing).
 func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed intakeAction) {
-	var reply string
-	switch parsed.Intent {
-	case "create_goal":
-		reply = d.intakeCreateGoal(ctx, parsed)
-	case "review_list":
-		reply = d.intakeReviewList(ctx)
-	case "goal_status":
-		reply = d.intakeGoalStatus(ctx, parsed.GoalID)
-	case "create_schedule":
-		reply = d.intakeCreateSchedule(ctx, parsed)
-	case "schedule_list":
-		reply = d.intakeScheduleList(ctx)
-	case "schedule_stop":
-		reply = d.intakeScheduleStop(ctx, parsed)
-	case "create_agent":
-		reply = d.intakeCreateAgent(ctx, parsed)
-	case "create_squad":
-		reply = d.intakeCreateSquad(ctx, parsed)
-	default:
-		reply = "没听懂这条指令 😅 你可以这样问我：\n- “创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>”\n- “查看待审批”\n- “查询任务状态 <id>”\n- “每 1 个小时做 <任务>”\n- “查看定时任务”\n- “停掉定时任务 <名字>”\n- “创建 agent <名字>，用 <运行时>，<人设描述>”\n- “创建 squad <名字>，leader 是 <agent>，成员有 <agent1> <agent2>”"
-	}
+	reply := intakeReg.dispatch(d, ctx, parsed)
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
 		reply, nowStr(), q.RunID); err != nil {
@@ -523,6 +584,216 @@ func (d *Daemon) doCreateSquad(ctx context.Context, sq squadAction) string {
 		return fmt.Sprintf("⚠️ 已创建 squad：%s（%s），但以下成员添加失败：%s", created.Name, shortID(created.ID), strings.Join(failed, "、"))
 	}
 	return fmt.Sprintf("✅ 已创建 squad：%s（%s）", created.Name, shortID(created.ID))
+}
+
+// resolveSquadByName finds a squad by exact name (the parser copies the
+// user's wording). Same lookup pattern as intakeScheduleStop.
+func (d *Daemon) resolveSquadByName(ctx context.Context, name string) (*service.Squad, error) {
+	all, err := d.squadSvc.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range all {
+		if all[i].Name == name {
+			return &all[i], nil
+		}
+	}
+	return nil, fmt.Errorf("没找到 squad %q——先「查看 squad 列表」确认名字", name)
+}
+
+// agentDisplayName resolves an agent id to a name, falling back to the short
+// id prefix when the QueryStore is nil or the agent was deleted.
+func (d *Daemon) agentDisplayName(ctx context.Context, agentID string) string {
+	if d.qs != nil {
+		if n, err := d.qs.AgentName(ctx, agentID); err == nil && n != "" {
+			return n
+		}
+	}
+	return shortID(agentID)
+}
+
+// intakeSquadList answers "查看 squad 列表" with all squads, their leader
+// name, and member count.
+func (d *Daemon) intakeSquadList(ctx context.Context) string {
+	all, err := d.squadSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+	if len(all) == 0 {
+		return "📭 当前没有 squad"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "👥 squad 列表（%d 个）：\n", len(all))
+	for _, sq := range all {
+		leader := d.agentDisplayName(ctx, sq.LeaderID)
+		members, _ := d.squadSvc.ListMembers(ctx, sq.ID)
+		fmt.Fprintf(&b, "- %s（%s）leader: %s", sq.Name, shortID(sq.ID), leader)
+		if n := len(members); n > 0 {
+			fmt.Fprintf(&b, "，成员 %d 人", n)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n查看详情：发送「查看 squad <名字>」")
+	return b.String()
+}
+
+// intakeSquadDetail answers "查看 squad <名字>" with the full roster.
+func (d *Daemon) intakeSquadDetail(ctx context.Context, parsed intakeAction) string {
+	name := strings.TrimSpace(parsed.Squad.Name)
+	if name == "" {
+		return "查看 squad 详情需要名字（如：查看 squad 审查组）"
+	}
+	sq, err := d.resolveSquadByName(ctx, name)
+	if err != nil {
+		return err.Error()
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "👥 %s（%s）\n", sq.Name, shortID(sq.ID))
+	if sq.Description != "" {
+		b.WriteString("描述：" + firstLineIn(sq.Description) + "\n")
+	}
+	fmt.Fprintf(&b, "leader: %s\n", d.agentDisplayName(ctx, sq.LeaderID))
+	if sq.Instructions != "" {
+		b.WriteString("协作规则：" + truncateIn(sq.Instructions, 200) + "\n")
+	}
+	members, err := d.squadSvc.ListMembers(ctx, sq.ID)
+	if err == nil && len(members) > 0 {
+		b.WriteString("成员：\n")
+		for _, m := range members {
+			fmt.Fprintf(&b, "- %s（%s）\n", d.agentDisplayName(ctx, m.MemberID), m.Role)
+		}
+	} else {
+		b.WriteString("成员：（无）\n")
+	}
+	return b.String()
+}
+
+// intakeSquadUpdate updates a squad's leader/description/instructions. Only
+// non-empty parsed fields are applied (partial update); rename is Web-only
+// (squad.name is the lookup key, not the new name).
+func (d *Daemon) intakeSquadUpdate(ctx context.Context, parsed intakeAction) string {
+	name := strings.TrimSpace(parsed.Squad.Name)
+	if name == "" {
+		return "修改 squad 需要名字（如：把审查组的 leader 换成 agent2）"
+	}
+	sq, err := d.resolveSquadByName(ctx, name)
+	if err != nil {
+		return err.Error()
+	}
+	leaderID, description, instructions := sq.LeaderID, sq.Description, sq.Instructions
+	changed := false
+	if strings.TrimSpace(parsed.Squad.LeaderID) != "" {
+		leaderID = parsed.Squad.LeaderID
+		changed = true
+	}
+	if strings.TrimSpace(parsed.Squad.Description) != "" {
+		description = parsed.Squad.Description
+		changed = true
+	}
+	if strings.TrimSpace(parsed.Squad.Instructions) != "" {
+		instructions = parsed.Squad.Instructions
+		changed = true
+	}
+	if !changed {
+		return "修改 squad 需要指定改什么（如：把审查组的 leader 换成 agent2 / 把审查组的描述改成 xxx）"
+	}
+	updated, err := d.squadSvc.Update(ctx, sq.ID, service.Squad{
+		Name: sq.Name, LeaderID: leaderID, Description: description, Instructions: instructions,
+	})
+	if err != nil {
+		return "修改 squad 失败：" + err.Error()
+	}
+	return fmt.Sprintf("✅ 已更新 squad：%s（%s）", updated.Name, shortID(updated.ID))
+}
+
+// intakeSquadAddMember attaches agent members to an existing squad.
+func (d *Daemon) intakeSquadAddMember(ctx context.Context, parsed intakeAction) string {
+	name := strings.TrimSpace(parsed.Squad.Name)
+	if name == "" {
+		return "添加成员需要 squad 名字（如：给审查组加成员 agent2）"
+	}
+	sq, err := d.resolveSquadByName(ctx, name)
+	if err != nil {
+		return err.Error()
+	}
+	if len(parsed.Squad.MemberIDs) == 0 {
+		return "添加成员需要指定 agent（如：给审查组加成员 agent2）"
+	}
+	var failed []string
+	for _, mid := range parsed.Squad.MemberIDs {
+		mid = strings.TrimSpace(mid)
+		if mid == "" || mid == sq.LeaderID {
+			continue
+		}
+		if _, err := d.squadSvc.AddMember(ctx, sq.ID, "agent", mid, "member"); err != nil {
+			failed = append(failed, mid)
+		}
+	}
+	if len(failed) > 0 {
+		return fmt.Sprintf("⚠️ 已添加部分成员到 squad %s，但以下添加失败：%s", sq.Name, strings.Join(failed, "、"))
+	}
+	return fmt.Sprintf("✅ 已添加成员到 squad：%s（%s）", sq.Name, shortID(sq.ID))
+}
+
+// intakeSquadRemoveMember detaches members from a squad. Reports "not in
+// squad" for members that aren't attached (not a silent no-op).
+func (d *Daemon) intakeSquadRemoveMember(ctx context.Context, parsed intakeAction) string {
+	name := strings.TrimSpace(parsed.Squad.Name)
+	if name == "" {
+		return "移除成员需要 squad 名字（如：从审查组移除 agent2）"
+	}
+	sq, err := d.resolveSquadByName(ctx, name)
+	if err != nil {
+		return err.Error()
+	}
+	if len(parsed.Squad.MemberIDs) == 0 {
+		return "移除成员需要指定 agent（如：从审查组移除 agent2）"
+	}
+	current, _ := d.squadSvc.ListMembers(ctx, sq.ID)
+	memberSet := make(map[string]bool, len(current))
+	for _, m := range current {
+		memberSet[m.MemberID] = true
+	}
+	var notIn, failed []string
+	for _, mid := range parsed.Squad.MemberIDs {
+		mid = strings.TrimSpace(mid)
+		if mid == "" {
+			continue
+		}
+		if !memberSet[mid] {
+			notIn = append(notIn, mid)
+			continue
+		}
+		if err := d.squadSvc.RemoveMember(ctx, sq.ID, mid); err != nil {
+			failed = append(failed, mid)
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "✅ 已从 squad %s 移除成员", sq.Name)
+	if len(notIn) > 0 {
+		fmt.Fprintf(&b, "（以下不在 squad 里：%s）", strings.Join(notIn, "、"))
+	}
+	if len(failed) > 0 {
+		fmt.Fprintf(&b, "（以下移除失败：%s）", strings.Join(failed, "、"))
+	}
+	return b.String()
+}
+
+// intakeSquadDelete deletes a squad. Goals assigned to it fall back to human
+// (the service layer handles this).
+func (d *Daemon) intakeSquadDelete(ctx context.Context, parsed intakeAction) string {
+	name := strings.TrimSpace(parsed.Squad.Name)
+	if name == "" {
+		return "删除 squad 需要名字（如：删除 squad 审查组）"
+	}
+	sq, err := d.resolveSquadByName(ctx, name)
+	if err != nil {
+		return err.Error()
+	}
+	if err := d.squadSvc.Delete(ctx, sq.ID); err != nil {
+		return "删除 squad 失败：" + err.Error()
+	}
+	return fmt.Sprintf("✅ 已删除 squad：%s（%s）", sq.Name, shortID(sq.ID))
 }
 
 // collectAndAsk builds ONE clarification message listing all missing required
