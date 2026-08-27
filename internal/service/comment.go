@@ -131,7 +131,7 @@ func (s *CommentService) CreateNoDispatch(ctx context.Context, c Comment) (*Comm
 // goal lands without reopening either.
 func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (*Comment, error) {
 	if c.GoalID == "" {
-		return nil, NewValidationError("goal_id is required")
+		return nil, NewFieldRequiredError("goal_id")
 	}
 	if c.AuthorType == "" {
 		c.AuthorType = "human"

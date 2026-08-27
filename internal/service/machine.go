@@ -42,10 +42,10 @@ func NewMachineService(st *store.Store) *MachineService {
 // --name instead. Re-registering under its own name is fine.
 func (s *MachineService) Register(ctx context.Context, m Machine, probedCLIsJSON string) error {
 	if m.ID == "" {
-		return NewValidationError("machine_id is required")
+		return NewFieldRequiredError("machine_id")
 	}
 	if m.Name == "" {
-		return NewValidationError("name is required")
+		return NewFieldRequiredError("name")
 	}
 	var holder string
 	if err := s.st.DB().QueryRowContext(ctx,

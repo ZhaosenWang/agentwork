@@ -125,7 +125,7 @@ func (s *DomainService) SetRunService(rs *RunService) { s.runSvc = rs }
 // it via FreezeChecks. Returns the processor run.
 func (s *DomainService) CompilePolicy(ctx context.Context, domainID, policyText, processorAgentID string) (*Run, error) {
 	if strings.TrimSpace(policyText) == "" {
-		return nil, NewValidationError("policy_text is required")
+		return nil, NewFieldRequiredError("policy_text")
 	}
 	d, err := s.Get(ctx, domainID)
 	if err != nil {
@@ -207,7 +207,7 @@ func compilePromptScratch(d *Domain, policyText string) string {
 
 func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 	if d.Name == "" {
-		return nil, NewValidationError("name is required")
+		return nil, NewFieldRequiredError("name")
 	}
 	if d.Type == "" {
 		d.Type = "repo"
@@ -215,7 +215,7 @@ func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 	switch d.Type {
 	case "repo":
 		if d.GitURL == "" {
-			return nil, NewValidationError("git_url is required for a repo domain")
+			return nil, NewFieldRequiredError("git_url")
 		}
 	case "scratch":
 		// A scratch domain has NO shared repository — its persistent home is
@@ -267,6 +267,9 @@ func (s *DomainService) Create(ctx context.Context, d Domain) (*Domain, error) {
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		d.ID, d.Type, d.Name, d.GitURL, d.DefaultBranch, d.GitIdentity, d.GitCredentials, d.PolicyText, string(checksJSON), d.VerificationStrength, d.MaxRunDuration, d.VerifyTimeout, d.ProcessorAgentID, d.ChecksCompiledAt, d.MetricsBaseline, d.IssueRepo, d.IssueAssignee, d.IssueAssigneeType, d.IssueProvider, d.CreatedAt)
 	if err != nil {
+		if ve := dupNameCodedError(err, CodeDomainNameExists, "domain", d.Name); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("insert domain: %w", err)
 	}
 	s.bus.Publish(ctx, events.Event{Topic: "domain:created", Payload: d})
@@ -330,7 +333,17 @@ func (s *DomainService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("check goals: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("domain %s has %d goal(s); delete or reassign them first", id, n))
+		// Resolve the name for a human-facing message — the id is opaque to
+		// the operator. The query is best-effort (row may be gone in a race);
+		// fall back to id so we never fail to report the conflict.
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM domain WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeDomainHasGoals,
+			fmt.Sprintf("domain %q has %d goal(s); delete its goals first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	// Refuse if schedules reference this domain — a schedule.domain_id is a
 	// required execution precondition (fired goals need the domain's
@@ -340,7 +353,14 @@ func (s *DomainService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("check schedules: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("domain %s has %d schedule(s); delete or reassign them first", id, n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM domain WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeDomainHasSchedules,
+			fmt.Sprintf("domain %q has %d schedule(s); delete or reassign them first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	// The name travels in the payload: the daemon removes a scratch
 	// domain's project root after the row is gone.

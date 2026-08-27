@@ -36,10 +36,10 @@ func NewRuntimeService(st *store.Store) *RuntimeService { return &RuntimeService
 
 func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error) {
 	if r.Name == "" {
-		return nil, NewValidationError("name is required")
+		return nil, NewFieldRequiredError("name")
 	}
 	if r.MachineID == "" {
-		return nil, NewValidationError("machine_id is required — runtimes come from the machine's probe (agentwork connect)")
+		return nil, NewFieldRequiredError("machine_id")
 	}
 	if r.Args == nil {
 		r.Args = []string{}
@@ -55,6 +55,9 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 		`INSERT INTO runtime (id,name,machine_id,args,env,created_at) VALUES (?,?,?,?,?,?)`,
 		r.ID, r.Name, r.MachineID, string(argsJSON), string(envJSON), r.CreatedAt)
 	if err != nil {
+		if ve := dupNameCodedError(err, CodeRuntimeNameExists, "runtime", r.Name); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("insert runtime: %w", err)
 	}
 	return &r, nil
@@ -100,13 +103,20 @@ func (s *RuntimeService) Get(ctx context.Context, id string) (*Runtime, error) {
 
 func (s *RuntimeService) Delete(ctx context.Context, id string) error {
 	// Refuse if agents still reference this runtime. Cascading would silently
-	// orphan agents; the caller should delete or reassign them first.
+	// orphan agents; the caller should delete its agents first.
 	var n int
 	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM agent WHERE runtime_id=?`, id).Scan(&n); err != nil {
 		return fmt.Errorf("check agents: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("runtime %s has %d agent(s); delete or reassign them first", id, n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM runtime WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeRuntimeHasAgents,
+			fmt.Sprintf("runtime %q has %d agent(s); delete its agents first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	_, err := s.st.DB().ExecContext(ctx, `DELETE FROM runtime WHERE id=?`, id)
 	return err

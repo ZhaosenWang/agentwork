@@ -866,7 +866,7 @@ type RunIdentity struct {
 // params are ignored.
 func (s *RunService) ResolveRunToken(ctx context.Context, token string) (*RunIdentity, error) {
 	if token == "" {
-		return nil, NewValidationError("token is required")
+		return nil, NewFieldRequiredError("token")
 	}
 	var id RunIdentity
 	err := s.st.DB().QueryRowContext(ctx,

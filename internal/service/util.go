@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,13 +19,76 @@ var ErrNotFound = errors.New("not found")
 var ErrValidation = errors.New("validation error")
 
 // validationError wraps a message with ErrValidation so errors.Is works.
-type validationError struct{ msg string }
+// code is a machine-readable error code (may be empty for plain validation
+// errors); see codes.go for the shared set. detail is an optional set of
+// structured parameters the frontend interpolates into the localized
+// message template from the remote term.json (e.g. {name, count}).
+type validationError struct {
+	msg    string
+	code   string
+	detail map[string]any
+}
 
-func (e *validationError) Error() string { return e.msg }
-func (e *validationError) Unwrap() error { return ErrValidation }
+func (e *validationError) Error() string                  { return e.msg }
+func (e *validationError) Unwrap() error                  { return ErrValidation }
+func (e *validationError) Code() string                   { return e.code }
+func (e *validationError) Detail() map[string]any         { return e.detail }
 
 // NewValidationError returns an error that satisfies errors.Is(err, ErrValidation).
 func NewValidationError(msg string) error { return &validationError{msg: msg} }
+
+// NewCodedError returns a validation error carrying a machine-readable code
+// (see codes.go). Handlers surface the code in the JSON body so the frontend
+// can branch on it instead of string-matching the message.
+func NewCodedError(code, msg string) error {
+	return &validationError{msg: msg, code: code}
+}
+
+// NewCodedErrorDetail is like NewCodedError but also carries structured
+// parameters (detail) the frontend interpolates into the localized message
+// template. For example, a dependency-conflict error passes {"name","count"}
+// so the frontend can render "project {name} has {count} goals...".
+func NewCodedErrorDetail(code, msg string, detail map[string]any) error {
+	return &validationError{msg: msg, code: code, detail: detail}
+}
+
+// NewFieldRequiredError returns a CodeFieldRequired validation error for a
+// missing required field. The field is the English identifier the frontend
+// maps to a localized label via its fieldLabels table. Used for all simple
+// "xxx is required" checks; validations with richer context stay on
+// NewValidationError (→ CodeValidation fallback).
+func NewFieldRequiredError(field string) error {
+	return NewCodedErrorDetail(CodeFieldRequired, field+" is required", map[string]any{"field": field})
+}
+
+// CodedError is the interface a handler uses to extract the code. Both
+// validationError and the not-found path satisfy it (writeErr falls back to
+// CodeNotFound for ErrNotFound when the error has no Code() of its own).
+type CodedError interface {
+	Code() string
+}
+
+// DetailedError is the interface a handler uses to extract the structured
+// detail parameters for frontend template interpolation.
+type DetailedError interface {
+	Detail() map[string]any
+}
+
+// dupNameCodedError returns a 400 coded error when err is a SQLite
+// UNIQUE-name conflict (extended code SQLITE_CONSTRAINT_UNIQUE = 2067),
+// or nil otherwise. kind is the entity label ("agent"/"domain"/...) for
+// the message, code is the machine-readable code. Identified via errors.As
+// on the driver's typed error — precise (excludes NOT NULL / FK / other
+// constraints) and driver-typed. Callers return it directly on hit, else
+// wrap the original err for a 500. The returned error carries detail{name}
+// so the frontend can interpolate the localized "name {name} already exists" template.
+func dupNameCodedError(err error, code, kind, name string) error {
+	var se interface{ Code() int }
+	if errors.As(err, &se) && se.Code() == 2067 {
+		return NewCodedErrorDetail(code, fmt.Sprintf("%s %q already exists", kind, name), map[string]any{"name": name})
+	}
+	return nil
+}
 
 // newID returns a 16-byte hex id (32 chars). Good enough for a single-user
 // local store; not a UUID but unique in practice.

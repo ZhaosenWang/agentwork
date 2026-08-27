@@ -50,8 +50,11 @@ func NewAgentService(st *store.Store, bus *events.Bus) *AgentService {
 }
 
 func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
-	if a.Name == "" || a.RuntimeID == "" {
-		return nil, NewValidationError("name and runtime_id are required")
+	if a.Name == "" {
+		return nil, NewFieldRequiredError("name")
+	}
+	if a.RuntimeID == "" {
+		return nil, NewFieldRequiredError("runtime_id")
 	}
 	// Verify runtime exists.
 	var rtID string
@@ -84,7 +87,7 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		a.ID, a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, string(envJSON), string(mcpJSON), skillsJSON, a.MaxConcurrent, a.CreatedAt)
 	if err != nil {
-		if ve := dupNameError(err, a.Name); ve != nil {
+		if ve := dupNameCodedError(err, CodeAgentNameExists, "agent", a.Name); ve != nil {
 			return nil, ve
 		}
 		return nil, fmt.Errorf("insert agent: %w", err)
@@ -102,10 +105,10 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 // in-flight runs keep their snapshot.
 func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, error) {
 	if a.Name == "" {
-		return nil, NewValidationError("name is required")
+		return nil, NewFieldRequiredError("name")
 	}
 	if a.RuntimeID == "" {
-		return nil, NewValidationError("runtime_id is required")
+		return nil, NewFieldRequiredError("runtime_id")
 	}
 	// Verify the target runtime exists (FK guard) — same as Create.
 	var rtID string
@@ -127,26 +130,12 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 	if _, err := s.st.DB().ExecContext(ctx,
 		`UPDATE agent SET name=?, description=?, runtime_id=?, system_prompt=?, model=?, max_concurrent=?, env=?, mcp_servers=?, skills=? WHERE id=?`,
 		a.Name, a.Description, a.RuntimeID, a.SystemPrompt, a.Model, a.MaxConcurrent, string(envJSON), string(mcpJSON), string(skillsJSON), id); err != nil {
-		if ve := dupNameError(err, a.Name); ve != nil {
+		if ve := dupNameCodedError(err, CodeAgentNameExists, "agent", a.Name); ve != nil {
 			return nil, ve
 		}
 		return nil, fmt.Errorf("update agent: %w", err)
 	}
 	return s.Get(ctx, id)
-}
-
-// dupNameError returns a 400 validation error ("agent %q already exists")
-// when err is a SQLite UNIQUE-name conflict, or nil otherwise. Identified by
-// the driver's extended error code SQLITE_CONSTRAINT_UNIQUE (2067) via
-// errors.As — precise (excludes NOT NULL / FK / other constraints) and
-// driver-typed. Callers return it directly on hit, else wrap the original
-// err for a 500.
-func dupNameError(err error, name string) error {
-	var se interface{ Code() int }
-	if errors.As(err, &se) && se.Code() == 2067 {
-		return NewValidationError(fmt.Sprintf("agent %q already exists", name))
-	}
-	return nil
 }
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
@@ -207,14 +196,28 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("check goals: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("agent %s has %d goal(s); delete or reassign them first", id, n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeAgentHasGoals,
+			fmt.Sprintf("agent %q has %d goal(s); delete or reassign them first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM schedule WHERE assignee_type='agent' AND assignee_id=?`, id).Scan(&n); err != nil {
 		return fmt.Errorf("check schedules: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("agent %s has %d schedule(s); delete or reassign them first", id, n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeAgentHasSchedules,
+			fmt.Sprintf("agent %q has %d schedule(s); delete or reassign them first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	// squad.leader_id is RESTRICT — a leaderless squad is invalid.
 	if err := tx.QueryRowContext(ctx,
@@ -222,14 +225,28 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("check leader role: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("agent %s leads %d squad(s); delete or reassign them first", id, n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeAgentLeadsSquad,
+			fmt.Sprintf("agent %q leads %d squad(s); reassign leadership first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM squad_member WHERE member_type='agent' AND member_id=?`, id).Scan(&n); err != nil {
 		return fmt.Errorf("check squad membership: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("agent %s is a member of %d squad(s); remove them from squads first", id, n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeAgentInSquads,
+			fmt.Sprintf("agent %q is a member of %d squad(s); remove them from squads first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	// Only a RUNNING run blocks — completed/failed/cancelled runs are history.
 	if err := tx.QueryRowContext(ctx,
@@ -237,14 +254,28 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("check running runs: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("agent %s has %d running run(s); wait for them to finish or cancel them first", id, n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeAgentHasRunningRuns,
+			fmt.Sprintf("agent %q has %d running run(s); wait for them to finish or cancel them first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM domain WHERE issue_assignee=? AND issue_assignee_type='agent'`, id).Scan(&n); err != nil {
 		return fmt.Errorf("check issue assignee: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("agent %s handles issues for %d domain(s); reassign issue handling first", id, n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeAgentHandlesIssues,
+			fmt.Sprintf("agent %q handles issues for %d domain(s); reassign issue handling first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	// All guards passed (zero referencing rows). Clean up the FK-constrained
 	// history before the agent row can go: run.agent_id is a non-cascading FK,

@@ -48,10 +48,10 @@ const maxActiveSubGoals = 20
 // the MCP tool's requireOwnerOf; the service trusts the caller identity).
 func (s *GoalService) CreateSubGoal(ctx context.Context, goalID, title, description, assigneeID, verifierID, createdByType, createdByID string) (*SubGoal, error) {
 	if title == "" {
-		return nil, NewValidationError("title is required")
+		return nil, NewFieldRequiredError("title")
 	}
 	if assigneeID == "" {
-		return nil, NewValidationError("assignee_id is required")
+		return nil, NewFieldRequiredError("assignee_id")
 	}
 	// Fan-out cap (决策 6-8): at most maxActiveSubGoals non-terminal sub-goals
 	// per goal — an agent must not turn one goal into an unbounded work farm.
