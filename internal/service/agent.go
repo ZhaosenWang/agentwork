@@ -197,24 +197,63 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 		return err
 	}
 	defer tx.Rollback()
-	// Refuse if this agent leads a squad — forcing the caller to fix the squad
-	// first is safer than silently orphaning it (squad.leader_id is RESTRICT).
-	var squadCount int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM squad WHERE leader_id=?`, id).Scan(&squadCount); err != nil {
+	// Hard-reject guards: any referencing row blocks the delete and forces the
+	// caller to clean up first. goal/schedule/squad/run all hold an agent id;
+	// issue_assignee makes this agent an issue-handling target. Only when zero
+	// references remain does the delete proceed (plan §守卫矩阵).
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM goal WHERE assignee_type='agent' AND assignee_id=?`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check goals: %w", err)
+	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("agent %s has %d goal(s); delete or reassign them first", id, n))
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schedule WHERE assignee_type='agent' AND assignee_id=?`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check schedules: %w", err)
+	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("agent %s has %d schedule(s); delete or reassign them first", id, n))
+	}
+	// squad.leader_id is RESTRICT — a leaderless squad is invalid.
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM squad WHERE leader_id=?`, id).Scan(&n); err != nil {
 		return fmt.Errorf("check leader role: %w", err)
 	}
-	if squadCount > 0 {
-		return NewValidationError(fmt.Sprintf("agent %s leads %d squad(s); delete or reassign them first", id, squadCount))
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("agent %s leads %d squad(s); delete or reassign them first", id, n))
 	}
-	// chat_message references run; run references agent + goal. Schedules and
-	// goals reference agent by id (no FK) — null those assignee pointers so
-	// the goals survive as human-assigned rather than dangling.
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM squad_member WHERE member_type='agent' AND member_id=?`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check squad membership: %w", err)
+	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("agent %s is a member of %d squad(s); remove them from squads first", id, n))
+	}
+	// Only a RUNNING run blocks — completed/failed/cancelled runs are history.
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE agent_id=? AND status='running'`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check running runs: %w", err)
+	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("agent %s has %d running run(s); wait for them to finish or cancel them first", id, n))
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM domain WHERE issue_assignee=? AND issue_assignee_type='agent'`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check issue assignee: %w", err)
+	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("agent %s handles issues for %d domain(s); reassign issue handling first", id, n))
+	}
+	// All guards passed (zero referencing rows). Clean up the FK-constrained
+	// history before the agent row can go: run.agent_id is a non-cascading FK,
+	// so a run must be dropped (with its chat_message cache) before the agent.
+	// Schedules/goals/squad_members pointing at this agent are already gone
+	// (the guards above refused while any existed).
 	for _, stmt := range []string{
 		`DELETE FROM chat_message WHERE run_id IN (SELECT id FROM run WHERE agent_id=?)`,
 		`DELETE FROM run WHERE agent_id=?`,
-		`DELETE FROM squad_member WHERE member_type='agent' AND member_id=?`,
-		`DELETE FROM schedule_run WHERE schedule_id IN (SELECT id FROM schedule WHERE assignee_type='agent' AND assignee_id=?)`,
-		`DELETE FROM schedule WHERE assignee_type='agent' AND assignee_id=?`,
 		// v2 (决策 6-1): sub_goal has no FK on assignee/verifier — a deleted
 		// agent must not leave work items that later enqueue a run on a dead
 		// agent id (the run's agent FK would reject it and the sub-goal would
@@ -222,7 +261,6 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 		// terminal history (verified/failed/cancelled) stays, same as
 		// CancelSubGoal.
 		`UPDATE sub_goal SET status='cancelled' WHERE (assignee_id=?1 OR verifier_id=?1) AND status NOT IN ('verified','cancelled','failed')`,
-		`UPDATE goal SET assignee_type='human', assignee_id='' WHERE assignee_type='agent' AND assignee_id=?`,
 		`DELETE FROM agent WHERE id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {

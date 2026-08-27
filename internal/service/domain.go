@@ -332,6 +332,16 @@ func (s *DomainService) Delete(ctx context.Context, id string) error {
 	if n > 0 {
 		return NewValidationError(fmt.Sprintf("domain %s has %d goal(s); delete or reassign them first", id, n))
 	}
+	// Refuse if schedules reference this domain — a schedule.domain_id is a
+	// required execution precondition (fired goals need the domain's
+	// acceptance policy + worktree), so deleting the domain would turn every
+	// dependent schedule into a zombie that fails its next firing.
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule WHERE domain_id=?`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check schedules: %w", err)
+	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("domain %s has %d schedule(s); delete or reassign them first", id, n))
+	}
 	// The name travels in the payload: the daemon removes a scratch
 	// domain's project root after the row is gone.
 	var name string

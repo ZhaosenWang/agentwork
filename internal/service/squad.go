@@ -184,17 +184,38 @@ func (s *SquadService) ListMembers(ctx context.Context, squadID string) ([]Squad
 }
 
 func (s *SquadService) Delete(ctx context.Context, id string) error {
-	// On delete, goals assigned to this squad fall back to human (a squadless
-	// goal must not dispatch). The leader agent and members are untouched.
+	// Hard-reject guards: any goal/schedule/issue-assignee referencing this
+	// squad blocks the delete and forces the caller to clean up first. Only
+	// when zero references remain does the delete proceed (plan §守卫矩阵).
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE goal SET assignee_type='human', assignee_id='' WHERE assignee_type='squad' AND assignee_id=?`, id); err != nil {
-		return fmt.Errorf("orphan squad goals: %w", err)
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM goal WHERE assignee_type='squad' AND assignee_id=?`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check goals: %w", err)
 	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("squad %s has %d goal(s); delete or reassign them first", id, n))
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM schedule WHERE assignee_type='squad' AND assignee_id=?`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check schedules: %w", err)
+	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("squad %s has %d schedule(s); delete or reassign them first", id, n))
+	}
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM domain WHERE issue_assignee=? AND issue_assignee_type='squad'`, id).Scan(&n); err != nil {
+		return fmt.Errorf("check issue assignee: %w", err)
+	}
+	if n > 0 {
+		return NewValidationError(fmt.Sprintf("squad %s handles issues for %d domain(s); reassign issue handling first", id, n))
+	}
+	// Guards passed (zero referencing rows). squad_member.squad_id is ON DELETE
+	// CASCADE; the explicit delete is kept for clarity and ordering.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM squad_member WHERE squad_id=?`, id); err != nil {
 		return fmt.Errorf("delete squad members: %w", err)
 	}
