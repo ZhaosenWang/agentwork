@@ -838,8 +838,27 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 	if rc.Summary != "" {
 		sum = fmt.Sprintf(" summary=%q", trimLog(rc.Summary, 80))
 	}
+	if rc.Status == "cancelled" && rc.CancelReason != "" {
+		sum += fmt.Sprintf(" cancel_reason=%s", rc.CancelReason)
+	}
 	logging.Infof("run: finished %s goal=%q (%s) role=%s status=%s attempt=%d%s",
 		runID, s.goalTitleForLog(ctx, rc.GoalID), rc.GoalID, rc.Role, rc.Status, rc.Attempt, sum)
+	// run:cancelled — the structured cancellation event for the notify layer
+	// (Feishu "任务中断" card). Finish is the single terminal chokepoint: a
+	// stamp that won (RowsAffected > 0) reaches here; a late result that lost
+	// the race returned ErrRunAlreadyTerminal above. So publishing here covers
+	// every cancelled path that flows through Finish — including the machine
+	// watchdog (idle/timeout) which previously had NO event and left notify
+	// blind. StopRun and the runaway reaper publish their OWN events before
+	// the stamp, but their late Finish returns ErrRunAlreadyTerminal and never
+	// reaches here — no double publish. notify skips reason_code=handoff/stopped.
+	if rc.Status == "cancelled" && rc.CancelReason != "" && rc.GoalID != "" {
+		s.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
+			"run_id": rc.RunID, "goal_id": rc.GoalID,
+			"reason": cancelReasonDescription(rc.CancelReason),
+			"reason_code": rc.CancelReason,
+		}})
+	}
 	// run.terminal is the Coordinator's wakeup hint (决策 6-4, P2-5): the
 	// latch's second edge — "owner run terminal → Reconcile" — subscribes here.
 	// Published AFTER the reconcile committed (invariant 13).
@@ -886,9 +905,9 @@ func (s *RunService) ResolveRunToken(ctx context.Context, token string) (*RunIde
 func (s *RunService) loadRunContext(ctx context.Context, runID string) (goalRunContext, error) {
 	var rc goalRunContext
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary, trigger_comment_id, role, sub_goal_id, base_ref, head_ref, session_id
+		`SELECT id, goal_id, agent_id, is_leader_run, squad_id, status, attempt, result_summary, trigger_comment_id, role, sub_goal_id, base_ref, head_ref, session_id, cancel_reason
 		 FROM run WHERE id=?`, runID).
-		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary, &rc.TriggerCommentID, &rc.Role, &rc.SubGoalID, &rc.BaseRef, &rc.HeadRef, &rc.SessionID)
+		Scan(&rc.RunID, &rc.GoalID, &rc.AgentID, &rc.IsLeaderRun, &rc.SquadID, &rc.Status, &rc.Attempt, &rc.Summary, &rc.TriggerCommentID, &rc.Role, &rc.SubGoalID, &rc.BaseRef, &rc.HeadRef, &rc.SessionID, &rc.CancelReason)
 	if err != nil {
 		return rc, err
 	}
