@@ -197,7 +197,7 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 	}
 	if n > 0 {
 		var name string
-		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
 		if name == "" {
 			name = id
 		}
@@ -211,7 +211,7 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 	}
 	if n > 0 {
 		var name string
-		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
 		if name == "" {
 			name = id
 		}
@@ -226,7 +226,7 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 	}
 	if n > 0 {
 		var name string
-		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
 		if name == "" {
 			name = id
 		}
@@ -240,7 +240,7 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 	}
 	if n > 0 {
 		var name string
-		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
 		if name == "" {
 			name = id
 		}
@@ -255,7 +255,7 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 	}
 	if n > 0 {
 		var name string
-		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
 		if name == "" {
 			name = id
 		}
@@ -269,7 +269,7 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 	}
 	if n > 0 {
 		var name string
-		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, id).Scan(&name)
 		if name == "" {
 			name = id
 		}
