@@ -190,7 +190,7 @@ func (h *Handlers) deleteAgent(w http.ResponseWriter, r *http.Request) {
 		machineID = h.Daemon.AgentMachineID(r.Context(), r.PathValue("id"))
 	}
 	if err := h.Agent.Delete(r.Context(), r.PathValue("id")); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeJSON(w, nil, err) // maps ErrValidation→400, ErrNotFound→404, else 500
 		return
 	}
 	if h.Daemon != nil && machineID != "" {
@@ -446,7 +446,7 @@ func (h *Handlers) listScheduleRuns(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handlers) deleteSchedule(w http.ResponseWriter, r *http.Request) {
 	if err := h.Schedule.Delete(r.Context(), r.PathValue("id")); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeJSON(w, nil, err) // maps ErrValidation→400, ErrNotFound→404, else 500
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
