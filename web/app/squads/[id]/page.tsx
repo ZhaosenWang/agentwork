@@ -13,7 +13,10 @@ export default function SquadDetailPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
   const { data: squads } = useSquads(true);
+  // archived-inclusive for name resolution (leader/成员原名), active-only for
+  // the add-member selector (已删除 agent 不可加回).
   const { data: agents } = useAgents(true);
+  const { data: activeAgents } = useAgents();
   const { data: members, isLoading } = useSquadMembers(id);
   const addMember = useAddSquadMember();
   const updateSquad = useUpdateSquad();
@@ -132,7 +135,7 @@ export default function SquadDetailPage() {
       {showAdd && (
         <AddMemberDialog
           squadId={id}
-          agents={agents}
+          agents={activeAgents}
           onClose={() => setShowAdd(false)}
         />
       )}
@@ -165,7 +168,7 @@ export default function SquadDetailPage() {
             <Field label="Leader" hint="必填，leader 必须是 agent（角色动态生效：旧 leader 的 in-flight run 会孤儿化）">
               <select value={editLeader} onChange={(e) => setEditLeader(e.target.value)} className={inputCls}>
                 <option value="">选择…</option>
-                {agents?.map((a) => (
+                {activeAgents?.map((a) => (
                   <option key={a.id} value={a.id}>{a.name}</option>
                 ))}
               </select>

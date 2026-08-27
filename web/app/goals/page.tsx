@@ -34,8 +34,12 @@ const initials = (name: string) => (name ? name.slice(0, 1).toUpperCase() : "?")
 export default function GoalsPage() {
   useGoalEvents();
   const { data: goals, isLoading } = useGoals();
+  // Two slices: archived-inclusive for name resolution (timeline/列表引用原
+  // 名), active-only for the create-goal assignee selector (已删除项不可选).
   const { data: agents } = useAgents(true);
   const { data: squads } = useSquads(true);
+  const { data: activeAgents } = useAgents();
+  const { data: activeSquads } = useSquads();
   const { data: domains } = useDomains();
   const createGoal = useCreateGoal();
   const [filter, setFilter] = useState<GoalStatus | "all">("all");
@@ -158,7 +162,7 @@ export default function GoalsPage() {
       )}
 
       {/* Create Goal dialog */}
-      {showForm && <NewGoalForm agents={agents} squads={squads} domains={domains} onClose={() => setShowForm(false)} />}
+      {showForm && <NewGoalForm agents={activeAgents} squads={activeSquads} domains={domains} onClose={() => setShowForm(false)} />}
 
       {createGoal.isError && (
         <p className="text-sm text-red-500 mt-2">{String(createGoal.error)}</p>

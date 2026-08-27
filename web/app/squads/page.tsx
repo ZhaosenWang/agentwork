@@ -10,7 +10,10 @@ import { displayName } from "@/lib/utils";
 export default function SquadsPage() {
   useGoalEvents();
   const { data: squads, isLoading } = useSquads();
+  // archived-inclusive for leader-name resolution (列表显示原名), active-only
+  // for the create-squad member/leader selector (已删除 agent 不可选).
   const { data: agents } = useAgents(true);
+  const { data: activeAgents } = useAgents();
   const createSquad = useCreateSquad();
   const deleteSquad = useDeleteSquad();
   const [showForm, setShowForm] = useState(false);
@@ -70,7 +73,7 @@ export default function SquadsPage() {
         </div>
       )}
 
-      {showForm && <NewSquadForm agents={agents} onClose={() => setShowForm(false)} />}
+      {showForm && <NewSquadForm agents={activeAgents} onClose={() => setShowForm(false)} />}
       {deleteTarget && (
         <ConfirmDialog
           title="确认删除"
