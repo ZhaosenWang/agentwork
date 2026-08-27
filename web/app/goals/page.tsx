@@ -40,8 +40,8 @@ export default function GoalsPage() {
   const [filter, setFilter] = useState<GoalStatus | "all">("all");
   const [showForm, setShowForm] = useState(false);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
-  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? sid;
+  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
+  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? "已删除";
 
   const filtered = goals?.filter((g) => filter === "all" || g.status === filter) ?? [];
 

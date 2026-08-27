@@ -105,6 +105,14 @@ CREATE TABLE IF NOT EXISTS agent (
     mcp_servers     TEXT NOT NULL DEFAULT '[]', -- extra MCP servers advertised at session/new (acp.McpServer JSON array); the platform's workspace server is always prepended
     skills          TEXT NOT NULL DEFAULT '[]', -- JSON []skill-id — platform-managed skills pushed to the agent's machine (CLI 分支 Phase 4)
     max_concurrent  INTEGER NOT NULL DEFAULT 1,
+    -- Soft archive (对齐 multica archived_at): deleting an agent marks it
+    -- instead of hard-deleting, so audit rows (comment.author_id,
+    -- activity_log.actor_id, handoff_event.*, ...) that store the bare id stay
+    -- JOIN-resolvable to a name forever. '' = active. List filters
+    -- archived_at=''; Get does NOT filter (archived rows remain readable by id
+    -- for history). See plan §4.
+    archived_at     TEXT NOT NULL DEFAULT '',  -- RFC3339 of the archive action; '' = active
+    archived_by     TEXT NOT NULL DEFAULT '',  -- who archived (human id / 'system'); '' = active
     created_at      TEXT NOT NULL
 );
 
@@ -130,6 +138,14 @@ CREATE TABLE IF NOT EXISTS squad (
     description  TEXT NOT NULL DEFAULT '',
     leader_id    TEXT NOT NULL REFERENCES agent(id),  -- must be an agent
     instructions TEXT NOT NULL DEFAULT '',            -- extra briefing for leader runs
+    -- Soft archive (对齐 multica archived_at): a squad row is marked, not
+    -- hard-deleted, so run.squad_id / schedule.assignee_id / goal.assignee_id
+    -- that point at it stay resolvable. On archive the squad's goals +
+    -- schedules are transferred to the leader agent (plan §5), so an archived
+    -- squad has no active ownership. '' = active. List filters archived_at='';
+    -- Get does NOT filter.
+    archived_at  TEXT NOT NULL DEFAULT '',  -- RFC3339 of the archive action; '' = active
+    archived_by  TEXT NOT NULL DEFAULT '',  -- who archived; '' = active
     created_at   TEXT NOT NULL
 );
 

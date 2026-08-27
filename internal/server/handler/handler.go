@@ -183,18 +183,15 @@ func (h *Handlers) updateAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out, err)
 }
 func (h *Handlers) deleteAgent(w http.ResponseWriter, r *http.Request) {
-	// Resolve the machine BEFORE the delete — after it, the agent row is
-	// gone and the machine's skill dirs would keep the stale union.
-	machineID := ""
-	if h.Daemon != nil {
-		machineID = h.Daemon.AgentMachineID(r.Context(), r.PathValue("id"))
-	}
+	// DELETE /agents/:id now archives (软归档, plan §4): the agent row stays,
+	// history is preserved, audit ids stay resolvable. The machine's skill
+	// dirs are NOT touched — an archived agent is restorable, so its skills
+	// stay pushed. (The old hard-delete path resolved the machine BEFORE the
+	// row vanished and re-pushed the union to drop the stale skill set; that
+	// re-push is deliberately gone under soft archive.)
 	if err := h.Agent.Delete(r.Context(), r.PathValue("id")); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
-	}
-	if h.Daemon != nil && machineID != "" {
-		go h.Daemon.PushMachineSkills(context.Background(), machineID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

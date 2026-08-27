@@ -54,7 +54,7 @@ function useFlow(goalId: string, goalStatus: string) {
     return () => clearInterval(t);
   }, []);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid.slice(0, 8);
+  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
   const nowMs = Date.now();
 
   const runs = (items ?? []).filter((i) => i.kind === "run");

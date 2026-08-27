@@ -15,7 +15,7 @@ export default function SquadsPage() {
   const [showForm, setShowForm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
+  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
 
   return (
     <div className="p-8">

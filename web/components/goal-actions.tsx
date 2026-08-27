@@ -98,7 +98,7 @@ function ReviewPanel({ goal }: { goal: Goal }) {
   const [rejectForm, setRejectForm] = useState<"" | "reject" | "redirect">("");
   const [justResolved, setJustResolved] = useState<string | null>(null);
 
-  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
+  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? "已删除";
   // 审查意见 / 人的话 — 审批时直接可见，不用滚到评论区（squad 审查的
   // 价值就在审批这一刻）。最近 4 条，倒序。
   const recentComments = (comments ?? []).slice(-4).reverse();

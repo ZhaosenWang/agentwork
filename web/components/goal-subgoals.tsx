@@ -96,7 +96,7 @@ export function GoalSubGoals({ goalId }: { goalId: string }) {
   useWSEvent("sub_goal.failed", () => refetch());
   useWSEvent("sub_goal.cancelled", () => refetch());
 
-  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
+  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? "已删除";
 
   return (
     <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">

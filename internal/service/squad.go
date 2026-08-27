@@ -23,6 +23,14 @@ type Squad struct {
 	Description  string `json:"description"`
 	LeaderID     string `json:"leader_id"`
 	Instructions string `json:"instructions"`
+	// ArchivedAt / ArchivedBy are the soft-archive markers (对齐 multica
+	// archived_at, plan §5). '' = active. An archived squad has already
+	// transferred its goals + schedules to the leader agent and cleared its
+	// domain.issue_assignee, so it holds no active ownership; the row stays so
+	// run.squad_id / historical references stay resolvable. List filters
+	// archived_at=''; Get does NOT filter.
+	ArchivedAt   string `json:"archived_at"`
+	ArchivedBy   string `json:"archived_by"`
 	CreatedAt    string `json:"created_at"`
 }
 
@@ -67,8 +75,10 @@ func (s *SquadService) Create(ctx context.Context, sq Squad) (*Squad, error) {
 }
 
 func (s *SquadService) List(ctx context.Context) ([]Squad, error) {
+	// Active squads only: archived rows are excluded (plan §5.6). Get does
+	// NOT filter, so run.squad_id / historical references stay resolvable.
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,description,leader_id,instructions,created_at FROM squad ORDER BY created_at`)
+		`SELECT id,name,description,leader_id,instructions,archived_at,archived_by,created_at FROM squad WHERE archived_at='' ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +86,7 @@ func (s *SquadService) List(ctx context.Context) ([]Squad, error) {
 	out := []Squad{}
 	for rows.Next() {
 		var sq Squad
-		if err := rows.Scan(&sq.ID, &sq.Name, &sq.Description, &sq.LeaderID, &sq.Instructions, &sq.CreatedAt); err != nil {
+		if err := rows.Scan(&sq.ID, &sq.Name, &sq.Description, &sq.LeaderID, &sq.Instructions, &sq.ArchivedAt, &sq.ArchivedBy, &sq.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, sq)
@@ -85,10 +95,12 @@ func (s *SquadService) List(ctx context.Context) ([]Squad, error) {
 }
 
 func (s *SquadService) Get(ctx context.Context, id string) (*Squad, error) {
+	// NOTE: no archived_at filter — an archived squad stays readable by id so
+	// run.squad_id and historical references JOIN back to a name.
 	var sq Squad
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,description,leader_id,instructions,created_at FROM squad WHERE id=?`, id).
-		Scan(&sq.ID, &sq.Name, &sq.Description, &sq.LeaderID, &sq.Instructions, &sq.CreatedAt)
+		`SELECT id,name,description,leader_id,instructions,archived_at,archived_by,created_at FROM squad WHERE id=?`, id).
+		Scan(&sq.ID, &sq.Name, &sq.Description, &sq.LeaderID, &sq.Instructions, &sq.ArchivedAt, &sq.ArchivedBy, &sq.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -183,28 +195,95 @@ func (s *SquadService) ListMembers(ctx context.Context, squadID string) ([]Squad
 	return out, rows.Err()
 }
 
+// Archive soft-deletes a squad (对齐 multica DeleteSquad=archive, plan §5):
+// the row is marked archived_at instead of hard-deleted, so run.squad_id /
+// schedule.assignee_id / goal.assignee_id that point at it stay resolvable.
+// The squad's goals + schedules are transferred to the leader agent (NOT
+// dropped to human — the leader is the natural successor, same as multica's
+// TransferSquadAssignees), its domain.issue_assignee is cleared (an archived
+// squad must not keep auto-creating issues), and its leader's running runs
+// are captured so the daemon can cut them. squad_member rows are PRESERVED
+// (restorable; an archived squad's roster stays for history).
 func (s *SquadService) Delete(ctx context.Context, id string) error {
-	// On delete, goals assigned to this squad fall back to human (a squadless
-	// goal must not dispatch). The leader agent and members are untouched.
+	return s.Archive(ctx, id, "")
+}
+
+// Archive is the soft-delete entry point. archivedBy is the actor.
+func (s *SquadService) Archive(ctx context.Context, id, archivedBy string) error {
+	// Read the leader BEFORE the transaction — it's the transfer target and
+	// travels in the event payload. A missing squad is ErrNotFound.
+	var leaderID string
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT leader_id FROM squad WHERE id=?`, id).Scan(&leaderID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("load squad: %w", err)
+	}
+
+	// Capture the squad's running leader runs BEFORE the transaction — the
+	// daemon cuts them (they were executing on behalf of this squad). Same
+	// shape as GoalService.Delete's running-run capture.
+	runningRows, err := s.st.DB().QueryContext(ctx,
+		`SELECT id FROM run WHERE squad_id=? AND status='running'`, id)
+	if err != nil {
+		return fmt.Errorf("collect running runs: %w", err)
+	}
+	var runningRunIDs []string
+	for runningRows.Next() {
+		var rid string
+		if err := runningRows.Scan(&rid); err != nil {
+			runningRows.Close()
+			return err
+		}
+		runningRunIDs = append(runningRunIDs, rid)
+	}
+	runningRows.Close()
+	if err := runningRows.Err(); err != nil {
+		return err
+	}
+
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	// Transfer the squad's goals to the leader agent (替代 退回 human —
+	// the leader inherits, 对齐 multica TransferSquadAssignees).
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE goal SET assignee_type='human', assignee_id='' WHERE assignee_type='squad' AND assignee_id=?`, id); err != nil {
-		return fmt.Errorf("orphan squad goals: %w", err)
+		`UPDATE goal SET assignee_type='agent', assignee_id=? WHERE assignee_type='squad' AND assignee_id=?`, leaderID, id); err != nil {
+		return fmt.Errorf("transfer squad goals: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM squad_member WHERE squad_id=?`, id); err != nil {
-		return fmt.Errorf("delete squad members: %w", err)
+	// Transfer the squad's schedules to the leader agent (对齐 multica
+	// TransferSquadAutopilotsToLeader) — they keep firing, now as the leader's.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE schedule SET assignee_type='agent', assignee_id=? WHERE assignee_type='squad' AND assignee_id=?`, leaderID, id); err != nil {
+		return fmt.Errorf("transfer squad schedules: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM squad WHERE id=?`, id); err != nil {
-		return fmt.Errorf("delete squad: %w", err)
+	// Clear domain.issue_assignee pointing at this squad — an archived squad
+	// must not keep auto-creating issues from its repo. Reset to agent/'' so
+	// the owner must reassign (NOT transferred: issue routing is a domain
+	// decision, not an inherited default).
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE domain SET issue_assignee='', issue_assignee_type='agent' WHERE issue_assignee_type='squad' AND issue_assignee=?`, id); err != nil {
+		return fmt.Errorf("clear issue assignee: %w", err)
+	}
+	// squad_member rows are PRESERVED (not deleted) — an archived squad's
+	// roster stays for history and potential restore, 对齐 multica.
+	// Mark archived (the row stays — run.squad_id stays resolvable).
+	stamp := now()
+	if _, err := tx.ExecContext(ctx, `UPDATE squad SET archived_at=?, archived_by=? WHERE id=?`, stamp, archivedBy, id); err != nil {
+		return fmt.Errorf("archive squad: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	s.bus.Publish(ctx, events.Event{Topic: "squad:deleted", Payload: map[string]string{"id": id}})
+	// Tell the daemon to cut the squad's running leader runs. Payload shape
+	// mirrors agent:archived / goal:deleted ({run_ids}).
+	s.bus.Publish(ctx, events.Event{Topic: "squad:archived", Payload: map[string]any{
+		"id":        id,
+		"leader_id": leaderID,
+		"run_ids":   runningRunIDs,
+	}})
 	return nil
 }
 

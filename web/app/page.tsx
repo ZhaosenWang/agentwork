@@ -13,8 +13,8 @@ export default function Home() {
   const { data: agents } = useAgents();
   const { data: squads } = useSquads();
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
-  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? sid;
+  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
+  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? "已删除";
   const assigneeLabel = (g: Goal) =>
     g.assignee_type === "squad" ? squadName(g.assignee_id) : g.assignee_id ? agentName(g.assignee_id) : "-";
 

@@ -42,7 +42,7 @@ export function GoalRuns({ goalId }: { goalId: string }) {
   const [showPast, setShowPast] = useState(false);
 
   // Agent id → name (the runs table reads who is working, not a hex id).
-  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
+  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? "已删除";
 
   // Refresh on run LIFECYCLE events only (enqueued/claimed/cancelled/
   // terminal) — the TERMINAL events matter most for the stop button: the

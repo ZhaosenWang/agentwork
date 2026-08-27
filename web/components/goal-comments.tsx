@@ -15,7 +15,9 @@ export function GoalComments({ goalId }: { goalId: string }) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Agent id → name (mentions and authors display as names, not 32-hex ids).
-  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? id.slice(0, 8);
+  // Soft-archive (plan §7.1): an archived agent is filtered out of GET /agents,
+  // so the cache miss falls back to "已删除" rather than leaking a uuid slice.
+  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? "已删除";
 
   // Reset live comments when goal changes
   useEffect(() => {

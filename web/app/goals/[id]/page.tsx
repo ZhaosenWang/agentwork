@@ -23,8 +23,8 @@ export default function GoalDetailPage() {
   if (isLoading) return <div className="p-8 text-sm text-zinc-400">加载中…</div>;
   if (!goal) return <div className="p-8 text-sm text-zinc-400">找不到 Goal。</div>;
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
-  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? sid;
+  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
+  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? "已删除";
   const assigneeLabel = goal.assignee_type === "squad"
     ? (squadName(goal.assignee_id) || goal.assignee_id || "-")
     : goal.assignee_id

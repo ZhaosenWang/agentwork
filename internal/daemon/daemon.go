@@ -246,7 +246,15 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		machineLastEvent:  make(map[string]time.Time),
 	}
 	bus.Subscribe("agent:created", d.onAgentCreated)
-	bus.Subscribe("agent:deleted", d.onAgentDeleted)
+	// Archive (软归档, plan §4): the agent row stays, but its running runs
+	// must stop (they were executing on a now-archived agent) and its worker
+	// must drop (no new runs). Payload carries run_ids captured before the
+	// archive transaction — same shape as goal:deleted.
+	bus.Subscribe("agent:archived", d.onAgentArchived)
+	// Squad archive (plan §5): the squad row stays, but its leader's running
+	// runs (executing on behalf of this squad) must stop. Payload carries
+	// run_ids + leader_id.
+	bus.Subscribe("squad:archived", d.onSquadArchived)
 	bus.Subscribe("domain:deleted", d.onDomainDeleted)
 	// run.terminal → ReconcileGoal (决策 6-4): the latch's second edge — any
 	// terminal run re-evaluates whether the goal needs its owner. The event is
@@ -648,12 +656,24 @@ func (d *Daemon) onAgentCreated(ctx context.Context, e events.Event) {
 	logging.Infof("daemon: worker ready for agent %s", a.ID)
 }
 
-func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
-	m, ok := e.Payload.(map[string]string)
+// onAgentArchived terminates an archived agent's running runs and drops its
+// worker (plan §4). The agent row stays (archived), so unlike goal:deleted
+// this is not pure row-gone reclamation — the processes must stop because the
+// agent is no longer active, but the run rows persist as history. The run_ids
+// travel in the payload (captured before the archive transaction). The
+// worker's drain is cancelled (no new runs claim); in-flight runs are cut by
+// cancelRun and finish on the daemon ctx.
+func (d *Daemon) onAgentArchived(_ context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]any)
 	if !ok {
 		return
 	}
-	id := m["id"]
+	id, _ := m["id"].(string)
+	ids, _ := m["run_ids"].([]string)
+	for _, rid := range ids {
+		logging.Infof("daemon: agent archived — stopping run %s", rid)
+		d.cancelRun(rid, "agent_archived")
+	}
 	d.mu.Lock()
 	w, ok := d.workers[id]
 	if ok {
@@ -663,7 +683,27 @@ func (d *Daemon) onAgentDeleted(ctx context.Context, e events.Event) {
 	if w != nil {
 		w.cancel() // stop the drain; in-flight runs finish on daemonCtx
 	}
-	logging.Infof("daemon: worker removed for agent %s", id)
+	logging.Infof("daemon: worker removed for archived agent %s", id)
+}
+
+// onSquadArchived terminates an archived squad's running leader runs (plan
+// §5). The squad row stays (archived); its goals + schedules were already
+// transferred to the leader agent in the archive transaction, so the leader's
+// worker stays (it now owns the transferred goals). Only the runs that were
+// executing ON BEHALF OF this squad (run.squad_id=this) are cut — their
+// ownership context is gone. Payload shape mirrors agent:archived.
+func (d *Daemon) onSquadArchived(_ context.Context, e events.Event) {
+	m, ok := e.Payload.(map[string]any)
+	if !ok {
+		return
+	}
+	id, _ := m["id"].(string)
+	ids, _ := m["run_ids"].([]string)
+	for _, rid := range ids {
+		logging.Infof("daemon: squad archived — stopping run %s", rid)
+		d.cancelRun(rid, "squad_archived")
+	}
+	logging.Infof("daemon: squad %s archived (%d run(s) cut)", id, len(ids))
 }
 
 // onRunTerminal funnels a terminal run into the Coordinator (决策 6-4): the
@@ -746,22 +786,39 @@ func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
 	}
 }
 
-// onDomainDeleted removes a scratch domain's project root once its row is
-// gone (the name travels in the payload — repo domains have nothing on disk
-// to remove here; their bare repos die with the goals that used them).
+// onDomainDeleted removes a deleted domain's on-disk footprint once its row
+// is gone. The type + id travel in the payload (the row is gone by the time
+// this runs): a scratch domain's persistent project root runs/scratch/<name>/
+// and a repo domain's shared bare repo runs/repos/<domainID>/ are both
+// reclaimed. The three Delete guards (goal + schedule + running processor
+// run) guarantee no live worktree remains under the bare repo when we remove
+// it — every goal was already deleted (and each goal deletion pruned its own
+// worktree + branch).
 func (d *Daemon) onDomainDeleted(_ context.Context, e events.Event) {
 	m, ok := e.Payload.(map[string]string)
 	if !ok {
 		return
 	}
 	name := m["name"]
-	if name == "" {
-		return
+	domainID := m["domain_id"]
+	dtype := m["domain_type"]
+	// Scratch domain: persistent project root named by the domain name.
+	if name != "" {
+		if err := os.RemoveAll(service.ScratchDomainRoot(name)); err != nil {
+			logging.Infof("daemon: remove scratch domain root %s: %v", name, err)
+		}
 	}
-	// The payload does not carry the type (the row is gone) — a repo domain
-	// has no scratch/<name> dir, so the remove is a cheap no-op for it.
-	if err := os.RemoveAll(service.ScratchDomainRoot(name)); err != nil {
-		logging.Infof("daemon: remove scratch domain root %s: %v", name, err)
+	// Repo domain: shared bare repo directory named by the domain id. The old
+	// comment assumed these "die with the goals that used them" — they do
+	// not: the bare repo is a domain-level shared resource that goal deletion
+	// never touches (each goal only prunes its own worktree + branch). Without
+	// this remove a recreated-same-name domain would reuse a stale bare repo
+	// holding orphaned feat branches. Plan §6.3.
+	if domainID != "" && dtype != "scratch" {
+		dir := domainRepoPath(domainID)
+		if err := os.RemoveAll(dir); err != nil {
+			logging.Infof("daemon: remove domain bare repo %s: %v", dir, err)
+		}
 	}
 }
 

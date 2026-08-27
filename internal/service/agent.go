@@ -37,6 +37,12 @@ type Agent struct {
 	// (CLI 分支 Phase 4) — pushed to the agent's machine via config.push.
 	Skills        []string        `json:"skills"`
 	MaxConcurrent int             `json:"max_concurrent"`
+	// ArchivedAt / ArchivedBy are the soft-archive markers (对齐 multica
+	// archived_at). '' = active. Populated by Archive; an archived agent is
+	// excluded from List but still returned by Get (audit rows that store the
+	// bare id stay JOIN-resolvable to a name). See plan §4.
+	ArchivedAt    string          `json:"archived_at"`
+	ArchivedBy    string          `json:"archived_by"`
 	CreatedAt     string          `json:"created_at"`
 }
 
@@ -150,9 +156,11 @@ func dupNameError(err error, name string) error {
 }
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
+	// Active agents only: archived rows are excluded (plan §4.5). Get does
+	// NOT filter, so audit references stay resolvable.
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
-		 FROM agent ORDER BY created_at`)
+		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,archived_at,archived_by,created_at
+		 FROM agent WHERE archived_at='' ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +169,7 @@ func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 	for rows.Next() {
 		var a Agent
 		var envJSON, mcpJSON, skillsJSON string
-		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt); err != nil {
+		if err := rows.Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.ArchivedAt, &a.ArchivedBy, &a.CreatedAt); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(envJSON), &a.Env)
@@ -173,12 +181,15 @@ func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
 }
 
 func (s *AgentService) Get(ctx context.Context, id string) (*Agent, error) {
+	// NOTE: no archived_at filter — an archived agent stays readable by id so
+	// audit rows (comment.author_id, activity_log.actor_id, ...) JOIN back to
+	// a name. List is the active-only view; Get is the resolver.
 	var a Agent
 	var envJSON, mcpJSON, skillsJSON string
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at
+		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,archived_at,archived_by,created_at
 		 FROM agent WHERE id=?`, id).
-		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.CreatedAt)
+		Scan(&a.ID, &a.Name, &a.Description, &a.RuntimeID, &a.SystemPrompt, &a.Model, &envJSON, &mcpJSON, &skillsJSON, &a.MaxConcurrent, &a.ArchivedAt, &a.ArchivedBy, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -191,48 +202,110 @@ func (s *AgentService) Get(ctx context.Context, id string) (*Agent, error) {
 	return &a, nil
 }
 
+// Archive soft-deletes an agent (对齐 multica ArchiveAgent, plan §4): the row
+// is marked archived_at instead of hard-deleted, so audit rows that store the
+// bare agent id (comment.author_id, activity_log.actor_id, handoff_event.*,
+// consult_request.*, sub_goal.assignee_id/verifier_id, goal.created_by_id)
+// stay JOIN-resolvable to a name forever. History (runs, chat messages,
+// comments) is preserved in place.
+//
+// Runtime cleanup mirrors goal:deleted — the agent's running runs are
+// captured BEFORE the transaction and carried in the event payload; the
+// daemon's onAgentArchived cancelRun's each one and drops the worker. The
+// agent's owned goals fall back to human (an archived agent must not own
+// active goals) and its non-terminal sub-goals are cancelled (same as the old
+// hard-delete path — a dead assignee would stall them running forever). Its
+// schedules are disabled (enabled=0, not deleted) so they stop firing but can
+// be re-enabled if the agent is ever restored.
+//
+// archivedBy records who performed the archive (human id or "system"); it is
+// carried in the event payload alongside the run_ids.
 func (s *AgentService) Delete(ctx context.Context, id string) error {
-	tx, err := s.st.DB().BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	return s.Archive(ctx, id, "")
+}
+
+// Archive is the soft-delete entry point. archivedBy is the actor ("system"
+// when invoked internally, the human id when invoked from the HTTP handler —
+// passed through from the session once auth is wired).
+func (s *AgentService) Archive(ctx context.Context, id, archivedBy string) error {
 	// Refuse if this agent leads a squad — forcing the caller to fix the squad
-	// first is safer than silently orphaning it (squad.leader_id is RESTRICT).
+	// first is safer than archiving a leader (squad.leader_id is RESTRICT and
+	// a leaderless squad is invalid). Reassign the squad's leader first.
 	var squadCount int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM squad WHERE leader_id=?`, id).Scan(&squadCount); err != nil {
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM squad WHERE leader_id=?`, id).Scan(&squadCount); err != nil {
 		return fmt.Errorf("check leader role: %w", err)
 	}
 	if squadCount > 0 {
 		return NewValidationError(fmt.Sprintf("agent %s leads %d squad(s); delete or reassign them first", id, squadCount))
 	}
-	// chat_message references run; run references agent + goal. Schedules and
-	// goals reference agent by id (no FK) — null those assignee pointers so
-	// the goals survive as human-assigned rather than dangling.
-	for _, stmt := range []string{
-		`DELETE FROM chat_message WHERE run_id IN (SELECT id FROM run WHERE agent_id=?)`,
-		`DELETE FROM run WHERE agent_id=?`,
-		`DELETE FROM squad_member WHERE member_type='agent' AND member_id=?`,
-		`DELETE FROM schedule_run WHERE schedule_id IN (SELECT id FROM schedule WHERE assignee_type='agent' AND assignee_id=?)`,
-		`DELETE FROM schedule WHERE assignee_type='agent' AND assignee_id=?`,
-		// v2 (决策 6-1): sub_goal has no FK on assignee/verifier — a deleted
-		// agent must not leave work items that later enqueue a run on a dead
-		// agent id (the run's agent FK would reject it and the sub-goal would
-		// stall running forever). Cancel the agent's non-terminal sub-goals;
-		// terminal history (verified/failed/cancelled) stays, same as
-		// CancelSubGoal.
-		`UPDATE sub_goal SET status='cancelled' WHERE (assignee_id=?1 OR verifier_id=?1) AND status NOT IN ('verified','cancelled','failed')`,
-		`UPDATE goal SET assignee_type='human', assignee_id='' WHERE assignee_type='agent' AND assignee_id=?`,
-		`DELETE FROM agent WHERE id=?`,
-	} {
-		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {
-			return fmt.Errorf("delete agent dependents: %w", err)
+
+	// Capture the agent's running runs BEFORE the transaction — the daemon
+	// needs their ids to cut the processes (the rows stay, but the runs must
+	// not keep burning compute on an archived agent). Same shape as
+	// GoalService.Delete's running-run capture.
+	runningRows, err := s.st.DB().QueryContext(ctx,
+		`SELECT id FROM run WHERE agent_id=? AND status='running'`, id)
+	if err != nil {
+		return fmt.Errorf("collect running runs: %w", err)
+	}
+	var runningRunIDs []string
+	for runningRows.Next() {
+		var rid string
+		if err := runningRows.Scan(&rid); err != nil {
+			runningRows.Close()
+			return err
 		}
+		runningRunIDs = append(runningRunIDs, rid)
+	}
+	runningRows.Close()
+	if err := runningRows.Err(); err != nil {
+		return err
+	}
+
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Drop the agent's squad memberships (关系表, not audit — an archived agent
+	// is no longer an active member; restoring re-adds it). squad_member rows
+	// for this agent are removed so a squad's roster doesn't list a stale
+	// archived agent.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM squad_member WHERE member_type='agent' AND member_id=?`, id); err != nil {
+		return fmt.Errorf("drop squad memberships: %w", err)
+	}
+	// Disable the agent's schedules (enabled=0, not deleted — restorable).
+	if _, err := tx.ExecContext(ctx, `UPDATE schedule SET enabled=0 WHERE assignee_type='agent' AND assignee_id=?`, id); err != nil {
+		return fmt.Errorf("disable schedules: %w", err)
+	}
+	// Cancel the agent's non-terminal sub-goals (terminal history stays) — a
+	// deleted assignee must not leave work items that later enqueue a run on a
+	// dead agent id. Same as the old hard-delete path.
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE sub_goal SET status='cancelled' WHERE (assignee_id=?1 OR verifier_id=?1) AND status NOT IN ('verified','cancelled','failed')`, id); err != nil {
+		return fmt.Errorf("cancel sub-goals: %w", err)
+	}
+	// The agent's owned goals fall back to human — an archived agent must not
+	// own active goals. (NOT transferred: there's no natural successor for an
+	// agent's goals, unlike a squad whose leader inherits them.)
+	if _, err := tx.ExecContext(ctx, `UPDATE goal SET assignee_type='human', assignee_id='' WHERE assignee_type='agent' AND assignee_id=?`, id); err != nil {
+		return fmt.Errorf("orphan agent goals: %w", err)
+	}
+	// Mark archived (the row stays — history + audit resolvability preserved).
+	stamp := now()
+	if _, err := tx.ExecContext(ctx, `UPDATE agent SET archived_at=?, archived_by=? WHERE id=?`, stamp, archivedBy, id); err != nil {
+		return fmt.Errorf("archive agent: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// Tell the daemon to drop this agent's worker.
-	s.bus.Publish(ctx, events.Event{Topic: "agent:deleted", Payload: map[string]string{"id": id}})
+	// Tell the daemon to cut the agent's running runs and drop its worker.
+	// Payload shape mirrors goal:deleted ({run_ids}) so onAgentArchived reads
+	// it the same way onGoalDeleted does.
+	s.bus.Publish(ctx, events.Event{Topic: "agent:archived", Payload: map[string]any{
+		"id":          id,
+		"run_ids":     runningRunIDs,
+		"archived_by": archivedBy,
+	}})
 	return nil
 }

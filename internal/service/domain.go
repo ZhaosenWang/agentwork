@@ -332,14 +332,46 @@ func (s *DomainService) Delete(ctx context.Context, id string) error {
 	if n > 0 {
 		return NewValidationError(fmt.Sprintf("domain %s has %d goal(s); delete or reassign them first", id, n))
 	}
-	// The name travels in the payload: the daemon removes a scratch
-	// domain's project root after the row is gone.
-	var name string
-	_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM domain WHERE id=?`, id).Scan(&name)
+	// v2 (plan §6.3): schedule guard. schedule.domain_id is a REQUIRED
+	// execution precondition (schedule.go:77 — unattended goals need the
+	// domain's acceptance policy + worktree), so SET NULL would make a
+	// schedule a zombie (next firing fails mustExist, retries forever). The
+	// caller must delete the schedules or point them at another domain first.
+	var schedN int
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule WHERE domain_id=?`, id).Scan(&schedN); err != nil {
+		return fmt.Errorf("check schedules: %w", err)
+	}
+	if schedN > 0 {
+		return NewValidationError(fmt.Sprintf("domain %s has %d schedule(s); delete or reassign them first", id, schedN))
+	}
+	// v2 (plan §6.3): running processor run guard. Processor runs
+	// (run_kind='processor', goal_id='') target this domain's compile/intake
+	// pipeline and have NO goal — the goal guard above doesn't catch them.
+	// Refuse while one is running (caller cancels it first), rather than
+	// silently cutting the process mid-compile.
+	var procN int
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE domain_id=? AND run_kind='processor' AND status='running'`, id).Scan(&procN); err != nil {
+		return fmt.Errorf("check processor runs: %w", err)
+	}
+	if procN > 0 {
+		return NewValidationError(fmt.Sprintf("domain %s has %d running processor run(s); cancel them first", id, procN))
+	}
+	// Load name + type BEFORE the delete — both travel in the payload so the
+	// daemon can clean the right on-disk dir (scratch root vs repo bare repo)
+	// after the row is gone. domain_id is the daemon's lookup key for repo
+	// domains; name is the scratch dir's path component.
+	var name, dtype string
+	_ = s.st.DB().QueryRowContext(ctx, `SELECT name, COALESCE(type,'repo') FROM domain WHERE id=?`, id).Scan(&name, &dtype)
 	if _, err := s.st.DB().ExecContext(ctx, `DELETE FROM domain WHERE id=?`, id); err != nil {
 		return fmt.Errorf("delete domain: %w", err)
 	}
-	s.bus.Publish(ctx, events.Event{Topic: "domain:deleted", Payload: map[string]string{"id": id, "name": name}})
+	s.bus.Publish(ctx, events.Event{Topic: "domain:deleted", Payload: map[string]string{
+		"id":           id,
+		"name":         name,
+		"domain_type":  dtype,
+		"domain_id":    id,
+	}})
 	return nil
 }
 

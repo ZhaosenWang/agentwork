@@ -25,7 +25,7 @@ export default function SquadDetailPage() {
   const [editInstr, setEditInstr] = useState("");
 
   const squad = squads?.find((s) => s.id === id);
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
+  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
 
   if (!squad) {
     if (squads === undefined) return <div className="p-8 text-sm text-zinc-400">加载中…</div>;

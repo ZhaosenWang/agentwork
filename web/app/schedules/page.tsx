@@ -20,8 +20,8 @@ export default function SchedulesPage() {
   const [detail, setDetail] = useState<Schedule | null>(null);
   const [editTarget, setEditTarget] = useState<Schedule | null>(null);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? aid;
-  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? sid;
+  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
+  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? "已删除";
   const domainName = (did: string) => domains?.find((d) => d.id === did)?.name ?? did;
   const assigneeLabel = (s: Schedule) =>
     s.assignee_type === "squad" ? (squadName(s.assignee_id) || s.assignee_id) : (agentName(s.assignee_id) || s.assignee_id);
