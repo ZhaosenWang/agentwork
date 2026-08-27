@@ -107,12 +107,19 @@ func (s *SkillService) createSkillFromArchive(ctx context.Context, name, descrip
 		return nil, fmt.Errorf("check skill name: %w", err)
 	}
 	if n > 0 {
-		return nil, NewValidationError(fmt.Sprintf("skill %q already exists", name))
+		return nil, NewCodedErrorDetail(CodeSkillNameExists, fmt.Sprintf("skill %q already exists", name), map[string]any{"name": name})
 	}
 	sk := &Skill{ID: newID(), Name: name, Description: description, CreatedAt: now()}
 	if _, err := s.st.DB().ExecContext(ctx,
 		`INSERT INTO skill (id,name,description,created_at) VALUES (?,?,?,?)`,
 		sk.ID, sk.Name, sk.Description, sk.CreatedAt); err != nil {
+		// The pre-flight COUNT(*) + INSERT is not atomic — two concurrent
+		// creates with the same name can both pass COUNT(n=0) and the second
+		// hits UNIQUE. dupNameCodedError catches the driver conflict and
+		// surfaces a 400 coded error instead of a bare 500.
+		if ve := dupNameCodedError(err, CodeSkillNameExists, "skill", name); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("insert skill: %w", err)
 	}
 	dir := skillDir(sk.ID)
@@ -273,11 +280,25 @@ func (s *SkillService) List(ctx context.Context) ([]Skill, error) {
 // Delete removes a skill from the library and its files.
 func (s *SkillService) Delete(ctx context.Context, id string) error {
 	var n int
-	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM agent WHERE skills LIKE ?`, "%\""+id+"\"%").Scan(&n); err != nil {
+	// INSTR (not LIKE) for the usage check: LIKE '%"id"%' fails to match the
+	// skills JSON written by the service layer under modernc.org/sqlite
+	// (the param-bound pattern with embedded quotes does not match), so a
+	// skill selected by an agent could be silently deleted, leaving a
+	// dangling id in the agent's skills array. INSTR is a pure substring
+	// test with no wildcard semantics, and the surrounding quotes anchor
+	// the id to avoid prefix/suffix collisions (id "ab" won't match "abc").
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM agent WHERE INSTR(skills, ?) > 0`, `"`+id+`"`).Scan(&n); err != nil {
 		return fmt.Errorf("check skill usage: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("skill is selected by %d agent(s) — unselect it first", n))
+		var name string
+		_ = s.st.DB().QueryRowContext(ctx, `SELECT name FROM skill WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeSkillSelected,
+			fmt.Sprintf("skill %q is selected by %d agent(s); unselect it in those agents first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	if _, err := s.st.DB().ExecContext(ctx, `DELETE FROM skill WHERE id=?`, id); err != nil {
 		return fmt.Errorf("delete skill: %w", err)

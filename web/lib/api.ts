@@ -4,6 +4,26 @@ import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, 
 // 去时浏览器无需直连 daemon。本地直连场景可显式设置 NEXT_PUBLIC_API_URL。
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "/backend";
 
+// ApiError carries the backend's machine-readable `code` and structured
+// `detail` alongside the human message and HTTP status. Extends Error so
+// existing `String(e)` call sites (~40) keep working — Error.toString()
+// returns the message. The real frontend (AI_Shell_WEB) uses `code` to look
+// up a localized message in the remote term.json and `detail` to interpolate
+// template parameters; the self-test web/ only verifies the backend outputs
+// them correctly.
+export class ApiError extends Error {
+  code: string | null;
+  detail: Record<string, unknown> | null;
+  status: number;
+  constructor(code: string | null, message: string, status: number, detail: Record<string, unknown> | null = null) {
+    super(message);
+    this.name = "ApiError";
+    this.code = code;
+    this.detail = detail;
+    this.status = status;
+  }
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   // FormData (multipart) 的 Content-Type 必须交给浏览器自动生成（带
   // boundary）；显式声明 application/json 会覆盖 boundary，服务端会把
@@ -12,7 +32,16 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, { headers, ...init });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`${res.status}: ${text}`);
+    let code: string | null = null;
+    let detail: Record<string, unknown> | null = null;
+    let message = text;
+    try {
+      const body = JSON.parse(text) as { error?: string; code?: string; detail?: Record<string, unknown> };
+      message = body.error ?? text;
+      code = body.code ?? null;
+      detail = body.detail ?? null;
+    } catch { /* non-JSON error body, keep raw text */ }
+    throw new ApiError(code, message, res.status, detail);
   }
   if (res.status === 204) return undefined as T;
   return res.json();

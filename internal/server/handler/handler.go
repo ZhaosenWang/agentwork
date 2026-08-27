@@ -142,7 +142,7 @@ func (h *Handlers) getRuntime(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handlers) deleteRuntime(w http.ResponseWriter, r *http.Request) {
 	if err := h.Runtime.Delete(r.Context(), r.PathValue("id")); err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		writeJSON(w, nil, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -581,7 +581,7 @@ func (h *Handlers) deleteSkill(w http.ResponseWriter, r *http.Request) {
 		agents = h.Daemon.SkillAgents(r.Context(), skillID)
 	}
 	if err := h.Skills.Delete(r.Context(), skillID); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeJSON(w, nil, err)
 		return
 	}
 	if h.Daemon != nil {
@@ -895,7 +895,29 @@ func writeJSON(w http.ResponseWriter, v any, err error) {
 func writeErr(w http.ResponseWriter, code int, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	body := map[string]any{"error": err.Error()}
+	// Surface a machine-readable code so the frontend can branch on error
+	// type instead of string-matching. CodedError (validationError) carries
+	// its own; bare ErrNotFound has no Code() method so we map it to
+	// CodeNotFound here — one place, no service-layer churn. A plain
+	// validation error (NewValidationError, no code) gets CodeValidation so
+	// the frontend always sees a code on 4xx validation responses.
+	var ce service.CodedError
+	if errors.As(err, &ce) && ce.Code() != "" {
+		body["code"] = ce.Code()
+	} else if errors.Is(err, service.ErrNotFound) {
+		body["code"] = service.CodeNotFound
+	} else if errors.Is(err, service.ErrValidation) {
+		body["code"] = service.CodeValidation
+	}
+	// Surface structured detail parameters so the frontend can interpolate
+	// them into the localized message template from the remote term.json
+	// (e.g. {"name":"xxx","count":3} -> "project xxx has 3 goals...").
+	var de service.DetailedError
+	if errors.As(err, &de) && de.Detail() != nil {
+		body["detail"] = de.Detail()
+	}
+	_ = json.NewEncoder(w).Encode(body)
 }
 
 func (h *Handlers) listSubGoals(w http.ResponseWriter, r *http.Request) {

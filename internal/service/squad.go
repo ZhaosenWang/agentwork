@@ -47,10 +47,10 @@ func NewSquadService(st *store.Store, bus *events.Bus) *SquadService {
 
 func (s *SquadService) Create(ctx context.Context, sq Squad) (*Squad, error) {
 	if sq.Name == "" {
-		return nil, NewValidationError("name is required")
+		return nil, NewFieldRequiredError("name")
 	}
 	if sq.LeaderID == "" {
-		return nil, NewValidationError("leader_id is required")
+		return nil, NewFieldRequiredError("leader_id")
 	}
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, sq.LeaderID, "leader agent"); err != nil {
 		return nil, err
@@ -60,6 +60,9 @@ func (s *SquadService) Create(ctx context.Context, sq Squad) (*Squad, error) {
 	if _, err := s.st.DB().ExecContext(ctx,
 		`INSERT INTO squad (id,name,description,leader_id,instructions,created_at) VALUES (?,?,?,?,?,?)`,
 		sq.ID, sq.Name, sq.Description, sq.LeaderID, sq.Instructions, sq.CreatedAt); err != nil {
+		if ve := dupNameCodedError(err, CodeSquadNameExists, "squad", sq.Name); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("insert squad: %w", err)
 	}
 	s.bus.Publish(ctx, events.Event{Topic: "squad:created", Payload: sq})
@@ -105,10 +108,10 @@ func (s *SquadService) Get(ctx context.Context, id string) (*Squad, error) {
 // termination is a documented follow-up).
 func (s *SquadService) Update(ctx context.Context, id string, sq Squad) (*Squad, error) {
 	if sq.Name == "" {
-		return nil, NewValidationError("name is required")
+		return nil, NewFieldRequiredError("name")
 	}
 	if sq.LeaderID == "" {
-		return nil, NewValidationError("leader_id is required")
+		return nil, NewFieldRequiredError("leader_id")
 	}
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, id, "squad"); err != nil {
 		return nil, err
@@ -119,6 +122,9 @@ func (s *SquadService) Update(ctx context.Context, id string, sq Squad) (*Squad,
 	if _, err := s.st.DB().ExecContext(ctx,
 		`UPDATE squad SET name=?, description=?, leader_id=?, instructions=? WHERE id=?`,
 		sq.Name, sq.Description, sq.LeaderID, sq.Instructions, id); err != nil {
+		if ve := dupNameCodedError(err, CodeSquadNameExists, "squad", sq.Name); ve != nil {
+			return nil, ve
+		}
 		return nil, fmt.Errorf("update squad: %w", err)
 	}
 	return s.Get(ctx, id)
@@ -198,21 +204,42 @@ func (s *SquadService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("check goals: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("squad %s has %d goal(s); delete or reassign them first", id, n))
+		var name string
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM squad WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeSquadHasGoals,
+			fmt.Sprintf("squad %q has %d goal(s); delete or reassign them first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM schedule WHERE assignee_type='squad' AND assignee_id=?`, id).Scan(&n); err != nil {
 		return fmt.Errorf("check schedules: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("squad %s has %d schedule(s); delete or reassign them first", id, n))
+		var name string
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM squad WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeSquadHasSchedules,
+			fmt.Sprintf("squad %q has %d schedule(s); delete or reassign them first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	if err := tx.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM domain WHERE issue_assignee=? AND issue_assignee_type='squad'`, id).Scan(&n); err != nil {
 		return fmt.Errorf("check issue assignee: %w", err)
 	}
 	if n > 0 {
-		return NewValidationError(fmt.Sprintf("squad %s handles issues for %d domain(s); reassign issue handling first", id, n))
+		var name string
+		_ = tx.QueryRowContext(ctx, `SELECT name FROM squad WHERE id=?`, id).Scan(&name)
+		if name == "" {
+			name = id
+		}
+		return NewCodedErrorDetail(CodeSquadHandlesIssues,
+			fmt.Sprintf("squad %q handles issues for %d domain(s); reassign issue handling first", name, n),
+			map[string]any{"name": name, "count": n})
 	}
 	// Guards passed (zero referencing rows). squad_member.squad_id is ON DELETE
 	// CASCADE; the explicit delete is kept for clarity and ordering.

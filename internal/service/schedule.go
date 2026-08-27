@@ -51,13 +51,13 @@ func NewScheduleService(st *store.Store, bus *events.Bus) *ScheduleService {
 // existence is checked by Update's caller path.
 func (s *ScheduleService) validateSchedule(ctx context.Context, sch *Schedule) error {
 	if sch.Name == "" {
-		return NewValidationError("name is required")
+		return NewFieldRequiredError("name")
 	}
 	if sch.TitleTemplate == "" {
-		return NewValidationError("title_template is required")
+		return NewFieldRequiredError("title_template")
 	}
 	if sch.AssigneeID == "" {
-		return NewValidationError("assignee_id is required")
+		return NewFieldRequiredError("assignee_id")
 	}
 	if sch.AssigneeType == "" {
 		sch.AssigneeType = "agent"
@@ -77,13 +77,13 @@ func (s *ScheduleService) validateSchedule(ctx context.Context, sch *Schedule) e
 	// v2 (M1): unattended goals need a domain (acceptance policy + worktree +
 	// deliver). Require it for agent/squad assignees.
 	if sch.DomainID == "" {
-		return NewValidationError("domain_id is required — unattended goals need the domain's acceptance policy")
+		return NewFieldRequiredError("domain_id")
 	}
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM domain WHERE id=?`, sch.DomainID, "domain"); err != nil {
 		return err
 	}
 	if sch.CronExpression == "" {
-		return NewValidationError("cron_expression is required")
+		return NewFieldRequiredError("cron_expression")
 	}
 	if sch.Timezone == "" {
 		sch.Timezone = "UTC"

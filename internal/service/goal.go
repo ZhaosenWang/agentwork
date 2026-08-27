@@ -142,7 +142,7 @@ func (s *GoalService) SetRunService(rs *RunService) { s.runSvc = rs }
 // transaction (P0-2, 决策 6-15②) — no caller-side enqueue exists anymore.
 func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	if g.Title == "" {
-		return nil, NewValidationError("title is required")
+		return nil, NewFieldRequiredError("title")
 	}
 	if g.AssigneeType == "" {
 		if g.AssigneeID == "" {
@@ -172,14 +172,14 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	switch g.AssigneeType {
 	case "agent":
 		if g.AssigneeID == "" {
-			return nil, NewValidationError("assignee_id is required for an agent goal")
+			return nil, NewFieldRequiredError("assignee_id")
 		}
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, g.AssigneeID, "agent"); err != nil {
 			return nil, err
 		}
 	case "squad":
 		if g.AssigneeID == "" {
-			return nil, NewValidationError("assignee_id is required for a squad goal")
+			return nil, NewFieldRequiredError("assignee_id")
 		}
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, g.AssigneeID, "squad"); err != nil {
 			return nil, err
@@ -194,7 +194,7 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	// goals may be domain-less.
 	if g.AssigneeType != "human" {
 		if g.DomainID == "" {
-			return nil, NewValidationError("domain_id is required for an agent/squad goal")
+			return nil, NewFieldRequiredError("domain_id")
 		}
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM domain WHERE id=?`, g.DomainID, "domain"); err != nil {
 			return nil, err
@@ -490,14 +490,14 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 	switch assigneeType {
 	case "agent":
 		if assigneeID == "" {
-			return nil, NewValidationError("assignee_id is required for an agent goal")
+			return nil, NewFieldRequiredError("assignee_id")
 		}
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, assigneeID, "agent"); err != nil {
 			return nil, err
 		}
 	case "squad":
 		if assigneeID == "" {
-			return nil, NewValidationError("assignee_id is required for a squad goal")
+			return nil, NewFieldRequiredError("assignee_id")
 		}
 		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, assigneeID, "squad"); err != nil {
 			return nil, err
@@ -1403,7 +1403,7 @@ func (s *GoalService) ResolveReview(ctx context.Context, goalID, runID, decision
 	}
 	if g.Status != "review" {
 		logging.Warnf("review: goal %q decision=%s REJECTED (goal is %s, not review)", g.Title, decision, g.Status)
-		return nil, NewValidationError("goal is not in review")
+		return nil, NewCodedError(CodeGoalNotInReview, "goal is not in review")
 	}
 	// Duplicate-decision guard: the deliver step runs ASYNC after an approve,
 	// and the goal stays in review until it finishes — a second decision in
@@ -1648,7 +1648,7 @@ func (s *GoalService) Activate(ctx context.Context, goalID string) (*Goal, error
 		if gerr != nil {
 			return nil, gerr
 		}
-		return nil, NewValidationError(fmt.Sprintf("cannot activate: the goal is %s (only backlog goals can be activated)", g.Status))
+		return nil, NewCodedErrorDetail(CodeGoalNotActivatable, fmt.Sprintf("cannot activate: the goal is %s (only backlog goals can be activated)", g.Status), map[string]any{"status": g.Status})
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO activity_log (id,goal_id,actor_type,actor_id,action,detail,created_at) VALUES (?,?,?,?,'activated','{}',?)`,
@@ -1719,7 +1719,7 @@ func (s *GoalService) Reopen(ctx context.Context, goalID, reason, triggerComment
 		return nil, err
 	}
 	if g.Status != "failed" && g.Status != "cancelled" && g.Status != "done" {
-		return nil, NewValidationError("only done, failed, or cancelled goals can be reopened")
+		return nil, NewCodedError(CodeGoalNotReopenable, "only done, failed, or cancelled goals can be reopened")
 	}
 	note := "Reopened"
 	if reason != "" {
