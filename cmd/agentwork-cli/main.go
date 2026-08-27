@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,6 +143,8 @@ Subcommands:
                                              to enqueue a run on that agent
                                              human to decide (behavior gate)
   agent list                                 list all agents (JSON)
+  agent history [--limit N] [--status S]    your recent runs joined to their goals
+                                             [--agent ID]                 (JSON; default agent = AGENTWORK_AGENT_ID)
   squad list                                 list all squads (JSON)
   subgoal list|get <id>|create --title T --assignee A [--description D] [--verifier V]
                                              list/create/read work items (the owner splits)
@@ -380,16 +384,44 @@ func goalWait(goalID string, args []string) {
 
 func agentCmd(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork-cli agent <list>")
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli agent <list|history>")
 		os.Exit(2)
 	}
 	switch args[0] {
 	case "list":
 		get(serverURL() + "/agents")
+	case "history":
+		agentHistory(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown agent subcommand %q\n", args[0])
 		os.Exit(2)
 	}
+}
+
+// agentHistory implements `agent history [--limit N] [--status S] [--agent ID]`.
+// It returns the calling agent's recent runs joined to their goals — the chat
+// surface's "what have I done" view. The agent id defaults to
+// AGENTWORK_AGENT_ID (set by the executor at spawn, both run and chat paths);
+// --agent overrides it for manual invocation. Output is JSON (agents parse
+// stdout), matching `goal list`.
+func agentHistory(args []string) {
+	fs := flag.NewFlagSet("agent history", flag.ExitOnError)
+	limit := fs.Int("limit", 20, "max number of runs to return")
+	status := fs.String("status", "", "only runs with this status (exact match)")
+	agentID := fs.String("agent", "", "agent id (default: AGENTWORK_AGENT_ID)")
+	fs.Parse(args)
+	id := *agentID
+	if id == "" {
+		id = os.Getenv("AGENTWORK_AGENT_ID")
+	}
+	if id == "" {
+		fail("agent id is required: pass --agent or set AGENTWORK_AGENT_ID")
+	}
+	u := serverURL() + "/agents/" + id + "/history?limit=" + strconv.Itoa(*limit)
+	if *status != "" {
+		u += "&status=" + url.QueryEscape(*status)
+	}
+	get(u)
 }
 
 func squadCmd(args []string) {

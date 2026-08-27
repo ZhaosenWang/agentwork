@@ -1032,6 +1032,56 @@ func (s *RunService) ListMessages(ctx context.Context, runID string) ([]RunMessa
 	return out, rows.Err()
 }
 
+// AgentHistoryItem is one entry of an agent's past work — the chat surface's
+// "what have I done" view. It joins a run to its goal so the agent sees the
+// task title alongside the run outcome, without pulling the full Run row.
+type AgentHistoryItem struct {
+	GoalID        string `json:"goal_id"`
+	GoalTitle     string `json:"goal_title"`
+	GoalStatus    string `json:"goal_status"`
+	RunID         string `json:"run_id"`
+	RunStatus     string `json:"run_status"`
+	RunRole       string `json:"run_role"`
+	Attempt       int    `json:"attempt"`
+	ResultSummary string `json:"result_summary"`
+	FinishedAt    string `json:"finished_at"`
+}
+
+// HistoryByAgent returns the agent's recent runs joined to their goals, newest
+// finished first. limit<=0 defaults to 20; status filters by run.status ('' =
+// all). Processor runs (run_kind='processor', no goal) are excluded — they are
+// platform-internal, not the agent's own work. Runs still queued/running carry
+// an empty finished_at and sort after finished ones (NULLs last in DESC).
+func (s *RunService) HistoryByAgent(ctx context.Context, agentID string, limit int, status string) ([]AgentHistoryItem, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	q := `SELECT r.goal_id, g.title, g.status, r.id, r.status, r.role, r.attempt, r.result_summary, r.finished_at
+	      FROM run r JOIN goal g ON g.id=r.goal_id
+	      WHERE r.agent_id=? AND r.run_kind='worker'`
+	args := []any{agentID}
+	if status != "" {
+		q += " AND r.status=?"
+		args = append(args, status)
+	}
+	q += " ORDER BY r.finished_at DESC, r.created_at DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := s.st.DB().QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []AgentHistoryItem{}
+	for rows.Next() {
+		var it AgentHistoryItem
+		if err := rows.Scan(&it.GoalID, &it.GoalTitle, &it.GoalStatus, &it.RunID, &it.RunStatus, &it.RunRole, &it.Attempt, &it.ResultSummary, &it.FinishedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 // inPlaceholders builds "?,?,?" for a slice and returns the args slice.
 func inPlaceholders(ids []string) (string, []any) {
 	ph := ""

@@ -17,9 +17,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/link"
 	"github.com/eushing/agentwork/internal/runtime"
 )
@@ -30,6 +32,12 @@ type chatBridge struct {
 	// process (the runtime's Close tears down the transport + child).
 	writer  map[string]io.Writer
 	closeFn map[string]func() error
+	// mcpServers maps chatID → the agent's extra MCP servers (from
+	// ChatOpenParams.McpServers, same source as the run path's). The
+	// handleChatFrame rewriter injects them into the web client's session/new
+	// frame — chat has no run dispatch, so this is the injection point the run
+	// path doesn't need.
+	mcpServers map[string][]acp.McpServer
 	// seq is a MONOTONIC chat id counter — ids are never reused. A reused
 	// id let a late chat.close (the ghost StrictMode connection's teardown,
 	// delivered asynchronously) kill the REPLACEMENT process registered
@@ -39,7 +47,11 @@ type chatBridge struct {
 }
 
 func newChatBridge() *chatBridge {
-	return &chatBridge{writer: map[string]io.Writer{}, closeFn: map[string]func() error{}}
+	return &chatBridge{
+		writer:     map[string]io.Writer{},
+		closeFn:    map[string]func() error{},
+		mcpServers: map[string][]acp.McpServer{},
+	}
 }
 
 // handleChatOpen spawns the agent's CLI, stages persona + skills into the
@@ -62,12 +74,24 @@ func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, pe
 	if err := os.MkdirAll(p.Cwd, 0o755); err != nil {
 		return nil, &link.RPCError{Code: link.CodeInternal, Message: "mkdir chat cwd: " + err.Error()}
 	}
-	// Persona + project skills — FRESH staging on every open: the user
-	// may have edited the agent's system prompt / skills since the last
-	// chat. The chat cwd is platform-owned (no repo content to preserve),
-	// so overwrite the persona and wipe the skills subdir before copying.
-	if b, err := os.ReadFile(filepath.Join(agentProfileDir(p.AgentID), "AGENTS.md")); err == nil {
-		_ = os.WriteFile(filepath.Join(p.Cwd, "AGENTS.md"), b, 0o644)
+	// Persona + chat brief + project skills — FRESH staging on every open:
+	// the user may have edited the agent's system prompt / skills since the
+	// last chat. The chat cwd is platform-owned (no repo content to preserve),
+	// so overwrite the persona+brief and wipe the skills subdir before copying.
+	// The brief rides AGENTS.md (the runtime loads it natively) — the chat path
+	// has no prompt builder, so this is where the agent learns it is in a chat
+	// surface and that `agentwork agent history` exists.
+	persona, _ := os.ReadFile(filepath.Join(agentProfileDir(p.AgentID), "AGENTS.md"))
+	agentsMd := strings.TrimSpace(string(persona))
+	if p.ChatBrief != "" {
+		if agentsMd != "" {
+			agentsMd += "\n\n" + p.ChatBrief
+		} else {
+			agentsMd = p.ChatBrief
+		}
+	}
+	if agentsMd != "" {
+		_ = os.WriteFile(filepath.Join(p.Cwd, "AGENTS.md"), []byte(agentsMd), 0o644)
 	}
 	subdir := p.SkillsDir
 	if subdir == "" {
@@ -77,8 +101,13 @@ func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, pe
 
 	// The spawn env = the machine's own env (base) + the agent's runtime
 	// env (Spec.Env, layered by the runtime) + the agentwork CLI on PATH
-	// (the agent may call it from chat).
+	// (the agent may call it from chat). AGENTWORK_AGENT_ID lets the agent
+	// run `agentwork agent history` from chat (no run token in the chat
+	// path — the history endpoint resolves identity from this env, like the
+	// run path's executor sets it at exec.go spawn).
 	base := os.Environ()
+	base = append(base, "AGENTWORK_AGENT_ID="+p.AgentID)
+	base = append(base, "AGENTWORK_SERVER_URL="+os.Getenv("AGENTWORK_SERVER_URL"))
 	if shimDir, err := ensureAgentworkShim(); err == nil && shimDir != "" {
 		base = append(base, "PATH="+shimDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	}
@@ -97,6 +126,9 @@ func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, pe
 	b.mu.Lock()
 	b.writer[chatID] = conn.W
 	b.closeFn[chatID] = conn.Close
+	if len(p.McpServers) > 0 {
+		b.mcpServers[chatID] = p.McpServers
+	}
 	b.mu.Unlock()
 
 	// stdout pump: one JSON-RPC frame per line → chat.frame notification,
@@ -129,7 +161,14 @@ func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, pe
 	return link.ChatOpenResult{ChatID: chatID, Cwd: p.Cwd}, nil
 }
 
-// handleChatFrame writes one ACP frame to the CLI's stdin.
+// handleChatFrame writes one ACP frame to the CLI's stdin. For session/new it
+// first injects the agent's extra MCP servers into the frame — the chat path
+// has no run dispatch (the run path injects them via RunDispatchParams.McpServers
+// at ACP session/new), so this rewriter is the chat path's injection point.
+// Symmetric with the daemon's normalizeChatFrame (which injects cwd into
+// session/new on the daemon→machine leg); this runs on the web→machine leg.
+// Other methods pass through untouched (the relay stays blind outside this one
+// configured injection, matching the cwd injection's discipline).
 func (b *chatBridge) handleChatFrame(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 	var p link.ChatFrameParams
 	if err := json.Unmarshal(raw, &p); err != nil || p.ChatID == "" {
@@ -137,14 +176,74 @@ func (b *chatBridge) handleChatFrame(ctx context.Context, raw json.RawMessage) (
 	}
 	b.mu.Lock()
 	w := b.writer[p.ChatID]
+	mcp := b.mcpServers[p.ChatID]
 	b.mu.Unlock()
 	if w == nil {
 		return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "unknown chat " + p.ChatID}
 	}
-	if _, err := w.Write(append(p.Frame, '\n')); err != nil {
+	frame := p.Frame
+	if len(mcp) > 0 {
+		if rewritten := injectChatMcpServers(frame, mcp); rewritten != nil {
+			frame = rewritten
+			cliLogf("chat: %s session/new injected %d mcp server(s)", p.ChatID, len(mcp))
+		}
+	}
+	if _, err := w.Write(append(frame, '\n')); err != nil {
 		return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
 	}
 	return map[string]bool{"ok": true}, nil
+}
+
+// injectChatMcpServers rewrites a session/new frame's params.mcpServers,
+// replacing the web client's empty array with the agent's configured servers.
+// It is the machine-side mirror of the daemon's normalizeChatFrame (which
+// injects cwd): parse method/params → set one field → re-marshal the whole
+// frame preserving id/jsonrpc/other params. Returns nil if the frame is not
+// session/new or could not be parsed (the caller then writes the original —
+// the relay degrades to blind pass-through, never to a dropped frame).
+func injectChatMcpServers(frame []byte, mcpServers []acp.McpServer) []byte {
+	var msg struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(frame, &msg); err != nil || msg.Method != "session/new" {
+		return nil
+	}
+	var params map[string]json.RawMessage
+	if len(msg.Params) > 0 {
+		if err := json.Unmarshal(msg.Params, &params); err != nil {
+			return nil
+		}
+	}
+	if params == nil {
+		params = map[string]json.RawMessage{}
+	}
+	// Normalize through the SAME path the run-path SDK uses (acp.NormalizeForWire
+	// → normalizeNilSlices): strict ACP servers (opencode's zod) reject MISSING
+	// arrays ("expected array, received undefined") — a stdio server's nil
+	// headers/env must serialize as [], not vanish. Direct json.Marshal would
+	// omit them (omitempty); the run path avoids this because the SDK applies
+	// normalizeNilSlices to every request. The chat relay rewrites the frame
+	// outside the SDK, so we apply it here to match.
+	serversJSON, err := json.Marshal(acp.NormalizeForWire(mcpServers))
+	if err != nil {
+		return nil
+	}
+	params["mcpServers"] = serversJSON
+	b, err := json.Marshal(params)
+	if err != nil {
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(frame, &m); err != nil {
+		return nil
+	}
+	m["params"] = b
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // handleChatClose kills the chat process.
@@ -170,6 +269,7 @@ func (b *chatBridge) cleanup(chatID string) {
 	writer := b.writer[chatID]
 	delete(b.writer, chatID)
 	delete(b.closeFn, chatID)
+	delete(b.mcpServers, chatID)
 	b.mu.Unlock()
 	if closeFn == nil {
 		return

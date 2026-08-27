@@ -343,6 +343,20 @@ type ChatOpenParams struct {
 	Env       map[string]string `json:"env"`
 	Cwd       string            `json:"cwd"`
 	SkillsDir string            `json:"skills_dir,omitempty"` // project skills dir inside cwd ('' = .claude/skills)
+	// ChatBrief is the chat-surface platform brief appended to the chat cwd's
+	// AGENTS.md alongside the agent's persona. The chat path has no prompt
+	// builder (the daemon is an ACP relay, not a prompt assembler like the run
+	// path's buildRunProfile), so the brief rides the AGENTS.md file the
+	// runtime loads natively. Empty = no brief (persona only).
+	ChatBrief string `json:"chat_brief,omitempty"`
+	// McpServers are the agent's configured EXTRA MCP servers — the SAME
+	// source as the run path's RunDispatchParams.McpServers (agent.mcp_servers
+	// JSON, read by daemon.extraMcpServers). The run path injects them at ACP
+	// session/new via RunDispatchParams; the chat path has no run dispatch, so
+	// the machine injects them by rewriting the session/new frame the web
+	// client sends (handleChatFrame, symmetric with the daemon's cwd injection
+	// in normalizeChatFrame). Empty = no extra servers.
+	McpServers []acp.McpServer `json:"mcp_servers,omitempty"`
 }
 
 // ChatOpenResult is the chat.open response: the chat id the frames ride,

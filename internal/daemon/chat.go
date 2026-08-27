@@ -52,10 +52,11 @@ type queuedFrame struct {
 // OpenChatForAgent validates the agent's machine and spawns the
 // machine-side chat (the CLI process + ACP connection). Returns the chat id.
 func (d *Daemon) OpenChatForAgent(ctx context.Context, agentID string) (string, error) {
-	var machineID, argsJSON, envJSON string
+	var machineID, argsJSON, envJSON, agentName string
 	if err := d.st.DB().QueryRowContext(ctx,
-		`SELECT r.machine_id, r.args, r.env FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`,
-		agentID).Scan(&machineID, &argsJSON, &envJSON); err != nil {
+		`SELECT r.machine_id, r.args, r.env, a.name
+		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`,
+		agentID).Scan(&machineID, &argsJSON, &envJSON, &agentName); err != nil {
 		return "", fmt.Errorf("unknown agent")
 	}
 	if machineID == "" {
@@ -72,6 +73,11 @@ func (d *Daemon) OpenChatForAgent(ctx context.Context, agentID string) (string, 
 	if rtEnv == nil {
 		rtEnv = map[string]string{}
 	}
+	// MCP: reuse the run path's reader (extraMcpServers, daemon.go) so chat
+	// and run share one source of truth for agent.mcp_servers. The machine
+	// injects these into the ACP session/new frame (chat has no run token, so
+	// unlike the run path they can't ride RunDispatchParams.McpServers).
+	mcpServers := d.extraMcpServers(ctx, agentID)
 	// No artificial deadline — the spawn takes as long as it takes (the
 	// request context still bounds it by the connection's lifetime). A
 	// timeout here only orphans the machine-side process: the CLI keeps
@@ -79,9 +85,11 @@ func (d *Daemon) OpenChatForAgent(ctx context.Context, agentID string) (string, 
 	// the chat id to clean it up.
 	var res link.ChatOpenResult
 	if err := peer.Call(ctx, link.MethodChatOpen, link.ChatOpenParams{
-		AgentID:  agentID,
-		ACPSpawn: args,
-		Env:      rtEnv,
+		AgentID:    agentID,
+		ACPSpawn:   args,
+		Env:        rtEnv,
+		McpServers: mcpServers,
+		ChatBrief:  buildChatBrief(agentName),
 		// Cwd is omitted — the MACHINE resolves its own chat directory
 		// (~/.agentwork/chat/<agentID>/); the path is machine-local.
 	}, &res); err != nil {

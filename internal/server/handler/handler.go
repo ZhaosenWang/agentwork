@@ -58,6 +58,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /agents/{id}", h.getAgent)
 	mux.HandleFunc("PUT /agents/{id}", h.updateAgent)
 	mux.HandleFunc("DELETE /agents/{id}", h.deleteAgent)
+	mux.HandleFunc("GET /agents/{id}/history", h.agentHistory)
 
 	mux.HandleFunc("GET /goals", h.listGoals)
 	mux.HandleFunc("POST /goals", h.createGoal)
@@ -168,6 +169,23 @@ func (h *Handlers) listAgents(w http.ResponseWriter, r *http.Request) {
 }
 func (h *Handlers) getAgent(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Agent.Get(r.Context(), r.PathValue("id"))
+	writeJSON(w, out, err)
+}
+
+// agentHistory returns the agent's past runs joined to their goals — the
+// chat surface's "what have I done" view. Read-only, no token: the agent id
+// comes from the path (chat has no run token, so this stays off the /rpc
+// resolve path). ?limit=N (default 20), ?status=completed|failed|... filters
+// by run.status.
+func (h *Handlers) agentHistory(w http.ResponseWriter, r *http.Request) {
+	limit := 0
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			limit = n
+		}
+	}
+	status := r.URL.Query().Get("status")
+	out, err := h.Run.HistoryByAgent(r.Context(), r.PathValue("id"), limit, status)
 	writeJSON(w, out, err)
 }
 func (h *Handlers) updateAgent(w http.ResponseWriter, r *http.Request) {
