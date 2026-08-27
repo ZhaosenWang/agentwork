@@ -430,7 +430,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			if _, rpcErr := resolve(raw); rpcErr != nil {
 				return nil, rpcErr
 			}
-			all, err := agentSvc.List(ctx)
+			all, err := agentSvc.List(ctx, false)
 			if err != nil {
 				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
 			}
@@ -441,7 +441,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			if _, rpcErr := resolve(raw); rpcErr != nil {
 				return nil, rpcErr
 			}
-			all, err := s.squadSvc.List(ctx)
+			all, err := s.squadSvc.List(ctx, false)
 			if err != nil {
 				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
 			}

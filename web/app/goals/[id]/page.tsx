@@ -11,20 +11,27 @@ import { GoalChanges } from "@/components/goal-changes";
 import { GoalStatusBar, GoalTimeline } from "@/components/goal-timeline";
 import { Badge, AttentionChip } from "@/components/ui";
 import type { Goal } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 export default function GoalDetailPage() {
   useGoalEvents();
   const params = useParams<{ id: string }>();
   const id = params.id;
   const { data: goal, isLoading } = useGoal(id);
-  const { data: agents } = useAgents();
-  const { data: squads } = useSquads();
+  const { data: agents } = useAgents(true);
+  const { data: squads } = useSquads(true);
 
   if (isLoading) return <div className="p-8 text-sm text-zinc-400">加载中…</div>;
   if (!goal) return <div className="p-8 text-sm text-zinc-400">找不到 Goal。</div>;
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
-  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? "已删除";
+  const agentName = (aid: string) => {
+    const a = agents?.find((x) => x.id === aid);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
+  const squadName = (sid: string) => {
+    const s = squads?.find((x) => x.id === sid);
+    return s ? displayName(s.name, s.archived_at) : "已删除";
+  };
   const assigneeLabel = goal.assignee_type === "squad"
     ? (squadName(goal.assignee_id) || goal.assignee_id || "-")
     : goal.assignee_id

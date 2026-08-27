@@ -6,13 +6,14 @@ import Link from "next/link";
 import { useSquads, useAgents, useSquadMembers, useAddSquadMember, useUpdateSquad, useRemoveSquadMember, useGoalEvents } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
 import type { SquadMember } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 export default function SquadDetailPage() {
   useGoalEvents();
   const params = useParams<{ id: string }>();
   const id = params.id;
-  const { data: squads } = useSquads();
-  const { data: agents } = useAgents();
+  const { data: squads } = useSquads(true);
+  const { data: agents } = useAgents(true);
   const { data: members, isLoading } = useSquadMembers(id);
   const addMember = useAddSquadMember();
   const updateSquad = useUpdateSquad();
@@ -25,7 +26,10 @@ export default function SquadDetailPage() {
   const [editInstr, setEditInstr] = useState("");
 
   const squad = squads?.find((s) => s.id === id);
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
+  const agentName = (aid: string) => {
+    const a = agents?.find((x) => x.id === aid);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
 
   if (!squad) {
     if (squads === undefined) return <div className="p-8 text-sm text-zinc-400">加载中…</div>;

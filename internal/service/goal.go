@@ -174,14 +174,14 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 		if g.AssigneeID == "" {
 			return nil, NewValidationError("assignee_id is required for an agent goal")
 		}
-		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, g.AssigneeID, "agent"); err != nil {
+		if err := mustActiveAgent(ctx, s.st, g.AssigneeID, "agent"); err != nil {
 			return nil, err
 		}
 	case "squad":
 		if g.AssigneeID == "" {
 			return nil, NewValidationError("assignee_id is required for a squad goal")
 		}
-		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, g.AssigneeID, "squad"); err != nil {
+		if err := mustActiveSquadComplete(ctx, s.st, g.AssigneeID, "squad"); err != nil {
 			return nil, err
 		}
 	case "human":
@@ -492,14 +492,14 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 		if assigneeID == "" {
 			return nil, NewValidationError("assignee_id is required for an agent goal")
 		}
-		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, assigneeID, "agent"); err != nil {
+		if err := mustActiveAgent(ctx, s.st, assigneeID, "agent"); err != nil {
 			return nil, err
 		}
 	case "squad":
 		if assigneeID == "" {
 			return nil, NewValidationError("assignee_id is required for a squad goal")
 		}
-		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, assigneeID, "squad"); err != nil {
+		if err := mustActiveSquadComplete(ctx, s.st, assigneeID, "squad"); err != nil {
 			return nil, err
 		}
 	case "human":
@@ -2551,6 +2551,37 @@ func mustExist(ctx context.Context, st *store.Store, query, id, label string) er
 	}
 	if n == 0 {
 		return NewValidationError(fmt.Sprintf("%s %q does not exist", label, id))
+	}
+	return nil
+}
+
+// mustActiveAgent rejects an archived (soft-deleted) agent as an assignee — an
+// archived agent has no runtime and must not receive new work. The row stays
+// readable (Get does not filter archived_at), so this check is the assign-time
+// gate that keeps active work off archived agents.
+func mustActiveAgent(ctx context.Context, st *store.Store, id, label string) error {
+	return mustExist(ctx, st, `SELECT COUNT(*) FROM agent WHERE id=? AND archived_at=''`, id, label)
+}
+
+// mustActiveSquadComplete rejects an archived squad OR a squad whose roster
+// contains archived agents. An archived squad has transferred its goals away
+// and holds no active ownership; a squad with archived members is incomplete
+// and must not be assigned (the leader would dispatch to a dead agent id).
+// squad_member rows are preserved on archive (restorable), so completeness is
+// judged by joining agent.archived_at, not by the row's presence.
+func mustActiveSquadComplete(ctx context.Context, st *store.Store, id, label string) error {
+	if err := mustExist(ctx, st, `SELECT COUNT(*) FROM squad WHERE id=? AND archived_at=''`, id, label); err != nil {
+		return err
+	}
+	var archivedMembers int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM squad_member m
+		 JOIN agent a ON a.id = m.member_id
+		 WHERE m.squad_id=? AND m.member_type='agent' AND a.archived_at!=''`, id).Scan(&archivedMembers); err != nil {
+		return fmt.Errorf("check %s roster: %w", label, err)
+	}
+	if archivedMembers > 0 {
+		return NewValidationError(fmt.Sprintf("%s %q has %d archived member(s); remove or replace them before assigning", label, id, archivedMembers))
 	}
 	return nil
 }

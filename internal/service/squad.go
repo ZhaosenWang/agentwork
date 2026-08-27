@@ -74,11 +74,17 @@ func (s *SquadService) Create(ctx context.Context, sq Squad) (*Squad, error) {
 	return &sq, nil
 }
 
-func (s *SquadService) List(ctx context.Context) ([]Squad, error) {
-	// Active squads only: archived rows are excluded (plan §5.6). Get does
-	// NOT filter, so run.squad_id / historical references stay resolvable.
-	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,description,leader_id,instructions,archived_at,archived_by,created_at FROM squad WHERE archived_at='' ORDER BY created_at`)
+// List returns squads. Active only by default (archived rows excluded, plan
+// §5.6); includeArchived=true returns archived rows too so the UI can render
+// historical references with the squad's original name + a "已删除" tag.
+// Get does NOT filter, so run.squad_id / historical references stay resolvable.
+func (s *SquadService) List(ctx context.Context, includeArchived bool) ([]Squad, error) {
+	q := `SELECT id,name,description,leader_id,instructions,archived_at,archived_by,created_at FROM squad`
+	if !includeArchived {
+		q += ` WHERE archived_at=''`
+	}
+	q += ` ORDER BY created_at`
+	rows, err := s.st.DB().QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -220,26 +226,17 @@ func (s *SquadService) Archive(ctx context.Context, id, archivedBy string) error
 		return fmt.Errorf("load squad: %w", err)
 	}
 
-	// Capture the squad's running leader runs BEFORE the transaction — the
-	// daemon cuts them (they were executing on behalf of this squad). Same
-	// shape as GoalService.Delete's running-run capture.
-	runningRows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id FROM run WHERE squad_id=? AND status='running'`, id)
-	if err != nil {
-		return fmt.Errorf("collect running runs: %w", err)
+	// Refuse if this squad has running runs — cutting the leader's live
+	// process mid-run is destructive. The operator stops or reassigns the runs
+	// first, then archives. Guard基调对齐 domain.Delete. The daemon's
+	// onSquadArchived cancelRun path stays as a defensive backstop.
+	var runningCount int
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE squad_id=? AND status='running'`, id).Scan(&runningCount); err != nil {
+		return fmt.Errorf("check running runs: %w", err)
 	}
-	var runningRunIDs []string
-	for runningRows.Next() {
-		var rid string
-		if err := runningRows.Scan(&rid); err != nil {
-			runningRows.Close()
-			return err
-		}
-		runningRunIDs = append(runningRunIDs, rid)
-	}
-	runningRows.Close()
-	if err := runningRows.Err(); err != nil {
-		return err
+	if runningCount > 0 {
+		return NewValidationError(fmt.Sprintf("squad %s has %d running run(s); stop or reassign them first", id, runningCount))
 	}
 
 	tx, err := s.st.DB().BeginTx(ctx, nil)
@@ -277,12 +274,14 @@ func (s *SquadService) Archive(ctx context.Context, id, archivedBy string) error
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// Tell the daemon to cut the squad's running leader runs. Payload shape
+	// Tell the daemon the squad is archived. run_ids is empty — the
+	// running-run guard above refuses any active run, so onSquadArchived's
+	// cancelRun loop is a no-op backstop (kept for race safety). Payload shape
 	// mirrors agent:archived / goal:deleted ({run_ids}).
 	s.bus.Publish(ctx, events.Event{Topic: "squad:archived", Payload: map[string]any{
 		"id":        id,
 		"leader_id": leaderID,
-		"run_ids":   runningRunIDs,
+		"run_ids":   []string{},
 	}})
 	return nil
 }

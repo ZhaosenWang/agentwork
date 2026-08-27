@@ -6,6 +6,7 @@ import { useAgents, useSquads, useAssignGoal, useCancelGoal,
 import { Button, Dialog, Field, inputCls, ConfirmDialog, ReviewPhaseBadge } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Goal } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 export function GoalActions({ goal }: { goal: Goal }) {
   const assign = useAssignGoal();
@@ -93,12 +94,15 @@ function ReviewPanel({ goal }: { goal: Goal }) {
   const scratch = domains?.find((d) => d.id === goal.domain_id)?.type === "scratch";
   const { data: runs } = useGoalRuns(goal.id);
   const { data: comments } = useGoalComments(goal.id);
-  const { data: agents } = useAgents();
+  const { data: agents } = useAgents(true);
   const [reason, setReason] = useState("");
   const [rejectForm, setRejectForm] = useState<"" | "reject" | "redirect">("");
   const [justResolved, setJustResolved] = useState<string | null>(null);
 
-  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? "已删除";
+  const agentName = (id: string) => {
+    const a = agents?.find((x) => x.id === id);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
   // 审查意见 / 人的话 — 审批时直接可见，不用滚到评论区（squad 审查的
   // 价值就在审批这一刻）。最近 4 条，倒序。
   const recentComments = (comments ?? []).slice(-4).reverse();

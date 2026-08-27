@@ -163,7 +163,7 @@ func (h *Handlers) createAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out, err)
 }
 func (h *Handlers) listAgents(w http.ResponseWriter, r *http.Request) {
-	out, err := h.Agent.List(r.Context())
+	out, err := h.Agent.List(r.Context(), r.URL.Query().Has("include_archived"))
 	writeJSON(w, out, err)
 }
 func (h *Handlers) getAgent(w http.ResponseWriter, r *http.Request) {
@@ -361,7 +361,7 @@ func (h *Handlers) createSquad(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out, err)
 }
 func (h *Handlers) listSquads(w http.ResponseWriter, r *http.Request) {
-	out, err := h.Squad.List(r.Context())
+	out, err := h.Squad.List(r.Context(), r.URL.Query().Has("include_archived"))
 	writeJSON(w, out, err)
 }
 func (h *Handlers) getSquad(w http.ResponseWriter, r *http.Request) {

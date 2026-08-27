@@ -5,6 +5,7 @@ import { useSubGoals, useCreateSubGoal, useAgents, useSubGoalVerifications } fro
 import { useWSEvent } from "@/lib/ws";
 import { Button, Dialog, Field, inputCls, Empty } from "@/components/ui";
 import type { SubGoal, VerificationResult } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 const SUBGOAL_STATUS_COLORS: Record<string, string> = {
   running: "bg-blue-50 text-blue-700 dot-blue",
@@ -82,7 +83,7 @@ function Verifications({ goalId, subGoalId }: { goalId: string; subGoalId: strin
 // Rows expand to show the sub-goal's description + verification rounds.
 export function GoalSubGoals({ goalId }: { goalId: string }) {
   const { data: subGoals, refetch } = useSubGoals(goalId);
-  const { data: agents } = useAgents();
+  const { data: agents } = useAgents(true);
   const createSubGoal = useCreateSubGoal();
   const [showForm, setShowForm] = useState(false);
   const [expandedId, setExpandedId] = useState("");
@@ -96,7 +97,10 @@ export function GoalSubGoals({ goalId }: { goalId: string }) {
   useWSEvent("sub_goal.failed", () => refetch());
   useWSEvent("sub_goal.cancelled", () => refetch());
 
-  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? "已删除";
+  const agentName = (id: string) => {
+    const a = agents?.find((x) => x.id === id);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
 
   return (
     <div className="bg-white rounded-xl border border-zinc-200 overflow-hidden">

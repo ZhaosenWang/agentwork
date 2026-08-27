@@ -40,9 +40,10 @@ export const deleteRuntime = (id: string) =>
   api<void>(`/runtimes/${id}`, { method: "DELETE" });
 
 // ── Agent ──
-export const listAgents = () => api<Agent[]>("/agents");
+export const listAgents = (includeArchived = false) =>
+  api<Agent[]>(includeArchived ? "/agents?include_archived=1" : "/agents");
 export const getAgent = (id: string) => api<Agent>(`/agents/${id}`);
-export const createAgent = (body: Omit<Agent, "id" | "created_at">) =>
+export const createAgent = (body: Omit<Agent, "id" | "created_at" | "archived_at" | "archived_by">) =>
   api<Agent>("/agents", { method: "POST", body: JSON.stringify(body) });
 export const updateAgent = (id: string, body: Record<string, unknown>) =>
   api<Agent>(`/agents/${id}`, { method: "PUT", body: JSON.stringify(body) });
@@ -127,7 +128,8 @@ export const createGoalComment = (
 ) => api<Comment>(`/goals/${goalId}/comments`, { method: "POST", body: JSON.stringify(body) });
 
 // ── Squad ──
-export const listSquads = () => api<Squad[]>("/squads");
+export const listSquads = (includeArchived = false) =>
+  api<Squad[]>(includeArchived ? "/squads?include_archived=1" : "/squads");
 export const getSquad = (id: string) => api<Squad>(`/squads/${id}`);
 export const createSquad = (body: {
   name: string;

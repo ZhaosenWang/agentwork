@@ -2,17 +2,18 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 )
 
-// TestArchiveAgentStopsRunningRuns: archiving an agent carries its running
-// run ids in the agent:archived payload — the daemon cuts the processes from
-// them (the rows stay as history, unlike goal:deleted's row-gone reclamation).
-// Mirrors TestDeleteCarriesRunningRunIDs's payload-shape assertion (plan §9).
-func TestArchiveAgentStopsRunningRuns(t *testing.T) {
+// TestArchiveAgentRefusesRunningRun: archiving an agent with a running run is
+// refused — the operator stops the run first (plan §方案二, 反馈3). Once stopped,
+// the archive succeeds and carries an empty run_ids (the guard is the source of
+// truth; the daemon's cancelRun path is a no-op backstop).
+func TestArchiveAgentRefusesRunningRun(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "A")
@@ -29,6 +30,33 @@ func TestArchiveAgentStopsRunningRuns(t *testing.T) {
 
 	bus := events.NewBus()
 	as := NewAgentService(st, bus)
+	fired := make(chan struct{}, 1)
+	bus.Subscribe("agent:archived", func(_ context.Context, _ events.Event) { fired <- struct{}{} })
+
+	// A running run blocks the archive — the operator must stop it first.
+	if err := as.Delete(ctx, agentA); !errors.Is(err, ErrValidation) {
+		t.Fatalf("archive with a running run must be refused, got %v", err)
+	}
+	// No event fired — the guard rejected before publishing.
+	select {
+	case <-fired:
+		t.Fatal("agent:archived must not fire when the guard refused")
+	default:
+	}
+	// The agent is still active (not archived).
+	got, err := as.Get(ctx, agentA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ArchivedAt != "" {
+		t.Fatalf("agent must remain active, archived_at=%q", got.ArchivedAt)
+	}
+
+	// Once the run is no longer running, the archive succeeds and carries an
+	// empty run_ids (the guard, not the daemon, is the source of truth).
+	if _, err := st.DB().ExecContext(ctx, `UPDATE run SET status='completed' WHERE id=?`, r.ID); err != nil {
+		t.Fatal(err)
+	}
 	payloadCh := make(chan map[string]any, 1)
 	bus.Subscribe("agent:archived", func(_ context.Context, e events.Event) {
 		if m, ok := e.Payload.(map[string]any); ok {
@@ -36,13 +64,13 @@ func TestArchiveAgentStopsRunningRuns(t *testing.T) {
 		}
 	})
 	if err := as.Delete(ctx, agentA); err != nil {
-		t.Fatalf("archive agent: %v", err)
+		t.Fatalf("archive after run stopped: %v", err)
 	}
 	select {
 	case m := <-payloadCh:
-		ids, ok := m["run_ids"].([]string)
-		if !ok || len(ids) != 1 || ids[0] != r.ID {
-			t.Fatalf("agent:archived must carry the running run id, got %v", m["run_ids"])
+		ids, _ := m["run_ids"].([]string)
+		if len(ids) != 0 {
+			t.Fatalf("agent:archived run_ids must be empty post-guard, got %v", ids)
 		}
 		if m["id"] != agentA {
 			t.Fatalf("agent:archived must carry the agent id, got %v", m["id"])
@@ -75,7 +103,7 @@ func TestArchiveAgentKeepsHistoryAndResolvable(t *testing.T) {
 	}
 
 	// List excludes the archived agent.
-	list, err := as.List(ctx)
+	list, err := as.List(ctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +242,7 @@ func TestArchiveSquadClearsIssueAssignee(t *testing.T) {
 // TestArchiveSquadStopsLeaderRun: archiving a squad carries its leader's
 // running run ids in the squad:archived payload — the daemon cuts them (plan
 // §5). A leader run has run.squad_id set + is_leader_run=1.
-func TestArchiveSquadStopsLeaderRun(t *testing.T) {
+func TestArchiveSquadRefusesRunningRun(t *testing.T) {
 	gs, rs, _, st := newTestCluster(t)
 	ctx := context.Background()
 	leader := seedAgent(t, st, "leader")
@@ -237,6 +265,23 @@ func TestArchiveSquadStopsLeaderRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	fired := make(chan struct{}, 1)
+	bus.Subscribe("squad:archived", func(_ context.Context, _ events.Event) { fired <- struct{}{} })
+
+	// A running run blocks the archive — the operator must stop it first.
+	if err := squadSvc.Delete(ctx, sq.ID); !errors.Is(err, ErrValidation) {
+		t.Fatalf("archive squad with a running run must be refused, got %v", err)
+	}
+	select {
+	case <-fired:
+		t.Fatal("squad:archived must not fire when the guard refused")
+	default:
+	}
+
+	// Once stopped, the archive succeeds and carries an empty run_ids.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE run SET status='completed' WHERE id=?`, r.ID); err != nil {
+		t.Fatal(err)
+	}
 	payloadCh := make(chan map[string]any, 1)
 	bus.Subscribe("squad:archived", func(_ context.Context, e events.Event) {
 		if m, ok := e.Payload.(map[string]any); ok {
@@ -244,13 +289,13 @@ func TestArchiveSquadStopsLeaderRun(t *testing.T) {
 		}
 	})
 	if err := squadSvc.Delete(ctx, sq.ID); err != nil {
-		t.Fatalf("archive squad: %v", err)
+		t.Fatalf("archive squad after run stopped: %v", err)
 	}
 	select {
 	case m := <-payloadCh:
-		ids, ok := m["run_ids"].([]string)
-		if !ok || len(ids) != 1 || ids[0] != r.ID {
-			t.Fatalf("squad:archived must carry the leader run id, got %v", m["run_ids"])
+		ids, _ := m["run_ids"].([]string)
+		if len(ids) != 0 {
+			t.Fatalf("squad:archived run_ids must be empty post-guard, got %v", ids)
 		}
 		if m["leader_id"] != leader {
 			t.Fatalf("squad:archived must carry the leader id, got %v", m["leader_id"])
@@ -278,5 +323,130 @@ func TestArchiveAgentLeaderRestrict(t *testing.T) {
 	err := as.Delete(ctx, leader)
 	if err == nil {
 		t.Fatal("archiving a squad leader must be rejected")
+	}
+}
+
+// TestAssignRefusesArchivedAgent: after an agent is archived, assigning a goal
+// or creating a schedule to it is refused — active work must not land on a
+// soft-deleted agent (方案三, 反馈4).
+func TestAssignRefusesArchivedAgent(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomain(t, st)
+
+	as := NewAgentService(st, events.NewBus())
+	if err := as.Delete(ctx, agentA); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+
+	// Goal assignment is refused.
+	if _, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("create goal on archived agent must be refused, got %v", err)
+	}
+	// Schedule creation is refused.
+	ss := NewScheduleService(st, events.NewBus())
+	if _, err := ss.Create(ctx, Schedule{Name: "s", TitleTemplate: "t", AssigneeType: "agent", AssigneeID: agentA, DomainID: domID, CronExpression: "*/5 * * * *", Timezone: "UTC"}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("create schedule on archived agent must be refused, got %v", err)
+	}
+}
+
+// TestAssignRefusesSquadWithArchivedMember: a squad whose roster contains an
+// archived agent cannot be assigned (goal or schedule) — the roster is
+// incomplete and the leader would dispatch to a dead agent id. The squad row
+// itself stays active; the archived member is the blocker (方案三, 反馈4).
+func TestAssignRefusesSquadWithArchivedMember(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	leader := seedAgent(t, st, "leader")
+	member := seedAgent(t, st, "member")
+	domID := seedDomain(t, st)
+
+	squadSvc := NewSquadService(st, events.NewBus())
+	sq, err := squadSvc.Create(ctx, Squad{Name: "sq", LeaderID: leader})
+	if err != nil {
+		t.Fatalf("create squad: %v", err)
+	}
+	if _, err := squadSvc.AddMember(ctx, sq.ID, "agent", member, "reviewer"); err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+
+	// Archive the member (not the leader — leader is RESTRICT-protected).
+	as := NewAgentService(st, events.NewBus())
+	if err := as.Delete(ctx, member); err != nil {
+		t.Fatalf("archive member: %v", err)
+	}
+
+	// Assigning the squad to a goal is refused (roster incomplete).
+	if _, err := gs.Create(ctx, Goal{Title: "g", AssigneeType: "squad", AssigneeID: sq.ID, Status: "active", DomainID: domID}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("create goal on squad with archived member must be refused, got %v", err)
+	}
+	// Creating a schedule on this squad is refused.
+	ss := NewScheduleService(st, events.NewBus())
+	if _, err := ss.Create(ctx, Schedule{Name: "s", TitleTemplate: "t", AssigneeType: "squad", AssigneeID: sq.ID, DomainID: domID, CronExpression: "*/5 * * * *", Timezone: "UTC"}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("create schedule on squad with archived member must be refused, got %v", err)
+	}
+}
+
+// TestArchiveAgentPreservesSquadMembership: archiving an agent keeps its
+// squad_member rows — the roster still lists it (with a "已删除" tag in the UI),
+// and restore is trivial. Completeness is judged by joining agent.archived_at,
+// not by the row's presence (方案一, 反馈2).
+func TestArchiveAgentPreservesSquadMembership(t *testing.T) {
+	_, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	leader := seedAgent(t, st, "leader")
+	member := seedAgent(t, st, "member")
+
+	squadSvc := NewSquadService(st, events.NewBus())
+	sq, err := squadSvc.Create(ctx, Squad{Name: "sq", LeaderID: leader})
+	if err != nil {
+		t.Fatalf("create squad: %v", err)
+	}
+	if _, err := squadSvc.AddMember(ctx, sq.ID, "agent", member, "reviewer"); err != nil {
+		t.Fatalf("add member: %v", err)
+	}
+
+	as := NewAgentService(st, events.NewBus())
+	if err := as.Delete(ctx, member); err != nil {
+		t.Fatalf("archive member: %v", err)
+	}
+
+	// The squad_member row survives — roster still lists the archived agent.
+	var n int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM squad_member WHERE squad_id=? AND member_type='agent' AND member_id=?`, sq.ID, member).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("squad_member row must survive archive, got count=%d", n)
+	}
+}
+
+// TestScheduleEnableRevalidatesAssignee: enabling a schedule whose agent was
+// archived after creation is refused — the operator must reassign before
+// resuming firing (方案三, 反馈5).
+func TestScheduleEnableRevalidatesAssignee(t *testing.T) {
+	_, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	agentA := seedAgent(t, st, "A")
+	domID := seedDomain(t, st)
+
+	ss := NewScheduleService(st, events.NewBus())
+	sch, err := ss.Create(ctx, Schedule{Name: "s", TitleTemplate: "t", AssigneeType: "agent", AssigneeID: agentA, DomainID: domID, CronExpression: "*/5 * * * *", Timezone: "UTC"})
+	if err != nil {
+		t.Fatalf("create schedule: %v", err)
+	}
+	// Disable it, then archive the agent.
+	if _, err := ss.SetEnabled(ctx, sch.ID, false); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	as := NewAgentService(st, events.NewBus())
+	if err := as.Delete(ctx, agentA); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	// Re-enabling must be refused (assignee archived).
+	if _, err := ss.SetEnabled(ctx, sch.ID, true); !errors.Is(err, ErrValidation) {
+		t.Fatalf("enable schedule on archived agent must be refused, got %v", err)
 	}
 }

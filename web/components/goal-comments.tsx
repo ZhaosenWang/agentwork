@@ -6,18 +6,22 @@ import { useWSEvent } from "@/lib/ws";
 import { Button, Empty } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Comment } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 export function GoalComments({ goalId }: { goalId: string }) {
   const { data: comments, isLoading } = useGoalComments(goalId);
   const createComment = useCreateGoalComment();
-  const { data: agents } = useAgents();
+  const { data: agents } = useAgents(true);
   const [liveComments, setLiveComments] = useState<Comment[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Agent id → name (mentions and authors display as names, not 32-hex ids).
-  // Soft-archive (plan §7.1): an archived agent is filtered out of GET /agents,
-  // so the cache miss falls back to "已删除" rather than leaking a uuid slice.
-  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? "已删除";
+  // Soft-archive: include_archived pulls archived agents so the original name
+  // resolves with a "（已删除）" tag; only a truly unknown id falls back to "已删除".
+  const agentName = (id: string) => {
+    const a = agents?.find((x) => x.id === id);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
 
   // Reset live comments when goal changes
   useEffect(() => {

@@ -69,6 +69,7 @@ export const qk = {
   machines: ["machines"] as const,
   skills: ["skills"] as const,
   agents: ["agents"] as const,
+  agentsArchived: ["agents", "archived"] as const,
   goals: ["goals"] as const,
   goal: (id: string) => ["goals", id] as const,
   goalRuns: (goalId: string) => ["goals", goalId, "runs"] as const,
@@ -79,6 +80,7 @@ export const qk = {
   subGoalVerifications: (goalId: string, subGoalId: string) =>
     ["goals", goalId, "sub-goals", subGoalId, "verifications"] as const,
   squads: ["squads"] as const,
+  squadsArchived: ["squads", "archived"] as const,
   squad: (id: string) => ["squads", id] as const,
   squadMembers: (squadId: string) => ["squads", squadId, "members"] as const,
   schedules: ["schedules"] as const,
@@ -142,8 +144,11 @@ export function useDeleteRuntime() {
 }
 
 // ── Agent hooks ──
-export function useAgents() {
-  return useQuery({ queryKey: qk.agents, queryFn: listAgents });
+// includeArchived=true pulls archived (soft-deleted) agents so historical
+// references render with the agent's original name + a "已删除" tag instead of
+// a bare id/uuid fragment. The list page leaves it false (active only).
+export function useAgents(includeArchived = false) {
+  return useQuery({ queryKey: includeArchived ? qk.agentsArchived : qk.agents, queryFn: () => listAgents(includeArchived) });
 }
 export function useCreateAgent() {
   const qc = useQueryClient();
@@ -327,8 +332,8 @@ export function useCreateGoalComment() {
 }
 
 // ── Squad hooks ──
-export function useSquads() {
-  return useQuery({ queryKey: qk.squads, queryFn: listSquads });
+export function useSquads(includeArchived = false) {
+  return useQuery({ queryKey: includeArchived ? qk.squadsArchived : qk.squads, queryFn: () => listSquads(includeArchived) });
 }
 export function useCreateSquad() {
   const qc = useQueryClient();

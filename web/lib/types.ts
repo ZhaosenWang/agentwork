@@ -62,6 +62,8 @@ export interface Agent {
   mcp_servers: McpServer[]; // the agent's own tools (browser/db/…), always after the workspace server
   skills: string[]; // platform-managed skill ids (CLI 分支 Phase 4) — pushed to the agent's machine
   max_concurrent: number;
+  archived_at: string; // RFC3339 of the archive action; '' = active
+  archived_by: string; // '' = active
   created_at: string;
 }
 
@@ -200,6 +202,8 @@ export interface Squad {
   description: string;
   leader_id: string;
   instructions: string;
+  archived_at: string; // RFC3339 of the archive action; '' = active
+  archived_by: string; // '' = active
   created_at: string;
 }
 

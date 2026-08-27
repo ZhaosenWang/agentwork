@@ -8,6 +8,7 @@ import { useWSEvent } from "@/lib/ws";
 import { Badge, Empty } from "@/components/ui";
 import { Markdown } from "@/components/markdown";
 import type { Run } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 import type { ChatMessage } from "@/lib/api";
 import { groupMessages, StreamCards } from "@/lib/run-messages";
 
@@ -38,11 +39,14 @@ function useThrottled(fn: () => void, ms: number) {
 
 export function GoalRuns({ goalId }: { goalId: string }) {
   const { data: runs, isLoading, refetch } = useGoalRuns(goalId);
-  const { data: agents } = useAgents();
+  const { data: agents } = useAgents(true);
   const [showPast, setShowPast] = useState(false);
 
   // Agent id → name (the runs table reads who is working, not a hex id).
-  const agentName = (id: string) => agents?.find((a) => a.id === id)?.name ?? "已删除";
+  const agentName = (id: string) => {
+    const a = agents?.find((x) => x.id === id);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
 
   // Refresh on run LIFECYCLE events only (enqueued/claimed/cancelled/
   // terminal) — the TERMINAL events matter most for the stop button: the

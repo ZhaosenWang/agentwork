@@ -5,12 +5,13 @@ import Link from "next/link";
 import { useSchedules, useAgents, useSquads, useDomains, useCreateSchedule, useUpdateSchedule, useDeleteSchedule, useSetScheduleEnabled, useGoalEvents, useScheduleRuns } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls, ConfirmDialog, Badge } from "@/components/ui";
 import type { Schedule } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 export default function SchedulesPage() {
   useGoalEvents();
   const { data: schedules, isLoading } = useSchedules();
-  const { data: agents } = useAgents();
-  const { data: squads } = useSquads();
+  const { data: agents } = useAgents(true);
+  const { data: squads } = useSquads(true);
   const { data: domains } = useDomains();
   const createSchedule = useCreateSchedule();
   const deleteSchedule = useDeleteSchedule();
@@ -20,8 +21,14 @@ export default function SchedulesPage() {
   const [detail, setDetail] = useState<Schedule | null>(null);
   const [editTarget, setEditTarget] = useState<Schedule | null>(null);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
-  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? "已删除";
+  const agentName = (aid: string) => {
+    const a = agents?.find((x) => x.id === aid);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
+  const squadName = (sid: string) => {
+    const s = squads?.find((x) => x.id === sid);
+    return s ? displayName(s.name, s.archived_at) : "已删除";
+  };
   const domainName = (did: string) => domains?.find((d) => d.id === did)?.name ?? did;
   const assigneeLabel = (s: Schedule) =>
     s.assignee_type === "squad" ? (squadName(s.assignee_id) || s.assignee_id) : (agentName(s.assignee_id) || s.assignee_id);

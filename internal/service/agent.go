@@ -155,12 +155,17 @@ func dupNameError(err error, name string) error {
 	return nil
 }
 
-func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
-	// Active agents only: archived rows are excluded (plan §4.5). Get does
-	// NOT filter, so audit references stay resolvable.
-	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,archived_at,archived_by,created_at
-		 FROM agent WHERE archived_at='' ORDER BY created_at`)
+// List returns agents. Active only by default (archived rows excluded, plan
+// §4.5); includeArchived=true returns archived rows too so the UI can render
+// historical references with the agent's original name + a "已删除" tag.
+// Get does NOT filter, so audit references stay resolvable regardless.
+func (s *AgentService) List(ctx context.Context, includeArchived bool) ([]Agent, error) {
+	q := `SELECT id,name,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,archived_at,archived_by,created_at FROM agent`
+	if !includeArchived {
+		q += ` WHERE archived_at=''`
+	}
+	q += ` ORDER BY created_at`
+	rows, err := s.st.DB().QueryContext(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -239,27 +244,18 @@ func (s *AgentService) Archive(ctx context.Context, id, archivedBy string) error
 		return NewValidationError(fmt.Sprintf("agent %s leads %d squad(s); delete or reassign them first", id, squadCount))
 	}
 
-	// Capture the agent's running runs BEFORE the transaction — the daemon
-	// needs their ids to cut the processes (the rows stay, but the runs must
-	// not keep burning compute on an archived agent). Same shape as
-	// GoalService.Delete's running-run capture.
-	runningRows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id FROM run WHERE agent_id=? AND status='running'`, id)
-	if err != nil {
-		return fmt.Errorf("collect running runs: %w", err)
+	// Refuse if this agent has running runs — cutting a live process mid-run
+	// is destructive and surprising. The operator stops or reassigns the runs
+	// first, then archives. (Guard基调对齐 domain.Delete 的 schedule/processor
+	// 守卫.) The daemon's onAgentArchived cancelRun path stays as a defensive
+	// backstop for any race that lands a run after this check.
+	var runningCount int
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE agent_id=? AND status='running'`, id).Scan(&runningCount); err != nil {
+		return fmt.Errorf("check running runs: %w", err)
 	}
-	var runningRunIDs []string
-	for runningRows.Next() {
-		var rid string
-		if err := runningRows.Scan(&rid); err != nil {
-			runningRows.Close()
-			return err
-		}
-		runningRunIDs = append(runningRunIDs, rid)
-	}
-	runningRows.Close()
-	if err := runningRows.Err(); err != nil {
-		return err
+	if runningCount > 0 {
+		return NewValidationError(fmt.Sprintf("agent %s has %d running run(s); stop or reassign them first", id, runningCount))
 	}
 
 	tx, err := s.st.DB().BeginTx(ctx, nil)
@@ -267,14 +263,11 @@ func (s *AgentService) Archive(ctx context.Context, id, archivedBy string) error
 		return err
 	}
 	defer tx.Rollback()
-	// Drop the agent's squad memberships (关系表, not audit — an archived agent
-	// is no longer an active member; restoring re-adds it). squad_member rows
-	// for this agent are removed so a squad's roster doesn't list a stale
-	// archived agent.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM squad_member WHERE member_type='agent' AND member_id=?`, id); err != nil {
-		return fmt.Errorf("drop squad memberships: %w", err)
-	}
-	// Disable the agent's schedules (enabled=0, not deleted — restorable).
+	// squad_member rows are PRESERVED (not deleted) — an archived agent stays
+	// on the roster with a "已删除" tag, so a squad's history is intact and
+	// restore is trivial. Completeness at assign-time is judged by joining
+	// agent.archived_at (see mustActiveSquadComplete), not by the row's
+	// presence. Disabling schedules is enough to keep the agent off new work.
 	if _, err := tx.ExecContext(ctx, `UPDATE schedule SET enabled=0 WHERE assignee_type='agent' AND assignee_id=?`, id); err != nil {
 		return fmt.Errorf("disable schedules: %w", err)
 	}
@@ -299,12 +292,13 @@ func (s *AgentService) Archive(ctx context.Context, id, archivedBy string) error
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// Tell the daemon to cut the agent's running runs and drop its worker.
-	// Payload shape mirrors goal:deleted ({run_ids}) so onAgentArchived reads
-	// it the same way onGoalDeleted does.
+	// Tell the daemon to drop the agent's worker. run_ids is empty — the
+	// running-run guard above refuses any active run, so onAgentArchived's
+	// cancelRun loop is a no-op backstop (kept for race safety). Payload shape
+	// mirrors goal:deleted ({run_ids}) for consistency.
 	s.bus.Publish(ctx, events.Event{Topic: "agent:archived", Payload: map[string]any{
 		"id":          id,
-		"run_ids":     runningRunIDs,
+		"run_ids":     []string{},
 		"archived_by": archivedBy,
 	}})
 	return nil

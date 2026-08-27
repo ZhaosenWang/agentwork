@@ -5,17 +5,21 @@ import Link from "next/link";
 import { useSquads, useAgents, useCreateSquad, useAddSquadMember, useDeleteSquad, useGoalEvents } from "@/lib/queries";
 import { Button, PageHeader, Empty, Dialog, Field, inputCls, ConfirmDialog } from "@/components/ui";
 import type { Squad } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 export default function SquadsPage() {
   useGoalEvents();
   const { data: squads, isLoading } = useSquads();
-  const { data: agents } = useAgents();
+  const { data: agents } = useAgents(true);
   const createSquad = useCreateSquad();
   const deleteSquad = useDeleteSquad();
   const [showForm, setShowForm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
+  const agentName = (aid: string) => {
+    const a = agents?.find((x) => x.id === aid);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
 
   return (
     <div className="p-8">

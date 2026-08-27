@@ -26,6 +26,7 @@ import { useWSEvent } from "@/lib/ws";
 import { Badge, Button, Dialog } from "@/components/ui";
 import type { TimelineItem } from "@/lib/types";
 import { groupMessages, StreamCards } from "@/lib/run-messages";
+import { displayName } from "@/lib/utils";
 
 /** 1min ago → "1min"; 3h12m → "3h 12m"; 2d → "2d". */
 function dur(start: number, end: number): string {
@@ -45,7 +46,7 @@ function fmtTime(iso: string): string {
 // Shared flow state: the merged timeline + the computed active holder.
 function useFlow(goalId: string, goalStatus: string) {
   const { data: items } = useGoalTimeline(goalId);
-  const { data: agents } = useAgents();
+  const { data: agents } = useAgents(true);
   const [, setTick] = useState(0);
 
   // Live elapsed clock — the active segment's "已处理 X" keeps moving.
@@ -54,7 +55,10 @@ function useFlow(goalId: string, goalStatus: string) {
     return () => clearInterval(t);
   }, []);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
+  const agentName = (aid: string) => {
+    const a = agents?.find((x) => x.id === aid);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
   const nowMs = Date.now();
 
   const runs = (items ?? []).filter((i) => i.kind === "run");

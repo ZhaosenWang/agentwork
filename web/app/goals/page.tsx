@@ -6,6 +6,7 @@ import { useGoals, useAgents, useSquads, useDomains, useCreateGoal, useGoalEvent
 import { Badge, AttentionChip, ReviewPhaseBadge, Button, PageHeader, Empty, Dialog, Field, inputCls } from "@/components/ui";
 import { GoalStats } from "@/components/goal-stats";
 import type { Goal, GoalStatus } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 const STATUS_TABS: { label: string; value: GoalStatus | "all" }[] = [
   { label: "全部", value: "all" },
@@ -33,15 +34,21 @@ const initials = (name: string) => (name ? name.slice(0, 1).toUpperCase() : "?")
 export default function GoalsPage() {
   useGoalEvents();
   const { data: goals, isLoading } = useGoals();
-  const { data: agents } = useAgents();
-  const { data: squads } = useSquads();
+  const { data: agents } = useAgents(true);
+  const { data: squads } = useSquads(true);
   const { data: domains } = useDomains();
   const createGoal = useCreateGoal();
   const [filter, setFilter] = useState<GoalStatus | "all">("all");
   const [showForm, setShowForm] = useState(false);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
-  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? "已删除";
+  const agentName = (aid: string) => {
+    const a = agents?.find((x) => x.id === aid);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
+  const squadName = (sid: string) => {
+    const s = squads?.find((x) => x.id === sid);
+    return s ? displayName(s.name, s.archived_at) : "已删除";
+  };
 
   const filtered = goals?.filter((g) => filter === "all" || g.status === filter) ?? [];
 

@@ -4,17 +4,24 @@ import Link from "next/link";
 import { useGoals, useAgents, useSquads, useGoalEvents } from "@/lib/queries";
 import { Badge, PageHeader, Button, Empty } from "@/components/ui";
 import type { Goal } from "@/lib/types";
+import { displayName } from "@/lib/utils";
 
 // 总览：开门三件事——有什么要我批（待审批队列）、什么在跑（活跃任务）、
 // 最近完成了什么（最近完成）。WS 订阅保证卡点变化实时进队列。
 export default function Home() {
   useGoalEvents();
   const { data: goals } = useGoals();
-  const { data: agents } = useAgents();
-  const { data: squads } = useSquads();
+  const { data: agents } = useAgents(true);
+  const { data: squads } = useSquads(true);
 
-  const agentName = (aid: string) => agents?.find((a) => a.id === aid)?.name ?? "已删除";
-  const squadName = (sid: string) => squads?.find((s) => s.id === sid)?.name ?? "已删除";
+  const agentName = (aid: string) => {
+    const a = agents?.find((x) => x.id === aid);
+    return a ? displayName(a.name, a.archived_at) : "已删除";
+  };
+  const squadName = (sid: string) => {
+    const s = squads?.find((x) => x.id === sid);
+    return s ? displayName(s.name, s.archived_at) : "已删除";
+  };
   const assigneeLabel = (g: Goal) =>
     g.assignee_type === "squad" ? squadName(g.assignee_id) : g.assignee_id ? agentName(g.assignee_id) : "-";
 

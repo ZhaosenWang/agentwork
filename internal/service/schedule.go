@@ -64,11 +64,11 @@ func (s *ScheduleService) validateSchedule(ctx context.Context, sch *Schedule) e
 	}
 	switch sch.AssigneeType {
 	case "agent":
-		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, sch.AssigneeID, "assignee agent"); err != nil {
+		if err := mustActiveAgent(ctx, s.st, sch.AssigneeID, "assignee agent"); err != nil {
 			return err
 		}
 	case "squad":
-		if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM squad WHERE id=?`, sch.AssigneeID, "assignee squad"); err != nil {
+		if err := mustActiveSquadComplete(ctx, s.st, sch.AssigneeID, "assignee squad"); err != nil {
 			return err
 		}
 	default:
@@ -229,6 +229,19 @@ func (s *ScheduleService) ListRuns(ctx context.Context, scheduleID string) ([]Sc
 // "停掉定时任务" flow — the schedule row and its firing history stay, the
 // daemon's dispatchSchedules only fires enabled=1 rows).
 func (s *ScheduleService) SetEnabled(ctx context.Context, id string, enabled bool) (*Schedule, error) {
+	// Enabling re-validates the assignee: an agent/squad archived after the
+	// schedule was created (or a squad whose roster since lost members) must
+	// not silently resume firing on a dead/incomplete assignee. The operator
+	// reassigns first. Disabling is always allowed (safe regardless of state).
+	if enabled {
+		sch, err := s.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.validateSchedule(ctx, sch); err != nil {
+			return nil, err
+		}
+	}
 	v := 0
 	if enabled {
 		v = 1
