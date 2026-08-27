@@ -276,6 +276,17 @@ func normalizeNilSlices(v any) any {
 	}
 }
 
+// NormalizeForWire deep-converts a value so its JSON marshaling is accepted by
+// strict ACP servers (opencode's zod schema): nil slices on omitempty fields
+// become [] instead of vanishing ("expected array, received undefined"). This
+// is the SAME normalization the SDK applies to every request it sends
+// (writeRequest → normalizeNilSlices); callers that marshal ACP params
+// OUTSIDE the SDK — e.g. the chat relay's session/new mcpServers injection,
+// which rewrites a frame the web client sent rather than going through the
+// SDK — must apply this to match what the run path's SDK send produces.
+// Returns the normalized value (marshal it yourself).
+func NormalizeForWire(v any) any { return normalizeNilSlices(v) }
+
 // SetEventHandler registers the callback that receives session/update
 // notifications from the agent. Must be set before [Session.Prompt] to
 // capture streaming output.
