@@ -309,6 +309,10 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 		// terminal history (verified/failed/cancelled) stays, same as
 		// CancelSubGoal.
 		`UPDATE sub_goal SET status='cancelled' WHERE (assignee_id=?1 OR verifier_id=?1) AND status NOT IN ('verified','cancelled','failed')`,
+		// Sidebar pin preference: a user-facing preference, not a guard — drop
+		// it silently. Must precede the agent delete: agent_pin.agent_id is a
+		// non-cascading FK, so a leftover pin row would reject DELETE FROM agent.
+		`DELETE FROM agent_pin WHERE agent_id=?`,
 		`DELETE FROM agent WHERE id=?`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt, id); err != nil {

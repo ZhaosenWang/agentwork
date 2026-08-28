@@ -79,6 +79,18 @@ export const updateAgent = (id: string, body: Record<string, unknown>) =>
 export const deleteAgent = (id: string) =>
   api<void>(`/agents/${id}`, { method: "DELETE" });
 
+// ── Agent pin (sidebar) ──
+// Pin state lives in the agent_pin table (single-user, per-agent only). Row
+// existence = pinned. PUT toggles; GET returns the pinned id set. The
+// external frontend pairs GET /agents/pinned with GET /agents to render each
+// agent's pin button state; this self-test page does the same.
+export const setAgentPin = (id: string, pinned: boolean) =>
+  api<{ agent_id: string; pinned: boolean }>(`/agents/${id}/pin`, {
+    method: "PUT",
+    body: JSON.stringify({ pinned }),
+  });
+export const listPinnedAgents = () => api<string[]>("/agents/pinned");
+
 // ── Goal ──
 export const listGoals = () => api<Goal[]>("/goals");
 export const getGoal = (id: string) => api<Goal>(`/goals/${id}`);
