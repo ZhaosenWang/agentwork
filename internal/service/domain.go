@@ -449,13 +449,25 @@ func (s *DomainService) validateIssueTracking(ctx context.Context, d *Domain) er
 // the edit path). Compile artifacts (checks/strength/baseline) are only
 // touched by CompilePolicy/FreezeChecks; policy_text by CompilePolicy.
 func (s *DomainService) Update(ctx context.Context, id string, d Domain) (*Domain, error) {
-	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM domain WHERE id=?`, id, "domain"); err != nil {
+	// The edit path never changes type — repo/scratch is fixed at creation.
+	// Fetching the old domain both checks existence and yields the DB's real
+	// type for validation. The frontend edit form omits type, so the decoded
+	// d.Type is "" and the scratch guard in validateIssueTracking would never
+	// fire against that empty value — letting a scratch domain silently absorb
+	// issue tracking config (a type ↔ capability contradiction). Overlaying the
+	// real type makes the guard evaluate against the true domain type.
+	old, err := s.Get(ctx, id)
+	if err != nil {
 		return nil, err
 	}
+	if d.Type != "" && d.Type != old.Type {
+		return nil, NewValidationError("domain type cannot be changed after creation (repo ↔ scratch is not supported)")
+	}
+	d.Type = old.Type
 	if err := s.validateIssueTracking(ctx, &d); err != nil {
 		return nil, err
 	}
-	_, err := s.st.DB().ExecContext(ctx,
+	_, err = s.st.DB().ExecContext(ctx,
 		`UPDATE domain SET git_url=?, default_branch=?, git_identity=?, git_credentials=?, issue_repo=?, issue_assignee=?, issue_assignee_type=?, issue_provider=? WHERE id=?`,
 		d.GitURL, d.DefaultBranch, d.GitIdentity, d.GitCredentials, d.IssueRepo, d.IssueAssignee, d.IssueAssigneeType, d.IssueProvider, id)
 	if err != nil {

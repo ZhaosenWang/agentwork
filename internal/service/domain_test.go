@@ -201,3 +201,67 @@ func TestDomainCRUDAndFreeze(t *testing.T) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
+
+// TestUpdateDomainTypeGuard covers the edit-path type guard: type is fixed
+// at creation, and Update must validate against the DB's real type, not the
+// (often-empty) value in the request body. The frontend edit form omits type
+// entirely — without the guard, a scratch domain could silently absorb issue
+// tracking config (type ↔ capability contradiction) because the scratch
+// branch in validateIssueTracking never fires on d.Type == "".
+func TestUpdateDomainTypeGuard(t *testing.T) {
+	st := newTestStore(t)
+	svc := NewDomainService(st, events.NewBus())
+	ctx := context.Background()
+
+	// A scratch domain — no repo, so issue tracking must be rejected on edit.
+	scratch, err := svc.Create(ctx, Domain{Name: "notebook", Type: "scratch"})
+	if err != nil {
+		t.Fatalf("create scratch: %v", err)
+	}
+	if scratch.Type != "scratch" {
+		t.Fatalf("expected scratch, got %q", scratch.Type)
+	}
+	// validateIssueTracking now sees the real type (scratch) and must refuse
+	// issue config even though the request body carries no type field.
+	if _, err := svc.Update(ctx, scratch.ID, Domain{
+		IssueRepo:     "eushing/notebook",
+		IssueAssignee: "someone",
+	}); err == nil {
+		t.Fatalf("expected scratch domain to reject issue tracking on edit")
+	}
+
+	// A repo domain — editing without type (the normal frontend path) keeps
+	// working and persists the git config.
+	repo, err := svc.Create(ctx, Domain{
+		Name:   "agentwork",
+		Type:   "repo",
+		GitURL: "https://github.com/eushing/agentwork.git",
+	})
+	if err != nil {
+		t.Fatalf("create repo: %v", err)
+	}
+	updated, err := svc.Update(ctx, repo.ID, Domain{
+		GitURL:        "https://github.com/eushing/agentwork.git",
+		GitCredentials: "token-xyz",
+	})
+	if err != nil {
+		t.Fatalf("update repo without type: %v", err)
+	}
+	if updated.Type != "repo" || updated.GitCredentials != "token-xyz" {
+		t.Fatalf("repo edit round-trip mismatch: %+v", updated)
+	}
+
+	// A request that tries to flip the type must be refused loudly — the edit
+	// path must never silently swallow a type change into a contradiction.
+	if _, err := svc.Update(ctx, repo.ID, Domain{
+		Type:   "scratch",
+		GitURL: "https://github.com/eushing/agentwork.git",
+	}); err == nil {
+		t.Fatalf("expected error when editing tries to change type repo→scratch")
+	}
+	if _, err := svc.Update(ctx, scratch.ID, Domain{
+		Type: "repo",
+	}); err == nil {
+		t.Fatalf("expected error when editing tries to change type scratch→repo")
+	}
+}
