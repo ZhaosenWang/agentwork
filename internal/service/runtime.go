@@ -24,8 +24,11 @@ type Runtime struct {
 	// MachineID is the registered machine that executes this runtime's
 	// runs (transport='agentwork'; '' = local/legacy transports).
 	MachineID string `json:"machine_id,omitempty"`
-	// Status: active | absent — absent = the machine's latest probe no
-	// longer sees this CLI (uninstalled); the claim gate rejects it.
+	// Status: active | absent | inactive — absent = the machine's latest
+	// probe no longer sees this CLI (uninstalled); the claim gate rejects
+	// it. inactive = the machine is offline (heartbeat lost); List derives
+	// this at read time via a LEFT JOIN on machine — the stored value is
+	// active/absent only, so a reconnect auto-restores without a write.
 	Status    string `json:"status"`
 	CreatedAt string `json:"created_at"`
 }
@@ -65,7 +68,12 @@ func (s *RuntimeService) Create(ctx context.Context, r Runtime) (*Runtime, error
 
 func (s *RuntimeService) List(ctx context.Context) ([]Runtime, error) {
 	rows, err := s.st.DB().QueryContext(ctx,
-		`SELECT id,name,machine_id,args,env,status,created_at FROM runtime ORDER BY created_at`)
+		`SELECT r.id, r.name, r.machine_id, r.args, r.env,
+		        CASE WHEN m.status='offline' THEN 'inactive' ELSE r.status END,
+		        r.created_at
+		 FROM runtime r
+		 LEFT JOIN machine m ON m.id = r.machine_id
+		 ORDER BY r.created_at`)
 	if err != nil {
 		return nil, err
 	}
