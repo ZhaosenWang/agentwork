@@ -75,6 +75,11 @@ type goalRunContext struct {
 	SubGoalID string
 	BaseRef   string
 	HeadRef   string
+	// CancelReason is the structured cancellation cause
+	// (idle_watchdog|handoff|stopped|timeout|runaway|goal_terminal|goal_cancelled)
+	// — read by the cancelled reconcile branch to post a system feed comment
+	// and by Finish to publish run:cancelled with a structured reason_code.
+	CancelReason string
 }
 
 const maxAttempts = 3
@@ -970,6 +975,64 @@ func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) 
 	return id, nil
 }
 
+// cancelReasonDescription maps a structured cancel_reason code to a short
+// human-readable phrase (English — platform text stays fixed per 决策 6-18).
+// Used by the cancelled-run feed comment and the run:cancelled event reason.
+func cancelReasonDescription(code string) string {
+	switch code {
+	case "idle_watchdog":
+		return "agent was silent beyond the idle window"
+	case "timeout":
+		return "exceeded max run duration"
+	case "handoff":
+		return "goal reassigned to another agent"
+	case "stopped":
+		return "stopped by user"
+	case "runaway":
+		return "run exceeded time budget and was reaped"
+	case "goal_terminal":
+		return "goal reached a terminal state"
+	case "goal_cancelled":
+		return "goal was cancelled"
+	default:
+		return code
+	}
+}
+
+// insertCancelledRunComment posts a SYSTEM comment for a cancelled run — the
+// platform's voice (author_type='system'), not the agent's. A cancelled run's
+// summary is "cancelled by platform" (platform noise, not the agent's words),
+// so it must NOT be authored as the agent. The comment threads to the same
+// parent as insertRunResultComment (trigger comment / goal root / wake anchor).
+// Returns early when there is no structured cancel_reason to report.
+func insertCancelledRunComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) (string, error) {
+	if rc.CancelReason == "" {
+		return "", nil
+	}
+	id := newID()
+	var parentID any
+	if rc.TriggerCommentID != "" {
+		parentID = rc.TriggerCommentID
+	} else {
+		var root string
+		if err := tx.QueryRowContext(ctx, `SELECT id FROM comment WHERE goal_id=? ORDER BY created_at ASC LIMIT 1`, rc.GoalID).Scan(&root); err == nil && root != "" {
+			parentID = root
+		} else if rc.RunID != "" {
+			var anchor string
+			if err := tx.QueryRowContext(ctx, `SELECT wake_anchor FROM run WHERE id=?`, rc.RunID).Scan(&anchor); err == nil && anchor != "" {
+				parentID = anchor
+			}
+		}
+	}
+	content := "Run cancelled: " + cancelReasonDescription(rc.CancelReason) + " (" + rc.CancelReason + ")"
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,'system','',?,?,?,?)`,
+		id, rc.GoalID, parentID, content, now(), rc.RunID); err != nil {
+		return "", fmt.Errorf("insert cancelled-run comment: %w", err)
+	}
+	return id, nil
+}
+
 // ReconcileOnRunEnd runs under withBusyRetry for the same snapshot-upgrade
 // reason as ReconcileGoal — a BUSY here would drop the reconcile AND the
 // run.terminal publish (Finish returns the error), which is a worse failure
@@ -1305,8 +1368,13 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 	case "cancelled":
 		// The run ended without completing or failing the goal: a timeout /
 		// watchdog cut or a handoff cut (cancel_reason='handoff', 决策 6-6).
-		// The goal stays exactly where it is — no goal-level event (决策 5-10);
-		// the daemon already published run:cancelled with the structured reason.
+		// The goal stays exactly where it is — no goal-level event (决策 5-10).
+		// Post a SYSTEM feed comment so the cancellation cause is visible in
+		// the goal feed (the summary "cancelled by platform" is platform noise,
+		// not the agent's words — author as system, not agent).
+		if _, err := insertCancelledRunComment(ctx, tx, rc); err != nil {
+			return err
+		}
 	}
 
 	return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit, rc.RunID)

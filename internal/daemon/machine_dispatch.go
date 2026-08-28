@@ -490,6 +490,19 @@ func (d *Daemon) runMachineWatchdog(runID, machineID string) {
 		}
 		if cancelSent.IsZero() {
 			logging.Infof("machine: watchdog firing for run %s (%s)", runID, reason)
+			// Stamp the structured cancel_reason BEFORE the cancel rides out —
+			// Finish (the terminal chokepoint) does not write cancel_reason, so
+			// without this stamp the reason is lost to the DB and the feed
+			// comment / IM card / log line all go blind. max_run_duration maps
+			// to the schema's "timeout" code (schema.sql:205).
+			reasonCode := reason
+			if reason == "max_run_duration" {
+				reasonCode = "timeout"
+			}
+			if _, err := d.st.DB().ExecContext(context.Background(),
+				`UPDATE run SET cancel_reason=? WHERE id=? AND status='running'`, reasonCode, runID); err != nil {
+				logging.Infof("machine: watchdog stamp cancel_reason %s: %v", runID, err)
+			}
 			// PULL model: the cancel rides the machine's next poll.
 			d.enqueueMachineCancel(machineID, link.RunCancelParams{RunID: runID, Reason: reason})
 			cancelSent = time.Now()
