@@ -331,6 +331,27 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	// case (a CLI added while connect is running).
 	probeTick := time.NewTicker(time.Minute)
 	defer probeTick.Stop()
+	// gracefulOffline is set when the loop exits via ctx cancellation
+	// (SIGTERM/SIGINT) — a deliberate shutdown that should tell the daemon
+	// to mark this machine offline NOW. A link death (peer.Done) does NOT
+	// set it: the connection may have dropped due to a transient network
+	// blip, and the reconnect loop will dial back in seconds — flagging
+	// the machine offline would make the runtime flash inactive→active in
+	// the dropdown (the 90s stale sweep exists precisely to tolerate this).
+	// The tricky case is SIGTERM racing a link death: both peer.Done and
+	// ctx.Done fire near-simultaneously, and select picks one at random.
+	// If peer.Done wins, we'd miss the notification. So peer.Done ALSO
+	// checks ctx: if ctx is already done, this is a graceful shutdown
+	// whose link happened to die first — notify anyway.
+	gracefulOffline := false
+	defer func() {
+		if !gracefulOffline {
+			return
+		}
+		notifyCtx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		_ = peer.Notify(notifyCtx, link.MethodMachineOffline, link.HeartbeatParams{MachineID: st.MachineID})
+		cancel()
+	}()
 	for {
 		select {
 		case <-tick.C:
@@ -361,9 +382,20 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 				}
 			}
 		case <-peer.Done():
+			// The link died. If ctx is also done, this is a graceful
+			// shutdown (SIGTERM) whose link happened to tear down first —
+			// still notify. Otherwise it's a transient drop: the reconnect
+			// loop will retry, so leave the machine connected and let the
+			// stale sweep handle a true disappearance.
+			select {
+			case <-ctx.Done():
+				gracefulOffline = true
+			default:
+			}
 			cliLogf("link: closed")
 			return fmt.Errorf("link closed")
 		case <-ctx.Done():
+			gracefulOffline = true
 			return nil
 		}
 	}

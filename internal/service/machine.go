@@ -135,6 +135,21 @@ func (s *MachineService) MarkStale(ctx context.Context, cutoff time.Time) (int, 
 	return int(n), nil
 }
 
+// MarkOffline marks one machine offline immediately (graceful CLI shutdown via
+// machine.offline notification). Idempotent: only a connected machine flips,
+// so a second notification is a no-op. Does not touch last_seen_at — the
+// stale sweep still owns that field. A notification from a dead link that
+// races a reconnect can clobber the new connected state, but the next
+// heartbeat (≤5s) restores it — a tolerable flap vs the 90s it replaces.
+func (s *MachineService) MarkOffline(ctx context.Context, machineID string) error {
+	_, err := s.st.DB().ExecContext(ctx,
+		`UPDATE machine SET status='offline' WHERE id=? AND status='connected'`, machineID)
+	if err != nil {
+		return fmt.Errorf("mark machine offline: %w", err)
+	}
+	return nil
+}
+
 // MarshalProbedCLIs encodes a probe report for storage.
 func MarshalProbedCLIs(v any) string {
 	b, err := json.Marshal(v)

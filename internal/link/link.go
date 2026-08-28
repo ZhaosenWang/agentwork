@@ -24,6 +24,7 @@ const (
 	MethodMachineRegister    = "machine.register"
 	MethodMachineHeartbeat   = "machine.heartbeat"
 	MethodMachineProbeUpdate = "machine.probe_update"
+	MethodMachineOffline     = "machine.offline" // notification: CLI graceful shutdown — mark machine offline now, skip the 90s stale sweep
 
 	// machine → daemon (Phase 2, PULL model — multica-style): the machine
 	// POLLS for work; the daemon never pushes to the machine's link. The
