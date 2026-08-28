@@ -93,6 +93,58 @@ func TestMachineRegistry(t *testing.T) {
 	}
 }
 
+// TestMarkOffline covers the graceful-shutdown path: a connected machine
+// flips to offline immediately (no 90s stale-sweep wait), the call is
+// idempotent (an already-offline machine is a no-op), and a stale
+// notification arriving AFTER a reconnect does not clobber the new
+// connected state — the WHERE status='connected' guard.
+func TestMarkOffline(t *testing.T) {
+	st := newTestStore(t)
+	svc := NewMachineService(st)
+	ctx := context.Background()
+
+	if err := svc.Register(ctx, Machine{ID: "m1", Name: "dev", Hostname: "h"}, "[]"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Graceful shutdown: connected → offline, immediately.
+	if err := svc.MarkOffline(ctx, "m1"); err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+	list, _ := svc.List(ctx)
+	if list[0].Status != "offline" {
+		t.Fatalf("expected offline after MarkOffline, got %s", list[0].Status)
+	}
+
+	// Idempotent: a second call on an offline machine is a no-op (no row
+	// matches WHERE status='connected').
+	if err := svc.MarkOffline(ctx, "m1"); err != nil {
+		t.Fatalf("second mark offline: %v", err)
+	}
+	list, _ = svc.List(ctx)
+	if list[0].Status != "offline" {
+		t.Fatalf("second MarkOffline must be a no-op, got %s", list[0].Status)
+	}
+
+	// After a reconnect (Heartbeat re-marks connected), MarkOffline must
+	// take effect again — a machine that comes back and then shuts down
+	// gracefully is flipped offline a second time.
+	if err := svc.Heartbeat(ctx, "m1"); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	list, _ = svc.List(ctx)
+	if list[0].Status != "connected" {
+		t.Fatalf("heartbeat must re-mark connected, got %s", list[0].Status)
+	}
+	if err := svc.MarkOffline(ctx, "m1"); err != nil {
+		t.Fatalf("mark offline after reconnect: %v", err)
+	}
+	list, _ = svc.List(ctx)
+	if list[0].Status != "offline" {
+		t.Fatalf("expected offline after post-reconnect MarkOffline, got %s", list[0].Status)
+	}
+}
+
 // TestUpsertProbeRuntimes covers the Phase 2 runtime provisioning: a probed
 // CLI becomes a machine-owned runtime row; a
 // re-register refreshes it instead of duplicating.

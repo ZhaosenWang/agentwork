@@ -278,6 +278,22 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			}
 			return nil, nil // notification — no reply
 		})
+		peer.Handle(link.MethodMachineOffline, func(ctx context.Context, params json.RawMessage) (any, *link.RPCError) {
+			var p link.HeartbeatParams // reuse: {machine_id} same shape as heartbeat
+			if err := json.Unmarshal(params, &p); err != nil || p.MachineID == "" {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "machine_id is required"}
+			}
+			// The notification arrives just before the CLI closes the
+			// WebSocket — the peer's ctx (passed in as ctx) is cancelled
+			// the instant the read loop sees the close frame, racing the
+			// DB write. Use a detached context so MarkOffline completes
+			// even as the connection tears down.
+			if err := machineSvc.MarkOffline(context.Background(), p.MachineID); err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			logging.Infof("connect: machine %s marked offline (graceful shutdown)", p.MachineID)
+			return nil, nil // notification — no reply
+		})
 		peer.Handle(link.MethodMachineProbeUpdate, func(ctx context.Context, params json.RawMessage) (any, *link.RPCError) {
 			var p link.ProbeUpdateParams
 			if err := json.Unmarshal(params, &p); err != nil || p.MachineID == "" {
