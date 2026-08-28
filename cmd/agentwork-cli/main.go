@@ -601,8 +601,12 @@ func postNoBody(url string, body any) {
 	}
 }
 
+// versionCmd prints just the build version (e.g. "v0.0.2") on stdout — the
+// machine-capture form (VER=$(agentwork version)). The binary name is dropped
+// so the output is the version alone, matching `git --version`/`go version`
+// convention (stdout, not stderr).
 func versionCmd() {
-	fmt.Fprintf(os.Stderr, "agentwork v%s\n", cliVersion)
+	fmt.Printf("v%s\n", cliVersion)
 }
 
 func fail(format string, args ...any) {

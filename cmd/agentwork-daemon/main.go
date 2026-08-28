@@ -32,8 +32,13 @@ import (
 )
 
 func main() {
+	// version: print just the build version (e.g. "v0.0.2") on stdout — the
+	// machine-capture form (VER=$(agentwork-daemon version)), matching the
+	// CLI's `agentwork version` and git --version / go version convention.
+	// Checked BEFORE flag.Parse: the flag package doesn't recognize the bare
+	// "version" positional, and would error out on it.
 	if len(os.Args) >= 2 && os.Args[1] == "version" {
-		fmt.Fprintf(os.Stderr, "agentwork-daemon v%s\n", daemon.DaemonVersion)
+		fmt.Printf("v%s\n", daemon.DaemonVersion)
 		return
 	}
 	addr := flag.String("addr", ":7373", "HTTP listen address")
