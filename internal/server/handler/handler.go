@@ -45,6 +45,10 @@ type Handlers struct {
 	Machines *service.MachineService
 	// Skills is the skills library (CLI 分支 Phase 4).
 	Skills *service.SkillService
+	// AgentPin manages the sidebar-pin preference for agents (single-user:
+	// per-agent only, no user dimension). Backs PUT /agents/{id}/pin and
+	// GET /agents/pinned — the external frontend's "pin to sidebar" button.
+	AgentPin *service.AgentPinService
 }
 
 func (h *Handlers) Mount(mux *http.ServeMux) {
@@ -59,6 +63,11 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /agents/{id}", h.updateAgent)
 	mux.HandleFunc("DELETE /agents/{id}", h.deleteAgent)
 	mux.HandleFunc("GET /agents/{id}/history", h.agentHistory)
+	// Sidebar pin: PUT toggles one agent's pin, GET lists pinned ids. The
+	// static /agents/pinned path wins over the /agents/{id} wildcard in
+	// Go 1.22 ServeMux (more specific pattern first), so they don't collide.
+	mux.HandleFunc("PUT /agents/{id}/pin", h.setAgentPin)
+	mux.HandleFunc("GET /agents/pinned", h.listPinnedAgents)
 
 	mux.HandleFunc("GET /goals", h.listGoals)
 	mux.HandleFunc("POST /goals", h.createGoal)
@@ -215,6 +224,35 @@ func (h *Handlers) deleteAgent(w http.ResponseWriter, r *http.Request) {
 		go h.Daemon.PushMachineSkills(context.Background(), machineID)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ── agent pin ──
+
+// setAgentPin toggles the sidebar-pin state for one agent.
+// PUT /agents/{id}/pin  body {"pinned": bool} — mirrors the
+// PUT /schedules/{id}/enabled toggle pattern. Idempotent: repeating the same
+// state is a no-op. Agent existence is checked in the service (→ 400 if missing).
+func (h *Handlers) setAgentPin(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Pinned bool `json:"pinned"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, nil, service.NewValidationError("invalid body: "+err.Error()))
+		return
+	}
+	if err := h.AgentPin.SetPinned(r.Context(), r.PathValue("id"), body.Pinned); err != nil {
+		writeJSON(w, nil, err)
+		return
+	}
+	writeJSON(w, map[string]any{"agent_id": r.PathValue("id"), "pinned": body.Pinned}, nil)
+}
+
+// listPinnedAgents returns the IDs of agents pinned to the sidebar.
+// GET /agents/pinned → ["id1", ...] ([] when none pinned). The frontend pairs
+// this with GET /agents to mark each agent's pin button state.
+func (h *Handlers) listPinnedAgents(w http.ResponseWriter, r *http.Request) {
+	ids, err := h.AgentPin.ListPinned(r.Context())
+	writeJSON(w, ids, err)
 }
 
 // ── goal ──

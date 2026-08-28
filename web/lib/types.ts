@@ -313,7 +313,7 @@ export type WSTopic =
   | "change.ready" | "change.integrated" | "change.conflict"
   | "comment:created"
   | "log:line"
-  | "agent:created" | "agent:deleted"
+  | "agent:created" | "agent:deleted" | "agent:pin_changed"
   | "squad:created" | "squad:deleted" | "squad:member_added" | "squad:member_removed"
   | "schedule:created" | "schedule:fired"
   | "domain:created" | "domain:deleted" | "domain:compiled" | "domain:compile_failed";

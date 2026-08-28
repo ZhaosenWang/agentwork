@@ -74,6 +74,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		Daemon:   s.d,
 		Machines: machineSvc,
 		Skills:   service.NewSkillService(s.st),
+		AgentPin: service.NewAgentPinService(s.st, s.bus),
 		// M4-B: the real-time issue triggers (github + gitcode) share the
 		// poller's create path (source_ref idempotency makes webhook + poll
 		// racing safe). The shared secret lives in app_settings

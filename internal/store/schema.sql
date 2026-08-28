@@ -452,3 +452,16 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value      TEXT NOT NULL DEFAULT '',  -- JSON
     updated_at TEXT NOT NULL
 );
+
+-- agent_pin: sidebar pin state for agents (single-user — no user dimension).
+-- Row existence = pinned: pin = INSERT OR IGNORE, unpin = DELETE, and
+-- SELECT agent_id FROM agent_pin is the pinned set. The PK makes toggle
+-- idempotent (one pin per agent). Cleaned up manually in
+-- AgentService.Delete's dependent-cleanup loop — same non-cascading-FK
+-- pattern as chat_message→run→agent (no ON DELETE CASCADE, matching the
+-- predominant schema style; only squad_member uses CASCADE).
+CREATE TABLE IF NOT EXISTS agent_pin (
+    agent_id   TEXT NOT NULL REFERENCES agent(id),
+    created_at TEXT NOT NULL,                 -- RFC3339Nano; pin time, drives sidebar order
+    PRIMARY KEY (agent_id)
+);

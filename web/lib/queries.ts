@@ -13,6 +13,8 @@ import {
   createAgent,
   updateAgent,
   deleteAgent,
+  listPinnedAgents,
+  setAgentPin,
   listGoals,
   getGoal,
   createGoal,
@@ -69,6 +71,7 @@ export const qk = {
   machines: ["machines"] as const,
   skills: ["skills"] as const,
   agents: ["agents"] as const,
+  pinnedAgents: ["agents", "pinned"] as const,
   goals: ["goals"] as const,
   goal: (id: string) => ["goals", id] as const,
   goalRuns: (goalId: string) => ["goals", goalId, "runs"] as const,
@@ -165,7 +168,27 @@ export function useDeleteAgent() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: deleteAgent,
-    onSuccess: () => qc.invalidateQueries({ queryKey: qk.agents }),
+    onSuccess: () => {
+      // Deleting an agent cleans up its pin row server-side; refresh both.
+      qc.invalidateQueries({ queryKey: qk.agents });
+      qc.invalidateQueries({ queryKey: qk.pinnedAgents });
+    },
+  });
+}
+
+// ── Agent pin (sidebar) hooks ──
+// usePinnedAgents returns the pinned agent id set. Pair with useAgents: the
+// page renders each agent's pin button state from pinnedSet.has(a.id).
+export function usePinnedAgents() {
+  return useQuery({ queryKey: qk.pinnedAgents, queryFn: listPinnedAgents });
+}
+// useSetAgentPin toggles one agent's pin. Invalidates the pinned set so the
+// sidebar + the full list's button states flip immediately.
+export function useSetAgentPin() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, pinned }: { id: string; pinned: boolean }) => setAgentPin(id, pinned),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.pinnedAgents }),
   });
 }
 
@@ -574,7 +597,13 @@ export function useGoalEvents() {
   useWSEvent("change.conflict", invalidateGoal);
   // Agent lifecycle events
   useWSEvent("agent:created", () => qc.invalidateQueries({ queryKey: qk.agents }));
-  useWSEvent("agent:deleted", () => qc.invalidateQueries({ queryKey: qk.agents }));
+  useWSEvent("agent:deleted", () => {
+    qc.invalidateQueries({ queryKey: qk.agents });
+    qc.invalidateQueries({ queryKey: qk.pinnedAgents });
+  });
+  // Pin toggle: another tab/session changed pin state — refresh the set so
+  // the sidebar + button states follow live without a reload.
+  useWSEvent("agent:pin_changed", () => qc.invalidateQueries({ queryKey: qk.pinnedAgents }));
   // Squad events — the member events invalidate the whole "squads" prefix so
   // an open squad detail page sees roster changes too (P1-2, 决策 6-15⑧).
   useWSEvent("squad:created", () => qc.invalidateQueries({ queryKey: qk.squads }));
