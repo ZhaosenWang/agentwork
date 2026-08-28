@@ -47,12 +47,21 @@ export default function AgentsPage() {
               </tr>
             </thead>
             <tbody>
-              {agents.map((a: Agent) => (
+              {agents.map((a: Agent) => {
+                const isSteward = a.type === "steward";
+                return (
                 <tr key={a.id} className="border-b border-zinc-50 last:border-0 hover:bg-zinc-50/60">
                   <td className="px-4 py-3">
-                    <button onClick={() => setEditing(a)} className="font-medium text-zinc-900 hover:text-indigo-600 hover:underline" title="点击编辑 agent">
-                      {a.name}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button onClick={() => setEditing(a)} className="font-medium text-zinc-900 hover:text-indigo-600 hover:underline" title="点击编辑 agent">
+                        {a.name}
+                      </button>
+                      {isSteward && (
+                        <span className="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                          管家
+                        </span>
+                      )}
+                    </div>
                     {a.description && (
                       <div className="text-xs text-zinc-400 mt-0.5 line-clamp-1">{a.description}</div>
                     )}
@@ -76,7 +85,8 @@ export default function AgentsPage() {
                     </button>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

@@ -94,9 +94,13 @@ CREATE TABLE IF NOT EXISTS runtime (
 -- future long-lived-session model and would be dead columns today.
 -- workdir_base was removed in v2: where a run works is decided by the goal's
 -- domain (worktree), never by the agent (DESIGN.md §6).
+-- type: standard (user-created, the default) | steward (system-internal
+-- agent for special platform roles). Optional at creation time — empty
+-- defaults to "standard".
 CREATE TABLE IF NOT EXISTS agent (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
+    type            TEXT NOT NULL DEFAULT 'standard',  -- standard | steward
     description     TEXT NOT NULL DEFAULT '',  -- human-facing one-liner (shown in the web list); distinct from system_prompt (the persona)
     runtime_id      TEXT NOT NULL REFERENCES runtime(id),
     system_prompt   TEXT NOT NULL DEFAULT '',

@@ -53,6 +53,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
   const update = useUpdateAgent();
   const { data: runtimes } = useRuntimes();
   const [name, setName] = useState(agent?.name ?? "");
+  const [type, setType] = useState(agent?.type ?? "standard");
   const [description, setDescription] = useState(agent?.description ?? "");
   const [runtimeId, setRuntimeId] = useState(agent?.runtime_id ?? "");
   const [systemPrompt, setSystemPrompt] = useState(agent?.system_prompt ?? "");
@@ -73,6 +74,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
     }
     const body = {
       name,
+      type,
       description,
       runtime_id: runtimeId,
       system_prompt: systemPrompt,
@@ -109,6 +111,13 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
       <form id="agent-form" onSubmit={handleSubmit} className="space-y-4">
         <Field label="名称">
           <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required />
+        </Field>
+
+        <Field label="类型" hint="标准=普通 agent；管家=系统级 agent">
+          <select value={type} onChange={(e) => setType(e.target.value)} className={inputCls}>
+            <option value="standard">标准</option>
+            <option value="steward">管家</option>
+          </select>
         </Field>
 
         <Field label="描述" hint="一句话说明这个 agent 干什么（列表里展示）；和 System Prompt 不同，这是给人看的">

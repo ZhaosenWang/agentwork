@@ -54,6 +54,7 @@ export interface McpServer {
 export interface Agent {
   id: string;
   name: string;
+  type: string; // standard | steward
   description?: string; // human-facing one-liner (shown in the web list); distinct from system_prompt
   runtime_id: string;
   system_prompt: string;
