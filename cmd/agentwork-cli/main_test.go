@@ -139,12 +139,12 @@ func TestGoalListStatusLimitEndToEnd(t *testing.T) {
 	}
 }
 
-// TestVersionCmd: prints "agentwork v<cliVersion>" to stderr (stdout is the
-// data channel agents parse; version is meta output) using the build-stamped
-// variable (defaults to 0.0.1-beta.1 without -ldflags).
+// TestVersionCmd: prints "v<cliVersion>" on stdout — the machine-capture form
+// (VER=$(agentwork version)) — using the build-stamped variable (defaults to
+// 0.0.1-beta.1 without -ldflags).
 func TestVersionCmd(t *testing.T) {
-	out := captureStderr(t, versionCmd)
-	want := "agentwork v" + cliVersion + "\n"
+	out := captureStdout(t, versionCmd)
+	want := "v" + cliVersion + "\n"
 	if string(out) != want {
 		t.Fatalf("version output = %q, want %q", out, want)
 	}
