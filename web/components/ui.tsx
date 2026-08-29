@@ -106,6 +106,7 @@ export function Badge({ status, className }: { status: string; className?: strin
 // the goal's owner is being woken for. '' renders nothing.
 const ATTENTION_LABELS: Record<string, { label: string; cls: string }> = {
   integration: { label: "待集成变更", cls: "bg-blue-50 text-blue-700 border-blue-200" },
+  wrapup: { label: "待收尾确认", cls: "bg-teal-50 text-teal-700 border-teal-200" },
   recovery: { label: "需处理失败", cls: "bg-amber-50 text-amber-700 border-amber-200" },
   user_action: { label: "待人工决策", cls: "bg-red-50 text-red-700 border-red-200" },
 };

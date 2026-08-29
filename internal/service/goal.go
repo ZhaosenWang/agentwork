@@ -38,7 +38,10 @@ type Goal struct {
 	CreatedAt       string `json:"created_at"`
 	SourceRef       string `json:"source_ref"` // external source (M4-B): "github:owner/repo#123"
 	// Attention is the v2 derived OwnerAttention persisted by ReconcileGoal
-	// (决策 6-8): '' | integration | recovery | user_action (comma-joined).
+	// (决策 6-8): '' | integration | wrapup | recovery | user_action (comma-joined).
+	// integration = ready changes to merge; wrapup = verified sub-goals with no
+	// change (no-code completion, deliverable in the feed) — split so the UI chip
+	// and changes panel no longer disagree (决策 6-17 aligns flag with wake note).
 	Attention string `json:"attention"`
 	// ReviewPhase is the review window's DERIVED phase (决策 6-19 延伸): the
 	// platform's own judgment rendered for the Web —
@@ -815,7 +818,7 @@ func (s *GoalService) Delete(ctx context.Context, goalID string) error {
 	s.bus.Publish(ctx, events.Event{Topic: "goal:deleted", Payload: map[string]any{
 		"goal_id": goalID, "run_ids": runningRunIDs,
 		"goal_title": goalTitle,
-		"domain_id": domainID, "domain_type": domainType, "domain_name": domainName,
+		"domain_id":  domainID, "domain_type": domainType, "domain_name": domainName,
 		"git_url": gitURL, "git_credentials": gitCredentials,
 	}})
 	return nil
@@ -1179,7 +1182,7 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		// waiting for an answer; the resume only lands when the guest goes
 		// terminal — success or failure) keep the goal active. The
 		// Coordinator's attention spawn (run.terminal → ReconcileGoal) wakes
-		// the owner again for integration/recovery; a sub-goal completing
+		// the owner again for integration/wrapup/recovery; a sub-goal completing
 		// never completes the goal, and the human gate fires only on the
 		// FINAL state.
 		var pendingSG, pendingChanges, pendingConsults int
@@ -2272,9 +2275,9 @@ func (s *GoalService) compileWakeNoteTx(ctx context.Context, tx *sql.Tx, goalID,
 			}
 			bullets = append(bullets, fmt.Sprintf("- Sub-goal(s) %q failed — decide: cancel or re-create (inspect with `agentwork subgoal get <id>`, cancel with `agentwork subgoal cancel <id>`)", strings.Join(titles, ", ")))
 		case "integration":
-			// The two faces of "integration": ready changes to merge, and
-			// no-code wrapups (verified sub-goals whose deliverable lives in
-			// the feed — 决策 6-8).
+			// ready changes to merge (决策 6-8). The no-code wrapup face is its
+			// own bit now (see case "wrapup") — the flag layer was split to match
+			// the wake-note layer's already-distinct semantics (决策 6-17).
 			var ready int
 			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM change WHERE goal_id=? AND status='ready'`, goalID).Scan(&ready); err != nil {
 				return "", "", err
@@ -2282,6 +2285,9 @@ func (s *GoalService) compileWakeNoteTx(ctx context.Context, tx *sql.Tx, goalID,
 			if ready > 0 {
 				bullets = append(bullets, fmt.Sprintf("- %d change(s) ready to integrate — inspect with `agentwork change list`, merge each with `agentwork change integrate <id>`", ready))
 			}
+		case "wrapup":
+			// no-code wrapups: verified sub-goals whose deliverable lives in
+			// the feed / scratch dir — 决策 6-8.
 			titles, err := s.noChangeVerifiedTitlesTx(ctx, tx, goalID)
 			if err != nil {
 				return "", "", err
@@ -2369,13 +2375,19 @@ func (s *GoalService) deriveOwnerAttentionTx(ctx context.Context, tx *sql.Tx, go
 		`SELECT COUNT(*) FROM change WHERE goal_id=? AND status='ready'`, goalID).Scan(&ready); err != nil {
 		return "", fmt.Errorf("attention: changes ready: %w", err)
 	}
-	// need_integration (wrap-up): a verification round completed AFTER the
-	// owner's last spawn without producing a new ready change — the no-code
-	// completion case (决策 6-8: the deliverable lives in the feed). Without
+	if ready > 0 {
+		bits = append(bits, "integration")
+	}
+	// need_wrapup: a verification round completed AFTER the owner's last
+	// spawn without producing a new ready change — the no-code completion
+	// case (决策 6-8: the deliverable lives in the feed / scratch dir). Without
 	// this edge the owner is never woken to close the goal out (live: a goal
 	// parked active forever after its rework round verified against an
 	// already-integrated change). The spawn guard uses the same signal, so
-	// the owner waking and finishing clears it — no loop.
+	// the owner waking and finishing clears it — no loop. Distinct from
+	// `integration` (决策 6-17: the wake-note layer already named this face
+	// separately) so a no-code wrapup no longer lights the "待集成变更" chip
+	// while the changes panel is empty.
 	var wrapup int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM sub_goal sg
@@ -2385,8 +2397,8 @@ func (s *GoalService) deriveOwnerAttentionTx(ctx context.Context, tx *sql.Tx, go
 		goalID).Scan(&wrapup); err != nil {
 		return "", fmt.Errorf("attention: verified wrap-up: %w", err)
 	}
-	if ready > 0 || wrapup > 0 {
-		bits = append(bits, "integration")
+	if wrapup > 0 {
+		bits = append(bits, "wrapup")
 	}
 	return strings.Join(bits, ","), nil
 }

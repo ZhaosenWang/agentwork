@@ -657,8 +657,12 @@ func TestWrapUpAttentionAfterNoChangeVerification(t *testing.T) {
 		t.Fatalf("reconcile 2: %v", err)
 	}
 	g2, _ := gs.Get(ctx, g.ID)
-	if g2.Attention == "" {
-		t.Fatalf("wrap-up attention must arm for the owner to close out, got empty")
+	// The no-code wrap-up face is its own attention bit now (决策 6-17): a
+	// verified sub-goal that produced no new ready change arms `wrapup`, not
+	// `integration` — so the UI no longer shows "待集成变更" while the changes
+	// panel is empty.
+	if !strings.Contains(g2.Attention, "wrapup") {
+		t.Fatalf("wrap-up attention must arm the `wrapup` bit for the owner to close out, got %q", g2.Attention)
 	}
 	var pendingOwner int
 	_ = st.DB().QueryRowContext(ctx,

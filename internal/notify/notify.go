@@ -163,13 +163,25 @@ func (n *Notifier) onGoalAttentionNeeded(_ context.Context, e events.Event) {
 	if title == "" {
 		title = short(goalID)
 	}
-	reason := map[string]string{
+	// attention is comma-joined (决策 6-8): a goal can need the owner for
+	// several reasons at once (e.g. "integration,wrapup"). Map each bit to a
+	// localized reason and join — the old single-value lookup only matched a
+	// one-bit string and fell through to the raw value otherwise.
+	labels := map[string]string{
 		"integration": "有 Change 等待集成",
+		"wrapup":      "有子任务待收尾确认",
 		"recovery":    "有子任务失败，需要处理",
 		"user_action": "需要人工决策",
-	}[attention]
+	}
+	var reasons []string
+	for _, bit := range strings.Split(attention, ",") {
+		if r, ok := labels[bit]; ok {
+			reasons = append(reasons, r)
+		}
+	}
+	reason := strings.Join(reasons, "；")
 	if reason == "" {
-		reason = attention
+		reason = attention // unknown bit — surface the raw value rather than empty
 	}
 	n.sendMilestoneCard("👤", "purple", "需要你处理", milestoneBody(title, reason))
 }
