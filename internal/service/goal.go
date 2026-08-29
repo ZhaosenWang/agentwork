@@ -2332,11 +2332,20 @@ func (s *GoalService) subGoalTitlesTx(ctx context.Context, tx *sql.Tx, goalID, s
 // the wrapup bullet's exact predicate (决策 6-8). A verified sub-goal WITH a
 // ready Change is the integration bullet's subject, not "no changes" — mixing
 // them described the same work item as both (live wording bug).
+// noChangeVerifiedTitlesTx returns the verified sub-goals that drive the
+// `wrapup` wake bullet — the same set deriveOwnerAttentionTx counts for the
+// `wrapup` bit (决策 6-17): a verified sub-goal whose latest verification
+// landed after the owner's last spawn with no READY change behind it. "No
+// READY change", not "no change row at all": an already-integrated change is
+// the owner's done work (the rework-against-integrated case still wraps up).
+// Kept as a title list so the wake note can name the concrete sub-goals.
 func (s *GoalService) noChangeVerifiedTitlesTx(ctx context.Context, tx *sql.Tx, goalID string) ([]string, error) {
 	rows, err := tx.QueryContext(ctx,
 		`SELECT sg.title FROM sub_goal sg
 		 WHERE sg.goal_id=? AND sg.status='verified'
-		   AND NOT EXISTS (SELECT 1 FROM change c WHERE c.sub_goal_id=sg.id)
+		   AND NOT EXISTS (SELECT 1 FROM change c WHERE c.sub_goal_id=sg.id AND c.status='ready')
+		   AND COALESCE((SELECT MAX(r.finished_at) FROM run r WHERE r.sub_goal_id=sg.id AND r.role='subgoal'),'')
+		     > COALESCE((SELECT MAX(r2.queued_at) FROM run r2 WHERE r2.goal_id=sg.goal_id AND r2.role='owner'),'')
 		 ORDER BY sg.created_at`, goalID)
 	if err != nil {
 		return nil, err
@@ -2379,19 +2388,26 @@ func (s *GoalService) deriveOwnerAttentionTx(ctx context.Context, tx *sql.Tx, go
 		bits = append(bits, "integration")
 	}
 	// need_wrapup: a verification round completed AFTER the owner's last
-	// spawn without producing a new ready change — the no-code completion
-	// case (决策 6-8: the deliverable lives in the feed / scratch dir). Without
-	// this edge the owner is never woken to close the goal out (live: a goal
-	// parked active forever after its rework round verified against an
-	// already-integrated change). The spawn guard uses the same signal, so
-	// the owner waking and finishing clears it — no loop. Distinct from
-	// `integration` (决策 6-17: the wake-note layer already named this face
-	// separately) so a no-code wrapup no longer lights the "待集成变更" chip
-	// while the changes panel is empty.
+	// spawn and left no READY change behind — the no-code completion case
+	// (决策 6-8: the deliverable lives in the feed / scratch dir), INCLUDING
+	// the rework-against-already-integrated case (a conflict round verified
+	// again with base==head → no NEW ready change, the old change stays
+	// integrated). The guard is "no READY change", not "no change row at
+	// all": an integrated change is already the owner's done work, not a
+	// pending need, so it must not block wrapup. This is the exact complement
+	// of `integration` (which arms on a READY change) — the two bits are
+	// mutually exclusive per sub-goal, so a ready-change goal lights only
+	// "待集成变更" and a no-ready-change verified goal lights only "待收尾确认"
+	// (决策 6-17: aligns the flag with the wake-note layer's distinct face).
+	// Without this edge the owner is never woken to close the goal out (live:
+	// a goal parked active forever after its rework round verified against an
+	// already-integrated change). The spawn guard uses the same signal, so the
+	// owner waking and finishing clears it — no loop.
 	var wrapup int
 	if err := tx.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM sub_goal sg
 		WHERE sg.goal_id=? AND sg.status='verified'
+		  AND NOT EXISTS (SELECT 1 FROM change c WHERE c.sub_goal_id=sg.id AND c.status='ready')
 		  AND COALESCE((SELECT MAX(r.finished_at) FROM run r WHERE r.sub_goal_id=sg.id AND r.role='subgoal'),'')
 		    > COALESCE((SELECT MAX(r2.queued_at) FROM run r2 WHERE r2.goal_id=sg.goal_id AND r2.role='owner'),'')`,
 		goalID).Scan(&wrapup); err != nil {
