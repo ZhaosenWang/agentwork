@@ -1,4 +1,4 @@
-import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem } from "./types";
+import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem, TeamImportResponse } from "./types";
 
 // 默认走同源 /backend/*（Next rewrites 转发到本机 daemon 7373）——反代出
 // 去时浏览器无需直连 daemon。本地直连场景可显式设置 NEXT_PUBLIC_API_URL。
@@ -315,3 +315,16 @@ export const listScheduleRuns = (id: string) =>
   api<import("./types").ScheduleRun[]>(`/schedules/${id}/runs`);
 export const setScheduleEnabled = (id: string, enabled: boolean) =>
   api<Schedule>(`/schedules/${id}/enabled`, { method: "PUT", body: JSON.stringify({ enabled }) });
+
+// ── Team import (processor-run-driven) ──
+export const importTeam = (body: {
+  git_url: string;
+  git_credentials?: string;
+  default_branch?: string;
+}) => api<TeamImportResponse>("/teams/import", { method: "POST", body: JSON.stringify(body) });
+
+// ── Intake (Web assistant dialog) ──
+export const sendIntake = (text: string) =>
+  api<{ run_id: string }>("/intake", { method: "POST", body: JSON.stringify({ text }) });
+export const getIntakeResult = (runId: string) =>
+  api<{ status: string; result_summary: string }>(`/intake/${runId}`);

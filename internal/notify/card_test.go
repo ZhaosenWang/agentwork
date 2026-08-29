@@ -281,18 +281,21 @@ func TestBuildDigestCard(t *testing.T) {
 }
 
 // TestIntakeBuildPrompt: the parser prompt carries the roster and the
-// intake.json contract; unconfigured parser agent is surfaced to the owner.
+// intake.json contract; missing steward agent is surfaced to the owner.
 func TestIntakeBuildPrompt(t *testing.T) {
 	st, err := store.Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	runSvc := service.NewRunService(st, events.NewBus())
-	seedAgentRow(t, ctx, st)
+	bus := events.NewBus()
+	runSvc := service.NewRunService(st, bus)
+	agentSvc := service.NewAgentService(st, bus)
+	seedAgentRow(t, ctx, st) // seeds a standard agent, NOT a steward
 	qs := NewSQLQueryStore(st)
 	fake := &mapSettings{vals: map[string]string{}}
 	is := NewIntakeService(qs, fake, runSvc)
+	is.SetAgentService(agentSvc)
 	prompt, err := is.BuildPrompt(ctx, "创建任务：把登录页修一下")
 	if err != nil {
 		t.Fatal(err)
@@ -300,9 +303,9 @@ func TestIntakeBuildPrompt(t *testing.T) {
 	if !strings.Contains(prompt, "worker1") || !strings.Contains(prompt, "intake.json") {
 		t.Fatalf("prompt must carry roster + contract: %s", prompt)
 	}
-	// Unconfigured parser agent → Enqueue surfaces the setup hint.
-	if _, err := is.Enqueue(ctx, "msg1", prompt); err == nil || !strings.Contains(err.Error(), "IM 解析 Agent 未配置或者已删除") {
-		t.Fatalf("expected unconfigured-agent error, got %v", err)
+	// No steward agent → Enqueue surfaces the setup hint.
+	if _, err := is.Enqueue(ctx, "msg1", prompt); err == nil || !strings.Contains(err.Error(), "steward agent does not exist") {
+		t.Fatalf("expected missing-steward error, got %v", err)
 	}
 }
 
@@ -321,41 +324,51 @@ func seedAgentRow(t *testing.T, ctx context.Context, st *store.Store) {
 	}
 }
 
-// TestIntakeStaleAgentConfig: a platform.m3.intake_agent that points at an
-// agent row that no longer exists (deleted, or DB re-seeded) must surface a
-// human-readable setup hint at Enqueue — NOT an opaque FOREIGN KEY
-// constraint failure from EnqueueProcessorRun's INSERT. This is the setup
-// drift the live system hit ("解析任务创建失败：FOREIGN KEY constraint failed").
-func TestIntakeStaleAgentConfig(t *testing.T) {
+func seedStewardRow(t *testing.T, ctx context.Context, st *store.Store) {
+	t.Helper()
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO runtime (id,name,status,created_at) VALUES ('rt-s','rt-s','active',?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,type,runtime_id,max_concurrent,created_at) VALUES ('steward-1','steward','steward','rt-s',1,?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestIntakeStewardResolution: the intake pipeline resolves the parser
+// agent via GetSteward (type='steward'), not the old platform.m3 setting.
+// Enqueue must fail when no steward exists (setup hint) and succeed when
+// one does. The run row is platform-level: domain_id is "".
+func TestIntakeStewardResolution(t *testing.T) {
 	st, err := store.Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	runSvc := service.NewRunService(st, events.NewBus())
-	seedAgentRow(t, ctx, st) // seeds 'a1'/'worker1'
+	bus := events.NewBus()
+	runSvc := service.NewRunService(st, bus)
+	agentSvc := service.NewAgentService(st, bus)
 	qs := NewSQLQueryStore(st)
 	fake := &mapSettings{vals: map[string]string{}}
-	// Configure a parser agent id that does NOT exist in the agent table.
-	if err := fake.Set(ctx, "platform.m3", `{"intake_agent":"deadbeefdeadbeefdeadbeefdeadbeef"}`); err != nil {
-		t.Fatal(err)
-	}
 	is := NewIntakeService(qs, fake, runSvc)
-	_, err = is.Enqueue(ctx, "msg1", "prompt")
-	if err == nil {
-		t.Fatal("stale intake_agent must fail Enqueue")
+	is.SetAgentService(agentSvc)
+
+	// No steward agent → Enqueue must fail with the setup hint.
+	if _, err := is.Enqueue(ctx, "msg1", "prompt"); err == nil {
+		t.Fatal("missing steward must fail Enqueue")
 	}
-	if !strings.Contains(err.Error(), "IM 解析 Agent 未配置或者已删除") {
-		t.Fatalf("stale config must surface the setup hint, got %q", err.Error())
-	}
-	// And a live config must NOT fail at the existence check (it reaches
-	// EnqueueProcessorRun, which enqueues a real run row).
-	if err := fake.Set(ctx, "platform.m3", `{"intake_agent":"a1"}`); err != nil {
-		t.Fatal(err)
-	}
+
+	// Seed a steward agent (type='steward') — this is what SeedSteward does.
+	seedStewardRow(t, ctx, st)
+
+	// Now Enqueue must succeed.
 	if _, err := is.Enqueue(ctx, "msg1", "prompt"); err != nil {
-		t.Fatalf("live intake_agent must enqueue, got %v", err)
+		t.Fatalf("steward present must enqueue, got %v", err)
 	}
+
 	// The run row is platform-level: domain_id is "" (not the msgID).
 	var domainID string
 	if err := st.DB().QueryRowContext(ctx,

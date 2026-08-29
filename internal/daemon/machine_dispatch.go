@@ -438,19 +438,79 @@ func (d *Daemon) ingestProcessorFinished(ctx context.Context, p link.RunFinished
 	d.flushRunMessages(ctx, p.RunID)
 	q := &service.ClaimedRow{RunID: p.RunID}
 	if p.Status != "completed" {
-		if runType == "intake" {
-			d.failIntakeRun(ctx, q, p.Summary)
+		if runType == "intake" || runType == "intake_web" {
+			d.failIntakeRun(ctx, q, p.Summary, runType)
 		} else {
 			d.failProcessorRun(ctx, q, p.Summary)
 		}
 		return nil
 	}
-	if runType == "intake" {
-		d.ingestIntakeArtifact(ctx, q, p.Artifacts["intake.json"])
+	if runType == "intake" || runType == "intake_web" {
+		d.ingestIntakeArtifact(ctx, q, p.Artifacts["intake.json"], runType)
+		return nil
+	}
+	if runType == "import" {
+		if d.teamImportSvc != nil {
+			ti, squadName, err := d.teamImportSvc.IngestImport(ctx, p.RunID, p.Artifacts, p.Summary)
+			if err != nil {
+				logging.Errorf("daemon: team import %s failed: %v", p.RunID, err)
+				d.failProcessorRun(ctx, q, err.Error())
+			} else {
+				if _, err := d.st.DB().ExecContext(ctx,
+					`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
+					p.Summary, nowStr(), q.RunID); err != nil {
+					logging.Errorf("daemon: finish import run %s: %v", q.RunID, err)
+				} else {
+					logging.Infof("daemon: team import run %s completed", q.RunID)
+				}
+				d.notifyTeamImportComplete(ctx, ti, squadName)
+			}
+		} else {
+			logging.Warnf("daemon: import run %s finished but teamImportSvc is nil — artifacts dropped", p.RunID)
+		}
 		return nil
 	}
 	d.storeProcessorArtifacts(ctx, q, domainID, p.Artifacts, p.Summary)
 	return nil
+}
+
+func (d *Daemon) notifyTeamImportComplete(ctx context.Context, ti *service.TeamImport, squadName string) {
+	var result struct {
+		Agents   int    `json:"agents"`
+		Skills   int    `json:"skills"`
+		HasSquad bool   `json:"has_squad"`
+	}
+	_ = json.Unmarshal([]byte(ti.Result), &result)
+	summary := fmt.Sprintf("✅ 团队导入完成：%d 个 agent、%d 个 skill", result.Agents, result.Skills)
+	if result.HasSquad {
+		summary += "、1 个 squad"
+	}
+		body := summary
+	if squadName != "" {
+		sq, err := d.resolveSquadByName(ctx, squadName)
+		if err == nil {
+			body += "\n\n**👥 " + sq.Name + "**"
+			if sq.Description != "" {
+				body += "\n\n**描述：** " + firstLineIn(sq.Description)
+			}
+			body += "\n\n**leader：** " + d.agentDisplayName(ctx, sq.LeaderID)
+			if sq.Instructions != "" {
+				body += "\n\n**协作规则：** " + truncateIn(sq.Instructions, 200)
+			}
+			members, err := d.squadSvc.ListMembers(ctx, sq.ID)
+			if err == nil && len(members) > 0 {
+				body += "\n\n**成员：**"
+				for _, m := range members {
+					body += "  \n　- " + d.agentDisplayName(ctx, m.MemberID) + "（" + m.Role + "）"
+				}
+			} else {
+				body += "\n\n**成员：** （无）"
+			}
+		}
+	}
+	if n := d.imNotifier(); n != nil {
+		n.SendMilestoneCard("✅", "green", "团队导入完成", body)
+	}
 }
 
 // runMachineWatchdog supervises a dispatched run: no events for idleWindow

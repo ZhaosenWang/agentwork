@@ -95,8 +95,7 @@ CREATE TABLE IF NOT EXISTS runtime (
 -- workdir_base was removed in v2: where a run works is decided by the goal's
 -- domain (worktree), never by the agent (DESIGN.md §6).
 -- type: standard (user-created, the default) | steward (system-internal
--- agent for special platform roles). Optional at creation time — empty
--- defaults to "standard".
+-- agent for team-import / intake; auto-seeded at daemon startup).
 CREATE TABLE IF NOT EXISTS agent (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL UNIQUE,
@@ -442,6 +441,29 @@ CREATE TABLE IF NOT EXISTS schedule_run (
 
 CREATE INDEX IF NOT EXISTS idx_schedule_run_schedule ON schedule_run(schedule_id, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_run_planned ON schedule_run(schedule_id, planned_at);
+
+-- team_import is a TEMPORARY tracking table for the team-definition-repo
+-- import processor run: the run that clones a team repo, has the steward
+-- agent explore it, and produces team.json (agents + skills + squad). The
+-- platform reads team.json and upserts the entities by name. The steward
+-- agent decides which runtime each imported agent binds to (from the team
+-- definition or random assignment); runtime_id is NOT stored here.
+-- git_url/credentials/branch persist from the HTTP request to daemon dispatch
+-- (the run may sit queued for seconds/minutes before claim). ImportTeam
+-- cleans up old completed/failed rows at the start of each import. status:
+-- pending|completed|failed.
+CREATE TABLE IF NOT EXISTS team_import (
+    id              TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL DEFAULT '',         -- the processor run (back-filled after enqueue)
+    git_url         TEXT NOT NULL DEFAULT '',         -- team repo URL (read at dispatch time)
+    git_credentials TEXT NOT NULL DEFAULT '',         -- team repo token
+    default_branch  TEXT NOT NULL DEFAULT '',         -- team repo branch
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending|completed|failed
+    result          TEXT NOT NULL DEFAULT '',         -- JSON summary (agents/skills/squad created/updated)
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_team_import_run ON team_import(run_id);
 
 -- settings: key-value daemon configuration (e.g. the Feishu connection
 -- credentials + receive target captured by the IM connect flow, M1). The

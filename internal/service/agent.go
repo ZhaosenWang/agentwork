@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/events"
@@ -20,8 +21,7 @@ type Agent struct {
 	ID           string            `json:"id"`
 	Name         string            `json:"name"`
 	// Type: standard (user-created, the default) | steward (system-internal
-	// agent for special platform roles). Optional at creation time — empty
-	// defaults to "standard".
+	// parser agent for team-import / intake; auto-seeded at daemon startup).
 	Type         string            `json:"type"`
 	// Description is a human-facing one-liner shown in the web list — what
 	// this agent does in a glance. Distinct from SystemPrompt (the persona
@@ -153,6 +153,44 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 		return nil, fmt.Errorf("update agent: %w", err)
 	}
 	return s.Get(ctx, id)
+}
+
+
+// UpsertByName creates or updates an agent by name (the team-import path).
+// When the agent exists, its description/system_prompt/skills are updated;
+// runtime_id is left unchanged (the team repo does not define machines). When
+// it does not exist, a new agent is created bound to the supplied runtimeID.
+// Returns the agent.
+func (s *AgentService) UpsertByName(ctx context.Context, name, description, systemPrompt, runtimeID string, skillIDs []string) (*Agent, error) {
+	if name = strings.TrimSpace(name); name == "" {
+		return nil, NewValidationError("agent name is required")
+	}
+	var existingID string
+	_ = s.st.DB().QueryRowContext(ctx, `SELECT id FROM agent WHERE name=?`, name).Scan(&existingID)
+	if existingID != "" {
+		if skillIDs == nil {
+			skillIDs = []string{}
+		}
+		skillsJSON, _ := json.Marshal(skillIDs)
+		if _, err := s.st.DB().ExecContext(ctx,
+			`UPDATE agent SET description=?, system_prompt=?, skills=? WHERE id=?`,
+			description, systemPrompt, string(skillsJSON), existingID); err != nil {
+			return nil, fmt.Errorf("update agent %q: %w", name, err)
+		}
+		return s.Get(ctx, existingID)
+	}
+	if runtimeID == "" {
+		return nil, NewValidationError(fmt.Sprintf("runtime_id is required for new agent %q", name))
+	}
+	a := Agent{
+		Name:         name,
+		Description:  description,
+		RuntimeID:    runtimeID,
+		SystemPrompt: systemPrompt,
+		Skills:       skillIDs,
+		MaxConcurrent: 1,
+	}
+	return s.Create(ctx, a)
 }
 
 func (s *AgentService) List(ctx context.Context) ([]Agent, error) {
@@ -324,5 +362,134 @@ func (s *AgentService) Delete(ctx context.Context, id string) error {
 	}
 	// Tell the daemon to drop this agent's worker.
 	s.bus.Publish(ctx, events.Event{Topic: "agent:deleted", Payload: map[string]string{"id": id}})
+	return nil
+}
+
+// GetSteward returns the system-internal steward agent (type=steward), used by
+// the team-import flow to run the exploration processor task. Returns
+// ErrNotFound if no steward agent exists (the daemon seed has not run or no
+// active runtime was available at startup).
+func (s *AgentService) GetSteward(ctx context.Context) (*Agent, error) {
+	var id string
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT id FROM agent WHERE type='steward' LIMIT 1`).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return s.Get(ctx, id)
+}
+
+// EnsureStewardRuntime checks whether the steward agent's runtime is still
+// active. If not, it reassigns the steward to the first active runtime. Returns
+// an error if no active runtime exists. Called at daemon startup (seed) and at
+// import time (safety check).
+func (s *AgentService) EnsureStewardRuntime(ctx context.Context) error {
+	st, err := s.GetSteward(ctx)
+	if err != nil {
+		return err
+	}
+	var status string
+	if err := s.st.DB().QueryRowContext(ctx, `SELECT status FROM runtime WHERE id=?`, st.RuntimeID).Scan(&status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return NewValidationError("steward agent's runtime no longer exists")
+		}
+		return fmt.Errorf("check steward runtime: %w", err)
+	}
+	if status == "active" {
+		return nil
+	}
+	activeID, err := s.firstActiveRuntimeID(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := s.st.DB().ExecContext(ctx, `UPDATE agent SET runtime_id=? WHERE id=?`, activeID, st.ID); err != nil {
+		return fmt.Errorf("reassign steward runtime: %w", err)
+	}
+	return nil
+}
+
+// firstActiveRuntimeID returns the ID of the first active runtime by creation
+// order, or an error if none exist.
+func (s *AgentService) firstActiveRuntimeID(ctx context.Context) (string, error) {
+	var id string
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT id FROM runtime WHERE status='active' ORDER BY created_at LIMIT 1`).Scan(&id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", NewValidationError("no active runtime available — connect a machine first")
+		}
+		return "", fmt.Errorf("find active runtime: %w", err)
+	}
+	return id, nil
+}
+
+// ListActiveRuntimeNames returns the names of all active runtimes, for the
+// steward agent's import prompt (it decides which runtime each imported agent
+// binds to).
+func (s *AgentService) ListActiveRuntimeNames(ctx context.Context) ([]string, error) {
+	rows, err := s.st.DB().QueryContext(ctx, `SELECT name FROM runtime WHERE status='active' ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
+}
+
+// ListActiveRuntimeIDs returns the IDs of all active runtimes, for resolving
+// runtime names in team.json to runtime IDs during import ingestion.
+func (s *AgentService) ListActiveRuntimeIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.st.DB().QueryContext(ctx, `SELECT id FROM runtime WHERE status='active' ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// SeedSteward inserts the system-internal steward agent if none exists. Called
+// at daemon startup. The steward is bound to the first active runtime; if no
+// active runtime exists, the seed is skipped (ImportTeam will report the error
+// when the user tries to import). If the steward already exists but its
+// runtime is no longer active, it is reassigned.
+func (s *AgentService) SeedSteward(ctx context.Context) error {
+	_, err := s.GetSteward(ctx)
+	if err == nil {
+		return s.EnsureStewardRuntime(ctx)
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	activeID, err := s.firstActiveRuntimeID(ctx)
+	if err != nil {
+		// No active runtime yet — skip seed; ImportTeam will report the error.
+		if errors.Is(err, ErrValidation) {
+			return nil
+		}
+		return err
+	}
+	_, err = s.st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,type,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		newID(), "小二", "steward", "Team import processor — auto-seeded", activeID, "", "", "{}", "[]", "[]", 1, now())
+	if err != nil {
+		return fmt.Errorf("seed steward agent: %w", err)
+	}
 	return nil
 }

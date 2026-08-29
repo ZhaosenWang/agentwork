@@ -1101,6 +1101,15 @@ func (s *RunService) HistoryByAgent(ctx context.Context, agentID string, limit i
 	return out, rows.Err()
 }
 
+// Status returns the run's current status and result summary. Used by the
+// Web intake polling endpoint (GET /intake/{runId}).
+func (s *RunService) Status(ctx context.Context, runID string) (status, summary string, err error) {
+	err = s.st.DB().QueryRowContext(ctx,
+		`SELECT status, COALESCE(result_summary,'') FROM run WHERE id=?`, runID).
+		Scan(&status, &summary)
+	return
+}
+
 // inPlaceholders builds "?,?,?" for a slice and returns the args slice.
 func inPlaceholders(ids []string) (string, []any) {
 	ph := ""

@@ -61,6 +61,9 @@ import {
   getPlatformSettings,
   savePlatformSettings,
   getGateStats,
+  importTeam,
+  sendIntake,
+  getIntakeResult,
 } from "./api";
 import { useWSEvent } from "./ws";
 import type { WSEvent } from "./types";
@@ -91,6 +94,7 @@ export const qk = {
   im: ["im"] as const,
   platformSettings: ["platform-settings"] as const,
   gateStats: ["gate-stats"] as const,
+  intake: (runId: string) => ["intake", runId] as const,
 };
 
 // ── Platform settings (M3) ──
@@ -536,6 +540,39 @@ export function useScheduleRuns(scheduleId: string, enabled = true) {
   });
 }
 
+// ── Team import hooks ──
+export function useImportTeam() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: importTeam,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.agents });
+      qc.invalidateQueries({ queryKey: qk.squads });
+      qc.invalidateQueries({ queryKey: qk.skills });
+      qc.invalidateQueries({ queryKey: qk.domains });
+    },
+  });
+}
+
+// ── Intake (Web assistant dialog) hooks ──
+export function useSendIntake() {
+  return useMutation({
+    mutationFn: sendIntake,
+  });
+}
+export function useIntakeResult(runId: string | null) {
+  return useQuery({
+    queryKey: runId ? qk.intake(runId) : ["intake", "none"],
+    queryFn: () => getIntakeResult(runId!),
+    enabled: !!runId,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      if (status === "completed" || status === "failed") return false;
+      return 2000;
+    },
+  });
+}
+
 // ── WebSocket event → cache invalidation ──
 export function useGoalEvents() {
   const qc = useQueryClient();
@@ -617,4 +654,13 @@ export function useGoalEvents() {
   useWSEvent("domain:deleted", () => qc.invalidateQueries({ queryKey: qk.domains }));
   useWSEvent("domain:compiled", () => qc.invalidateQueries({ queryKey: qk.domains }));
   useWSEvent("domain:compile_failed", () => qc.invalidateQueries({ queryKey: qk.domains }));
+  // Team import events
+  useWSEvent("team:imported", () => {
+    qc.invalidateQueries({ queryKey: qk.agents });
+    qc.invalidateQueries({ queryKey: qk.squads });
+    qc.invalidateQueries({ queryKey: qk.skills });
+    qc.invalidateQueries({ queryKey: qk.domains });
+    qc.invalidateQueries({ queryKey: ["team-import"] });
+  });
+  useWSEvent("team:import_failed", () => qc.invalidateQueries({ queryKey: ["team-import"] }));
 }

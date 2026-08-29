@@ -460,6 +460,7 @@ func TestIntakeRegistryIntents(t *testing.T) {
 		"create_agent": true, "create_squad": true,
 		"squad_list": true, "squad_detail": true, "squad_update": true,
 		"squad_add_member": true, "squad_remove_member": true, "squad_delete": true,
+		"import_team": true,
 	}
 	got := make(map[string]bool)
 	for _, c := range intakeReg.cmds {
