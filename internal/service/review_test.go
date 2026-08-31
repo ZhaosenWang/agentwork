@@ -333,7 +333,7 @@ func TestReviewMentionQueuesIntentAndReopen(t *testing.T) {
 
 	// Mention B during review: the intent QUEUES (no execution — the Claim
 	// gate holds it), and the comment stays in the feed.
-	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 这里还有问题"}); err != nil {
+	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "human", AuthorID: "ui", Content: "[@B](mention://agent/" + agentB + ") 这里还有问题"}); err != nil {
 		t.Fatalf("comment: %v", err)
 	}
 	var queued string
@@ -364,7 +364,7 @@ func TestReviewMentionQueuesIntentAndReopen(t *testing.T) {
 		`SELECT status FROM run WHERE id=?`, queued).Scan(&dropped); err != nil || dropped != "cancelled" {
 		t.Fatalf("approve+deliver must visibly drop the queued intent, got %q err=%v", dropped, err)
 	}
-	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 现在可以做了"}); err != nil {
+	if _, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "human", AuthorID: "ui", Content: "[@B](mention://agent/" + agentB + ") 现在可以做了"}); err != nil {
 		t.Fatalf("comment 2: %v", err)
 	}
 	reopened, _ := gs.Get(ctx, g.ID)
@@ -491,7 +491,7 @@ func TestGuestRunResultLandsInFeed(t *testing.T) {
 
 	// Reviewer is mentioned mid-flight (guest run). Its run completes with a
 	// verdict; the platform must surface it in the feed.
-	c, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 请审查"})
+	c, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "human", AuthorID: "ui", Content: "[@B](mention://agent/" + agentB + ") 请审查"})
 	if err != nil {
 		t.Fatalf("comment: %v", err)
 	}
