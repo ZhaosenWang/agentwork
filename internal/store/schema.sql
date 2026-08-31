@@ -171,7 +171,7 @@ CREATE TABLE IF NOT EXISTS goal (
     created_at       TEXT NOT NULL,
     source_ref       TEXT NOT NULL DEFAULT '',     -- external source (M4-B): "github:owner/repo#123" — one goal per issue
     execution_attempt INTEGER NOT NULL DEFAULT 0,  -- v2 (决策 6-9): machine-retry counter, authoritative; run.attempt is just the instance ordinal
-    attention        TEXT NOT NULL DEFAULT ''      -- v2 (决策 6-8): derived OwnerAttention persisted by Reconcile ('' | integration|recovery|user_action)
+    attention        TEXT NOT NULL DEFAULT ''      -- v2 (决策 6-8): derived OwnerAttention persisted by Reconcile ('' | integration|wrapup|recovery|user_action)
 );
 
 CREATE INDEX IF NOT EXISTS idx_goal_assignee ON goal(assignee_type, assignee_id);
