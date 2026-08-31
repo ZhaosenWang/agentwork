@@ -241,6 +241,7 @@ func importPrompt(runtimeNames []string) string {
 	b.WriteString("- role=\"leader\" → squad.leader; role=\"reviewer\" → the platform auto-pulls into review checkpoints; role=\"member\" → regular member.\n")
 	b.WriteString("- skills[].files must include ALL files of that skill (at least SKILL.md), with original file contents.\n")
 	b.WriteString("- squad.members does NOT include the leader (the leader is in squad.leader).\n")
+	b.WriteString("- You are the import processor, NOT a team member. Do NOT include yourself in the agents list or squad — only include agents defined in the team repo.\n")
 	b.WriteString("- The repo format is not fixed — use your understanding to map any format to the schema above.\n")
 	b.WriteString("- runtime: assign each agent a runtime from the list below. If the team definition specifies a preference (e.g. \"this role needs a coding CLI\"), match it to the most suitable runtime. If no preference is stated, pick any runtime (random is fine). Every agent MUST have a runtime.\n")
 	b.WriteString("  Available runtimes: " + strings.Join(runtimeNames, ", ") + "\n")
