@@ -107,10 +107,24 @@ const (
 	handoffCycleThreshold = 8
 )
 
+// StaleConflictResolver identifies conflict changes whose head_ref is already
+// merged into the goal branch (stale conflicts) — the daemon layer knows the
+// git worktree, the service layer does not. The resolver runs OUTSIDE the
+// reconcile transaction (git operates on the worktree, not the DB); the
+// returned change IDs are marked integrated inside the tx.
+type StaleConflictResolver interface {
+	StaleConflictChanges(ctx context.Context, goalID string) ([]string, error)
+}
+
 type GoalService struct {
 	st     *store.Store
 	bus    *events.Bus
 	runSvc *RunService // back-reference for retry/wake enqueue (same package)
+
+	// staleConf clears stale conflict changes during reconcile. nil in tests
+	// (no git worktree) — the cleanup is skipped and reconcile proceeds as
+	// before. Wired by the daemon via SetStaleConflictResolver.
+	staleConf StaleConflictResolver
 
 	// reconcileLocks serializes ReconcileGoal per goal (single-process): an
 	// event storm fires run.terminal + sub_goal.* concurrently, and racing
@@ -144,6 +158,11 @@ func (s *GoalService) lockReconcile(goalID string) func() {
 // SetRunService wires the RunService back-reference once both exist. Kept
 // explicit (not in the constructor) to avoid a constructor-order chicken/egg.
 func (s *GoalService) SetRunService(rs *RunService) { s.runSvc = rs }
+
+// SetStaleConflictResolver wires the git-ancestry checker. Kept explicit (not
+// in the constructor) so tests construct GoalService without a git worktree;
+// a nil resolver simply skips stale-conflict cleanup.
+func (s *GoalService) SetStaleConflictResolver(r StaleConflictResolver) { s.staleConf = r }
 
 // Create inserts a goal. backlog (the semantic invariant) does not enqueue a
 // run; an ACTIVE agent/squad goal births its first run IN the same
@@ -1166,6 +1185,32 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		return s.commitAndEmit(ctx, tx, pendingEvents, afterCommit, rc.RunID)
 	}
 
+	// Stale-conflict cleanup: a conflict change whose head_ref is already an
+	// ancestor of the goal branch HEAD is stale — the content landed via
+	// another path but the row was never marked integrated. These block the
+	// finalization guard below forever (the failed sub-goal can't re-run to
+	// produce a new revision). The ancestry check runs OUTSIDE the tx (git
+	// operates on the worktree); only the UPDATE is inside. Non-fatal on
+	// resolver error — proceed without cleanup rather than blocking
+	// reconcile (a missing worktree or git fault should not strand the goal).
+	// Runs BEFORE the status switch so a cancelled/failed owner run (e.g. an
+	// idle-watchdog cancel) also clears the deadlock — the stale conflicts are
+	// independent of how this particular run ended.
+	if s.staleConf != nil {
+		staleIDs, stErr := s.staleConf.StaleConflictChanges(ctx, rc.GoalID)
+		if stErr != nil {
+			logging.Infof("goal: %q stale-conflict resolve skipped: %v", g.Title, stErr)
+		} else if len(staleIDs) > 0 {
+			for _, id := range staleIDs {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE change SET status='integrated' WHERE id=? AND status='conflict'`, id); err != nil {
+					return fmt.Errorf("clear stale conflict: %w", err)
+				}
+			}
+			logging.Infof("goal: %q cleared %d stale conflict change(s)", g.Title, len(staleIDs))
+		}
+	}
+
 	switch rc.Status {
 	case "completed":
 		// The run's report lands in the feed as the agent's comment — the
@@ -1220,15 +1265,23 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		// reply-triggered successor run reaches the gate normally when IT ends.
 		// This mirrors the consult hold above but for the agent→human channel
 		// (which has no consult_request row — decision 7-3 D).
+		//
+		// Stale-ask narrowing: only ask_human from THIS run holds — an ask
+		// from a PRIOR run is stale (that run ended, a newer run completed
+		// past it; the question's context is gone). Without this, an answered-
+		// in-effect ask (the deadlock it asked about was resolved by a later
+		// run) strands the goal at the guard forever (live: a 2026-08-28 ask
+		// about conflict changes blocked review after all conflicts cleared).
 		var pendingAskHuman int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM comment ask
 			 WHERE ask.goal_id=? AND ask.ask_human=1 AND ask.author_type='agent'
+			   AND ask.run_id=?
 			   AND NOT EXISTS (
 			     SELECT 1 FROM comment rep
 			     WHERE rep.parent_id = ask.id AND rep.author_type='human'
 			   )`,
-			rc.GoalID).Scan(&pendingAskHuman); err != nil {
+			rc.GoalID, rc.RunID).Scan(&pendingAskHuman); err != nil {
 			return fmt.Errorf("count pending ask-human: %w", err)
 		}
 		if pendingSG > 0 || pendingChanges > 0 || pendingConsults > 0 || pendingAskHuman > 0 {
@@ -2010,6 +2063,26 @@ func (s *GoalService) reconcileGoalOnce(ctx context.Context, goalID string) erro
 	}
 	if err != nil {
 		return fmt.Errorf("load goal for reconcile: %w", err)
+	}
+
+	// Stale-conflict cleanup (also runs here, not just on run-end): a
+	// run.terminal or sub_goal.* event fires ReconcileGoal, and the goal may
+	// have stale conflicts from a prior failed sub-goal that never got a
+	// completed owner run to clear them. Clearing here lets the next owner
+	// run (or the attention spawn below) see a clean pendingChanges count.
+	if s.staleConf != nil && status == "active" {
+		staleIDs, stErr := s.staleConf.StaleConflictChanges(ctx, goalID)
+		if stErr != nil {
+			logging.Infof("goal: %s stale-conflict resolve skipped: %v", goalID, stErr)
+		} else if len(staleIDs) > 0 {
+			for _, id := range staleIDs {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE change SET status='integrated' WHERE id=? AND status='conflict'`, id); err != nil {
+					return fmt.Errorf("clear stale conflict: %w", err)
+				}
+			}
+			logging.Infof("goal: %s cleared %d stale conflict change(s)", goalID, len(staleIDs))
+		}
 	}
 
 	// Attention is armed only for ACTIVE goals: terminal goals have no owner

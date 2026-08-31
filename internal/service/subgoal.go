@@ -825,6 +825,60 @@ func (s *GoalService) CancelSubGoal(ctx context.Context, subGoalID string) (*Sub
 	return sg, nil
 }
 
+// RetrySubGoal re-arms a terminal-failed sub-goal: reset execution_attempt=0
+// and status='running', then enqueue a fresh run in the same transaction
+// (P0-3: the retry transition and its successor run are one atomic unit). A
+// non-failed sub-goal is rejected — this is the outlet for the case where the
+// sub-goal hit the execution_attempt cap and reconcile stopped retrying.
+func (s *GoalService) RetrySubGoal(ctx context.Context, subGoalID string) (*SubGoal, error) {
+	tx, err := s.st.DB().BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	var goalID string
+	if err := tx.QueryRowContext(ctx, `SELECT goal_id FROM sub_goal WHERE id=?`, subGoalID).Scan(&goalID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("load sub-goal: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE sub_goal SET status='running', execution_attempt=0 WHERE id=? AND status='failed'`,
+		subGoalID)
+	if err != nil {
+		return nil, fmt.Errorf("retry sub-goal: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, NewValidationError("the sub-goal is not failed — nothing to retry")
+	}
+
+	if s.runSvc == nil {
+		return nil, errors.New("runSvc not wired")
+	}
+	_, runEv, err := s.runSvc.enqueueSubGoalRunTx(ctx, tx, subGoalID, "")
+	if err != nil {
+		return nil, fmt.Errorf("enqueue retry run: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "sub_goal.retrying", Payload: map[string]any{
+		"goal_id": goalID, "sub_goal_id": subGoalID, "execution_attempt": 0,
+	}})
+	if runEv != nil {
+		s.bus.Publish(ctx, *runEv)
+	}
+	sg, err := s.GetSubGoal(ctx, subGoalID)
+	if err != nil {
+		return nil, err
+	}
+	return sg, nil
+}
+
 // waitChildrenTimeout bounds `goal wait` — the owner parks until its
 // dispatched work settles, never forever.
 const waitChildrenTimeout = 10 * time.Minute
