@@ -195,7 +195,7 @@ func TestRunReportThreadsToTrigger(t *testing.T) {
 	domID := seedDomain(t, st)
 
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
-	trigger, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 请审查"})
+	trigger, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "human", AuthorID: "ui", Content: "[@B](mention://agent/" + agentB + ") 请审查"})
 	if err != nil {
 		t.Fatalf("trigger comment: %v", err)
 	}
@@ -242,7 +242,7 @@ func TestAgentCommentAutoThreadsToTrigger(t *testing.T) {
 	g, _ := gs.Create(ctx, Goal{Title: "g", AssigneeType: "agent", AssigneeID: agentA, Status: "active", DomainID: domID})
 	enqueueFirst(t, rs, g)
 
-	trigger, err := cs.Create(ctx, Comment{GoalID: g.ID, Content: "[@B](mention://agent/" + agentB + ") 请审查"})
+	trigger, err := cs.Create(ctx, Comment{GoalID: g.ID, AuthorType: "human", AuthorID: "ui", Content: "[@B](mention://agent/" + agentB + ") 请审查"})
 	if err != nil {
 		t.Fatalf("trigger comment: %v", err)
 	}

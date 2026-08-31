@@ -133,8 +133,14 @@ func (s *CommentService) create(ctx context.Context, c Comment, dispatch bool) (
 	if c.GoalID == "" {
 		return nil, NewFieldRequiredError("goal_id")
 	}
+	// author_type is required: the HTTP /goals/{id}/comments handler accepts a
+	// self-reported author, and a missing field used to silently default to
+	// "human" — which let an unidentified caller post as a human with an empty
+	// author_id (a spurious human "deploy done" message appeared in the feed
+	// this way). Reject instead; every known caller (RPC handler, web, Feishu
+	// connector, watchdog) already passes an explicit author_type.
 	if c.AuthorType == "" {
-		c.AuthorType = "human"
+		return nil, NewFieldRequiredError("author_type")
 	}
 	// Platform threading: an agent comment made inside a run automatically
 	// replies to the comment that triggered that run (mention → run →
