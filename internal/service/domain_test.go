@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/eushing/agentwork/internal/events"
+	"github.com/eushing/agentwork/internal/store"
 )
 
 // TestCompilePolicyEnqueuesProcessorRun covers the compile kickoff: the NL
@@ -264,4 +267,106 @@ func TestUpdateDomainTypeGuard(t *testing.T) {
 	}); err == nil {
 		t.Fatalf("expected error when editing tries to change type scratch→repo")
 	}
+}
+
+// seedSteward inserts a minimal steward agent (type='steward') bound to a
+// throwaway active runtime, returning the agent id. Mirrors SeedSteward.
+func seedSteward(t *testing.T, ctx context.Context, st *store.Store) string {
+	t.Helper()
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO runtime (id,name,status,created_at) VALUES ('rt-s','rt-s','active',?)`,
+		now()); err != nil {
+		t.Fatalf("seed steward runtime: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,type,runtime_id,max_concurrent,created_at) VALUES ('steward-1','steward','steward','rt-s',1,?)`,
+		now()); err != nil {
+		t.Fatalf("seed steward agent: %v", err)
+	}
+	return "steward-1"
+}
+
+// TestCompilePolicyProcessorAgentFallback covers the CompilePolicy agent
+// fallback chain (决策 2-17): request → domain config → steward.
+func TestCompilePolicyProcessorAgentFallback(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("domain_configured_agent", func(t *testing.T) {
+		st := newTestStore(t)
+		bus := events.NewBus()
+		domainSvc := NewDomainService(st, bus)
+		runSvc := NewRunService(st, bus)
+		domainSvc.SetRunService(runSvc)
+
+		procAgentID := seedAgent(t, st, "processor")
+		d, err := domainSvc.Create(ctx, Domain{
+			Name:            "d1",
+			GitURL:          "https://example.com/d1.git",
+			ProcessorAgentID: procAgentID,
+		})
+		if err != nil {
+			t.Fatalf("create domain: %v", err)
+		}
+		run, err := domainSvc.CompilePolicy(ctx, d.ID, "测试必须通过", "")
+		if err != nil {
+			t.Fatalf("compile with domain-configured agent: %v", err)
+		}
+		if run.AgentID != procAgentID {
+			t.Fatalf("expected agent %s, got %s", procAgentID, run.AgentID)
+		}
+	})
+
+	t.Run("steward_default", func(t *testing.T) {
+		st := newTestStore(t)
+		bus := events.NewBus()
+		domainSvc := NewDomainService(st, bus)
+		runSvc := NewRunService(st, bus)
+		domainSvc.SetRunService(runSvc)
+
+		stewardID := seedSteward(t, ctx, st)
+		d, err := domainSvc.Create(ctx, Domain{
+			Name:   "d2",
+			GitURL: "https://example.com/d2.git",
+		})
+		if err != nil {
+			t.Fatalf("create domain: %v", err)
+		}
+		run, err := domainSvc.CompilePolicy(ctx, d.ID, "测试必须通过", "")
+		if err != nil {
+			t.Fatalf("compile with steward fallback: %v", err)
+		}
+		if run.AgentID != stewardID {
+			t.Fatalf("expected steward %s, got %s", stewardID, run.AgentID)
+		}
+	})
+
+	t.Run("no_agent_available", func(t *testing.T) {
+		st := newTestStore(t)
+		bus := events.NewBus()
+		domainSvc := NewDomainService(st, bus)
+		runSvc := NewRunService(st, bus)
+		domainSvc.SetRunService(runSvc)
+
+		d, err := domainSvc.Create(ctx, Domain{
+			Name:   "d3",
+			GitURL: "https://example.com/d3.git",
+		})
+		if err != nil {
+			t.Fatalf("create domain: %v", err)
+		}
+		_, err = domainSvc.CompilePolicy(ctx, d.ID, "测试必须通过", "")
+		if err == nil {
+			t.Fatalf("expected error when no processor agent available")
+		}
+		if !errors.Is(err, ErrValidation) {
+			t.Fatalf("expected ErrValidation, got %v", err)
+		}
+		msg := err.Error()
+		if strings.Contains(msg, `"" does not exist`) {
+			t.Fatalf("error must not leak the empty-id mustExist message, got: %s", msg)
+		}
+		if !strings.Contains(msg, "no processor agent available") {
+			t.Fatalf("expected friendly setup-hint message, got: %s", msg)
+		}
+	})
 }

@@ -121,8 +121,10 @@ func (s *DomainService) SetRunService(rs *RunService) { s.runSvc = rs }
 // (DESIGN.md §5.3): records the NL intent, enqueues a processor run on the
 // given processor agent. The daemon executes the run, reads checks.json from
 // the run's workdir, and stores the result on the domain in an UNFROZEN state
-// (checks_compiled_at stays ”); the owner's confirmation card then freezes
+// (checks_compiled_at stays ""); the owner's confirmation card then freezes
 // it via FreezeChecks. Returns the processor run.
+// The processor agent falls back to the domain's processor_agent_id, then the
+// system steward (决策 2-17) — the user never has to pick one.
 func (s *DomainService) CompilePolicy(ctx context.Context, domainID, policyText, processorAgentID string) (*Run, error) {
 	if strings.TrimSpace(policyText) == "" {
 		return nil, NewFieldRequiredError("policy_text")
@@ -130,6 +132,15 @@ func (s *DomainService) CompilePolicy(ctx context.Context, domainID, policyText,
 	d, err := s.Get(ctx, domainID)
 	if err != nil {
 		return nil, err
+	}
+	if processorAgentID == "" {
+		processorAgentID = d.ProcessorAgentID
+	}
+	if processorAgentID == "" {
+		processorAgentID, err = s.resolveStewardAgent(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, processorAgentID, "processor agent"); err != nil {
 		return nil, err
@@ -141,6 +152,22 @@ func (s *DomainService) CompilePolicy(ctx context.Context, domainID, policyText,
 		return nil, fmt.Errorf("update policy_text: %w", err)
 	}
 	return s.runSvc.EnqueueProcessorRun(ctx, "compile", domainID, processorAgentID, compilePrompt(d, policyText))
+}
+
+// resolveStewardAgent returns the system steward agent id — the bootstrap
+// default processor when neither request nor domain names one. Mirrors
+// intake/team_import. Returns a setup-hint error when no steward exists
+// (no machine connected).
+func (s *DomainService) resolveStewardAgent(ctx context.Context) (string, error) {
+	var id string
+	err := s.st.DB().QueryRowContext(ctx, `SELECT id FROM agent WHERE type='steward' LIMIT 1`).Scan(&id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", NewValidationError("no processor agent available — configure one on the domain, or connect a machine and restart the daemon")
+		}
+		return "", fmt.Errorf("resolve steward agent: %w", err)
+	}
+	return id, nil
 }
 
 // compilePrompt builds the instruction for the processor agent. The compiled

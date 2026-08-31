@@ -125,8 +125,6 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   const [compileError, setCompileError] = useState<string | null>(null);
   const [compileRun, setCompileRun] = useState<Run | null>(null);
   const [runEvents, setRunEvents] = useState<ChatMessage[]>([]);
-  // 回显域已配置的处理器 agent（域创建时选的 / 已配过的），不必每次重选
-  const [processorAgent, setProcessorAgent] = useState(d.processor_agent_id);
   // 手动编辑验收策略（决策 2-8 降级路径：不依赖模型编译；冻结后也可再编辑）
   const [editChecksOpen, setEditChecksOpen] = useState(false);
   const [dlgSetup, setDlgSetup] = useState<string[]>([]);
@@ -196,7 +194,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
   }, [jsonDraft, editSetup, editExcludes, editVerify, d.checks]);
 
   const startCompile = () => {
-    if (!policyText.trim() || !processorAgent) return;
+    if (!policyText.trim()) return;
     setCompiling(true);
     setCompileError(null);
     // Compilation is an ASYNC processor run (explores the repo, installs
@@ -205,7 +203,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
     // run was enqueued. The state clears when the platform's
     // domain:compiled / domain:compile_failed event arrives below.
     compile.mutate(
-      { id: d.id, policy_text: policyText, processor_agent_id: processorAgent },
+      { id: d.id, policy_text: policyText, processor_agent_id: "" },
       {
         onSuccess: (run) => {
           setCompileRun(run);
@@ -415,15 +413,7 @@ function DomainCard({ domain: initial }: { domain: Domain }) {
                 />
               </Field>
               <div className="flex items-end gap-3 flex-wrap">
-                <Field label="用哪个 agent 生成验收命令">
-                  <select value={processorAgent} onChange={(e) => setProcessorAgent(e.target.value)} className={inputCls}>
-                    <option value="">选择…</option>
-                    {agents?.map((a) => (
-                      <option key={a.id} value={a.id}>{a.name}</option>
-                    ))}
-                  </select>
-                </Field>
-                <Button onClick={startCompile} disabled={compiling || !policyText.trim() || !processorAgent}>
+                <Button onClick={startCompile} disabled={compiling || !policyText.trim()}>
                   {compiling ? "生成中…" : "生成验收命令"}
                 </Button>
                 <Button variant="outline" onClick={openChecksEditor}>
@@ -825,7 +815,6 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const [gitUrl, setGitUrl] = useState("");
   const [defaultBranch, setDefaultBranch] = useState("");
   const [policyText, setPolicyText] = useState("");
-  const [processorAgent, setProcessorAgent] = useState("");
   const [issueAssigneeType, setIssueAssigneeType] = useState("agent");
   const [issueAssignee, setIssueAssignee] = useState("");
   const [gitCredentials, setGitCredentials] = useState("");
@@ -837,11 +826,11 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     create.mutate(
-      { name, type: domainType, git_url: domainType === "scratch" ? "" : gitUrl, default_branch: domainType === "scratch" ? "" : defaultBranch, policy_text: policyText, processor_agent_id: processorAgent, issue_repo: "", issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: "", git_credentials: gitCredentials, git_identity: gitIdentity },
+      { name, type: domainType, git_url: domainType === "scratch" ? "" : gitUrl, default_branch: domainType === "scratch" ? "" : defaultBranch, policy_text: policyText, processor_agent_id: "", issue_repo: "", issue_assignee: issueAssignee, issue_assignee_type: issueAssigneeType, issue_provider: "", git_credentials: gitCredentials, git_identity: gitIdentity },
       {
         onSuccess: (d) => {
-          if (policyText.trim() && processorAgent) {
-            compile.mutate({ id: d.id, policy_text: policyText, processor_agent_id: processorAgent });
+          if (policyText.trim()) {
+            compile.mutate({ id: d.id, policy_text: policyText, processor_agent_id: "" });
           }
           onClose();
         },
@@ -901,14 +890,6 @@ function CreateDomainDialog({ onClose }: { onClose: () => void }) {
             )}
             <Field label="验收要求（可选，创建后可再生成）" hint="用一句话说清楚这个项目怎么算干完了">
               <textarea value={policyText} onChange={(e) => setPolicyText(e.target.value)} className={inputCls} rows={3} placeholder="比如：测试必须通过，改动要带测试用例" />
-            </Field>
-            <Field label="用哪个 agent 生成验收命令（可选）">
-              <select value={processorAgent} onChange={(e) => setProcessorAgent(e.target.value)} className={inputCls}>
-                <option value="">选择…</option>
-                {agents?.map((a) => (
-                  <option key={a.id} value={a.id}>{a.name}</option>
-                ))}
-              </select>
             </Field>
           </div>
         </details>
