@@ -59,6 +59,7 @@ const (
 	MethodSubGoalList  = "subgoal.list"
 	MethodSubGoalCreate = "subgoal.create"
 	MethodSubGoalCancel = "subgoal.cancel"
+	MethodSubGoalRetry  = "subgoal.retry"
 	MethodSubGoalVerify = "subgoal.verify"
 	MethodSubGoalGet    = "subgoal.get"
 	MethodSubGoalVerifications = "subgoal.verifications"
@@ -206,6 +207,12 @@ type SubGoalVerifyParams struct {
 
 // SubGoalCancelParams cancels a sub-goal.
 type SubGoalCancelParams struct {
+	RPCToken
+	SubGoalID string `json:"sub_goal_id"`
+}
+
+// SubGoalRetryParams re-arms a terminal-failed sub-goal.
+type SubGoalRetryParams struct {
 	RPCToken
 	SubGoalID string `json:"sub_goal_id"`
 }

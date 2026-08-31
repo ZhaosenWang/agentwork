@@ -1164,3 +1164,214 @@ func TestAttentionClearsAfterIntegration(t *testing.T) {
 		t.Fatalf("attention must clear once the change is integrated and the owner run is terminal, got %q", g2.Attention)
 	}
 }
+
+// TestStaleAskHumanDoesNotBlockReview: an ask_human from a PRIOR run must not
+// hold the finalization guard when a newer owner run completes. The guard
+// narrows to ask.run_id = rc.RunID (the current run); stale asks from old
+// runs are ignored. Without this, a 3-day-old ask about a since-resolved
+// deadlock stranded the goal at active forever.
+func TestStaleAskHumanDoesNotBlockReview(t *testing.T) {
+	gs, rs, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	// A stale ask_human from a prior run (simulating the 2026-08-28 consult
+	// ask about conflicts that were later resolved). No human reply threads
+	// under it — the old guard would count it.
+	oldRunID := "old-consult-run-1"
+	if _, err := cs.Create(ctx, Comment{
+		GoalID: g.ID, AuthorType: "agent", AuthorID: a, RunID: oldRunID,
+		Content: "stale ask about conflicts", AskHuman: true,
+	}); err != nil {
+		t.Fatalf("seed stale ask_human: %v", err)
+	}
+	// The current owner run completes. Under the old guard, the stale ask
+	// would hold (pendingAskHuman=1). Under the narrowed guard, only THIS
+	// run's asks count — it has none → guard passes → goal promotes.
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) == 0 {
+		t.Fatalf("expected birth owner run")
+	}
+	curRun := runs[0]
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='completed', finished_at=? WHERE id=?`, now(), curRun.ID); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+	if err := gs.ReconcileOnRunEnd(ctx, goalRunContext{
+		RunID: curRun.ID, GoalID: g.ID, AgentID: a, Role: "owner", Status: "completed",
+	}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	var status string
+	if err := st.DB().QueryRowContext(ctx, `SELECT status FROM goal WHERE id=?`, g.ID).Scan(&status); err != nil {
+		t.Fatalf("load goal: %v", err)
+	}
+	if status == "active" {
+		t.Fatalf("goal must leave active (stale ask_human must not hold the guard), still active")
+	}
+}
+
+// TestProbeOldGuardCountsStaleAsk: SQL proof that the old guard (no run_id
+// filter) counts the stale ask, while the new guard (ask.run_id = ?) does
+// not. This is the causal evidence that the narrowing is what unblocks it.
+func TestProbeOldGuardCountsStaleAsk(t *testing.T) {
+	gs, _, cs, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	if _, err := cs.Create(ctx, Comment{
+		GoalID: g.ID, AuthorType: "agent", AuthorID: a, RunID: "old-run",
+		Content: "stale ask", AskHuman: true,
+	}); err != nil {
+		t.Fatalf("seed ask: %v", err)
+	}
+	var oldCount, newCount int
+	// Old guard: all unanswered agent ask_human on the goal.
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment ask
+		 WHERE ask.goal_id=? AND ask.ask_human=1 AND ask.author_type='agent'
+		   AND NOT EXISTS (SELECT 1 FROM comment rep WHERE rep.parent_id=ask.id AND rep.author_type='human')`,
+		g.ID).Scan(&oldCount); err != nil {
+		t.Fatalf("old guard: %v", err)
+	}
+	// New guard: only the current run's ask_human.
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM comment ask
+		 WHERE ask.goal_id=? AND ask.ask_human=1 AND ask.author_type='agent'
+		   AND ask.run_id='current-run'
+		   AND NOT EXISTS (SELECT 1 FROM comment rep WHERE rep.parent_id=ask.id AND rep.author_type='human')`,
+		g.ID).Scan(&newCount); err != nil {
+		t.Fatalf("new guard: %v", err)
+	}
+	if oldCount != 1 {
+		t.Fatalf("old guard must count the stale ask, got %d", oldCount)
+	}
+	if newCount != 0 {
+		t.Fatalf("new guard must not count the stale ask, got %d", newCount)
+	}
+}
+
+// TestRetrySubGoalResetsFailed: RetrySubGoal on a terminal-failed sub-goal
+// resets execution_attempt=0, status='running', and enqueues a fresh run.
+func TestRetrySubGoalResetsFailed(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work", "desc", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	// Force the sub-goal to terminal-failed (bypass the 3-failure loop).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE sub_goal SET status='failed', execution_attempt=3 WHERE id=?`, sg.ID); err != nil {
+		t.Fatalf("fail sub-goal: %v", err)
+	}
+	sg2, err := gs.RetrySubGoal(ctx, sg.ID)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if sg2.Status != "running" || sg2.ExecutionAttempt != 0 {
+		t.Fatalf("retry must reset to running/attempt=0, got status=%q attempt=%d", sg2.Status, sg2.ExecutionAttempt)
+	}
+	var queuedRuns int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run WHERE sub_goal_id=? AND status='queued'`, sg.ID).Scan(&queuedRuns); err != nil {
+		t.Fatalf("count queued: %v", err)
+	}
+	if queuedRuns != 1 {
+		t.Fatalf("retry must enqueue exactly one run, got %d", queuedRuns)
+	}
+}
+
+// TestRetrySubGoalRejectsNonFailed: RetrySubGoal on a non-failed sub-goal
+// returns a validation error (the sub-goal is not in a retryable state).
+func TestRetrySubGoalRejectsNonFailed(t *testing.T) {
+	gs, _, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	b := seedAgent(t, st, "b")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	sg, err := gs.CreateSubGoal(ctx, g.ID, "work", "desc", b, "", "agent", a)
+	if err != nil {
+		t.Fatalf("create sub-goal: %v", err)
+	}
+	// Sub-goal is 'running' (its birth state) — retry must reject.
+	if _, err := gs.RetrySubGoal(ctx, sg.ID); err == nil {
+		t.Fatalf("retry must reject non-failed sub-goal")
+	}
+	// Force to verified — also rejected.
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE sub_goal SET status='verified' WHERE id=?`, sg.ID); err != nil {
+		t.Fatalf("verify sub-goal: %v", err)
+	}
+	if _, err := gs.RetrySubGoal(ctx, sg.ID); err == nil {
+		t.Fatalf("retry must reject verified sub-goal")
+	}
+}
+
+// TestStaleConflictResolverNilSafe: a nil staleConf (tests, no git worktree)
+// must not block reconcile — the cleanup is skipped and the goal proceeds
+// as before. This guards every test that constructs GoalService without
+// SetStaleConflictResolver.
+func TestStaleConflictResolverNilSafe(t *testing.T) {
+	gs, rs, _, st := newTestCluster(t)
+	ctx := context.Background()
+	a := seedAgent(t, st, "a")
+	domID := seedDomain(t, st)
+	g, err := gs.Create(ctx, Goal{Title: "g", Description: "d", DomainID: domID, AssigneeType: "agent", AssigneeID: a, Status: "active"})
+	if err != nil {
+		t.Fatalf("create goal: %v", err)
+	}
+	// Seed a conflict change — without a resolver, it stays conflict and
+	// holds the guard. The point is reconcile does NOT crash with nil.
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO sub_goal (id,goal_id,title,assignee_id,status,created_at) VALUES (?,?,?,?,?,?)`,
+		"sg-x", g.ID, "done-work", a, "failed", now()); err != nil {
+		t.Fatalf("seed sub-goal: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO change (id,goal_id,sub_goal_id,status,created_at) VALUES (?,?,?,?,?)`,
+		"ch-1", g.ID, "sg-x", "conflict", now()); err != nil {
+		t.Fatalf("seed conflict: %v", err)
+	}
+	runs, _ := rs.List(ctx, g.ID)
+	if len(runs) == 0 {
+		t.Fatalf("expected birth run")
+	}
+	curRun := runs[0]
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE run SET status='completed', finished_at=? WHERE id=?`, now(), curRun.ID); err != nil {
+		t.Fatalf("complete run: %v", err)
+	}
+	// Must not panic/err — nil resolver is skipped, not dereferenced.
+	if err := gs.ReconcileOnRunEnd(ctx, goalRunContext{
+		RunID: curRun.ID, GoalID: g.ID, AgentID: a, Role: "owner", Status: "completed",
+	}); err != nil {
+		t.Fatalf("reconcile with nil resolver: %v", err)
+	}
+	// The conflict holds the guard (no resolver to clear it) — goal stays
+	// active. This confirms nil-safety without depending on git.
+	var status string
+	_ = st.DB().QueryRowContext(ctx, `SELECT status FROM goal WHERE id=?`, g.ID).Scan(&status)
+	if status != "active" {
+		t.Fatalf("with nil resolver, conflict must hold guard — goal stays active, got %q", status)
+	}
+}

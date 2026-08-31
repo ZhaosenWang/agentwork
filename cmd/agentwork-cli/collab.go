@@ -17,7 +17,7 @@ import (
 
 func subgoalCmd(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork subgoal <list|get|create|cancel|verify|verifications>")
+		fmt.Fprintln(os.Stderr, "usage: agentwork subgoal <list|get|create|cancel|retry|verify|verifications>")
 		os.Exit(2)
 	}
 	switch args[0] {
@@ -59,6 +59,15 @@ func subgoalCmd(args []string) {
 		}
 		var out map[string]any
 		if err := rpcCall(link.MethodSubGoalCancel, link.SubGoalCancelParams{RPCToken: rpcToken(), SubGoalID: args[1]}, &out); err != nil {
+			fail("%v", err)
+		}
+		rpcPrintJSON(out)
+	case "retry":
+		if len(args) < 2 {
+			fail("usage: agentwork subgoal retry <sub-goal-id>")
+		}
+		var out map[string]any
+		if err := rpcCall(link.MethodSubGoalRetry, link.SubGoalRetryParams{RPCToken: rpcToken(), SubGoalID: args[1]}, &out); err != nil {
 			fail("%v", err)
 		}
 		rpcPrintJSON(out)

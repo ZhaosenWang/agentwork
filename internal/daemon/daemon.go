@@ -246,6 +246,11 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 		machinePollWake:   make(map[string]chan struct{}),
 		machineLastEvent:  make(map[string]time.Time),
 	}
+	// Wire the stale-conflict resolver: the daemon layer owns the git worktree,
+	// the service layer clears stale conflicts during reconcile. Set after
+	// construction (like SetRunService) — the resolver is a standalone struct
+	// to avoid a Daemon↔GoalService cycle.
+	goalSvc.SetStaleConflictResolver(&staleConflictResolver{st: st})
 	bus.Subscribe("agent:created", d.onAgentCreated)
 	bus.Subscribe("agent:deleted", d.onAgentDeleted)
 	bus.Subscribe("domain:deleted", d.onDomainDeleted)

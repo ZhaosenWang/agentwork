@@ -513,6 +513,21 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			return sg, nil
 		})
 
+		peer.Handle(link.MethodSubGoalRetry, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
+			if _, rpcErr := resolve(raw); rpcErr != nil {
+				return nil, rpcErr
+			}
+			var p link.SubGoalRetryParams
+			if err := json.Unmarshal(raw, &p); err != nil || p.SubGoalID == "" {
+				return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "sub_goal_id is required"}
+			}
+			sg, err := s.goalSvc.RetrySubGoal(ctx, p.SubGoalID)
+			if err != nil {
+				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			return sg, nil
+		})
+
 		peer.Handle(link.MethodSubGoalVerify, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 			id, rpcErr := resolve(raw)
 			if rpcErr != nil {
