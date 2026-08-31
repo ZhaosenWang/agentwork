@@ -94,10 +94,21 @@ func main() {
 	commentSvc.SetRunService(runSvc)
 	commentSvc.SetGoalService(goalSvc)
 
+	// Seed the system-internal steward agent (type=steward) — used by team-import
+	// to run the exploration processor task. Binds to the first active runtime;
+	// skipped if no runtime is active yet (ImportTeam reports the error then).
+	if err := agentSvc.SeedSteward(context.Background()); err != nil {
+		logging.Warnf("seed steward agent: %v", err)
+	}
+
 	squadSvc := service.NewSquadService(st, bus)
 	schedSvc := service.NewScheduleService(st, bus)
 	domainSvc := service.NewDomainService(st, bus)
 	domainSvc.SetRunService(runSvc)
+
+	skillSvc := service.NewSkillService(st)
+	teamImportSvc := service.NewTeamImportService(st, bus)
+	teamImportSvc.SetDependencies(runSvc, agentSvc, skillSvc, squadSvc)
 
 	// M3 IM: the approval-card callbacks resolve through the goal layer; the
 	// owner's inbound messages become intake parse runs on the configured
@@ -107,6 +118,7 @@ func main() {
 	imConn.SetGoalService(goalSvc)
 	imConn.SetCommentService(commentSvc)
 	intakeSvc := notify.NewIntakeService(qs, settingsSvc, runSvc)
+	intakeSvc.SetAgentService(agentSvc)
 	imConn.SetIntakeService(intakeSvc)
 
 	// Protocol backends registered by provider name (runtime.provider selects).
@@ -116,13 +128,14 @@ func main() {
 	protoReg.Register("jsonrpc", jsonrpcbackend.New())
 
 	d := daemon.New(st, bus, *addr, protoReg, goalSvc, runSvc, commentSvc, agentSvc, squadSvc, schedSvc, imConn, qs, intakeSvc)
+	d.SetTeamImportService(teamImportSvc)
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			logging.Errorf("daemon: %v", err)
 		}
 	}()
 
-	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc, domainSvc, imConn)
+	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc, domainSvc, imConn, teamImportSvc, skillSvc, intakeSvc)
 	if err := srv.ListenAndServe(ctx, *addr); err != nil && !errors.Is(err, context.Canceled) {
 		logging.Fatalf("server: %v", err)
 	}

@@ -45,8 +45,8 @@ build/
 node_modules/
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
 
 # OS noise
 .DS_Store

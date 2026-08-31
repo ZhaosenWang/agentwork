@@ -15,21 +15,22 @@ import (
 	"github.com/eushing/agentwork/internal/service"
 )
 
-// runIntakeTask executes an inbound-message parse run (M3-4): the parser
+// runIntakeTask executes an inbound-message parse run: the parser
 // agent reads the owner's message (the run prompt) and writes intake.json —
 // the parsed action — into its scratch workdir. The PLATFORM executes the
-// action (goal create / review list / goal status — never the agent; the
-// parser only understands intent and names ids) and replies over IM.
+// action (goal create / review list / goal status / team import — never the
+// agent; the parser only understands intent and names ids) and replies over
+// IM (Feishu path) or stores the result for Web polling (intake_web path).
 //
 // Structured output is read from the file, never from agent stdout
 // (DESIGN.md §5.3, §9): the parser is a processor agent, same as the
 // policy compiler.
-func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, prompt, agentID string) {
+func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, prompt, agentID, runType string) {
 	// Scratch workdir (no repo): the parser works from the prompt alone and
 	// writes its result file here.
 	workdir := filepath.Join(runsRoot(), "proc", q.RunID)
 	if err := os.MkdirAll(workdir, 0o755); err != nil {
-		d.failIntakeRun(ctx, q, "mkdir workdir: "+err.Error())
+		d.failIntakeRun(ctx, q, "mkdir workdir: "+err.Error(), runType)
 		return
 	}
 	// The artifact's ABSOLUTE path: the scratch dir is opaque to the agent —
@@ -46,7 +47,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 		 FROM agent a JOIN runtime r ON r.id = a.runtime_id WHERE a.id=?`, agentID).
 		Scan(&argsJSON, &rtEnvJSON, &intakeMachineID, &maxConcurrent)
 	if err != nil {
-		d.failIntakeRun(ctx, q, "load agent runtime: "+err.Error())
+		d.failIntakeRun(ctx, q, "load agent runtime: "+err.Error(), runType)
 		return
 	}
 	d.ensureWorker(agentID, maxConcurrent)
@@ -71,7 +72,7 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 			RunID: q.RunID, AgentID: q.AgentID, Attempt: q.Attempt, Token: q.Token,
 			Prompt: prompt, Proc: true, Scratch: true,
 			ArtifactFiles: []string{"intake.json"},
-			ACPSpawn: args, Env: dispatchEnv,
+			ACPSpawn:      args, Env: dispatchEnv,
 			McpServers: d.extraMcpServers(ctx, q.AgentID),
 		}, intakeMachineID)
 		return
@@ -79,19 +80,19 @@ func (d *Daemon) runIntakeTask(ctx context.Context, q *service.ClaimedRow, promp
 
 	// Legacy transports have no executor anymore (the unified model
 	// dispatches everything to machines).
-	d.failIntakeRun(ctx, q, "this runtime has no machine — run `agentwork connect` and point the agent at a machine-owned runtime")
+	d.failIntakeRun(ctx, q, "this runtime has no machine — run `agentwork connect` and point the agent at a machine-owned runtime", runType)
 }
 
 // ingestIntakeArtifact completes an intake run from its FILE artifact
 // (intake.json) — the shared path for local execution and the machine-
 // dispatched upload (CLI 分支 Phase 2).
-func (d *Daemon) ingestIntakeArtifact(ctx context.Context, q *service.ClaimedRow, artifactContent string) {
+func (d *Daemon) ingestIntakeArtifact(ctx context.Context, q *service.ClaimedRow, artifactContent, runType string) {
 	var parsed intakeAction
 	if err := json.Unmarshal([]byte(artifactContent), &parsed); err != nil {
-		d.failIntakeRun(ctx, q, "parse intake.json: "+err.Error())
+		d.failIntakeRun(ctx, q, "parse intake.json: "+err.Error(), runType)
 		return
 	}
-	d.replyIntake(ctx, q, parsed)
+	d.replyIntake(ctx, q, parsed, runType)
 }
 
 // failIntakeRun marks the parse run failed AND tells the owner — the inbound
@@ -99,10 +100,12 @@ func (d *Daemon) ingestIntakeArtifact(ctx context.Context, q *service.ClaimedRow
 // would leave the user waiting for a result that never comes. The failure
 // detail is sent IN FULL (no truncation): the user debugging a parse failure
 // needs the whole reason, including the path that failed.
-func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summary string) {
-	if n := d.imNotifier(); n != nil {
-		if err := n.Send("⚠️ 消息解析失败：" + summary); err != nil {
-			logging.Errorf("daemon: intake failure reply: %v", err)
+func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summary, runType string) {
+	if runType != "intake_web" {
+		if n := d.imNotifier(); n != nil {
+			if err := n.Send("⚠️ 消息解析失败：" + summary); err != nil {
+				logging.Errorf("daemon: intake failure reply: %v", err)
+			}
 		}
 	}
 	// Stamp the run failed directly (P0-5 conditional — a reaper stamp
@@ -126,7 +129,7 @@ func (d *Daemon) failIntakeRun(ctx context.Context, q *service.ClaimedRow, summa
 // parameters (an anonymous struct can't be a func arg) and the draft can
 // round-trip a sub-struct as JSON via a concrete type.
 type intakeAction struct {
-	Intent string `json:"intent"`
+	Intent string     `json:"intent"`
 	Goal   goalAction `json:"goal"`
 	GoalID string     `json:"goal_id"`
 	// Schedule carries the parsed定时任务 fields (create_schedule / schedule_stop).
@@ -139,8 +142,16 @@ type intakeAction struct {
 		AssigneeID  string `json:"assignee_id"`
 		DomainID    string `json:"domain_id"`
 	} `json:"schedule"`
-	Agent agentAction  `json:"agent"`
-	Squad squadAction  `json:"squad"`
+	Agent      agentAction      `json:"agent"`
+	Squad      squadAction      `json:"squad"`
+	ImportTeam importTeamAction `json:"import_team"`
+}
+
+// importTeamAction carries the import_team fields parsed from NL.
+type importTeamAction struct {
+	GitURL      string `json:"git_url"`
+	Branch      string `json:"branch"`
+	Credentials string `json:"credentials"`
 }
 
 // goalAction is the create_goal sub-struct.
@@ -229,6 +240,8 @@ var intakeReg = &intakeRegistry{cmds: []intakeCommand{
 		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadRemoveMember(ctx, p) }},
 	{"squad_delete", func() string { return "删除 squad <名字>" },
 		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadDelete(ctx, p) }},
+	{"import_team", func() string { return "根据 <git URL> 创建一个 team" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeImportTeam(ctx, p) }},
 }}
 
 // dispatch finds the intent in the registry and calls its handler; if not
@@ -257,16 +270,18 @@ func (r *intakeRegistry) fallbackReply() string {
 
 // replyIntake executes the parsed action and replies over IM. The run row is
 // stamped completed here (the daemon owns processor-run finishing).
-func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed intakeAction) {
+func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed intakeAction, runType string) {
 	reply := intakeReg.dispatch(d, ctx, parsed)
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
 		reply, nowStr(), q.RunID); err != nil {
 		logging.Infof("daemon: finish intake run %s: %v", q.RunID, err)
 	}
-	if n := d.imNotifier(); n != nil {
-		if err := n.Send(reply); err != nil {
-			logging.Errorf("daemon: intake reply: %v", err)
+	if runType != "intake_web" {
+		if n := d.imNotifier(); n != nil {
+			if err := n.Send(reply); err != nil {
+				logging.Errorf("daemon: intake reply: %v", err)
+			}
 		}
 	}
 	logging.Infof("daemon: intake %s → %s", q.RunID, parsed.Intent)
@@ -643,24 +658,28 @@ func (d *Daemon) intakeSquadDetail(ctx context.Context, parsed intakeAction) str
 	if name == "" {
 		return "查看 squad 详情需要名字（如：查看 squad 审查组）"
 	}
+	return d.squadDetailText(ctx, name)
+}
+
+func (d *Daemon) squadDetailText(ctx context.Context, name string) string {
 	sq, err := d.resolveSquadByName(ctx, name)
 	if err != nil {
 		return err.Error()
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "👥 %s（%s）\n", sq.Name, shortID(sq.ID))
+	fmt.Fprintf(&b, "👥 %s\n", sq.Name)
 	if sq.Description != "" {
-		b.WriteString("描述：" + firstLineIn(sq.Description) + "\n")
+		fmt.Fprintf(&b, "描述：\n    %s", firstLineIn(sq.Description))
 	}
-	fmt.Fprintf(&b, "leader: %s\n", d.agentDisplayName(ctx, sq.LeaderID))
+	fmt.Fprintf(&b, "leader：\n    %s", d.agentDisplayName(ctx, sq.LeaderID))
 	if sq.Instructions != "" {
-		b.WriteString("协作规则：" + truncateIn(sq.Instructions, 200) + "\n")
+		fmt.Fprintf(&b, "协作规则：\n    %s", truncateIn(sq.Instructions, 200))
 	}
 	members, err := d.squadSvc.ListMembers(ctx, sq.ID)
 	if err == nil && len(members) > 0 {
 		b.WriteString("成员：\n")
 		for _, m := range members {
-			fmt.Fprintf(&b, "- %s（%s）\n", d.agentDisplayName(ctx, m.MemberID), m.Role)
+			fmt.Fprintf(&b, "      - %s（%s）\n", d.agentDisplayName(ctx, m.MemberID), m.Role)
 		}
 	} else {
 		b.WriteString("成员：（无）\n")
@@ -794,6 +813,29 @@ func (d *Daemon) intakeSquadDelete(ctx context.Context, parsed intakeAction) str
 		return "删除 squad 失败：" + err.Error()
 	}
 	return fmt.Sprintf("✅ 已删除 squad：%s（%s）", sq.Name, shortID(sq.ID))
+}
+
+// intakeImportTeam triggers a team-repo import from a git URL parsed out of
+// the owner's NL message. The import run is enqueued via TeamImportService —
+// the steward explores the repo and produces team.json in a separate
+// processor run (run_type="import"); this intake run merely starts it.
+func (d *Daemon) intakeImportTeam(ctx context.Context, parsed intakeAction) string {
+	it := parsed.ImportTeam
+	if strings.TrimSpace(it.GitURL) == "" {
+		return "导入失败：缺少 git 仓库地址"
+	}
+	if d.teamImportSvc == nil {
+		return "导入失败：team import 服务未接线"
+	}
+	ti, _, err := d.teamImportSvc.ImportTeam(ctx, service.ImportRequest{
+		GitURL:         it.GitURL,
+		DefaultBranch:  it.Branch,
+		GitCredentials: it.Credentials,
+	})
+	if err != nil {
+		return "导入失败：" + err.Error()
+	}
+	return fmt.Sprintf("✅ 团队导入已启动（%s），完成后会通知你", shortID(ti.ID))
 }
 
 // collectAndAsk builds ONE clarification message listing all missing required

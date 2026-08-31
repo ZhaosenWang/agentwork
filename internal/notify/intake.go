@@ -8,29 +8,29 @@ import (
 	"strings"
 	"time"
 
-	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/service"
 )
 
-// IntakeService is the IM inbound pipeline (M3-4): the owner's natural-
-// language message becomes a processor run whose parsed action (intake.json,
-// file-as-side-effect — never parsed from agent stdout) the daemon executes
-// and replies to. The parser agent is a global platform setting
-// (platform.intake_agent) — processor agents are platform configuration,
-// same as the acceptance-policy compiler (DESIGN.md §5.3, decision 2-4).
+// IntakeService is the inbound NL pipeline: the owner's natural-language
+// message (from Feishu IM or the Web assistant dialog) becomes a processor
+// run whose parsed action (intake.json, file-as-side-effect — never parsed
+// from agent stdout) the daemon executes and replies to. The parser agent
+// is the system-internal steward (type=steward), auto-seeded at daemon
+// startup — both IM and Web paths share the same agent and prompt.
 //
 // Triangle separation holds: the parser only understands intent and names
 // ids; the PLATFORM executes the action (Create/Enqueue/query) and builds
 // the reply — the agent never touches the store.
 type IntakeService struct {
-	qs     QueryStore
-	store  SettingsStore
-	runSvc *service.RunService
+	qs       QueryStore
+	store    SettingsStore
+	runSvc   *service.RunService
+	agentSvc *service.AgentService
 }
 
-// intakeAgentKey is the app_settings blob holding the platform-wide M3
-// settings (intake_agent + digest_time; owned by the settings API).
-const intakeAgentKey = "platform.m3"
+func (s *IntakeService) SetAgentService(as *service.AgentService) {
+	s.agentSvc = as
+}
 
 // intakeDraft is the pending clarification (single-slot, single-user
 // platform; expires after draftTTL). A create_X intent whose required
@@ -59,12 +59,6 @@ type IntakeDraft struct {
 const draftKey = "intake.draft"
 const draftTTL = 10 * time.Minute
 
-// intakeSettings is the JSON shape of that blob.
-type intakeSettings struct {
-	IntakeAgent string `json:"intake_agent"`
-	DigestTime  string `json:"digest_time"`
-}
-
 func NewIntakeService(qs QueryStore, store SettingsStore, runSvc *service.RunService) *IntakeService {
 	return &IntakeService{qs: qs, store: store, runSvc: runSvc}
 }
@@ -78,7 +72,7 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 		return "", errors.New("空消息")
 	}
 	var b strings.Builder
-	b.WriteString("你是 agentwork 的 IM 入站解析器。用户通过飞书向 agentwork 发了一条消息，请解析其意图并写入当前工作目录的 intake.json 文件（文件即结果，不要输出到 stdout）。\n\n")
+	b.WriteString("你是 agentwork 的入站解析器。用户发了一条消息，请解析其意图并写入当前工作目录的 intake.json 文件（文件即结果，不要输出到 stdout）。\n\n")
 	// A pending clarification draft: the previous message created a create_X
 	// intent whose required fields the parser could not fully resolve. This
 	// message is parsed IN THAT CONTEXT so a bare completion reply finishes
@@ -108,12 +102,13 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 	b.WriteString("用户消息：\n" + text + "\n\n")
 	b.WriteString(`intake.json 结构：
 {
-  "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|unknown",
+  "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|import_team|unknown",
   "goal": {"title": "", "description": "", "assignee_id": "", "domain_id": ""},
   "goal_id": "",
   "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "domain_id": ""},
   "agent": {"name": "", "runtime_id": "", "description": "", "system_prompt": "", "skills": [], "skills_specified": false},
-  "squad": {"name": "", "leader_id": "", "description": "", "instructions": "", "member_ids": []}
+  "squad": {"name": "", "leader_id": "", "description": "", "instructions": "", "member_ids": []},
+  "import_team": {"git_url": "", "branch": "", "credentials": ""}
 }
 
 意图说明：
@@ -135,6 +130,7 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 - squad_add_member：用户想给某个 squad 加成员。squad.name 填 squad 名字（照抄）；squad.member_ids 填要加的 agent id 数组（从名单里选，必须真实存在，不含 leader）。
 - squad_remove_member：用户想从某个 squad 移除成员。squad.name 填 squad 名字（照抄）；squad.member_ids 填要移除的 agent id 数组（从名单里选）。
 - squad_delete：用户想删除某个 squad。squad.name 填要删除的 squad 名字（照抄）。
+- import_team：用户想从 git 仓库导入团队定义。import_team.git_url 必填（用户消息中提到的仓库地址）；import_team.branch 可选（留空用默认分支）；import_team.credentials 可选（私有仓库才需要）。例如："根据 https://gitcode.com/xiaozoom/demo-team.git 创建一个team"。
 - unknown：无法归入以上意图（闲聊、问候、无关话题）。
 
 cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时间 Asia/Shanghai）：
@@ -147,7 +143,7 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 - 每月 X 日 Y 点：Y X X * *
 - 无法可靠转换就 intent=unknown，别编造 cron。
 
-规则：intent 只能填上面十五个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
+规则：intent 只能填上面十六个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
 `)
 	b.WriteString("\n当前可用 agent（id: name）：\n")
 	if agents, err := s.qs.Agents(ctx); err == nil {
@@ -196,6 +192,25 @@ func (s *IntakeService) Enqueue(ctx context.Context, msgID, prompt string) (*ser
 		return nil, err
 	}
 	return s.runSvc.EnqueueProcessorRun(ctx, "intake", "", agentID, prompt)
+}
+
+// EnqueueWeb dispatches an intake parse run from the Web assistant dialog.
+// Same pipeline as the Feishu path (BuildPrompt + EnqueueProcessorRun) but
+// uses run_type="intake_web" so the daemon can skip IM replies and store the
+// result for HTTP polling instead.
+func (s *IntakeService) EnqueueWeb(ctx context.Context, text string) (*service.Run, error) {
+	if s.runSvc == nil {
+		return nil, errors.New("intake: runSvc not wired")
+	}
+	prompt, err := s.BuildPrompt(ctx, text)
+	if err != nil {
+		return nil, err
+	}
+	agentID, err := s.intakeAgent(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.runSvc.EnqueueProcessorRun(ctx, "intake_web", "", agentID, prompt)
 }
 
 // SaveDraft stores the pending clarification (multi-domain task creation).
@@ -356,32 +371,17 @@ func fieldName(kind, key string) string {
 	return key
 }
 
-// intakeAgent resolves the configured global parser agent and verifies it
-// still exists. A deleted agent (id left over in platform.m3 after a teardown
-// or a re-seed) would otherwise fail at EnqueueProcessorRun with an opaque
-// FOREIGN KEY error — the owner sees "解析任务创建失败：FOREIGN KEY
-// constraint failed" and has no idea the configured agent is gone. Surface
-// the real cause here, with the setup hint.
+// intakeAgent resolves the steward agent — the system-internal parser that
+// serves both the Feishu IM path and the Web assistant path. A missing
+// steward means the daemon hasn't seeded one (no active runtime at startup);
+// the error surfaces the setup hint.
 func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
-	raw, err := s.store.Get(ctx, intakeAgentKey)
+	if s.agentSvc == nil {
+		return "", errors.New("intake: agent service not wired")
+	}
+	agent, err := s.agentSvc.GetSteward(ctx)
 	if err != nil {
-		return "", fmt.Errorf("read intake settings: %w", err)
+		return "", errors.New("steward agent does not exist — connect a machine and restart the daemon")
 	}
-	var st intakeSettings
-	if raw != "" {
-		_ = json.Unmarshal([]byte(raw), &st)
-	}
-	if st.IntakeAgent == "" {
-		logging.Warnf("intake: platform.m3 intake_agent unset — inbound IM messages will be rejected (Settings → 全局解析 Agent)")
-		return "", errors.New("IM 解析 Agent 未配置或者已删除，请重新配置")
-	}
-	// The configured id must point at a live agent row — a stale config
-	// (agent deleted, DB re-seeded) is the one setup drift that produces an
-	// unreadable FK failure deep in EnqueueProcessorRun. AgentName returns
-	// ("", nil) on miss; "" means the id is gone.
-	if name, _ := s.qs.AgentName(ctx, st.IntakeAgent); name == "" {
-		logging.Warnf("intake: platform.m3 intake_agent %s not found in agent table — reconfigure (Settings → 全局解析 Agent)", st.IntakeAgent)
-		return "", errors.New("IM 解析 Agent 未配置或者已删除，请重新配置")
-	}
-	return st.IntakeAgent, nil
+	return agent.ID, nil
 }

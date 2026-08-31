@@ -113,7 +113,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
           <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} required />
         </Field>
 
-        <Field label="类型" hint="标准=普通 agent；管家=系统级 agent">
+        <Field label="类型" hint="标准=普通 agent；管家=系统级 agent（team 导入 / 自然语言指令）">
           <select value={type} onChange={(e) => setType(e.target.value)} className={inputCls}>
             <option value="standard">标准</option>
             <option value="steward">管家</option>

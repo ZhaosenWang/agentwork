@@ -520,6 +520,13 @@ func (n *Notifier) Send(text string) error {
 	return err
 }
 
+// SendMilestoneCard builds and pushes a milestone card with a markdown body
+// (lark_md renders **bold**). Falls back to plain text when card building
+// fails. Exposed for daemon-side notifications (e.g. team import complete).
+func (n *Notifier) SendMilestoneCard(emoji, template, title, body string) {
+	n.sendMilestoneCard(emoji, template, title, body)
+}
+
 // SendCard delivers an interactive card (JSON 2.0, M3). The card content is
 // a passthrough — msg_type=interactive with the card JSON as content.
 // Returns the sent message's id (” for the injected test send) — the

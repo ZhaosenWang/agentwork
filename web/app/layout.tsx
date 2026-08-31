@@ -4,6 +4,7 @@ import "./globals.css";
 import { Providers } from "@/components/providers";
 import { Nav } from "@/components/nav";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { ChatAssistant } from "@/components/chat-assistant";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -36,6 +37,7 @@ export default function RootLayout({
           <main className="flex-1 overflow-auto">
             <ErrorBoundary>{children}</ErrorBoundary>
           </main>
+          <ChatAssistant />
         </Providers>
       </body>
     </html>
