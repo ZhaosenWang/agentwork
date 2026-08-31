@@ -513,68 +513,96 @@ func (d *Daemon) notifyTeamImportComplete(ctx context.Context, ti *service.TeamI
 	}
 }
 
-// runMachineWatchdog supervises a dispatched run: no events for idleWindow
-// or a total duration beyond maxRunDuration cancels it via the machine
-// link (the local executor's watchdog semantics, re-applied across the
-// wire). The cancel is a REQUEST, not a stamp: after firing it keeps
-// ticking, and if the machine has not reported the terminal state within
-// a grace period (dead link, or an executor that ignores run.cancel) it
-// stamps cancelled locally — the run must never hang 'running' on an
-// unresponsive machine.
+// runMachineWatchdog supervises a dispatched run. Two signals, two policies:
+//
+//   - idle (no events for idleWindow): NOTIFY the human, do NOT cancel. The
+//     silence may be a model rate-limit backoff that will recover — cancelling
+//     turns "will finish, slowly" into "a broken run" with no recovery. The human
+//     decides (manual stop, or wait). One comment per run (idleNotified).
+//
+//   - max_run_duration (total duration > 2h): CANCEL automatically. This is a
+//     budget the run declared ("I take at most N minutes"); exceeding it is a
+//     contract violation, not a speculation — the platform may act unilaterally.
+//
+// The cancel is a REQUEST, not a stamp: after firing it keeps ticking, and if
+// the machine has not reported the terminal state within a grace period (dead
+// link, or an executor that ignores run.cancel) it stamps cancelled locally —
+// the run must never hang 'running' on an unresponsive machine.
 func (d *Daemon) runMachineWatchdog(runID, machineID string) {
 	tick := time.NewTicker(idleWindow / 2)
 	defer tick.Stop()
 	start := time.Now()
 	cancelSent := time.Time{}
+	idleNotified := false
 	for {
 		<-tick.C
-		// Terminal? The run's state is the truth — the watchdog dies when
-		// its run is no longer running.
-		var status string
-		if err := d.st.DB().QueryRowContext(context.Background(),
-			`SELECT status FROM run WHERE id=?`, runID).Scan(&status); err != nil || status != "running" {
-			return
-		}
-		d.machineLastEventMu.Lock()
-		last, ok := d.machineLastEvent[runID]
-		d.machineLastEventMu.Unlock()
-		fired := false
-		reason := ""
-		if ok && time.Since(last) > idleWindow {
-			fired, reason = true, "idle_watchdog"
-		} else if time.Since(start) > 2*time.Hour {
-			fired, reason = true, "max_run_duration"
-		}
-		if !fired {
-			continue
-		}
-		if cancelSent.IsZero() {
-			logging.Infof("machine: watchdog firing for run %s (%s)", runID, reason)
-			// Stamp the structured cancel_reason BEFORE the cancel rides out —
-			// Finish (the terminal chokepoint) does not write cancel_reason, so
-			// without this stamp the reason is lost to the DB and the feed
-			// comment / IM card / log line all go blind. max_run_duration maps
-			// to the schema's "timeout" code (schema.sql:205).
-			reasonCode := reason
-			if reason == "max_run_duration" {
-				reasonCode = "timeout"
-			}
-			if _, err := d.st.DB().ExecContext(context.Background(),
-				`UPDATE run SET cancel_reason=? WHERE id=? AND status='running'`, reasonCode, runID); err != nil {
-				logging.Infof("machine: watchdog stamp cancel_reason %s: %v", runID, err)
-			}
-			// PULL model: the cancel rides the machine's next poll.
-			d.enqueueMachineCancel(machineID, link.RunCancelParams{RunID: runID, Reason: reason})
-			cancelSent = time.Now()
-			continue
-		}
-		// Cancel sent but no terminal report: grace, then stamp locally.
-		if time.Since(cancelSent) > 2*time.Minute {
-			logging.Infof("machine: watchdog stamping run %s cancelled locally (machine unresponsive after cancel)", runID)
-			_ = d.runSvc.Finish(context.Background(), runID, "cancelled", "watchdog cancelled (machine unresponsive)")
+		if d.machineWatchdogTick(runID, machineID, start, &cancelSent, &idleNotified) {
 			return
 		}
 	}
+}
+
+// machineWatchdogTick is one watchdog iteration. Returns true to stop the
+// watchdog (run terminal or max_run_duration grace exhausted). Mutates
+// cancelSent and idleNotified in place across ticks.
+func (d *Daemon) machineWatchdogTick(runID, machineID string, start time.Time, cancelSent *time.Time, idleNotified *bool) bool {
+	// Terminal? The run's state is the truth — the watchdog dies when
+	// its run is no longer running.
+	var status string
+	if err := d.st.DB().QueryRowContext(context.Background(),
+		`SELECT status FROM run WHERE id=?`, runID).Scan(&status); err != nil || status != "running" {
+		return true
+	}
+
+	// Idle signal: notify once, never cancel. The run stays — if the
+	// agent is in rate-limit backoff it recovers; if truly stuck the human
+	// stops it (or max_run_duration below eventually cancels).
+	d.machineLastEventMu.Lock()
+	last, ok := d.machineLastEvent[runID]
+	d.machineLastEventMu.Unlock()
+	if ok && time.Since(last) > idleWindow && !*idleNotified {
+		var goalID string
+		if err := d.st.DB().QueryRowContext(context.Background(),
+			`SELECT goal_id FROM run WHERE id=?`, runID).Scan(&goalID); err == nil && goalID != "" {
+			content := fmt.Sprintf("Run idle for %s — possibly stuck or in rate-limit backoff. The platform will not auto-cancel. Stop it manually if needed, otherwise wait for recovery.", idleWindow)
+			if _, err := d.commentSvc.CreateNoDispatch(context.Background(), service.Comment{
+				GoalID:     goalID,
+				AuthorType: "system",
+				Content:    content,
+				RunID:      runID,
+			}); err != nil {
+				logging.Infof("machine: watchdog idle-notify comment for run %s: %v", runID, err)
+			} else {
+				*idleNotified = true // only lock after a successful post
+			}
+		}
+		logging.Infof("machine: watchdog idle-notify for run %s (silent %s) — not cancelling, waiting for recovery or human stop",
+			runID, time.Since(last).Round(time.Second))
+		return false
+	}
+
+	// max_run_duration: declared budget exceeded — cancel unilaterally.
+	if time.Since(start) <= 2*time.Hour {
+		return false
+	}
+	if cancelSent.IsZero() {
+		logging.Infof("machine: watchdog firing for run %s (max_run_duration)", runID)
+		if _, err := d.st.DB().ExecContext(context.Background(),
+			`UPDATE run SET cancel_reason='timeout' WHERE id=? AND status='running'`, runID); err != nil {
+			logging.Infof("machine: watchdog stamp cancel_reason %s: %v", runID, err)
+		}
+		// PULL model: the cancel rides the machine's next poll.
+		d.enqueueMachineCancel(machineID, link.RunCancelParams{RunID: runID, Reason: "max_run_duration"})
+		*cancelSent = time.Now()
+		return false
+	}
+	// Cancel sent but no terminal report: grace, then stamp locally.
+	if time.Since(*cancelSent) > 2*time.Minute {
+		logging.Infof("machine: watchdog stamping run %s cancelled locally (machine unresponsive after cancel)", runID)
+		_ = d.runSvc.Finish(context.Background(), runID, "cancelled", "watchdog cancelled (machine unresponsive)")
+		return true
+	}
+	return false
 }
 
 // processMachineRunCompletion is the daemon-side completion processing for

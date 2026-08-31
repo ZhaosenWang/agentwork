@@ -26,7 +26,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/eushing/agentwork/internal/link"
@@ -115,13 +114,11 @@ const runawayScanInterval = time.Minute
 // broke and only the DB-level reaper can free the owner single-flight.
 const runawayGrace = 5 * time.Minute
 
-// idleWindow is the no-activity budget after which the idle watchdog cancels
-// a hung turn. An agent that emits nothing for this long is presumed stuck.
+// idleWindow is the no-activity budget after which the idle watchdog notifies
+// the human (it no longer cancels — the silence may be a recoverable rate-limit
+// backoff, not a stuck run). max_run_duration is the platform's only unilateral
+// cancellation authority.
 const idleWindow = 2 * time.Minute
-
-// idleToolWindow extends the budget while a tool is in flight (a long-running
-// tool is legitimately silent between tool_use and tool_result).
-const idleToolWindow = 10 * time.Minute
 
 // maxAttempts bounds per-run retries; mirrored from service. A run that fails
 // this many times leaves the goal failed for human inspection.
@@ -2080,20 +2077,6 @@ func (d *Daemon) priorSessionFor(ctx context.Context, goalID, agentID, subGoalID
 // nowStr is the daemon-side UTC timestamp helper (service.now is private).
 func nowStr() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-// trackToolInflight maintains the in-flight-tool counter the idle watchdog
-// reads to decide whether to use idleWindow or the larger idleToolWindow.
-func (d *Daemon) trackToolInflight(n *atomic.Int32, ev proto.Event) {
-	switch ev.Type {
-	case proto.EventToolUse:
-		n.Add(1)
-	case proto.EventToolResult:
-		n.Add(-1)
-		if v := n.Load(); v < 0 {
-			n.Store(0)
-		}
-	}
-}
-
 // persistEvent stores one protocol event into chat_message (the run detail
 // view's data source) and returns the event to broadcast over WS run:event
 // (the live panels' real-time feed). Consecutive text/thought chunks from
@@ -2459,42 +2442,6 @@ func (d *Daemon) goalAttention(ctx context.Context, goalID string) string {
 	var a string
 	_ = d.st.DB().QueryRowContext(ctx, `SELECT attention FROM goal WHERE id=?`, goalID).Scan(&a)
 	return a
-}
-
-// runIdleWatchdog cancels a Prompt if the agent emits nothing for idleWindow
-// (or idleToolWindow while a tool is in flight or a terminal command is
-// running). Terminal polling (Agent→Client RPC) never appears on the event
-// stream — an agent waiting on `npm test` is silent to the daemon, so an
-// in-flight terminal widens the budget exactly like an in-flight tool.
-// It ticks at window/2.
-func (d *Daemon) runIdleWatchdog(parent context.Context, lastActivity *atomic.Int64, inFlightTools *atomic.Int32, cancel context.CancelFunc, runID string, activeTerms func() int) {
-	interval := idleWindow / 2
-	if interval <= 0 {
-		interval = idleWindow
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-parent.Done():
-			return
-		case <-ticker.C:
-			threshold := idleWindow
-			if inFlightTools.Load() > 0 || (activeTerms != nil && activeTerms() > 0) {
-				threshold = idleToolWindow
-			}
-			last := time.Unix(0, lastActivity.Load())
-			if time.Since(last) < threshold {
-				continue
-			}
-			logging.Infof("daemon: idle watchdog firing for run %s (silent %s), force-stopping", runID, time.Since(last).Round(time.Second))
-			d.mu.Lock()
-			d.runCancelReasons[runID] = "idle_watchdog"
-			d.mu.Unlock()
-			cancel()
-			return
-		}
-	}
 }
 
 // ── runaway reaper (P1, 决策 6-15⑦) ──
