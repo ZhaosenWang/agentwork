@@ -260,14 +260,29 @@ func (d *Daemon) deliverGoal(ctx context.Context, goalID string) {
 	}
 
 	// Merge the goal branch (--no-ff: a merge commit makes the delivered
-	// change an explicit, revertible unit).
+	// change an explicit, revertible unit). The merge COMMIT needs a committer
+	// identity — pass it via -c so a machine with no global user.name/user.email
+	// (containers, fresh runners) can still create the merge commit. Same
+	// resolution as commitRunChanges (verify.go); without it git aborts with
+	// "Committer identity unknown", which this path used to misreport as a
+	// merge conflict (deliver: merge conflict: …identity unknown…).
+	mergeName, mergeEmail := "agentwork[bot]", "agentwork@local"
+	if id := d.domainGitIdentity(ctx, domainID); id != "" {
+		if l, r, ok := strings.Cut(id, "<"); ok && strings.Contains(r, ">") {
+			mergeName = strings.TrimSpace(l)
+			mergeEmail = strings.TrimSuffix(strings.TrimSpace(r), ">")
+		}
+	}
 	start = time.Now()
 	logging.Infof("git: deliver %q (%s): merge %s ...", goalTitle, goalID, branchName)
-	mergeOut, err := gitRunCtx(ctx, wt, "merge", "--no-ff", branchName, "-m", "Merge "+branchName+" (agentwork deliver)")
+	mergeOut, err := gitRunCtx(ctx, wt, "-c", "user.name="+mergeName, "-c", "user.email="+mergeEmail, "merge", "--no-ff", branchName, "-m", "Merge "+branchName+" (agentwork deliver)")
 	if err != nil {
-		// Conflict: abort and report — the ephemeral worktree is removed by
-		// the defer; the goal branch stays intact for a reject-and-fix cycle.
-		_, _ = gitRunCtx(ctx, wt, "merge", "--abort")
+		// Conflict or identity/config error: abort and report — the ephemeral
+		// worktree is removed by the defer; the goal branch stays intact for a
+		// reject-and-fix cycle. The message preserves git's own output so the
+		// human can tell a real conflict from a config/identity failure (the
+		// label says "merge conflict" but the body is git's verbatim stderr).
+		_, _ = gitRunCtx(ctx, wt, "-c", "user.name="+mergeName, "-c", "user.email="+mergeEmail, "merge", "--abort")
 		d.finishDeliver(ctx, goalID, false, "deliver: merge conflict:\n"+mergeOut)
 		return
 	}
