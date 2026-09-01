@@ -43,6 +43,10 @@ type Server struct {
 	intakeSvc     *notify.IntakeService
 }
 
+// stewardSeedCLIName is the probed CLI name that triggers auto-seeding of
+// the steward agent at machine register / probe_update time.
+var stewardSeedCLIName = "hwcloud"
+
 // statusWriter captures the response status for request logging (the MCP
 // handshake's health is only visible through which requests return what).
 type statusWriter struct {
@@ -92,6 +96,19 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			"gitcode": issue.NewWebhookHandler("gitcode", s.st, s.d.Poller(),
 				func(ctx context.Context) (string, error) { return settingsSvc.Get(ctx, "platform.webhook_secret") }),
 		},
+	}
+
+	// seedStewardIfCLI scans probed CLIs for a stewardSeedCLIName entry and seeds
+	// the steward agent on its runtime. Shared by register and probe_update.
+	seedStewardIfCLI := func(ctx context.Context, machineName string, clis []link.ProbeCLI) {
+		for _, c := range clis {
+			if c.Name == stewardSeedCLIName {
+				if err := h.Agent.SeedStewardForRuntime(ctx, stewardSeedCLIName+"@"+machineName); err != nil {
+					logging.Warnf("connect: seed steward for %s: %v", stewardSeedCLIName, err)
+				}
+				return
+			}
+		}
 	}
 
 	mux := http.NewServeMux()
@@ -206,6 +223,7 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			if err := machineSvc.ReconcileProbeRuntimes(ctx, p.MachineID, p.Name, p.CLIs); err != nil {
 				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
 			}
+			seedStewardIfCLI(ctx, p.Name, p.CLIs)
 			// Bind the live peer: dispatched runs for this machine's
 			// runtimes flow over THIS link.
 			s.d.RegisterMachinePeer(p.MachineID, peer)
@@ -307,6 +325,10 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			}
 			if err := machineSvc.UpdateProbe(ctx, p.MachineID, service.MarshalProbedCLIs(p.CLIs)); err != nil {
 				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			var machineName string
+			if err := s.st.DB().QueryRowContext(ctx, `SELECT name FROM machine WHERE id=?`, p.MachineID).Scan(&machineName); err == nil {
+				seedStewardIfCLI(ctx, machineName, p.CLIs)
 			}
 			logging.Infof("connect: machine %s probe update: %d agent CLI(s)", p.MachineID, len(p.CLIs))
 			return link.RegisterResult{OK: true}, nil

@@ -13,6 +13,16 @@ import (
 	"github.com/eushing/agentwork/internal/store"
 )
 
+// stewardSystemPrompt is the default persona shipped to the steward agent
+// (小二) at seed time. The steward receives the owner's instructions,
+// decomposes and delegates them to the right worker agent, tracks them to
+// completion, and reports back faithfully.
+const stewardSystemPrompt = "你是一位严谨周到的管家。职责：接收主人指令、拆解并委派给合适的执行者、跟进直到闭环、如实汇报结果。不确定时先问清需求，绝不擅自假设。回复简明扼要。"
+
+// stewardDescription is the human-facing one-liner shown in the web agent
+// list — what the steward does at a glance.
+const stewardDescription = "系统内部解析 agent：team-import / intake 处理器"
+
 // Agent is a runtime + a persona. Under the per-task connection model, creating
 // an agent does NOT launch a process: a fresh connection is opened per run.
 // status/pid columns are deliberately gone — they belong to the future
@@ -484,12 +494,48 @@ func (s *AgentService) SeedSteward(ctx context.Context) error {
 		}
 		return err
 	}
-	_, err = s.st.DB().ExecContext(ctx,
-		`INSERT INTO agent (id,name,type,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		newID(), "小二", "steward", "Team import processor — auto-seeded", activeID, "", "", "{}", "[]", "[]", 1, now())
-	if err != nil {
+	if err := s.insertSteward(ctx, activeID); err != nil {
 		return fmt.Errorf("seed steward agent: %w", err)
 	}
 	return nil
+}
+
+// SeedStewardForRuntime seeds the steward agent bound to a specific runtime
+// (by runtime name, e.g. "hwcloud@laptop"). Called when a machine registers
+// or updates its probe with a hwcloud CLI — the steward is auto-created if
+// it doesn't already exist. Idempotent: if a steward already exists (even on
+// a different runtime), this is a no-op. Returns an error only if the named
+// runtime doesn't exist or isn't active.
+func (s *AgentService) SeedStewardForRuntime(ctx context.Context, runtimeName string) error {
+	_, err := s.GetSteward(ctx)
+	if err == nil {
+		return nil // steward already exists — idempotent no-op
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	var runtimeID string
+	err = s.st.DB().QueryRowContext(ctx,
+		`SELECT id FROM runtime WHERE name=? AND status='active'`, runtimeName).Scan(&runtimeID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return NewValidationError(fmt.Sprintf("runtime %q not found or not active", runtimeName))
+	}
+	if err != nil {
+		return fmt.Errorf("lookup runtime %s: %w", runtimeName, err)
+	}
+	if err := s.insertSteward(ctx, runtimeID); err != nil {
+		return fmt.Errorf("seed steward agent for %s: %w", runtimeName, err)
+	}
+	return nil
+}
+
+// insertSteward inserts the system-internal steward agent bound to the given
+// runtime. Shared by SeedSteward (first active runtime) and SeedStewardForRuntime
+// (named runtime).
+func (s *AgentService) insertSteward(ctx context.Context, runtimeID string) error {
+	_, err := s.st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,type,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		newID(), "小二", "steward", stewardDescription, runtimeID, stewardSystemPrompt, "", "{}", "[]", "[]", 1, now())
+	return err
 }
