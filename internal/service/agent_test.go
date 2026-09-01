@@ -68,3 +68,126 @@ func TestDeleteAgentCancelsItsSubGoals(t *testing.T) {
 		t.Fatalf("verifying sub-goal must be cancelled with its verifier, got %q", sg3After.Status)
 	}
 }
+
+
+// TestSeedStewardForRuntime_Create covers the happy path: no steward exists,
+// an active hwcloud runtime is present → SeedStewardForRuntime creates the
+// steward agent bound to that exact runtime.
+func TestSeedStewardForRuntime_Create(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	bus := events.NewBus()
+	agentSvc := NewAgentService(st, bus)
+
+	// Seed a machine + an active runtime named "hwcloud@laptop".
+	if err := NewMachineService(st).Register(ctx, Machine{ID: "m1", Name: "laptop", Hostname: "h"}, "[]"); err != nil {
+		t.Fatalf("seed machine: %v", err)
+	}
+	rt, err := NewRuntimeService(st).Create(ctx, Runtime{Name: "hwcloud@laptop", MachineID: "m1"})
+	if err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+
+	if err := agentSvc.SeedStewardForRuntime(ctx, "hwcloud@laptop"); err != nil {
+		t.Fatalf("seed steward: %v", err)
+	}
+
+	steward, err := agentSvc.GetSteward(ctx)
+	if err != nil {
+		t.Fatalf("get steward after seed: %v", err)
+	}
+	if steward.Type != "steward" {
+		t.Fatalf("steward type = %q, want steward", steward.Type)
+	}
+	if steward.RuntimeID != rt.ID {
+		t.Fatalf("steward runtime_id = %q, want %q", steward.RuntimeID, rt.ID)
+	}
+	if steward.Name != "小二" {
+		t.Fatalf("steward name = %q, want 小二", steward.Name)
+	}
+}
+
+// TestSeedStewardForRuntime_Idempotent covers the idempotent path: a steward
+// already exists (even on a different runtime) → SeedStewardForRuntime is a
+// no-op, the existing steward is unchanged.
+func TestSeedStewardForRuntime_Idempotent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	bus := events.NewBus()
+	agentSvc := NewAgentService(st, bus)
+
+	// Seed a machine + two runtimes.
+	if err := NewMachineService(st).Register(ctx, Machine{ID: "m1", Name: "laptop", Hostname: "h"}, "[]"); err != nil {
+		t.Fatalf("seed machine: %v", err)
+	}
+	rtClaude, err := NewRuntimeService(st).Create(ctx, Runtime{Name: "claude@laptop", MachineID: "m1"})
+	if err != nil {
+		t.Fatalf("seed claude runtime: %v", err)
+	}
+	_, err = NewRuntimeService(st).Create(ctx, Runtime{Name: "hwcloud@laptop", MachineID: "m1"})
+	if err != nil {
+		t.Fatalf("seed hwcloud runtime: %v", err)
+	}
+
+	// Pre-create a steward on the claude runtime.
+	if err := agentSvc.SeedStewardForRuntime(ctx, "claude@laptop"); err != nil {
+		t.Fatalf("pre-seed steward on claude: %v", err)
+	}
+	steward, err := agentSvc.GetSteward(ctx)
+	if err != nil {
+		t.Fatalf("get steward after pre-seed: %v", err)
+	}
+	originalRuntimeID := steward.RuntimeID
+
+	// Now call with hwcloud — must be a no-op.
+	if err := agentSvc.SeedStewardForRuntime(ctx, "hwcloud@laptop"); err != nil {
+		t.Fatalf("second seed (should be no-op): %v", err)
+	}
+	steward2, err := agentSvc.GetSteward(ctx)
+	if err != nil {
+		t.Fatalf("get steward after second seed: %v", err)
+	}
+	if steward2.RuntimeID != originalRuntimeID {
+		t.Fatalf("steward runtime changed: %q → %q (must be unchanged)", originalRuntimeID, steward2.RuntimeID)
+	}
+	if steward2.RuntimeID != rtClaude.ID {
+		t.Fatalf("steward should still be on claude runtime, got %q", steward2.RuntimeID)
+	}
+}
+
+// TestSeedStewardForRuntime_RuntimeNotFound covers the error path: the named
+// runtime doesn't exist or isn't active → SeedStewardForRuntime returns an
+// error, no steward is created.
+func TestSeedStewardForRuntime_RuntimeNotFound(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	agentSvc := NewAgentService(st, events.NewBus())
+
+	// No runtime at all.
+	err := agentSvc.SeedStewardForRuntime(ctx, "hwcloud@ghost")
+	if err == nil {
+		t.Fatal("expected error for non-existent runtime, got nil")
+	}
+
+	// Steward must not have been created.
+	if _, err := agentSvc.GetSteward(ctx); err == nil {
+		t.Fatal("steward should not exist after failed seed")
+	}
+
+	// Runtime exists but is absent (not active).
+	if err := NewMachineService(st).Register(ctx, Machine{ID: "m1", Name: "laptop", Hostname: "h"}, "[]"); err != nil {
+		t.Fatalf("seed machine: %v", err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO runtime (id,name,machine_id,status,created_at) VALUES ('rt1','hwcloud@laptop','m1','absent',?)`,
+		now()); err != nil {
+		t.Fatalf("seed absent runtime: %v", err)
+	}
+	err = agentSvc.SeedStewardForRuntime(ctx, "hwcloud@laptop")
+	if err == nil {
+		t.Fatal("expected error for absent runtime, got nil")
+	}
+	if _, err := agentSvc.GetSteward(ctx); err == nil {
+		t.Fatal("steward should not exist after failed seed on absent runtime")
+	}
+}
