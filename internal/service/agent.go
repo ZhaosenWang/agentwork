@@ -86,7 +86,7 @@ func (s *AgentService) Create(ctx context.Context, a Agent) (*Agent, error) {
 		a.Env = map[string]string{}
 	}
 	if a.MaxConcurrent < 1 {
-		a.MaxConcurrent = 1
+		a.MaxConcurrent = 3
 	}
 	if a.McpServers == nil {
 		a.McpServers = []acp.McpServer{}
@@ -146,7 +146,7 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 		return nil, fmt.Errorf("check runtime: %w", err)
 	}
 	if a.MaxConcurrent < 1 {
-		a.MaxConcurrent = 1
+		a.MaxConcurrent = 3
 	}
 	if err := mustExist(ctx, s.st, `SELECT COUNT(*) FROM agent WHERE id=?`, id, "agent"); err != nil {
 		return nil, err
