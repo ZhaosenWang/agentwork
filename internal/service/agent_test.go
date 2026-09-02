@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 )
@@ -102,8 +103,8 @@ func TestSeedStewardForRuntime_Create(t *testing.T) {
 	if steward.RuntimeID != rt.ID {
 		t.Fatalf("steward runtime_id = %q, want %q", steward.RuntimeID, rt.ID)
 	}
-	if steward.Name != "小二" {
-		t.Fatalf("steward name = %q, want 小二", steward.Name)
+	if steward.Name != "AI SHELL" {
+		t.Fatalf("steward name = %q, want AI SHELL", steward.Name)
 	}
 }
 
@@ -189,5 +190,82 @@ func TestSeedStewardForRuntime_RuntimeNotFound(t *testing.T) {
 	}
 	if _, err := agentSvc.GetSteward(ctx); err == nil {
 		t.Fatal("steward should not exist after failed seed on absent runtime")
+	}
+}
+
+// TestSeedStewardForRuntime_PublishesAgentCreated verifies the bug fix: the
+// steward is seeded AFTER daemon startup (when a machine registers via
+// server.go seedStewardIfCLI), so recoverWorkers — which ran once at boot
+// before the steward existed — will not build its worker. The only live-create
+// signal is the agent:created event (same as the user-facing Create path); if
+// insertSteward forgets to publish it, the steward's runs queue forever
+// (dispatchOnce only claims for agents with a worker in d.workers).
+func TestSeedStewardForRuntime_PublishesAgentCreated(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	bus := events.NewBus()
+	agentSvc := NewAgentService(st, bus)
+
+	// Capture agent:created events. Publish fans out in its own goroutine, so a
+	// buffered channel + a brief wait keeps the assertion deterministic.
+	got := make(chan Agent, 4)
+	bus.Subscribe("agent:created", func(_ context.Context, e events.Event) {
+		if a, ok := e.Payload.(Agent); ok {
+			got <- a
+		}
+	})
+
+	if err := NewMachineService(st).Register(ctx, Machine{ID: "m1", Name: "laptop", Hostname: "h"}, "[]"); err != nil {
+		t.Fatalf("seed machine: %v", err)
+	}
+	rt, err := NewRuntimeService(st).Create(ctx, Runtime{Name: "hwcloud@laptop", MachineID: "m1"})
+	if err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+
+	if err := agentSvc.SeedStewardForRuntime(ctx, "hwcloud@laptop"); err != nil {
+		t.Fatalf("seed steward: %v", err)
+	}
+
+	// The seed must have published exactly one agent:created carrying the
+	// steward row (id + type + runtime binding) — the same contract as Create,
+	// so onAgentCreated can build the worker.
+	select {
+	case a := <-got:
+		if a.Type != "steward" {
+			t.Fatalf("event agent type = %q, want steward", a.Type)
+		}
+		if a.Name != "AI SHELL" {
+			t.Fatalf("event agent name = %q, want AI SHELL", a.Name)
+		}
+		if a.RuntimeID != rt.ID {
+			t.Fatalf("event agent runtime_id = %q, want %q", a.RuntimeID, rt.ID)
+		}
+		if a.MaxConcurrent != 3 {
+			t.Fatalf("event agent max_concurrent = %d, want 3", a.MaxConcurrent)
+		}
+		// The id must match the persisted row — onAgentCreated keys the worker
+		// by this id, so a stale/mismatched id would build a worker nobody can
+		// claim through.
+		steward, err := agentSvc.GetSteward(ctx)
+		if err != nil {
+			t.Fatalf("get steward after seed: %v", err)
+		}
+		if a.ID != steward.ID {
+			t.Fatalf("event agent id = %q, want persisted %q", a.ID, steward.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("agent:created not published after seed — steward worker will not be built")
+	}
+
+	// A second seed is an idempotent no-op (steward already exists): it must
+	// NOT republish, or the daemon would rebuild a worker that already exists.
+	if err := agentSvc.SeedStewardForRuntime(ctx, "hwcloud@laptop"); err != nil {
+		t.Fatalf("second seed (should be no-op): %v", err)
+	}
+	select {
+	case extra := <-got:
+		t.Fatalf("idempotent seed republished agent:created for %q — should be silent", extra.ID)
+	default:
 	}
 }

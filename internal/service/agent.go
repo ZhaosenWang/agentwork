@@ -14,7 +14,7 @@ import (
 )
 
 // stewardSystemPrompt is the default persona shipped to the steward agent
-// (小二) at seed time. The steward receives the owner's instructions,
+// (AI SHELL) at seed time. The steward receives the owner's instructions,
 // decomposes and delegates them to the right worker agent, tracks them to
 // completion, and reports back faithfully.
 const stewardSystemPrompt = "你是一位严谨周到的管家。职责：接收主人指令、拆解并委派给合适的执行者、跟进直到闭环、如实汇报结果。不确定时先问清需求，绝不擅自假设。回复简明扼要。"
@@ -531,11 +531,24 @@ func (s *AgentService) SeedStewardForRuntime(ctx context.Context, runtimeName st
 
 // insertSteward inserts the system-internal steward agent bound to the given
 // runtime. Shared by SeedSteward (first active runtime) and SeedStewardForRuntime
-// (named runtime).
+// (named runtime). Publishes agent:created so the daemon builds the steward's
+// per-agent worker — the seed runs AFTER daemon startup when a machine
+// registers (server.go seedStewardIfCLI), so recoverWorkers (which ran once at
+// boot, before the steward existed) will not pick it up; without this event the
+// steward's runs queue forever (dispatchOnce only claims for agents with a
+// worker in d.workers).
 func (s *AgentService) insertSteward(ctx context.Context, runtimeID string) error {
-	_, err := s.st.DB().ExecContext(ctx,
+	id := newID()
+	if _, err := s.st.DB().ExecContext(ctx,
 		`INSERT INTO agent (id,name,type,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		newID(), "小二", "steward", stewardDescription, runtimeID, stewardSystemPrompt, "", "{}", "[]", "[]", 1, now())
-	return err
+		id, "AI SHELL", "steward", stewardDescription, runtimeID, stewardSystemPrompt, "", "{}", "[]", "[]", 3, now()); err != nil {
+		return err
+	}
+	a, err := s.Get(ctx, id)
+	if err != nil {
+		return fmt.Errorf("reload seeded steward: %w", err)
+	}
+	s.bus.Publish(ctx, events.Event{Topic: "agent:created", Payload: *a})
+	return nil
 }
