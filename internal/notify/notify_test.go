@@ -86,7 +86,7 @@ func (f *fakeQS) ReviewGoals(ctx context.Context) ([]ReviewGoal, error) { return
 func (f *fakeQS) PendingReviewers(ctx context.Context, goalID string) ([]string, error) {
 	return f.pendingReviewers, nil
 }
-func (f *fakeQS) GoalTitle(ctx context.Context, goalID string) (string, error) { return "g", nil }
+func (f *fakeQS) GoalTitle(ctx context.Context, goalID string) (string, error)  { return "g", nil }
 func (f *fakeQS) AgentName(ctx context.Context, agentID string) (string, error) { return "PM", nil }
 func (f *fakeQS) GoalDomainType(ctx context.Context, goalID string) (string, error) {
 	return "repo", nil
@@ -94,10 +94,11 @@ func (f *fakeQS) GoalDomainType(ctx context.Context, goalID string) (string, err
 func (f *fakeQS) GoalStatus(ctx context.Context, idPrefix string) (*GoalStatusView, error) {
 	return nil, nil
 }
-func (f *fakeQS) Agents(ctx context.Context) ([]NamedID, error)    { return nil, nil }
+func (f *fakeQS) Agents(ctx context.Context) ([]NamedID, error)   { return nil, nil }
 func (f *fakeQS) Domains(ctx context.Context) ([]NamedID, error)  { return nil, nil }
 func (f *fakeQS) Runtimes(ctx context.Context) ([]NamedID, error) { return nil, nil }
 func (f *fakeQS) Skills(ctx context.Context) ([]NamedID, error)   { return nil, nil }
+func (f *fakeQS) Squads(ctx context.Context) ([]NamedID, error)   { return nil, nil }
 func (f *fakeQS) TerminalSince(ctx context.Context, since, until string) ([]GoalBrief, error) {
 	return nil, nil
 }

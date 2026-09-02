@@ -135,12 +135,13 @@ type intakeAction struct {
 	// Schedule carries the parsed定时任务 fields (create_schedule / schedule_stop).
 	// Kept anonymous — it does not participate in the create-draft/merge flow.
 	Schedule struct {
-		Name        string `json:"name"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Cron        string `json:"cron"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"` // "agent" (default) | "squad"
+		DomainID     string `json:"domain_id"`
 	} `json:"schedule"`
 	Agent      agentAction      `json:"agent"`
 	Squad      squadAction      `json:"squad"`
@@ -156,10 +157,11 @@ type importTeamAction struct {
 
 // goalAction is the create_goal sub-struct.
 type goalAction struct {
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	AssigneeID  string `json:"assignee_id"`
-	DomainID    string `json:"domain_id"`
+	Title        string `json:"title"`
+	Description  string `json:"description"`
+	AssigneeID   string `json:"assignee_id"`
+	AssigneeType string `json:"assignee_type"` // "agent" (default) | "squad"
+	DomainID     string `json:"domain_id"`
 }
 
 // agentAction carries the create_agent fields. Technical config (env/model/
@@ -325,14 +327,18 @@ func (d *Daemon) doCreateGoal(ctx context.Context, g goalAction, hasAgents bool)
 	if strings.TrimSpace(g.DomainID) == "" {
 		return "创建任务失败：缺少项目/仓库"
 	}
-	if hasAgents && strings.TrimSpace(g.AssigneeID) == "" {
+	assigneeType := g.AssigneeType
+	if strings.TrimSpace(assigneeType) == "" {
+		assigneeType = "agent"
+	}
+	if assigneeType == "agent" && hasAgents && strings.TrimSpace(g.AssigneeID) == "" {
 		return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
 	}
 	created, err := d.goalSvc.Create(ctx, service.Goal{
 		Title:         g.Title,
 		Description:   g.Description,
 		DomainID:      g.DomainID,
-		AssigneeType:  "agent",
+		AssigneeType:  assigneeType,
 		AssigneeID:    g.AssigneeID,
 		Status:        "active",
 		CreatedByType: "human",
@@ -340,7 +346,7 @@ func (d *Daemon) doCreateGoal(ctx context.Context, g goalAction, hasAgents bool)
 	if err != nil {
 		return "创建任务失败：" + err.Error()
 	}
-	return fmt.Sprintf("✅ 已创建任务：%s（goal %s），agent 开始执行", created.Title, shortID(created.ID))
+	return fmt.Sprintf("✅ 已创建任务：%s（goal %s），%s 开始执行", created.Title, shortID(created.ID), assigneeType)
 }
 
 // intakeDomainList lists the available domains for the clarification ask.
@@ -427,7 +433,11 @@ func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) 
 		return "创建定时任务失败：没有可用的 domain（先在 Web 建域并配置验收策略）"
 	}
 	if strings.TrimSpace(sch.AssigneeID) == "" {
-		return "创建定时任务失败：没有可用的 agent（先在 Web 配置 agent）"
+		return "创建定时任务失败：缺少执行者（agent 或 squad）"
+	}
+	assigneeType := sch.AssigneeType
+	if strings.TrimSpace(assigneeType) == "" {
+		assigneeType = "agent"
 	}
 	// The schedule runs on the daemon machine's OWN local time — the owner
 	// speaks in their local hours ("每天 9 点"), and on a single-user machine
@@ -441,7 +451,7 @@ func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) 
 		Name:           sch.Name,
 		TitleTemplate:  sch.Title,
 		Description:    sch.Description,
-		AssigneeType:   "agent",
+		AssigneeType:   assigneeType,
 		AssigneeID:     sch.AssigneeID,
 		DomainID:       sch.DomainID,
 		CronExpression: sch.Cron,
@@ -953,6 +963,9 @@ func mergeGoal(draftPayload string, reply goalAction) goalAction {
 	}
 	if strings.TrimSpace(reply.AssigneeID) != "" {
 		draft.AssigneeID = reply.AssigneeID
+	}
+	if strings.TrimSpace(reply.AssigneeType) != "" {
+		draft.AssigneeType = reply.AssigneeType
 	}
 	if strings.TrimSpace(reply.DomainID) != "" {
 		draft.DomainID = reply.DomainID

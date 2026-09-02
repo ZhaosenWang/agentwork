@@ -51,8 +51,8 @@ func (s *IntakeService) SetAgentService(as *service.AgentService) {
 // vague reply that still misses required fields fails at the service
 // layer (a terminal error) rather than re-asking.
 type IntakeDraft struct {
-	Kind      string `json:"kind"`       // "goal" | "agent" | "squad"
-	Payload   string `json:"payload"`    // JSON of the create_X sub-struct
+	Kind      string `json:"kind"`    // "goal" | "agent" | "squad"
+	Payload   string `json:"payload"` // JSON of the create_X sub-struct
 	CreatedAt string `json:"created_at"`
 }
 
@@ -71,21 +71,21 @@ func intakeSchemaBody() string {
 	return `intake.json 结构：
 {
   "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|import_team|unknown",
-  "goal": {"title": "", "description": "", "assignee_id": "", "domain_id": ""},
+  "goal": {"title": "", "description": "", "assignee_id": "", "assignee_type": "", "domain_id": ""},
   "goal_id": "",
-  "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "domain_id": ""},
+  "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "assignee_type": "", "domain_id": ""},
   "agent": {"name": "", "runtime_id": "", "description": "", "system_prompt": "", "skills": [], "skills_specified": false},
   "squad": {"name": "", "leader_id": "", "description": "", "instructions": "", "member_ids": []},
   "import_team": {"git_url": "", "branch": "", "credentials": ""}
 }
 
 意图说明：
-- create_goal：用户想创建/安排一个任务。title 必填（简洁的任务标题）；description 放细节；assignee_id 从下面的名单里选最合适的 id（必须真实存在）；用户没指定时选最合理的。
+- create_goal：用户想创建/安排一个任务。title 必填（简洁的任务标题）；description 放细节；assignee_id 从下面的 agent 或 squad 名单里选最合适的 id（必须真实存在）；assignee_type 填 "agent" 或 "squad"（与 assignee_id 对应，默认 agent）；用户说"找个团队做"时选 squad 并填 assignee_type="squad"；用户没指定时选最合理的。
   title/description 用【直接指令口吻】写任务本身（如"优化 README 文档"），不要用"用户希望/用户想要"等转述口吻——执行 agent 看到的就是任务描述，不需要知道它是谁说的。
   domain_id 是【必要参数】：只有当用户的消息明确提到某个仓库/域（"在 test-repo 上做 xxx"、"给 agentwork 加个功能"）时才填；用户没明确指定时 domain_id 留空字符串（不要猜、不要选第一个）——平台会反问用户指定仓库。有多个可用域时尤其不能猜。
 - review_list：用户想查看待审批/卡点清单。不需要其他字段。
 - goal_status：用户问某个任务/目标的状态。goal_id 填用户提到的 id（可能是短 id，照抄）。
-- create_schedule：用户想创建定时任务/周期性任务（"每 1 个小时做 xxx"、"每天 9 点跑 xxx"、"每周一 xxx"）。schedule.name 填简短任务名；schedule.title 填每次触发时创建的任务标题；schedule.cron 把自然语言频率转成 5 段标准 cron 表达式；schedule.assignee_id 和 schedule.domain_id 从名单里选（必须真实存在）。
+- create_schedule：用户想创建定时任务/周期性任务（"每 1 个小时做 xxx"、"每天 9 点跑 xxx"、"每周一 xxx"）。schedule.name 填简短任务名；schedule.title 填每次触发时创建的任务标题；schedule.cron 把自然语言频率转成 5 段标准 cron 表达式；schedule.assignee_id 和 schedule.domain_id 从名单里选（必须真实存在）；schedule.assignee_type 填 "agent" 或 "squad"（与 assignee_id 对应，默认 agent）。
 - schedule_list：用户想查看定时任务/计划任务清单。不需要其他字段。
 - schedule_stop：用户想停掉/取消某个定时任务。schedule.name 填用户提到的定时任务名（照抄用户说的名字，可以不完全匹配）。
 - create_agent：用户想创建/配置一个 agent（含人设）。agent.name 必填（中文或英文短名）；agent.runtime_id 从下面的 runtime 名单里选 id（必填，必须真实存在）；agent.description 一句话描述（该 agent 做什么）；agent.system_prompt 是人设/角色说明（你是什么角色、怎么回答、有什么限制），用户没给也要塞一段合理默认值。
@@ -142,6 +142,12 @@ func (s *IntakeService) rosterBody(ctx context.Context) string {
 	if skills, err := s.qs.Skills(ctx); err == nil {
 		for _, sk := range skills {
 			fmt.Fprintf(&b, "- %s: %s\n", sk.ID, sk.Name)
+		}
+	}
+	b.WriteString("\n当前可用 squad（id: name）：\n")
+	if squads, err := s.qs.Squads(ctx); err == nil {
+		for _, sq := range squads {
+			fmt.Fprintf(&b, "- %s: %s\n", sq.ID, sq.Name)
 		}
 	}
 	return b.String()
@@ -341,6 +347,9 @@ func knownFieldsBody(kind, payload string) string {
 		}
 		if v := strField(m, "assignee_id"); v != "" {
 			fmt.Fprintf(&b, "- assignee_id：%s\n", v)
+		}
+		if v := strField(m, "assignee_type"); v != "" {
+			fmt.Fprintf(&b, "- assignee_type：%s\n", v)
 		}
 	case "agent":
 		if v := strField(m, "name"); v != "" {
