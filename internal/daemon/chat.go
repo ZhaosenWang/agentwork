@@ -55,7 +55,7 @@ type chatEntry struct {
 	isSteward       bool
 	inject          chan []byte // synthetic frames to the web (buffered)
 	mu              sync.Mutex  // guards steward fields below
-	pendingPromptID string      // JSON-RPC id of the in-flight session/prompt
+	pendingPromptID json.RawMessage // JSON-RPC id of the in-flight session/prompt (raw: string OR number)
 	sessionID       string      // current ACP session id (from session/prompt params)
 	stewardFrames   []stewardFrame
 }
