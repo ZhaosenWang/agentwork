@@ -62,7 +62,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
     agent?.env ? Object.entries(agent.env).map(([name, value]) => ({ name, value })) : []
   );
   const [mcpRows, setMcpRows] = useState<McpServer[]>(agent?.mcp_servers ?? []);
-  const [maxConcurrent, setMaxConcurrent] = useState(String(agent?.max_concurrent ?? 1));
+  const [maxConcurrent, setMaxConcurrent] = useState(String(agent?.max_concurrent ?? 3));
   const [skills, setSkills] = useState<string[]>(agent?.skills ?? []);
   const { data: skillLib } = useSkills();
 
@@ -84,7 +84,7 @@ export function AgentForm({ agent, onClose }: { agent?: Agent; onClose: () => vo
       mcp_servers: mcpRows
         .filter((m) => m.name.trim())
         .map((m) => ({ ...m, type: m.type === "stdio" ? "" : m.type })),
-      max_concurrent: parseInt(maxConcurrent) || 1,
+      max_concurrent: parseInt(maxConcurrent) || 3,
       skills,
     };
     if (agent) {
