@@ -11,6 +11,7 @@ package daemon
 // (ChatWrite, MachineChatFrame, BindChatSink) live in chat.go.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"sort"
@@ -46,7 +47,7 @@ func extractIntakeMarker(text string) (jsonStr, cleanText string, found bool) {
 // classifyStewardFrame determines how a machine→web frame should be handled
 // in a steward chat. Returns "buffer" (accumulate, don't forward), "complete"
 // (turn ended, trigger completion), or "forward" (pass through to the web).
-func classifyStewardFrame(frame []byte, pendingPromptID string) string {
+func classifyStewardFrame(frame []byte, pendingPromptID json.RawMessage) string {
 	var probe struct {
 		ID     json.RawMessage `json:"id,omitempty"`
 		Method string          `json:"method"`
@@ -55,9 +56,13 @@ func classifyStewardFrame(frame []byte, pendingPromptID string) string {
 		return "forward"
 	}
 	if probe.Method == "" && len(probe.ID) > 0 {
-		var idStr string
-		_ = json.Unmarshal(probe.ID, &idStr)
-		if idStr == pendingPromptID {
+		// Compare raw id bytes — ACP clients may use string ids ("1") or
+		// numeric ids (1); json.Unmarshal into a string fails on numbers,
+		// leaving idStr="" which matched an empty pendingPromptID and
+		// swallowed every non-prompt response (initialize, session/new,
+		// session/load…) as a false "complete". Raw byte comparison is
+		// type-agnostic, and the len>0 guard rejects the empty-pending case.
+		if len(pendingPromptID) > 0 && bytes.Equal(probe.ID, pendingPromptID) {
 			return "complete"
 		}
 		return "forward"
@@ -117,10 +122,8 @@ func interceptStewardPrompt(e *chatEntry, frame []byte) {
 	if probe.Method != "session/prompt" {
 		return
 	}
-	var idStr string
-	_ = json.Unmarshal(probe.ID, &idStr)
 	e.mu.Lock()
-	e.pendingPromptID = idStr
+	e.pendingPromptID = probe.ID
 	e.sessionID = probe.Params.SessionID
 	e.stewardFrames = e.stewardFrames[:0]
 	e.mu.Unlock()
@@ -139,7 +142,7 @@ func (d *Daemon) handleStewardTurnComplete(chatID string, e *chatEntry) {
 	promptID := e.pendingPromptID
 	sessionID := e.sessionID
 	e.stewardFrames = e.stewardFrames[:0]
-	e.pendingPromptID = ""
+	e.pendingPromptID = nil
 	e.mu.Unlock()
 
 	go func() {
@@ -210,8 +213,8 @@ func injectAgentMessage(e *chatEntry, sessionID, text string) {
 // injectPromptResponse constructs a session/prompt response (the JSON-RPC
 // response matching the original prompt request id) and sends it to the web.
 // This resolves the web client's prompt() promise and clears the busy state.
-func injectPromptResponse(e *chatEntry, promptID string) {
-	if promptID == "" {
+func injectPromptResponse(e *chatEntry, promptID json.RawMessage) {
+	if len(promptID) == 0 {
 		return
 	}
 	sendInject(e, map[string]any{

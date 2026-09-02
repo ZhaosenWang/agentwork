@@ -335,6 +335,23 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		})
 		peer.Wait()
 	})
+	// Chat keepalive: the ACP relay has no inherent traffic during an agent's
+	// turn — the steward chat is worse, because the daemon BUFFERS the steward's
+	// session/update frames (chat_steward.go) and injects synthetic frames only
+	// on turn completion. A reverse proxy's idle timeout (nginx 300s default)
+	// drops the silently idle WebSocket, surfacing as 1006 abnormal closure on
+	// both ends. The ping/pong pair mirrors /ws's ws/client.go: a 30s server
+	// ping refreshes the proxy's idle timer; the browser's native WebSocket
+	// auto-replies pong, which refreshes our read deadline. WriteControl is
+	// gorilla-safe to call concurrently with the pump goroutine's WriteMessage
+	// (doc.go: "The Close and WriteControl methods can be called concurrently
+	// with all other methods").
+	const (
+		chatWriteWait  = 10 * time.Second
+		chatPongWait   = 90 * time.Second
+		chatPingPeriod = 30 * time.Second // well under the 300s infra timeout
+	)
+
 	// The agent chat (Phase 6): a WebSocket upgrade for web ACP clients —
 	// the daemon opens a machine-side chat channel and relays ACP frames
 	// UNPARSED in both directions. The agent id comes from the PATH; the
@@ -345,6 +362,29 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		if err != nil {
 			return
 		}
+		// Keepalive: set up BEFORE OpenChatForAgent — the CLI spawn can take
+		// seconds, and an idle socket during spawn is the same timeout risk.
+		_ = conn.SetReadDeadline(time.Now().Add(chatPongWait))
+		conn.SetPongHandler(func(string) error {
+			_ = conn.SetReadDeadline(time.Now().Add(chatPongWait))
+			return nil
+		})
+		pingDone := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(chatPingPeriod)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(chatWriteWait)); err != nil {
+						return
+					}
+				case <-pingDone:
+					return
+				}
+			}
+		}()
+		defer close(pingDone)
 		chatID, err := s.d.OpenChatForAgent(r.Context(), agentID)
 		if err != nil {
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","error":{"code":-32000,"message":"`+err.Error()+`"}}`))
