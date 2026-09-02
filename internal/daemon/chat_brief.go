@@ -1,6 +1,9 @@
 package daemon
 
-import "strings"
+import (
+	"context"
+	"strings"
+)
 
 // ── Chat platform brief (the chat surface's platform role) ──
 //
@@ -37,4 +40,20 @@ func buildChatBrief(agentName string) string {
 		b.WriteString("\nAgent: " + agentName + "\n")
 	}
 	return b.String()
+}
+
+// stewardChatBrief renders the steward's chat-surface brief: the intake
+// schema + roster (so the steward can parse instructions conversationally)
+// plus the text-marker protocol the daemon relay extracts. Falls back to
+// the regular buildChatBrief when IntakeService is not wired or the roster
+// query fails — a steward without intake is just a normal chat agent.
+func (d *Daemon) stewardChatBrief(ctx context.Context, agentName string) string {
+	if d.intakeSvc == nil {
+		return buildChatBrief(agentName)
+	}
+	brief, err := d.intakeSvc.BuildStewardChatBrief(ctx)
+	if err != nil || strings.TrimSpace(brief) == "" {
+		return buildChatBrief(agentName)
+	}
+	return brief
 }
