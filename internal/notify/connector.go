@@ -397,6 +397,17 @@ func (c *Connector) handleRegistrationSuccess(result *registration.RegisterAppRe
 	// connection silently died and the UI kept showing "connected"
 	// (regression found in M4). A background context keeps the
 	// connection alive; Disconnect stops it via c.stop.
+	// A re-registration without Disconnect (the connection dropped to
+	// failed and the owner re-scanned) leaves the old Notifier on the bus
+	// — it would keep pushing to the old bot credentials alongside the new
+	// one (duplicate-card bug). Tear it down so connectWithCurrent creates
+	// a fresh Notifier with the new credentials.
+	c.mu.Lock()
+	if c.notify != nil {
+		c.notify.Unsubscribe()
+		c.notify = nil
+	}
+	c.mu.Unlock()
 	c.connectWithCurrent(context.Background())
 }
 
@@ -850,6 +861,13 @@ func (c *Connector) Disconnect(ctx context.Context) error {
 	}
 	c.status = StatusIdle
 	c.config = FeishuConfig{}
+	// Unsubscribe the orphan BEFORE dropping the reference — otherwise the
+	// stale Notifier stays on the bus and keeps pushing milestone events to
+	// the old bot credentials (the disconnect-then-reconnect duplicate-card
+	// bug: bot1 kept receiving cards after the owner switched to bot2).
+	if c.notify != nil {
+		c.notify.Unsubscribe()
+	}
 	c.notify = nil
 	c.mu.Unlock()
 	return c.store.Delete(ctx, settingsKey)

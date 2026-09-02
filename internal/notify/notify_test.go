@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -219,5 +220,72 @@ func TestReviewResolvedPatchesCard(t *testing.T) {
 	}
 	if !strings.Contains(patchedContent, "已批准") {
 		t.Fatalf("the processed card must stamp the outcome, got: %s", patchedContent)
+	}
+}
+
+// TestUnsubscribeStopsBusDelivery guards the orphan-Notifier bug: after
+// Unsubscribe, a Notifier must no longer react to bus events. The
+// disconnect-then-reconnect duplicate-card bug was caused by the old Notifier
+// staying on the bus — every milestone event triggered N sends (one per
+// Notifier ever created), so bot1 kept receiving cards after the owner
+// switched to bot2.
+func TestUnsubscribeStopsBusDelivery(t *testing.T) {
+	sent := make(chan string, 4)
+	n := New("app", "secret", "chat_id", "oc_mock")
+	n.send = func(text string) error { sent <- text; return nil }
+	bus := events.NewBus()
+	n.Subscribe(bus)
+
+	n.Unsubscribe()
+
+	bus.Publish(context.Background(), events.Event{
+		Topic: "goal:delivered", Payload: map[string]any{"goal_id": "abc123456789"},
+	})
+	select {
+	case <-sent:
+		t.Fatal("unsubscribed notifier must not receive events")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestReconnectDoesNotDuplicateSends guards the full reconnect scenario:
+// connect bot1 → disconnect → connect bot2 → publish one event → only ONE
+// send (to bot2). Before the fix, bot1's orphan Notifier was still on the
+// bus, so the event fanned out to both — bot1 got the card it should never
+// have received.
+func TestReconnectDoesNotDuplicateSends(t *testing.T) {
+	bus := events.NewBus()
+
+	// bot1: connect + subscribe
+	bot1 := New("app1", "secret1", "chat_id", "oc_bot1")
+	var bot1Sends atomic.Int32
+	bot1.send = func(string) error { bot1Sends.Add(1); return nil }
+	bot1.Subscribe(bus)
+
+	// disconnect bot1 (Unsubscribe detaches it from the bus)
+	bot1.Unsubscribe()
+
+	// bot2: connect + subscribe
+	bot2 := New("app2", "secret2", "chat_id", "oc_bot2")
+	var bot2Sends atomic.Int32
+	bot2.send = func(string) error { bot2Sends.Add(1); return nil }
+	bot2.Subscribe(bus)
+
+	bus.Publish(context.Background(), events.Event{
+		Topic: "goal:delivered", Payload: map[string]any{"goal_id": "abc123456789"},
+	})
+
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if bot2Sends.Load() > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if bot2Sends.Load() != 1 {
+		t.Fatalf("bot2 must receive exactly 1 send, got %d", bot2Sends.Load())
+	}
+	if bot1Sends.Load() != 0 {
+		t.Fatalf("bot1 (disconnected) must not receive any send, got %d", bot1Sends.Load())
 	}
 }
