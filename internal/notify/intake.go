@@ -63,44 +63,12 @@ func NewIntakeService(qs QueryStore, store SettingsStore, runSvc *service.RunSer
 	return &IntakeService{qs: qs, store: store, runSvc: runSvc}
 }
 
-// BuildPrompt assembles the parser instruction: the owner's raw message plus
-// the platform capability contract and the agent/domain roster so the parser
-// can resolve names to ids. Returns an error (with a user-facing message)
-// when the global parser agent is not configured.
-func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, error) {
-	if strings.TrimSpace(text) == "" {
-		return "", errors.New("空消息")
-	}
-	var b strings.Builder
-	b.WriteString("你是 agentwork 的入站解析器。用户发了一条消息，请解析其意图并写入当前工作目录的 intake.json 文件（文件即结果，不要输出到 stdout）。\n\n")
-	// A pending clarification draft: the previous message created a create_X
-	// intent whose required fields the parser could not fully resolve. This
-	// message is parsed IN THAT CONTEXT so a bare completion reply finishes
-	// the pending item instead of starting a new one. The draft carries the
-	// parser's whole sub-struct; the platform merges (reply's non-empty
-	// fields override) so the parser here only needs to extract whatever the
-	// reply supplies for the still-missing fields.
-	if draft, ok := s.LoadDraft(ctx); ok && draft.Kind != "" {
-		intent := "create_" + draft.Kind
-		b.WriteString("【上下文：你在补全之前的一个创建请求】\n")
-		b.WriteString("之前解析出的意图：" + intent + "\n")
-		if known := knownFieldsBody(draft.Kind, draft.Payload); known != "" {
-			b.WriteString("已知字段（保持不变，照抄进输出）：\n" + known)
-		}
-		if missing := missingFields(draft.Kind, draft.Payload); len(missing) > 0 {
-			b.WriteString("缺失字段（请从下面的用户回复中提取这些字段的值）：\n")
-			for _, f := range missing {
-				b.WriteString("- " + f + "\n")
-			}
-		}
-		b.WriteString("\n用户现在回复：\n\"" + text + "\"\n\n")
-		b.WriteString("请从回复中提取缺失字段的值，已知字段保持不变，输出完整的 " + intent + "。\n")
-		b.WriteString("- 若回复在补缺失字段 → 输出 " + intent + "：已知字段照抄草稿，缺失字段填回复里解析出的值。\n")
-		b.WriteString("- 若用户说「不要/不用」（针对 skills 这类选配字段）→ 该字段留空、对应 specified 标志置 true。\n")
-		b.WriteString("- 若用户开始了一个全新请求（与之前创建无关）→ 按正常规则解析这条新消息。\n\n")
-	}
-	b.WriteString("用户消息：\n" + text + "\n\n")
-	b.WriteString(`intake.json 结构：
+// intakeSchemaBody returns the intake.json schema, intent descriptions, cron
+// conversion rules, and parsing rules — the shared capability contract used
+// by both BuildPrompt (intake processor) and BuildStewardChatBrief (steward
+// chat). Extracted so the two prompts cannot drift.
+func intakeSchemaBody() string {
+	return `intake.json 结构：
 {
   "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|import_team|unknown",
   "goal": {"title": "", "description": "", "assignee_id": "", "domain_id": ""},
@@ -144,7 +112,14 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 - 无法可靠转换就 intent=unknown，别编造 cron。
 
 规则：intent 只能填上面十六个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
-`)
+`
+}
+
+// rosterBody queries the platform's agents/domains/runtimes/skills and
+// returns a formatted roster string. Shared by BuildPrompt and
+// BuildStewardChatBrief so both paths see the same capability list.
+func (s *IntakeService) rosterBody(ctx context.Context) string {
+	var b strings.Builder
 	b.WriteString("\n当前可用 agent（id: name）：\n")
 	if agents, err := s.qs.Agents(ctx); err == nil {
 		for _, a := range agents {
@@ -169,6 +144,48 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 			fmt.Fprintf(&b, "- %s: %s\n", sk.ID, sk.Name)
 		}
 	}
+	return b.String()
+}
+
+// BuildPrompt assembles the parser instruction: the owner's raw message plus
+// the platform capability contract and the agent/domain roster so the parser
+// can resolve names to ids. Returns an error (with a user-facing message)
+// when the global parser agent is not configured.
+func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, error) {
+	if strings.TrimSpace(text) == "" {
+		return "", errors.New("空消息")
+	}
+	var b strings.Builder
+	b.WriteString("你是 agentwork 的入站解析器。用户发了一条消息，请解析其意图并写入当前工作目录的 intake.json 文件（文件即结果，不要输出到 stdout）。\n\n")
+	// A pending clarification draft: the previous message created a create_X
+	// intent whose required fields the parser could not fully resolve. This
+	// message is parsed IN THAT CONTEXT so a bare completion reply finishes
+	// the pending item instead of starting a new one. The draft carries the
+	// parser's whole sub-struct; the platform merges (reply's non-empty
+	// fields override) so the parser here only needs to extract whatever the
+	// reply supplies for the still-missing fields.
+	if draft, ok := s.LoadDraft(ctx); ok && draft.Kind != "" {
+		intent := "create_" + draft.Kind
+		b.WriteString("【上下文：你在补全之前的一个创建请求】\n")
+		b.WriteString("之前解析出的意图：" + intent + "\n")
+		if known := knownFieldsBody(draft.Kind, draft.Payload); known != "" {
+			b.WriteString("已知字段（保持不变，照抄进输出）：\n" + known)
+		}
+		if missing := missingFields(draft.Kind, draft.Payload); len(missing) > 0 {
+			b.WriteString("缺失字段（请从下面的用户回复中提取这些字段的值）：\n")
+			for _, f := range missing {
+				b.WriteString("- " + f + "\n")
+			}
+		}
+		b.WriteString("\n用户现在回复：\n\"" + text + "\"\n\n")
+		b.WriteString("请从回复中提取缺失字段的值，已知字段保持不变，输出完整的 " + intent + "。\n")
+		b.WriteString("- 若回复在补缺失字段 → 输出 " + intent + "：已知字段照抄草稿，缺失字段填回复里解析出的值。\n")
+		b.WriteString("- 若用户说「不要/不用」（针对 skills 这类选配字段）→ 该字段留空、对应 specified 标志置 true。\n")
+		b.WriteString("- 若用户开始了一个全新请求（与之前创建无关）→ 按正常规则解析这条新消息。\n\n")
+	}
+	b.WriteString("用户消息：\n" + text + "\n\n")
+	b.WriteString(intakeSchemaBody())
+	b.WriteString(s.rosterBody(ctx))
 	b.WriteString("\n完成后用一句话说明解析依据。")
 	return b.String(), nil
 }
@@ -384,4 +401,38 @@ func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
 		return "", errors.New("steward agent does not exist — connect a machine and restart the daemon")
 	}
 	return agent.ID, nil
+}
+
+// BuildStewardChatBrief assembles the chat-surface brief for the steward
+// agent: the intake schema + roster (shared with BuildPrompt) framed for
+// conversational use. The steward decides whether the user's message is a
+// platform instruction, and if so outputs a structured marker
+// (<<<INTAKE_JSON>>>{...}<<<END>>>) the daemon relay extracts and dispatches.
+// Non-instruction messages get a normal reply (no marker).
+//
+// Unlike BuildPrompt (which creates a processor run that writes intake.json
+// to a file), the chat path embeds the schema in the session-fixed AGENTS.md
+// brief and reads the parsed intent from the steward's text output — no run,
+// no file, no autopermit. The daemon's chat relay buffers the steward's
+// agent_message_chunk frames, scans for the marker on turn completion, and
+// dispatches through the same intakeReg handlers as the IM/Web path.
+func (s *IntakeService) BuildStewardChatBrief(ctx context.Context) (string, error) {
+	var b strings.Builder
+	b.WriteString("# Steward Chat Context\n\n")
+	b.WriteString("你是管家 agent，正在与用户直接对话。你可以正常聊天，但当用户的消息是平台指令时（创建任务/查看状态/创建定时任务/创建 agent/创建 squad 等），请按下面的 schema 解析意图，并在回复末尾输出结构化标记。\n\n")
+	b.WriteString("判断规则：\n")
+	b.WriteString("- 如果用户消息是平台指令 → 按 schema 解析意图，输出标记\n")
+	b.WriteString("- 如果用户消息是闲聊/问候/技术讨论 → 正常回复，不输出标记\n")
+	b.WriteString("- 不确定时可以反问用户\n\n")
+	b.WriteString(intakeSchemaBody())
+	b.WriteString(s.rosterBody(ctx))
+	b.WriteString("\n输出格式（仅当判断为指令时）：\n")
+	b.WriteString("1. 先用一句话说明解析依据\n")
+	b.WriteString("2. 然后输出标记，格式为：\n")
+	b.WriteString("<<<INTAKE_JSON>>>{完整 JSON 对象}<<<END>>>\n")
+	b.WriteString("示例：\n")
+	b.WriteString("已解析意图：create_goal\n")
+	b.WriteString(`<<<INTAKE_JSON>>>{"intent":"create_goal","goal":{"title":"优化README","description":"","assignee_id":"agent_xxx","domain_id":"domain_xxx"},"goal_id":"","schedule":{"name":"","title":"","description":"","cron":"","assignee_id":"","domain_id":""},"agent":{"name":"","runtime_id":"","description":"","system_prompt":"","skills":[],"skills_specified":false},"squad":{"name":"","leader_id":"","description":"","instructions":"","member_ids":[]},"import_team":{"git_url":"","branch":"","credentials":""}}<<<END>>>`)
+	b.WriteString("\n")
+	return b.String(), nil
 }
