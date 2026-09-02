@@ -148,24 +148,26 @@ func TestIntakeCreateSchedule(t *testing.T) {
 	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
 
 	reply := d.intakeCreateSchedule(ctx, intakeAction{Intent: "create_schedule", Schedule: struct {
-		Name        string `json:"name"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Cron        string `json:"cron"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
 	}{Name: "每小时巡检", Title: "定时巡检", Cron: "0 * * * *", AssigneeID: "a1", DomainID: domID}})
 	if !strings.Contains(reply, "已创建定时任务") {
 		t.Fatalf("expected creation reply, got %q", reply)
 	}
 	// Bad cron → the validator's message, not a crash.
 	if r := d.intakeCreateSchedule(ctx, intakeAction{Intent: "create_schedule", Schedule: struct {
-		Name        string `json:"name"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Cron        string `json:"cron"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
 	}{Name: "坏cron", Title: "x", Cron: "not-a-cron", AssigneeID: "a1", DomainID: domID}}); !strings.Contains(r, "创建定时任务失败") {
 		t.Fatalf("bad cron must surface the validator message, got %q", r)
 	}
@@ -176,23 +178,25 @@ func TestIntakeCreateSchedule(t *testing.T) {
 	}
 
 	stop := d.intakeScheduleStop(ctx, intakeAction{Intent: "schedule_stop", Schedule: struct {
-		Name        string `json:"name"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Cron        string `json:"cron"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
 	}{Name: "每小时巡检"}})
 	if !strings.Contains(stop, "已停用") {
 		t.Fatalf("expected stop reply, got %q", stop)
 	}
 	if r := d.intakeScheduleStop(ctx, intakeAction{Intent: "schedule_stop", Schedule: struct {
-		Name        string `json:"name"`
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Cron        string `json:"cron"`
-		AssigneeID  string `json:"assignee_id"`
-		DomainID    string `json:"domain_id"`
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
 	}{Name: "不存在"}}); !strings.Contains(r, "没找到") {
 		t.Fatalf("stopping an unknown schedule must say so, got %q", r)
 	}

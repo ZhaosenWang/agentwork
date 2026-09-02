@@ -76,6 +76,7 @@ type QueryStore interface {
 	Domains(ctx context.Context) ([]NamedID, error)
 	Runtimes(ctx context.Context) ([]NamedID, error)
 	Skills(ctx context.Context) ([]NamedID, error)
+	Squads(ctx context.Context) ([]NamedID, error)
 	// TerminalSince lists goals whose last run reached a terminal status in
 	// [since, until) (RFC3339) — the daily digest's "yesterday" window.
 	TerminalSince(ctx context.Context, since, until string) ([]GoalBrief, error)
@@ -242,6 +243,23 @@ func (q *SQLQueryStore) Runtimes(ctx context.Context) ([]NamedID, error) {
 // id (uploaded/created ahead of time), they are never created from NL.
 func (q *SQLQueryStore) Skills(ctx context.Context) ([]NamedID, error) {
 	rows, err := q.st.DB().QueryContext(ctx, `SELECT id, name FROM skill ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []NamedID{}
+	for rows.Next() {
+		var n NamedID
+		if err := rows.Scan(&n.ID, &n.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, n)
+	}
+	return out, rows.Err()
+}
+
+func (q *SQLQueryStore) Squads(ctx context.Context) ([]NamedID, error) {
+	rows, err := q.st.DB().QueryContext(ctx, `SELECT id, name FROM squad ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
