@@ -63,6 +63,13 @@ type Notifier struct {
 	// SDK message-update path).
 	updateCardFn func(messageID, content string) error
 
+	// unsubs holds the bus unsubscribe callbacks returned by Subscribe, one
+	// per topic. Unsubscribe drains them so a Disconnect'd Notifier stops
+	// reacting to bus events — otherwise the orphan keeps pushing to the
+	// stale bot credentials (the disconnect-then-reconnect duplicate-card
+	// bug). Guarded by mu.
+	unsubs []func()
+
 	mu       sync.Mutex
 	token    string
 	tokenExp time.Time
@@ -89,29 +96,51 @@ func (n *Notifier) SetQueryStore(qs QueryStore) { n.qs = qs }
 // Subscribe wires the milestone topics. Handlers run in the bus's own
 // goroutines (fire-and-forget with panic recovery); each send runs in its
 // own goroutine so a slow Feishu API call never blocks the bus.
+// The returned unsubscribe callbacks are retained so Unsubscribe can detach
+// the whole set on Disconnect — an orphan Notifier still on the bus keeps
+// pushing to stale credentials (the duplicate-card bug).
 func (n *Notifier) Subscribe(bus *events.Bus) {
 	// Option B (reviewer-first opinions, zero wait): the card fires at park
 	// time with a "审查中" hint naming the reviewers; goal:review_ready (the
 	// daemon publishes it when this window's review runs are terminal, or
 	// the fallback elapsed / no reviewer exists) PATCHES the SAME card to
 	// replace the hint with the actual opinions.
-	bus.Subscribe("goal:reviewing", n.onGoalReviewing)
-	bus.Subscribe("goal:review_ready", n.onGoalReviewReady)
+	var unsubs []func()
+	unsubs = append(unsubs, bus.Subscribe("goal:reviewing", n.onGoalReviewing))
+	unsubs = append(unsubs, bus.Subscribe("goal:review_ready", n.onGoalReviewReady))
 	// A decision made on the WEB never touches the card's buttons — patch
 	// the card to its processed state from here (the button-callback path
 	// patches through the Connector with its own message id).
-	bus.Subscribe("goal:review_resolved", n.onGoalReviewResolved)
-	bus.Subscribe("goal:delivered", n.onGoalDelivered)
-	bus.Subscribe("goal:deliver_failed", n.onGoalDeliverFailed)
-	bus.Subscribe("goal:finished", n.onGoalFinished)
-	bus.Subscribe("run:cancelled", n.onRunCancelled)
+	unsubs = append(unsubs, bus.Subscribe("goal:review_resolved", n.onGoalReviewResolved))
+	unsubs = append(unsubs, bus.Subscribe("goal:delivered", n.onGoalDelivered))
+	unsubs = append(unsubs, bus.Subscribe("goal:deliver_failed", n.onGoalDeliverFailed))
+	unsubs = append(unsubs, bus.Subscribe("goal:finished", n.onGoalFinished))
+	unsubs = append(unsubs, bus.Subscribe("run:cancelled", n.onRunCancelled))
 	// v2 (决策 6-8): a human-owned goal needs its owner's attention — the
 	// goal has no agent run to spawn, so the IM push IS the wakeup.
-	bus.Subscribe("goal.attention_needed", n.onGoalAttentionNeeded)
+	unsubs = append(unsubs, bus.Subscribe("goal.attention_needed", n.onGoalAttentionNeeded))
 	// 决策 7-3: an agent asked the human a question (--ask comment) — push a
 	// Feishu card so the human notices and replies (their reply wakes the
 	// owner run via parent_id routing, not a consult).
-	bus.Subscribe("comment:agent_question", n.onAgentQuestion)
+	unsubs = append(unsubs, bus.Subscribe("comment:agent_question", n.onAgentQuestion))
+	n.mu.Lock()
+	n.unsubs = unsubs
+	n.mu.Unlock()
+}
+
+// Unsubscribe detaches all milestone handlers from the bus. Call on
+// Disconnect (and before re-creating the Notifier on a fresh registration) so
+// the stale Notifier stops reacting to events — an orphan still subscribed
+// keeps sending to its old bot credentials, producing duplicate cards on the
+// old bot after the owner reconnected to a new one.
+func (n *Notifier) Unsubscribe() {
+	n.mu.Lock()
+	unsubs := n.unsubs
+	n.unsubs = nil
+	n.mu.Unlock()
+	for _, u := range unsubs {
+		u()
+	}
 }
 
 // onAgentQuestion pushes an "agent is asking you" Feishu card (决策 7-3).
