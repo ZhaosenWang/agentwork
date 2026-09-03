@@ -86,6 +86,33 @@ func (s *scanDirsFlag) Set(v string) error {
 	return nil
 }
 
+// validateMachineID guards an injected --machine-id value. machine_id is NOT
+// used in any file path (it rides SQLite columns, log lines, JSON-RPC params,
+// and runtime.name as "<cli>@<machine>") and the daemon does no format
+// validation beyond non-empty — so the orchestrator is free to pass a stable
+// token like "sandbox-pool-3". But a stray shell glob, a newline, or an "@"
+// would corrupt those downstream contexts (break the runtime.name split,
+// poison log lines, collide with another machine's name-derived runtime).
+// Reject such values loudly at the injection point rather than let them
+// propagate. Pure visible-ASCII tokens are the expected shape.
+func validateMachineID(id string) error {
+	if id == "" {
+		return fmt.Errorf("must not be empty")
+	}
+	if len(id) > 128 {
+		return fmt.Errorf("too long (%d > 128)", len(id))
+	}
+	if strings.ContainsAny(id, "/\\\n\r@") {
+		return fmt.Errorf("must not contain /, \\, newline, or @ (breaks runtime.name \"<cli>@<machine>\")")
+	}
+	for _, r := range id {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("must not contain control characters")
+		}
+	}
+	return nil
+}
+
 // connectCmd runs `agentwork connect`: dial the daemon's /connect link,
 // register this machine (probing its agent CLIs), then heartbeat until
 // interrupted. Reconnects with exponential backoff.
@@ -95,9 +122,27 @@ func connectCmd(args []string) {
 	token := fs.String("token", "", "register token (daemon-side platform.worker_token; empty = none)")
 	name := fs.String("name", "", "machine display name (default: hostname)")
 	agentsCfg := fs.String("agents", "", "path to agents YAML config (default: ~/.agentwork/agents.yaml — adds/overrides probed agent CLIs)")
+	machineID := fs.String("machine-id", "", "stable machine identity injected by the orchestrator "+
+		"(overrides the persisted UUID in state — use a stable, unique value per logical machine across sandbox recreations)")
 	var scanDirs scanDirsFlag
 	fs.Var(&scanDirs, "scan", "extra directory (or glob, e.g. /opt/*/ or /opt/**/) to scan for agent CLIs not on PATH (repeatable; ~ expanded)")
 	fs.Parse(args)
+
+	// --machine-id validation: the injected value is the authority for
+	// identity stability across sandbox recreations, but it lands in SQLite
+	// TEXT columns, log lines, JSON-RPC params, and runtime.name
+	// ("<cli>@<machine>"). machine_id is NOT used in any file path and the
+	// daemon does no format validation beyond non-empty, so validation is
+	// concentrated at the client injection point — reject values that would
+	// corrupt a downstream context (path fragments, @, newlines, control
+	// chars, overlong). A bad config must fail immediately, not silently
+	// poison rows or logs.
+	if *machineID != "" {
+		if err := validateMachineID(*machineID); err != nil {
+			fmt.Fprintf(os.Stderr, "agentwork connect: --machine-id: %v\n", err)
+			os.Exit(2)
+		}
+	}
 
 	// Load the agents config (adds new CLIs or overrides builtins by name)
 	// BEFORE the first probe. A missing file is normal (builtins only); a
@@ -119,6 +164,17 @@ func connectCmd(args []string) {
 	st, err := loadState()
 	if err != nil || st.MachineID == "" {
 		st = cliState{MachineID: uuid.NewString(), Name: *name}
+	}
+	// --machine-id injection: the orchestrator's explicit intent overrides a
+	// residual UUID in state (the state file may have been copied into the
+	// sandbox by mistake; the flag is the authority for identity stability
+	// across sandbox recreations). Once injected, the id persists to state,
+	// so a later reconnect without the flag stays stable — but a different
+	// flag overrides (the orchestrator explicitly changed identity).
+	// Precedence: flag > state > uuid.
+	if *machineID != "" && st.MachineID != *machineID {
+		cliLogf("connect: --machine-id %s overrides persisted identity %s", *machineID, st.MachineID)
+		st.MachineID = *machineID
 	}
 	st.Server = *server
 	st.Name = *name
