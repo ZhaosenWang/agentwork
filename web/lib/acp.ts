@@ -54,7 +54,7 @@ export class AcpChatClient {
   // leaking a machine-side chat channel.
   private closed = false;
   private pending = new Map<
-    string,
+    number,
     { resolve: (v: unknown) => void; reject: (e: Error) => void }
   >();
   private cb: AcpChatCallbacks;
@@ -120,7 +120,7 @@ export class AcpChatClient {
   private send(method: string, params: unknown): Promise<unknown> {
     return new Promise((resolve, reject) => {
       if (!this.ws) return reject(new Error("not connected"));
-      const id = String(++this.id);
+      const id = ++this.id;
       this.pending.set(id, { resolve, reject });
       this.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
       // No artificial deadline — the agent takes as long as it takes.
@@ -138,9 +138,9 @@ export class AcpChatClient {
     }
     if (typeof msg.id !== "undefined" && msg.id !== null && msg.method === undefined) {
       // Response to one of our requests.
-      const p = this.pending.get(String(msg.id));
+      const p = this.pending.get(msg.id);
       if (!p) return;
-      this.pending.delete(String(msg.id));
+      this.pending.delete(msg.id);
       if (msg.error) p.reject(new Error(msg.error.message ?? "acp error"));
       else p.resolve(msg.result);
       return;
@@ -196,8 +196,10 @@ export class AcpChatClient {
 
   initialize(): Promise<void> {
     return this.send("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      protocolVersion: 2,
+      capabilities: { session: {} },
+      info: { name: "agentwork-web", title: "Agentwork Web", version: "1.0.0" },
+      clientInfo: { name: "agentwork-web", title: "Agentwork Web", version: "1.0.0" },
     }).then(() => undefined);
   }
 

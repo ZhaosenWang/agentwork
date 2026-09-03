@@ -47,7 +47,7 @@ func newIntakeDaemon(t *testing.T) (*Daemon, *store.Store) {
 	d := &Daemon{
 		st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc, schedSvc: schedSvc,
 		agentSvc: agentSvc, squadSvc: squadSvc, qs: notify.NewSQLQueryStore(st),
-		intakeSvc: intakeSvc,
+		intakeSvc: intakeSvc, domainSvc: ds,
 	}
 	return d, st
 }
@@ -235,6 +235,11 @@ func squadSub(Name, LeaderID, Description, Instructions string, MemberIDs []stri
 		Name: Name, LeaderID: LeaderID, Description: Description,
 		Instructions: Instructions, MemberIDs: MemberIDs,
 	}
+}
+
+// domainSub builds a domainAction for test call sites.
+func domainSub(Name, Type, GitURL string) domainAction {
+	return domainAction{Name: Name, Type: Type, GitURL: GitURL}
 }
 
 // TestIntakeCreateAgent: the platform executes create_agent through the
@@ -459,12 +464,15 @@ func TestIntakeCreateSquad(t *testing.T) {
 // of the expected surface, not a sync guard.
 func TestIntakeRegistryIntents(t *testing.T) {
 	want := map[string]bool{
-		"create_goal": true, "review_list": true, "goal_status": true,
+		"create_goal": true, "goal_list": true, "goal_cancel": true, "goal_assign": true,
+		"review_list": true, "goal_status": true,
 		"create_schedule": true, "schedule_list": true, "schedule_stop": true,
-		"create_agent": true, "create_squad": true,
+		"create_agent": true, "agent_list": true, "agent_delete": true, "agent_update": true,
+		"create_squad": true,
 		"squad_list": true, "squad_detail": true, "squad_update": true,
 		"squad_add_member": true, "squad_remove_member": true, "squad_delete": true,
 		"import_team": true,
+		"domain_create": true, "domain_list": true,
 	}
 	got := make(map[string]bool)
 	for _, c := range intakeReg.cmds {
@@ -646,5 +654,271 @@ func TestIntakeSquadDelete(t *testing.T) {
 	// Delete non-existent.
 	if r := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("不存在", "", "", "", nil)}); !strings.Contains(r, "没找到") {
 		t.Fatalf("delete on missing squad must say so, got %q", r)
+	}
+}
+
+// TestIntakeListGoals: empty list says so; populated list carries title,
+// short id, status, and assignee display name.
+func TestIntakeListGoals(t *testing.T) {
+	ctx := context.Background()
+
+	// Empty.
+	d, _ := newIntakeDaemon(t)
+	if r := d.intakeListGoals(ctx); !strings.Contains(r, "没有任务") {
+		t.Fatalf("empty list, got %q", r)
+	}
+
+	// With goals.
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("任务A", "", "a1", domID)})
+	d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("任务B", "", "a1", domID)})
+	list := d.intakeListGoals(ctx)
+	if !strings.Contains(list, "任务A") || !strings.Contains(list, "任务B") {
+		t.Fatalf("list must show both goals, got %q", list)
+	}
+	if !strings.Contains(list, "worker1") {
+		t.Fatalf("list must show assignee name, got %q", list)
+	}
+}
+
+// TestIntakeCancelGoal: cancel succeeds on an active goal; re-canceling a
+// cancelled goal fails; missing id asks for one; unknown id says not found.
+func TestIntakeCancelGoal(t *testing.T) {
+	d, _ := newIntakeDaemon(t)
+	ctx := context.Background()
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	g, err := d.goalSvc.Create(ctx, service.Goal{
+		Title: "可取消", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reply := d.intakeCancelGoal(ctx, g.ID[:8])
+	if !strings.Contains(reply, "已取消") {
+		t.Fatalf("cancel must succeed, got %q", reply)
+	}
+
+	// Re-cancel → fails (goal is terminal).
+	if r := d.intakeCancelGoal(ctx, g.ID[:8]); !strings.Contains(r, "取消失败") {
+		t.Fatalf("re-cancel must fail, got %q", r)
+	}
+	// No id.
+	if r := d.intakeCancelGoal(ctx, ""); !strings.Contains(r, "需要任务 id") {
+		t.Fatalf("no id must ask, got %q", r)
+	}
+	// Unknown id.
+	if r := d.intakeCancelGoal(ctx, "zzzzzzzz"); !strings.Contains(r, "找不到") {
+		t.Fatalf("unknown id must say not found, got %q", r)
+	}
+}
+
+// TestIntakeAssignGoal: assign succeeds and changes the assignee; missing
+// assignee asks; hallucinated agent fails at the service layer.
+func TestIntakeAssignGoal(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,runtime_id,max_concurrent,created_at) VALUES ('a2','worker2','rt1',1,?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	g, err := d.goalSvc.Create(ctx, service.Goal{
+		Title: "可转交", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reply := d.intakeAssignGoal(ctx, intakeAction{
+		GoalID: g.ID[:8], Goal: goalAction{AssigneeID: "a2", AssigneeType: "agent"}})
+	if !strings.Contains(reply, "已转交") || !strings.Contains(reply, "worker2") {
+		t.Fatalf("assign must succeed with new assignee name, got %q", reply)
+	}
+	var assigneeID string
+	if err := st.DB().QueryRowContext(ctx, `SELECT assignee_id FROM goal WHERE id=?`, g.ID).Scan(&assigneeID); err != nil {
+		t.Fatal(err)
+	}
+	if assigneeID != "a2" {
+		t.Fatalf("assignee must be a2, got %q", assigneeID)
+	}
+
+	// Missing assignee.
+	if r := d.intakeAssignGoal(ctx, intakeAction{GoalID: g.ID[:8]}); !strings.Contains(r, "需要指定执行者") {
+		t.Fatalf("missing assignee must ask, got %q", r)
+	}
+	// Missing goal id.
+	if r := d.intakeAssignGoal(ctx, intakeAction{}); !strings.Contains(r, "需要任务 id") {
+		t.Fatalf("missing id must ask, got %q", r)
+	}
+	// Hallucinated agent.
+	if r := d.intakeAssignGoal(ctx, intakeAction{
+		GoalID: g.ID[:8], Goal: goalAction{AssigneeID: "ghost", AssigneeType: "agent"}}); !strings.Contains(r, "转交失败") {
+		t.Fatalf("hallucinated agent must fail, got %q", r)
+	}
+}
+
+// TestIntakeListAgents: empty list says so; populated list carries name and
+// description.
+func TestIntakeListAgents(t *testing.T) {
+	ctx := context.Background()
+
+	// The test daemon seeds a1/worker1, so list is non-empty by default.
+	d, _ := newIntakeDaemon(t)
+	list := d.intakeListAgents(ctx)
+	if !strings.Contains(list, "worker1") {
+		t.Fatalf("list must show seeded agent, got %q", list)
+	}
+}
+
+// TestIntakeDeleteAgent: delete succeeds on a free agent; an agent with a
+// goal is guarded; non-existent name says not found.
+func TestIntakeDeleteAgent(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,runtime_id,max_concurrent,created_at) VALUES ('a2','worker2','rt1',1,?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+
+	reply := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker2", "rt1", "", "", nil, true)})
+	if !strings.Contains(reply, "已删除") {
+		t.Fatalf("delete must succeed, got %q", reply)
+	}
+	var count int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM agent WHERE name=?`, "worker2").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("agent must be deleted, got %d rows", count)
+	}
+
+	// Agent with a goal → guarded.
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	d.goalSvc.Create(ctx, service.Goal{
+		Title: "占用a1", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if r := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker1", "rt1", "", "", nil, true)}); !strings.Contains(r, "失败") {
+		t.Fatalf("agent with goal must fail, got %q", r)
+	}
+
+	// Non-existent.
+	if r := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("不存在", "rt1", "", "", nil, true)}); !strings.Contains(r, "没找到") {
+		t.Fatalf("non-existent must say so, got %q", r)
+	}
+}
+
+// TestIntakeUpdateAgent: partial update changes only the specified field;
+// no changes asks what to change; non-existent name says not found.
+func TestIntakeUpdateAgent(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+
+	// Change description.
+	reply := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "新描述", "", nil, true)})
+	if !strings.Contains(reply, "已更新") {
+		t.Fatalf("update must succeed, got %q", reply)
+	}
+	var desc string
+	if err := st.DB().QueryRowContext(ctx, `SELECT description FROM agent WHERE name=?`, "worker1").Scan(&desc); err != nil {
+		t.Fatal(err)
+	}
+	if desc != "新描述" {
+		t.Fatalf("description must change, got %q", desc)
+	}
+
+	// Change system_prompt.
+	reply = d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "", "新人设", nil, true)})
+	if !strings.Contains(reply, "已更新") {
+		t.Fatalf("update system_prompt must succeed, got %q", reply)
+	}
+	var sp string
+	if err := st.DB().QueryRowContext(ctx, `SELECT system_prompt FROM agent WHERE name=?`, "worker1").Scan(&sp); err != nil {
+		t.Fatal(err)
+	}
+	if sp != "新人设" {
+		t.Fatalf("system_prompt must change, got %q", sp)
+	}
+
+	// No fields specified.
+	if r := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "", "", nil, true)}); !strings.Contains(r, "需要指定") {
+		t.Fatalf("no changes must ask, got %q", r)
+	}
+
+	// Non-existent.
+	if r := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("不存在", "", "x", "", nil, true)}); !strings.Contains(r, "没找到") {
+		t.Fatalf("non-existent must say so, got %q", r)
+	}
+}
+
+// TestIntakeCreateDomain: repo domain creates; scratch domain creates without
+// git_url; missing name asks; missing git_url asks; draft clarification
+// completes in two steps.
+func TestIntakeCreateDomain(t *testing.T) {
+	ctx := context.Background()
+
+	// Repo domain — full fields.
+	d, st := newIntakeDaemon(t)
+	reply := d.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("myrepo", "repo", "https://e.com/myrepo.git")})
+	if !strings.Contains(reply, "已创建项目") {
+		t.Fatalf("repo domain must create, got %q", reply)
+	}
+	var name string
+	if err := st.DB().QueryRowContext(ctx, `SELECT name FROM domain WHERE name=?`, "myrepo").Scan(&name); err != nil {
+		t.Fatalf("domain must exist: %v", err)
+	}
+
+	// Scratch domain — no git_url needed.
+	d2, st2 := newIntakeDaemon(t)
+	reply = d2.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("myscratch", "scratch", "")})
+	if !strings.Contains(reply, "已创建项目") {
+		t.Fatalf("scratch domain must create without git_url, got %q", reply)
+	}
+	var dtype string
+	if err := st2.DB().QueryRowContext(ctx, `SELECT type FROM domain WHERE name=?`, "myscratch").Scan(&dtype); err != nil {
+		t.Fatalf("scratch domain must exist: %v", err)
+	}
+	if dtype != "scratch" {
+		t.Fatalf("type must be scratch, got %q", dtype)
+	}
+
+	// Missing name → ask.
+	d3, _ := newIntakeDaemon(t)
+	_ = d3.intakeSvc.ClearDraft(ctx)
+	if r := d3.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("", "repo", "https://e.com/x.git")}); !strings.Contains(r, "还需要") || !strings.Contains(r, "名称") {
+		t.Fatalf("missing name must ask, got %q", r)
+	}
+
+	// Missing git_url (repo) → ask.
+	d4, _ := newIntakeDaemon(t)
+	_ = d4.intakeSvc.ClearDraft(ctx)
+	if r := d4.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("no-url", "repo", "")}); !strings.Contains(r, "还需要") || !strings.Contains(r, "仓库地址") {
+		t.Fatalf("missing git_url must ask, got %q", r)
+	}
+
+	// Draft clarification: first message has name but no git_url → ask;
+	// second message supplies git_url → create from draft.
+	d5, _ := newIntakeDaemon(t)
+	_ = d5.intakeSvc.ClearDraft(ctx)
+	ask := d5.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("draftrepo", "repo", "")})
+	if !strings.Contains(ask, "仓库地址") {
+		t.Fatalf("draft setup must ask for git_url, got %q", ask)
+	}
+	// Clarification turn: supply git_url (name carried by draft).
+	reply = d5.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("", "", "https://e.com/draft.git")})
+	if !strings.Contains(reply, "已创建项目") {
+		t.Fatalf("draft clarification must create, got %q", reply)
+	}
+}
+
+// TestIntakeListDomains: the test daemon seeds d1, so list is non-empty.
+func TestIntakeListDomains(t *testing.T) {
+	ctx := context.Background()
+	d, _ := newIntakeDaemon(t)
+	list := d.intakeListDomains(ctx)
+	if !strings.Contains(list, "d1") {
+		t.Fatalf("list must show seeded domain d1, got %q", list)
+	}
+	if !strings.Contains(list, "repo") {
+		t.Fatalf("list must show domain type, got %q", list)
 	}
 }

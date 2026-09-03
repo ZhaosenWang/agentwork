@@ -144,6 +144,7 @@ type Daemon struct {
 	intakeSvc     *notify.IntakeService // M4-B: multi-domain clarification draft store
 	lastIssuePoll time.Time             // last poll time (the interval is configurable)
 	teamImportSvc *service.TeamImportService // team-import processor run lifecycle
+	domainSvc     *service.DomainService     // intake: domain CRUD (NL-driven)
 
 	mu          sync.Mutex
 	workers     map[string]*agentWorker // agentID → per-agent scheduler
@@ -366,6 +367,10 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 // after construction to avoid touching the already-long New signature).
 func (d *Daemon) SetTeamImportService(svc *service.TeamImportService) {
 	d.teamImportSvc = svc
+}
+
+func (d *Daemon) SetDomainService(svc *service.DomainService) {
+	d.domainSvc = svc
 }
 
 // Run starts the dispatch loop. Blocks until ctx is cancelled.

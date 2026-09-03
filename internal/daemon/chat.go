@@ -304,6 +304,7 @@ func (d *Daemon) ChatWrite(chatID string, frame []byte) error {
 	frame = normalizeChatFrame(frame, e.cwd)
 	if e.isSteward {
 		interceptStewardPrompt(e, frame)
+		frame = injectStewardRoster(d, frame)
 	}
 	logChatFrame("web→machine", frame)
 	// No artificial deadline: an agent turn takes as long as it takes, and

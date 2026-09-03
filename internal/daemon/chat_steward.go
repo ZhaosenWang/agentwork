@@ -170,6 +170,9 @@ func (d *Daemon) handleStewardTurnComplete(chatID string, e *chatEntry) {
 				if strings.TrimSpace(reply) != "" {
 					injectAgentMessage(e, sessionID, reply)
 				}
+				if d.intakeSvc != nil {
+					_ = d.intakeSvc.ClearDraft(context.Background())
+				}
 			}
 		}
 
@@ -224,4 +227,60 @@ func injectPromptResponse(e *chatEntry, promptID json.RawMessage) {
 			"stopReason": "end_turn",
 		},
 	})
+}
+
+// injectStewardRoster prepends a text block carrying the current platform
+// roster to a session/prompt frame's prompt array. The AGENTS.md brief is
+// session-fixed — entities created after the chat opened are invisible to
+// the steward. Injecting the fresh roster on every prompt ensures the
+// steward can resolve names to ids using the current state.
+//
+// Only session/prompt frames are rewritten; all other methods pass through
+// untouched. The injected block is a SEPARATE text block before the user's
+// prompt, so the user's original message stays intact (both web/ and
+// AI_SHELL_WEB display the user's text from a local push, not from the
+// forwarded frame).
+func injectStewardRoster(d *Daemon, frame []byte) []byte {
+	if d.intakeSvc == nil {
+		return frame
+	}
+	var msg struct {
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := json.Unmarshal(frame, &msg); err != nil || msg.Method != "session/prompt" {
+		return frame
+	}
+	roster := d.intakeSvc.RosterBody(context.Background())
+	if strings.TrimSpace(roster) == "" {
+		return frame
+	}
+	var params struct {
+		SessionID string            `json:"sessionId"`
+		Prompt    []json.RawMessage `json:"prompt"`
+	}
+	if err := json.Unmarshal(msg.Params, &params); err != nil {
+		return frame
+	}
+	injected, err := json.Marshal(map[string]any{
+		"type": "text",
+		"text": "【当前平台名单（每次消息自动注入，用户不可见）】" + roster,
+	})
+	if err != nil {
+		return frame
+	}
+	params.Prompt = append([]json.RawMessage{injected}, params.Prompt...)
+	newParams, err := json.Marshal(params)
+	if err != nil {
+		return frame
+	}
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(frame, &m)
+	m["params"] = newParams
+	out, err := json.Marshal(m)
+	if err != nil {
+		return frame
+	}
+	logging.Debugf("chat: steward session/prompt injected fresh roster")
+	return out
 }
