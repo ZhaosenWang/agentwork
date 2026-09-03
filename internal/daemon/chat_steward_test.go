@@ -51,8 +51,9 @@ func newStewardRosterDaemon(t *testing.T) *Daemon {
 // stays intact as the second element.
 func TestInjectStewardRosterOnPrompt(t *testing.T) {
 	d := newStewardRosterDaemon(t)
+	e := &chatEntry{}
 	original := `{"jsonrpc":"2.0","id":"1","method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"创建任务 优化README"}]}}`
-	out := injectStewardRoster(d, []byte(original))
+	out := injectStewardRoster(d, e, []byte(original))
 	if string(out) == original {
 		t.Fatal("session/prompt must be rewritten, got unchanged frame")
 	}
@@ -90,12 +91,13 @@ func TestInjectStewardRosterOnPrompt(t *testing.T) {
 // unchanged (return == input frame).
 func TestInjectStewardRosterIgnoresOtherMethods(t *testing.T) {
 	d := newStewardRosterDaemon(t)
+	e := &chatEntry{}
 	for _, frame := range []string{
 		`{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"mcpServers":[]}}`,
 		`{"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"s","mcpServers":[]}}`,
 		`{"jsonrpc":"2.0","id":3,"method":"session/list","params":{}}`,
 	} {
-		out := injectStewardRoster(d, []byte(frame))
+		out := injectStewardRoster(d, e, []byte(frame))
 		if string(out) != frame {
 			t.Fatalf("non-session/prompt method must pass through unchanged, got %s", out)
 		}
@@ -106,10 +108,47 @@ func TestInjectStewardRosterIgnoresOtherMethods(t *testing.T) {
 // fully wired), the frame passes through unchanged.
 func TestInjectStewardRosterNilIntakeSvc(t *testing.T) {
 	d := &Daemon{}
+	e := &chatEntry{}
 	frame := `{"jsonrpc":"2.0","id":"1","method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"hi"}]}}`
-	out := injectStewardRoster(d, []byte(frame))
+	out := injectStewardRoster(d, e, []byte(frame))
 	if string(out) != frame {
 		t.Fatalf("nil intakeSvc must pass through unchanged, got %s", out)
+	}
+}
+
+// TestInjectStewardRosterWithDispatchResult: when lastDispatchResult is set
+// on the chatEntry, it is injected as a context block before the user's
+// prompt, and cleared after injection.
+func TestInjectStewardRosterWithDispatchResult(t *testing.T) {
+	d := newStewardRosterDaemon(t)
+	e := &chatEntry{lastDispatchResult: "📋 任务列表（1 个）：\n- 测试任务（abc12345） | [active] | 执行者：worker1"}
+	original := `{"jsonrpc":"2.0","id":"1","method":"session/prompt","params":{"sessionId":"s1","prompt":[{"type":"text","text":"现在删掉"}]}}`
+	out := injectStewardRoster(d, e, []byte(original))
+	var msg struct {
+		Params struct {
+			Prompt []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"prompt"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(out, &msg); err != nil {
+		t.Fatalf("rewrite produced invalid JSON: %v", err)
+	}
+	if len(msg.Params.Prompt) != 3 {
+		t.Fatalf("prompt must have 3 blocks (roster + dispatch result + user), got %d", len(msg.Params.Prompt))
+	}
+	if !strings.Contains(msg.Params.Prompt[1].Text, "上次指令执行结果") {
+		t.Fatalf("second block must be dispatch result, got %q", msg.Params.Prompt[1].Text)
+	}
+	if !strings.Contains(msg.Params.Prompt[1].Text, "abc12345") {
+		t.Fatalf("dispatch result must contain task ID, got %q", msg.Params.Prompt[1].Text)
+	}
+	if msg.Params.Prompt[2].Text != "现在删掉" {
+		t.Fatalf("user text must be preserved as last block, got %q", msg.Params.Prompt[2].Text)
+	}
+	if e.lastDispatchResult != "" {
+		t.Fatal("lastDispatchResult must be cleared after injection")
 	}
 }
 

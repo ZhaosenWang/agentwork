@@ -170,10 +170,17 @@ func (d *Daemon) handleStewardTurnComplete(chatID string, e *chatEntry) {
 				if strings.TrimSpace(reply) != "" {
 					injectAgentMessage(e, sessionID, reply)
 				}
+				e.mu.Lock()
+				e.lastDispatchResult = reply
+				e.mu.Unlock()
 				if d.intakeSvc != nil {
 					_ = d.intakeSvc.ClearDraft(context.Background())
 				}
 			}
+		} else {
+			e.mu.Lock()
+			e.lastDispatchResult = ""
+			e.mu.Unlock()
 		}
 
 		injectPromptResponse(e, promptID)
@@ -229,18 +236,15 @@ func injectPromptResponse(e *chatEntry, promptID json.RawMessage) {
 	})
 }
 
-// injectStewardRoster prepends a text block carrying the current platform
-// roster to a session/prompt frame's prompt array. The AGENTS.md brief is
-// session-fixed — entities created after the chat opened are invisible to
-// the steward. Injecting the fresh roster on every prompt ensures the
-// steward can resolve names to ids using the current state.
+// injectStewardRoster prepends text blocks to a session/prompt frame's prompt
+// array: (1) the current platform roster (fresh every turn — the AGENTS.md
+// brief is session-fixed), and (2) the previous dispatch result if any (so
+// the steward can reference query results like task IDs in follow-up turns).
 //
 // Only session/prompt frames are rewritten; all other methods pass through
-// untouched. The injected block is a SEPARATE text block before the user's
-// prompt, so the user's original message stays intact (both web/ and
-// AI_SHELL_WEB display the user's text from a local push, not from the
-// forwarded frame).
-func injectStewardRoster(d *Daemon, frame []byte) []byte {
+// untouched. The injected blocks are SEPARATE text blocks before the user's
+// prompt, so the user's original message stays intact.
+func injectStewardRoster(d *Daemon, e *chatEntry, frame []byte) []byte {
 	if d.intakeSvc == nil {
 		return frame
 	}
@@ -251,10 +255,6 @@ func injectStewardRoster(d *Daemon, frame []byte) []byte {
 	if err := json.Unmarshal(frame, &msg); err != nil || msg.Method != "session/prompt" {
 		return frame
 	}
-	roster := d.intakeSvc.RosterBody(context.Background())
-	if strings.TrimSpace(roster) == "" {
-		return frame
-	}
 	var params struct {
 		SessionID string            `json:"sessionId"`
 		Prompt    []json.RawMessage `json:"prompt"`
@@ -262,14 +262,32 @@ func injectStewardRoster(d *Daemon, frame []byte) []byte {
 	if err := json.Unmarshal(msg.Params, &params); err != nil {
 		return frame
 	}
-	injected, err := json.Marshal(map[string]any{
-		"type": "text",
-		"text": "【当前平台名单（每次消息自动注入，用户不可见）】" + roster,
-	})
-	if err != nil {
+	var prepends []json.RawMessage
+	roster := d.intakeSvc.RosterBody(context.Background())
+	if strings.TrimSpace(roster) != "" {
+		if b, err := json.Marshal(map[string]any{
+			"type": "text",
+			"text": "【当前平台名单（每次消息自动注入，用户不可见）】" + roster,
+		}); err == nil {
+			prepends = append(prepends, b)
+		}
+	}
+	e.mu.Lock()
+	prevResult := e.lastDispatchResult
+	e.lastDispatchResult = ""
+	e.mu.Unlock()
+	if strings.TrimSpace(prevResult) != "" {
+		if b, err := json.Marshal(map[string]any{
+			"type": "text",
+			"text": "【上次指令执行结果（供你参考，用户已看到此结果）】\n" + prevResult,
+		}); err == nil {
+			prepends = append(prepends, b)
+		}
+	}
+	if len(prepends) == 0 {
 		return frame
 	}
-	params.Prompt = append([]json.RawMessage{injected}, params.Prompt...)
+	params.Prompt = append(prepends, params.Prompt...)
 	newParams, err := json.Marshal(params)
 	if err != nil {
 		return frame
@@ -281,6 +299,6 @@ func injectStewardRoster(d *Daemon, frame []byte) []byte {
 	if err != nil {
 		return frame
 	}
-	logging.Debugf("chat: steward session/prompt injected fresh roster")
+	logging.Debugf("chat: steward session/prompt injected roster+context")
 	return out
 }

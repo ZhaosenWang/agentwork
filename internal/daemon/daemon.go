@@ -138,21 +138,22 @@ type Daemon struct {
 	schedSvc   *service.ScheduleService
 	im         *notify.Connector // M3: daily digest + intake replies (the notifier
 	// is born when the long connection connects; fetch it live)
-	qs            notify.QueryStore     // M3: digest aggregation (may be nil)
-	issuePoll     *issue.Poller         // M4-B: open issues → goals
-	issueCloser   *issue.Closer         // M4-B: delivered goal → close its issue
-	intakeSvc     *notify.IntakeService // M4-B: multi-domain clarification draft store
-	lastIssuePoll time.Time             // last poll time (the interval is configurable)
+	qs            notify.QueryStore          // M3: digest aggregation (may be nil)
+	issuePoll     *issue.Poller              // M4-B: open issues → goals
+	issueCloser   *issue.Closer              // M4-B: delivered goal → close its issue
+	intakeSvc     *notify.IntakeService      // M4-B: multi-domain clarification draft store
+	lastIssuePoll time.Time                  // last poll time (the interval is configurable)
 	teamImportSvc *service.TeamImportService // team-import processor run lifecycle
 	domainSvc     *service.DomainService     // intake: domain CRUD (NL-driven)
+	skillSvc      *service.SkillService      // intake: skill CRUD (NL-driven)
 
 	mu          sync.Mutex
 	workers     map[string]*agentWorker // agentID → per-agent scheduler
 	domainLocks map[string]*domainLock  // per-domain git lock (fetch + deliver)
 	// sessionPool is the persistent (agent, goal) session pool (决策 6-21).
 	// Its own mutex (sessionMu) guards it — see session_pool.go.
-	msgBuffers   map[string]*msgBuffer          // runID → aggregated text row (persistEvent)
-	toolBuffers  map[string]map[string]*toolRow // runID → CallID → aggregated tool row (persistEvent)
+	msgBuffers  map[string]*msgBuffer          // runID → aggregated text row (persistEvent)
+	toolBuffers map[string]map[string]*toolRow // runID → CallID → aggregated tool row (persistEvent)
 	// runCancels maps runID → the run's prompt cancel (registered by runTask,
 	// used to terminate a running run when its goal changes hands — a handed
 	// off agent that keeps running deadlocks the new owner's queued run behind
@@ -175,15 +176,15 @@ type Daemon struct {
 	reviewReadyTimers map[string]*time.Timer
 	reviewReadyFired  map[string]bool
 	// mcpExecs maps runID → the run's workspace MCP executor (DESIGN.md
-	stopped  bool
-	ctx      context.Context
+	stopped bool
+	ctx     context.Context
 
 	// Machine link (CLI 分支 Phase 2): live /connect peers keyed by machine
 	// id, plus the per-run upload bookkeeping (event seq / last activity)
 	// for gap detection and the dispatched-run watchdog. Guarded by
 	// machineMu / machineLastEventMu.
-	machineMu     sync.Mutex
-	machinePeers  map[string]*link.Peer
+	machineMu          sync.Mutex
+	machinePeers       map[string]*link.Peer
 	machineLastEventMu sync.Mutex
 	machineLastSeq     map[string]int64
 	machineLastEvent   map[string]time.Time
@@ -371,6 +372,10 @@ func (d *Daemon) SetTeamImportService(svc *service.TeamImportService) {
 
 func (d *Daemon) SetDomainService(svc *service.DomainService) {
 	d.domainSvc = svc
+}
+
+func (d *Daemon) SetSkillService(svc *service.SkillService) {
+	d.skillSvc = svc
 }
 
 // Run starts the dispatch loop. Blocks until ctx is cancelled.
@@ -1771,27 +1776,27 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		}
 	}
 
-		var issueSection string
-		if issueRepo != "" {
-			// The run's goal tracks a PUBLIC issue on the git host. Anything
-			// the agent posts there with `agentwork issue comment` is read by
-			// humans outside the platform — the contract rides EVERY run that
-			// can touch the issue, not the user-written persona (which is
-			// easy to leave unconfigured).
-			issueSection = "## Source issue (public)\n" +
-				"This goal tracks a PUBLIC issue (" + issueRepo + "#" + issueNumber + ") on the git host. " +
-				"Comments you post there with `agentwork issue comment` are read by people outside the platform — " +
-				"write professionally and completely (current status / plan / blockers / conclusions), " +
-				"never mention platform-internal ids or process details.\n"
+	var issueSection string
+	if issueRepo != "" {
+		// The run's goal tracks a PUBLIC issue on the git host. Anything
+		// the agent posts there with `agentwork issue comment` is read by
+		// humans outside the platform — the contract rides EVERY run that
+		// can touch the issue, not the user-written persona (which is
+		// easy to leave unconfigured).
+		issueSection = "## Source issue (public)\n" +
+			"This goal tracks a PUBLIC issue (" + issueRepo + "#" + issueNumber + ") on the git host. " +
+			"Comments you post there with `agentwork issue comment` are read by people outside the platform — " +
+			"write professionally and completely (current status / plan / blockers / conclusions), " +
+			"never mention platform-internal ids or process details.\n"
+	}
+	if len(issueComments) > 0 {
+		var ib strings.Builder
+		ib.WriteString("\n## Latest issue conversation (from the remote)\n")
+		for _, cm := range issueComments {
+			fmt.Fprintf(&ib, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
 		}
-		if len(issueComments) > 0 {
-			var ib strings.Builder
-			ib.WriteString("\n## Latest issue conversation (from the remote)\n")
-			for _, cm := range issueComments {
-				fmt.Fprintf(&ib, "- %s：%s\n", cm.User.Login, truncateIn(cm.Body, 300))
-			}
-			issueSection += ib.String()
-		}
+		issueSection += ib.String()
+	}
 
 	// The domain's acceptance policy in NL (the "what counts as done" the
 	// OWNER defined) — the agent works toward it instead of finding out at
@@ -1949,7 +1954,7 @@ func (d *Daemon) runProcessorTask(ctx context.Context, q *service.ClaimedRow) {
 			RunID: q.RunID, AgentID: q.AgentID, Attempt: q.Attempt, Token: q.Token,
 			Prompt: prompt, Proc: true, Scratch: dType == "scratch",
 			ArtifactFiles: artifactFiles,
-			DomainID: domainID, GitURL: gitURL, GitCredentials: gitCredentials, DefaultBranch: defaultBranch,
+			DomainID:      domainID, GitURL: gitURL, GitCredentials: gitCredentials, DefaultBranch: defaultBranch,
 			ACPSpawn: args, Env: dispatchEnv,
 			McpServers: d.extraMcpServers(ctx, q.AgentID),
 		}, procMachineID)
@@ -2721,9 +2726,9 @@ func (d *Daemon) advanceScheduleNextRun(ctx context.Context, r scheduleDueRow, p
 // promptInputs carries everything the prompt assembly reads.
 type promptInputs struct {
 	agentName, systemPrompt, runRole, goalTitle, policyText, domainType, domainName string
-	triggerCommentID, triggerAuthor, triggerAuthorName, triggerCommentContent string
-	title, desc, handoff, wakeNote, wakeAnchorID, subGoalID string
-	consultRun, reviewRun, verifyRun, subGoalRun bool
+	triggerCommentID, triggerAuthor, triggerAuthorName, triggerCommentContent       string
+	title, desc, handoff, wakeNote, wakeAnchorID, subGoalID                         string
+	consultRun, reviewRun, verifyRun, subGoalRun                                    bool
 }
 
 // assemblePrompt renders the complete run prompt — the fixed block (or, for
@@ -2818,7 +2823,6 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 		}
 	}
 	wakeLine := buildWakeLine(wakeAnchor, wakeWho, wakeContent)
-
 
 	// Wake extras: sub-goal rework context, the mention-cycle hint, and the
 	// resolved-consult answers ride with the wake line.
@@ -2935,4 +2939,3 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 	// wake line alone is the whole message.
 	return wakeLine + extras.String()
 }
-

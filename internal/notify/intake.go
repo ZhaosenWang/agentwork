@@ -70,14 +70,15 @@ func NewIntakeService(qs QueryStore, store SettingsStore, runSvc *service.RunSer
 func intakeSchemaBody() string {
 	return `intake.json 结构：
 {
-  "intent": "create_goal|goal_list|goal_cancel|goal_assign|goal_status|review_list|create_schedule|schedule_list|schedule_stop|create_agent|agent_list|agent_delete|agent_update|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|import_team|domain_create|domain_list|unknown",
+  "intent": "create_goal|goal_list|goal_cancel|goal_assign|goal_reopen|goal_delete|goal_status|review_list|create_schedule|schedule_list|schedule_stop|schedule_enable|schedule_delete|create_agent|agent_list|agent_delete|agent_update|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|import_team|domain_create|domain_list|domain_delete|skill_list|skill_delete|unknown",
   "goal": {"title": "", "description": "", "assignee_id": "", "assignee_type": "", "domain_id": ""},
   "goal_id": "",
   "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "assignee_type": "", "domain_id": ""},
   "agent": {"name": "", "runtime_id": "", "description": "", "system_prompt": "", "skills": [], "skills_specified": false},
   "squad": {"name": "", "leader_id": "", "description": "", "instructions": "", "member_ids": []},
   "import_team": {"git_url": "", "branch": "", "credentials": ""},
-  "domain": {"name": "", "type": "", "git_url": "", "default_branch": "", "git_identity": "", "git_credentials": ""}
+  "domain": {"name": "", "type": "", "git_url": "", "default_branch": "", "git_identity": "", "git_credentials": ""},
+  "skill": {"name": ""}
 }
 
 意图说明：
@@ -89,14 +90,18 @@ func intakeSchemaBody() string {
 - goal_list：用户想查看所有任务/目标列表。不需要其他字段。
 - goal_cancel：用户想取消某个任务。goal_id 填用户提到的任务 id（可能是短 id，照抄）。
 - goal_assign：用户想把某个任务转交给另一个 agent 或 squad。goal_id 填要转交的任务 id（可能是短 id，照抄）；goal.assignee_id 填新执行者的 id（从名单里选，必须真实存在）；goal.assignee_type 填 "agent" 或 "squad"（与 assignee_id 对应，默认 agent）；goal.description 填转交说明/原因（可选）。
+- goal_reopen：用户想重开/恢复一个已结束（完成/失败/取消）的任务。goal_id 填要重开的任务 id（可能是短 id，照抄）；goal.description 填重开原因（可选）。
+- goal_delete：用户想彻底删除某个任务（含其运行记录、子目标、评论等）。goal_id 填要删除的任务 id（可能是短 id，照抄）；多个任务用逗号分隔。
 - create_schedule：用户想创建定时任务/周期性任务（"每 1 个小时做 xxx"、"每天 9 点跑 xxx"、"每周一 xxx"）。schedule.name 填简短任务名；schedule.title 填每次触发时创建的任务标题；schedule.cron 把自然语言频率转成 5 段标准 cron 表达式；schedule.assignee_id 和 schedule.domain_id 从名单里选（必须真实存在）；schedule.assignee_type 填 "agent" 或 "squad"（与 assignee_id 对应，默认 agent）。
 - schedule_list：用户想查看定时任务/计划任务清单。不需要其他字段。
 - schedule_stop：用户想停掉/取消某个定时任务。schedule.name 填用户提到的定时任务名（照抄用户说的名字，可以不完全匹配）。
+- schedule_enable：用户想重新启用/恢复某个已停用的定时任务。schedule.name 填用户提到的定时任务名（照抄用户说的名字）。
+- schedule_delete：用户想彻底删除某个定时任务（含执行历史）。schedule.name 填用户提到的定时任务名（照抄用户说的名字）；多个用逗号分隔。
 - create_agent：用户想创建/配置一个 agent（含人设）。agent.name 必填（中文或英文短名）；agent.runtime_id 从下面的 runtime 名单里选 id（必填，必须真实存在）；agent.description 一句话描述（该 agent 做什么）；agent.system_prompt 是人设/角色说明（你是什么角色、怎么回答、有什么限制），用户没给也要塞一段合理默认值。
   agent.skills 从下面的 skill 名单里选 id——用户明确说"不要 skills"则留空数组；用户完全没提 skills 时 skills 留空数组且 skills_specified=false（平台会反问是否要 skills）。用户指定了 skills（哪怕一个）或明确说不要时 skills_specified=true。
   技术参数（env/model/mcp_servers/max_concurrent）不填（留空），用户后续在 Web 配置。
 - agent_list：用户想查看所有 agent 列表。不需要其他字段。
-- agent_delete：用户想删除某个 agent。agent.name 填要删除的 agent 名字（照抄用户说的名字）。
+- agent_delete：用户想删除某个 agent。agent.name 填要删除的 agent 名字（照抄用户说的名字）；多个 agent 用逗号分隔（如：删掉 agent worker1, worker2）。
 - agent_update：用户想修改某个 agent 的属性（人设/描述/运行时）。agent.name 填要修改的 agent 名字（照抄，不作为修改对象——改名请走 Web）；agent.description/system_prompt/runtime_id 填用户指定的新值（用户没提到的字段留空字符串——平台只改用户指定的字段）。技术参数（env/model/mcp_servers/max_concurrent/skills）不通过指令修改，请在 Web 配置。
 - create_squad：用户想创建一个 squad（团队）。squad.name 必填；squad.leader_id 从下面的 agent 名单里选 id（必填，必须真实存在）；squad.description 一句话描述；squad.instructions 是团队协作指令/规则（给 leader 看的子目标拆分与委派规则，用户没给也要塞一段合理默认值）；squad.member_ids 是成员 agent id 数组（不含 leader——leader 单独在 leader_id 里）。
 - squad_list：用户想查看所有 squad（团队）列表。不需要其他字段。
@@ -104,10 +109,13 @@ func intakeSchemaBody() string {
 - squad_update：用户想修改某个 squad 的属性（换 leader、改描述、改协作规则）。squad.name 填要修改的 squad 名字（照抄）；squad.leader_id/description/instructions 填用户指定的新值（用户没提到的字段留空字符串——平台只改用户指定的字段）。squad.name 不作为修改对象（改名请走 Web）。
 - squad_add_member：用户想给某个 squad 加成员。squad.name 填 squad 名字（照抄）；squad.member_ids 填要加的 agent id 数组（从名单里选，必须真实存在，不含 leader）。
 - squad_remove_member：用户想从某个 squad 移除成员。squad.name 填 squad 名字（照抄）；squad.member_ids 填要移除的 agent id 数组（从名单里选）。
-- squad_delete：用户想删除某个 squad。squad.name 填要删除的 squad 名字（照抄）。
+- squad_delete：用户想删除某个 squad。squad.name 填要删除的 squad 名字（照抄）；多个用逗号分隔。
 - import_team：用户想从 git 仓库导入团队定义。import_team.git_url 必填（用户消息中提到的仓库地址）；import_team.branch 可选（留空用默认分支）；import_team.credentials 可选（私有仓库才需要）。例如："根据 https://gitcode.com/xiaozoom/demo-team.git 创建一个team"。
 - domain_create：用户想创建一个项目/仓库域。domain.name 必填；domain.type 填 "repo"（默认）或 "scratch"（无仓库项目）；domain.git_url 对 repo 类型必填（仓库地址）；domain.default_branch 可选（留空默认 main）；domain.git_identity 和 domain.git_credentials 可选（留空，后续在 Web 配置）。
 - domain_list：用户想查看所有项目/域列表。不需要其他字段。
+- domain_delete：用户想删除某个项目/域。domain.name 填要删除的项目名字（照抄用户说的名字）；多个用逗号分隔。注意：如果该项目下有任务或定时任务，平台会拒绝删除。
+- skill_list：用户想查看所有 skill 列表。不需要其他字段。
+- skill_delete：用户想删除某个 skill。skill.name 填要删除的 skill 名字（照抄用户说的名字）；多个用逗号分隔。注意：如果该 skill 被某个 agent 选用，平台会拒绝删除。
 - unknown：无法归入以上意图（闲聊、问候、无关话题）。
 
 cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时间 Asia/Shanghai）：
@@ -120,7 +128,7 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 - 每月 X 日 Y 点：Y X X * *
 - 无法可靠转换就 intent=unknown，别编造 cron。
 
-规则：intent 只能填上面二十四个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
+规则：intent 只能填上面三十一个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
 `
 }
 
@@ -461,7 +469,7 @@ func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
 func (s *IntakeService) BuildStewardChatBrief(ctx context.Context) (string, error) {
 	var b strings.Builder
 	b.WriteString("# Steward Chat Context\n\n")
-	b.WriteString("你是管家 agent，正在与用户直接对话。你可以正常聊天，但当用户的消息是平台指令时（创建/查看/取消/转交任务、查看待审批、创建/查看定时任务、创建/查看/删除/修改 agent、创建/查看/修改/删除 squad、创建/查看项目、导入团队 等），请按下面的 schema 解析意图，并在回复末尾输出结构化标记。\n\n")
+	b.WriteString("你是管家 agent，正在与用户直接对话。你可以正常聊天，但当用户的消息是平台指令时（创建/查看/取消/转交/重开/删除任务、查看待审批、创建/查看/停用/启用/删除定时任务、创建/查看/删除/修改 agent、创建/查看/修改/删除 squad、创建/查看/删除项目、查看/删除 skill、导入团队 等），请按下面的 schema 解析意图，并在回复末尾输出结构化标记。\n\n")
 	b.WriteString("判断规则：\n")
 	b.WriteString("- 如果用户消息是平台指令 → 按 schema 解析意图，输出标记\n")
 	b.WriteString("- 如果用户消息是闲聊/问候/技术讨论 → 正常回复，不输出标记\n")
@@ -473,9 +481,10 @@ func (s *IntakeService) BuildStewardChatBrief(ctx context.Context) (string, erro
 	b.WriteString("1. 先用一句话说明解析依据\n")
 	b.WriteString("2. 然后输出标记，格式为：\n")
 	b.WriteString("<<<INTAKE_JSON>>>{完整 JSON 对象}<<<END>>>\n")
+	b.WriteString("注意：只需输出 intent 字段和该意图涉及的子对象，其他字段省略。例如 domain_delete 只需 {\"intent\":\"domain_delete\",\"domain\":{\"name\":\"xxx\"}}\n")
 	b.WriteString("示例：\n")
 	b.WriteString("已解析意图：create_goal\n")
-	b.WriteString(`<<<INTAKE_JSON>>>{"intent":"create_goal","goal":{"title":"优化README","description":"","assignee_id":"agent_xxx","domain_id":"domain_xxx"},"goal_id":"","schedule":{"name":"","title":"","description":"","cron":"","assignee_id":"","domain_id":""},"agent":{"name":"","runtime_id":"","description":"","system_prompt":"","skills":[],"skills_specified":false},"squad":{"name":"","leader_id":"","description":"","instructions":"","member_ids":[]},"import_team":{"git_url":"","branch":"","credentials":""},"domain":{"name":"","type":"","git_url":"","default_branch":"","git_identity":"","git_credentials":""}}<<<END>>>`)
+	b.WriteString(`<<<INTAKE_JSON>>>{"intent":"create_goal","goal":{"title":"优化README","assignee_id":"agent_xxx","domain_id":"domain_xxx"}}<<<END>>>`)
 	b.WriteString("\n")
 	return b.String(), nil
 }
