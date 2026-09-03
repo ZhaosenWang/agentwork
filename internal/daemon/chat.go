@@ -52,12 +52,13 @@ type chatEntry struct {
 	// completion, dispatches through intakeReg, and injects the cleaned
 	// reply + dispatch result as synthetic ACP frames via the inject
 	// channel. Non-steward chats are pure pass-through (unchanged).
-	isSteward       bool
-	inject          chan []byte // synthetic frames to the web (buffered)
-	mu              sync.Mutex  // guards steward fields below
-	pendingPromptID json.RawMessage // JSON-RPC id of the in-flight session/prompt (raw: string OR number)
-	sessionID       string      // current ACP session id (from session/prompt params)
-	stewardFrames   []stewardFrame
+	isSteward          bool
+	inject             chan []byte     // synthetic frames to the web (buffered)
+	mu                 sync.Mutex      // guards steward fields below
+	pendingPromptID    json.RawMessage // JSON-RPC id of the in-flight session/prompt (raw: string OR number)
+	sessionID          string          // current ACP session id (from session/prompt params)
+	stewardFrames      []stewardFrame
+	lastDispatchResult string // last dispatch reply (injected into the next prompt so the steward can reference it)
 }
 
 // stewardFrame is one buffered agent text chunk with its machine-stamped seq
@@ -134,12 +135,12 @@ func (d *Daemon) OpenChatForAgent(ctx context.Context, agentID string) (string, 
 		d.chat.chats = map[string]*chatEntry{}
 	}
 	d.chat.chats[res.ChatID] = &chatEntry{
-		machineID:  machineID,
-		cwd:        res.Cwd,
-		pump:       make(chan queuedFrame, 256),
-		done:       make(chan struct{}),
-		isSteward:  isSteward,
-		inject:     make(chan []byte, 16),
+		machineID: machineID,
+		cwd:       res.Cwd,
+		pump:      make(chan queuedFrame, 256),
+		done:      make(chan struct{}),
+		isSteward: isSteward,
+		inject:    make(chan []byte, 16),
 	}
 	d.chat.mu.Unlock()
 	logging.Infof("chat: %s opened for agent %s on machine %s", res.ChatID, agentID, machineID)
@@ -304,7 +305,7 @@ func (d *Daemon) ChatWrite(chatID string, frame []byte) error {
 	frame = normalizeChatFrame(frame, e.cwd)
 	if e.isSteward {
 		interceptStewardPrompt(e, frame)
-		frame = injectStewardRoster(d, frame)
+		frame = injectStewardRoster(d, e, frame)
 	}
 	logChatFrame("web→machine", frame)
 	// No artificial deadline: an agent turn takes as long as it takes, and

@@ -44,10 +44,11 @@ func newIntakeDaemon(t *testing.T) (*Daemon, *store.Store) {
 	agentSvc := service.NewAgentService(st, bus)
 	squadSvc := service.NewSquadService(st, bus)
 	intakeSvc := notify.NewIntakeService(notify.NewSQLQueryStore(st), &mapSettings{vals: map[string]string{}}, runSvc)
+	skillSvc := service.NewSkillService(st)
 	d := &Daemon{
 		st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc, schedSvc: schedSvc,
 		agentSvc: agentSvc, squadSvc: squadSvc, qs: notify.NewSQLQueryStore(st),
-		intakeSvc: intakeSvc, domainSvc: ds,
+		intakeSvc: intakeSvc, domainSvc: ds, skillSvc: skillSvc,
 	}
 	return d, st
 }
@@ -465,14 +466,17 @@ func TestIntakeCreateSquad(t *testing.T) {
 func TestIntakeRegistryIntents(t *testing.T) {
 	want := map[string]bool{
 		"create_goal": true, "goal_list": true, "goal_cancel": true, "goal_assign": true,
+		"goal_reopen": true, "goal_delete": true,
 		"review_list": true, "goal_status": true,
 		"create_schedule": true, "schedule_list": true, "schedule_stop": true,
+		"schedule_enable": true, "schedule_delete": true,
 		"create_agent": true, "agent_list": true, "agent_delete": true, "agent_update": true,
 		"create_squad": true,
-		"squad_list": true, "squad_detail": true, "squad_update": true,
+		"squad_list":   true, "squad_detail": true, "squad_update": true,
 		"squad_add_member": true, "squad_remove_member": true, "squad_delete": true,
-		"import_team": true,
-		"domain_create": true, "domain_list": true,
+		"import_team":   true,
+		"domain_create": true, "domain_list": true, "domain_delete": true,
+		"skill_list": true, "skill_delete": true,
 	}
 	got := make(map[string]bool)
 	for _, c := range intakeReg.cmds {
@@ -657,6 +661,26 @@ func TestIntakeSquadDelete(t *testing.T) {
 	}
 }
 
+// TestIntakeSquadDeleteBatch: comma-separated names delete individually with
+// per-item result + summary.
+func TestIntakeSquadDeleteBatch(t *testing.T) {
+	d, _ := newIntakeDaemon(t)
+	ctx := context.Background()
+	d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub("组A", "a1", "", "", nil)})
+	d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub("组B", "a1", "", "", nil)})
+
+	reply := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("组A, 组B, 不存在", "", "", "", nil)})
+	if !strings.Contains(reply, "组A") || !strings.Contains(reply, "组B") {
+		t.Fatalf("must report deleted squads, got %q", reply)
+	}
+	if !strings.Contains(reply, "不存在") {
+		t.Fatalf("must report failed squad, got %q", reply)
+	}
+	if !strings.Contains(reply, "成功 2") || !strings.Contains(reply, "失败 1") {
+		t.Fatalf("must have summary, got %q", reply)
+	}
+}
+
 // TestIntakeListGoals: empty list says so; populated list carries title,
 // short id, status, and assignee display name.
 func TestIntakeListGoals(t *testing.T) {
@@ -807,6 +831,50 @@ func TestIntakeDeleteAgent(t *testing.T) {
 	}
 }
 
+// TestIntakeDeleteAgentBatch: comma-separated names delete individually with
+// per-item result; partial success + guarded failure + summary line.
+func TestIntakeDeleteAgentBatch(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	// Seed worker2, worker3 (worker1 is seeded by newIntakeDaemon).
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,runtime_id,max_concurrent,created_at) VALUES ('a2','worker2','rt1',1,?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO agent (id,name,runtime_id,max_concurrent,created_at) VALUES ('a3','worker3','rt1',1,?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	// worker1 has a goal → guarded.
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	d.goalSvc.Create(ctx, service.Goal{
+		Title: "占用a1", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+
+	// Batch: worker2 ✅, worker1 ❌ (guarded), worker3 ✅, ghost ❌ (not found).
+	reply := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker2, worker1, worker3, ghost", "", "", "", nil, true)})
+	if !strings.Contains(reply, "worker2") || !strings.Contains(reply, "worker3") {
+		t.Fatalf("must report deleted agents, got %q", reply)
+	}
+	if !strings.Contains(reply, "worker1") || !strings.Contains(reply, "ghost") {
+		t.Fatalf("must report failed agents, got %q", reply)
+	}
+	if !strings.Contains(reply, "成功 2") || !strings.Contains(reply, "失败 2") {
+		t.Fatalf("must have summary line, got %q", reply)
+	}
+	// worker2 and worker3 gone, worker1 still exists.
+	for _, name := range []string{"worker2", "worker3"} {
+		var n int
+		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM agent WHERE name=?`, name).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 0 {
+			t.Fatalf("%s must be deleted", name)
+		}
+	}
+}
+
 // TestIntakeUpdateAgent: partial update changes only the specified field;
 // no changes asks what to change; non-existent name says not found.
 func TestIntakeUpdateAgent(t *testing.T) {
@@ -920,5 +988,340 @@ func TestIntakeListDomains(t *testing.T) {
 	}
 	if !strings.Contains(list, "repo") {
 		t.Fatalf("list must show domain type, got %q", list)
+	}
+}
+
+// TestIntakeReopenGoal: reopen succeeds on a cancelled goal; reopening an
+// active goal fails; missing id asks; unknown id says not found.
+func TestIntakeReopenGoal(t *testing.T) {
+	d, _ := newIntakeDaemon(t)
+	ctx := context.Background()
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	g, err := d.goalSvc.Create(ctx, service.Goal{
+		Title: "可重开", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cancel it first so it becomes reopenable.
+	if _, err := d.goalSvc.Cancel(ctx, g.ID); err != nil {
+		t.Fatal(err)
+	}
+	reply := d.intakeReopenGoal(ctx, intakeAction{GoalID: g.ID[:8]})
+	if !strings.Contains(reply, "已重开") {
+		t.Fatalf("reopen must succeed, got %q", reply)
+	}
+	// Reopen an active goal → fails.
+	d.goalSvc.Create(ctx, service.Goal{
+		Title: "活跃的", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	var activeID string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT id FROM goal WHERE title=?`, "活跃的").Scan(&activeID); err != nil {
+		t.Fatal(err)
+	}
+	if r := d.intakeReopenGoal(ctx, intakeAction{GoalID: activeID[:8]}); !strings.Contains(r, "重开失败") {
+		t.Fatalf("reopen active must fail, got %q", r)
+	}
+	// No id.
+	if r := d.intakeReopenGoal(ctx, intakeAction{}); !strings.Contains(r, "需要任务 id") {
+		t.Fatalf("no id must ask, got %q", r)
+	}
+	// Unknown id.
+	if r := d.intakeReopenGoal(ctx, intakeAction{GoalID: "zzzzzzzz"}); !strings.Contains(r, "找不到") {
+		t.Fatalf("unknown id must say not found, got %q", r)
+	}
+}
+
+// TestIntakeDeleteGoal: delete succeeds on a free goal; missing id asks;
+// unknown id says not found.
+func TestIntakeDeleteGoal(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	g, err := d.goalSvc.Create(ctx, service.Goal{
+		Title: "可删除", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := d.intakeDeleteGoal(ctx, g.ID[:8])
+	if !strings.Contains(reply, "已删除") {
+		t.Fatalf("delete must succeed, got %q", reply)
+	}
+	var count int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM goal WHERE id=?`, g.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("goal must be deleted, got %d rows", count)
+	}
+	// No id.
+	if r := d.intakeDeleteGoal(ctx, ""); !strings.Contains(r, "需要任务 id") {
+		t.Fatalf("no id must ask, got %q", r)
+	}
+	// Unknown id.
+	if r := d.intakeDeleteGoal(ctx, "zzzzzzzz"); !strings.Contains(r, "找不到") {
+		t.Fatalf("unknown id must say not found, got %q", r)
+	}
+}
+
+// TestIntakeScheduleEnable: enable succeeds on a disabled schedule;
+// enabling an already-enabled schedule says not found (among disabled);
+// recompute next_run_at puts it in the future.
+func TestIntakeScheduleEnable(t *testing.T) {
+	d, _ := newIntakeDaemon(t)
+	ctx := context.Background()
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	// Create + stop a schedule.
+	d.intakeCreateSchedule(ctx, intakeAction{Intent: "create_schedule", Schedule: struct {
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
+	}{Name: "每小时巡检", Title: "定时巡检", Cron: "0 * * * *", AssigneeID: "a1", DomainID: domID}})
+	d.intakeScheduleStop(ctx, intakeAction{Intent: "schedule_stop", Schedule: struct {
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
+	}{Name: "每小时巡检"}})
+
+	// Enable it back.
+	reply := d.intakeScheduleEnable(ctx, intakeAction{Intent: "schedule_enable", Schedule: struct {
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
+	}{Name: "每小时巡检"}})
+	if !strings.Contains(reply, "已启用") {
+		t.Fatalf("enable must succeed, got %q", reply)
+	}
+	// next_run_at must be in the future.
+	var nextStr string
+	if err := d.st.DB().QueryRowContext(ctx,
+		`SELECT next_run_at FROM schedule WHERE name=?`, "每小时巡检").Scan(&nextStr); err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextStr)
+	if err != nil {
+		t.Fatalf("next_run_at must be parseable: %v", err)
+	}
+	if !next.After(time.Now()) {
+		t.Fatalf("next_run_at must be in the future, got %v", next)
+	}
+	// Enable non-existent.
+	if r := d.intakeScheduleEnable(ctx, intakeAction{Intent: "schedule_enable", Schedule: struct {
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
+	}{Name: "不存在"}}); !strings.Contains(r, "没找到") {
+		t.Fatalf("enable non-existent must say so, got %q", r)
+	}
+}
+
+// TestIntakeScheduleDelete: delete removes the schedule (enabled or disabled);
+// non-existent says not found.
+func TestIntakeScheduleDelete(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
+	d.intakeCreateSchedule(ctx, intakeAction{Intent: "create_schedule", Schedule: struct {
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
+	}{Name: "待删除", Title: "x", Cron: "0 * * * *", AssigneeID: "a1", DomainID: domID}})
+
+	reply := d.intakeScheduleDelete(ctx, intakeAction{Intent: "schedule_delete", Schedule: struct {
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
+	}{Name: "待删除"}})
+	if !strings.Contains(reply, "已删除") {
+		t.Fatalf("delete must succeed, got %q", reply)
+	}
+	var count int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM schedule WHERE name=?`, "待删除").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("schedule must be deleted, got %d rows", count)
+	}
+	// Non-existent.
+	if r := d.intakeScheduleDelete(ctx, intakeAction{Intent: "schedule_delete", Schedule: struct {
+		Name         string `json:"name"`
+		Title        string `json:"title"`
+		Description  string `json:"description"`
+		Cron         string `json:"cron"`
+		AssigneeID   string `json:"assignee_id"`
+		AssigneeType string `json:"assignee_type"`
+		DomainID     string `json:"domain_id"`
+	}{Name: "不存在"}}); !strings.Contains(r, "没找到") {
+		t.Fatalf("delete non-existent must say so, got %q", r)
+	}
+}
+
+// TestIntakeListSkills: empty list says so; populated list carries name.
+func TestIntakeListSkills(t *testing.T) {
+	ctx := context.Background()
+
+	// Empty.
+	d, _ := newIntakeDaemon(t)
+	if r := d.intakeListSkills(ctx); !strings.Contains(r, "没有 skill") {
+		t.Fatalf("empty list, got %q", r)
+	}
+	// With a skill.
+	if _, err := d.st.DB().ExecContext(ctx,
+		`INSERT INTO skill (id,name,description,created_at) VALUES ('sk1','git-helper','git helper',?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	list := d.intakeListSkills(ctx)
+	if !strings.Contains(list, "git-helper") {
+		t.Fatalf("list must show skill name, got %q", list)
+	}
+}
+
+// TestIntakeDeleteSkill: delete succeeds on a free skill; skill selected by
+// an agent is guarded; non-existent says not found.
+func TestIntakeDeleteSkill(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO skill (id,name,description,created_at) VALUES ('sk1','git-helper','git helper',?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	reply := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "git-helper"}})
+	if !strings.Contains(reply, "已删除") {
+		t.Fatalf("delete must succeed, got %q", reply)
+	}
+	var count int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM skill WHERE name=?`, "git-helper").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("skill must be deleted, got %d rows", count)
+	}
+	// Skill selected by an agent → guarded.
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO skill (id,name,description,created_at) VALUES ('sk2','web-scraper','scrapes web',?)`,
+		time.Now().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	// Agent a1 selects sk2 (the skills column stores JSON array of id strings).
+	if _, err := st.DB().ExecContext(ctx,
+		`UPDATE agent SET skills='["sk2"]' WHERE id='a1'`); err != nil {
+		t.Fatal(err)
+	}
+	if r := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "web-scraper"}}); !strings.Contains(r, "失败") {
+		t.Fatalf("skill selected by agent must fail, got %q", r)
+	}
+	// Non-existent.
+	if r := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "不存在"}}); !strings.Contains(r, "没找到") {
+		t.Fatalf("non-existent must say so, got %q", r)
+	}
+}
+
+// TestIntakeDeleteSkillBatch: comma-separated names delete individually.
+func TestIntakeDeleteSkillBatch(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	now := time.Now().Format(time.RFC3339Nano)
+	for _, s := range []struct{ id, name string }{
+		{"sk1", "skill-a"}, {"sk2", "skill-b"}, {"sk3", "skill-c"},
+	} {
+		if _, err := st.DB().ExecContext(ctx,
+			`INSERT INTO skill (id,name,description,created_at) VALUES (?,?,?,?)`, s.id, s.name, "", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// sk3 is selected by agent a1 → guarded.
+	if _, err := st.DB().ExecContext(ctx, `UPDATE agent SET skills='["sk3"]' WHERE id='a1'`); err != nil {
+		t.Fatal(err)
+	}
+
+	reply := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "skill-a, skill-c, skill-b, ghost"}})
+	if !strings.Contains(reply, "skill-a") || !strings.Contains(reply, "skill-b") {
+		t.Fatalf("must report deleted skills, got %q", reply)
+	}
+	if !strings.Contains(reply, "skill-c") || !strings.Contains(reply, "ghost") {
+		t.Fatalf("must report failed skills, got %q", reply)
+	}
+	if !strings.Contains(reply, "成功 2") || !strings.Contains(reply, "失败 2") {
+		t.Fatalf("must have summary, got %q", reply)
+	}
+}
+
+// TestIntakeDeleteDomain: delete succeeds on a free domain; domain with a
+// goal is guarded; non-existent says not found.
+func TestIntakeDeleteDomain(t *testing.T) {
+	d, st := newIntakeDaemon(t)
+	ctx := context.Background()
+	// Create an extra domain (d1 is seeded and has a goal in some tests).
+	d.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("free-repo", "repo", "https://e.com/free.git")})
+
+	reply := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("free-repo", "", "")})
+	if !strings.Contains(reply, "已删除") {
+		t.Fatalf("delete must succeed, got %q", reply)
+	}
+	var count int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM domain WHERE name=?`, "free-repo").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("domain must be deleted, got %d rows", count)
+	}
+	// Domain with a goal → guarded (d1 has no goal yet, create one).
+	domID := firstID(t, ctx, d, `SELECT id FROM domain WHERE name='d1'`)
+	d.goalSvc.Create(ctx, service.Goal{
+		Title: "占用d1", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+	if r := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("d1", "", "")}); !strings.Contains(r, "失败") {
+		t.Fatalf("domain with goal must fail, got %q", r)
+	}
+	// Non-existent.
+	if r := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("不存在", "", "")}); !strings.Contains(r, "没找到") {
+		t.Fatalf("non-existent must say so, got %q", r)
+	}
+}
+
+// TestIntakeDeleteDomainBatch: comma-separated names delete individually.
+func TestIntakeDeleteDomainBatch(t *testing.T) {
+	d, _ := newIntakeDaemon(t)
+	ctx := context.Background()
+	d.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("repo-a", "repo", "https://e.com/a.git")})
+	d.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("repo-b", "repo", "https://e.com/b.git")})
+	// d1 has a goal → guarded.
+	domID := firstID(t, ctx, d, `SELECT id FROM domain WHERE name='d1'`)
+	d.goalSvc.Create(ctx, service.Goal{
+		Title: "占用d1", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
+
+	reply := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("repo-a, d1, repo-b, ghost", "", "")})
+	if !strings.Contains(reply, "repo-a") || !strings.Contains(reply, "repo-b") {
+		t.Fatalf("must report deleted domains, got %q", reply)
+	}
+	if !strings.Contains(reply, "d1") || !strings.Contains(reply, "ghost") {
+		t.Fatalf("must report failed domains, got %q", reply)
+	}
+	if !strings.Contains(reply, "成功 2") || !strings.Contains(reply, "失败 2") {
+		t.Fatalf("must have summary, got %q", reply)
 	}
 }

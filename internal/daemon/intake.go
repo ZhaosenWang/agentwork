@@ -153,6 +153,13 @@ type intakeAction struct {
 	Squad      squadAction      `json:"squad"`
 	ImportTeam importTeamAction `json:"import_team"`
 	Domain     domainAction     `json:"domain"`
+	Skill      skillAction      `json:"skill"`
+}
+
+// skillAction carries the skill_list / skill_delete fields. Only name is
+// needed (skills are identified by name, same as agents/squads).
+type skillAction struct {
+	Name string `json:"name"`
 }
 
 // importTeamAction carries the import_team fields parsed from NL.
@@ -279,6 +286,20 @@ var intakeReg = &intakeRegistry{cmds: []intakeCommand{
 		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateDomain(ctx, p) }},
 	{"domain_list", func() string { return "查看项目列表" },
 		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeListDomains(ctx) }},
+	{"goal_reopen", func() string { return "重开任务 <id>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeReopenGoal(ctx, p) }},
+	{"goal_delete", func() string { return "删除任务 <id>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeDeleteGoal(ctx, p.GoalID) }},
+	{"schedule_enable", func() string { return "启用定时任务 <名字>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeScheduleEnable(ctx, p) }},
+	{"schedule_delete", func() string { return "删除定时任务 <名字>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeScheduleDelete(ctx, p) }},
+	{"skill_list", func() string { return "查看 skill 列表" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeListSkills(ctx) }},
+	{"skill_delete", func() string { return "删掉 skill <名字>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeDeleteSkill(ctx, p) }},
+	{"domain_delete", func() string { return "删除项目 <名字>" },
+		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeDeleteDomain(ctx, p) }},
 }}
 
 // dispatch finds the intent in the registry and calls its handler; if not
@@ -422,7 +443,8 @@ func (d *Daemon) intakeReviewList(ctx context.Context) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔔 待审批（%d 个）：\n", len(goals))
 	for _, g := range goals {
-		fmt.Fprintf(&b, "- %s（%s）\n  %s\n", g.Title, shortID(g.GoalID), firstLineIn(g.Reason))
+		nameID := fmt.Sprintf("%s（%s）", g.Title, shortID(g.GoalID))
+		fmt.Fprintf(&b, "- %s | %s\n", nameID, truncateIn(firstLineIn(g.Reason), listDescLimit))
 	}
 	b.WriteString("\n在飞书里点对应卡片的按钮，或打开 Web 审批队列处理。")
 	return b.String()
@@ -523,9 +545,12 @@ func (d *Daemon) intakeScheduleList(ctx context.Context) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "📅 启用的定时任务（%d 个）：\n", len(enabled))
 	for _, s := range enabled {
-		fmt.Fprintf(&b, "- %s（%s）\n", s.Name, s.CronExpression)
-		if s.Description != "" {
-			b.WriteString("  " + firstLineIn(s.Description) + "\n")
+		nameCron := fmt.Sprintf("%s（%s）", s.Name, s.CronExpression)
+		desc := truncateIn(firstLineIn(s.Description), listDescLimit)
+		if desc != "" {
+			fmt.Fprintf(&b, "- %s | %s\n", nameCron, desc)
+		} else {
+			fmt.Fprintf(&b, "- %s\n", nameCron)
 		}
 	}
 	b.WriteString("\n停掉某个：发送“停掉定时任务 <名字>”")
@@ -720,11 +745,12 @@ func (d *Daemon) intakeSquadList(ctx context.Context) string {
 	for _, sq := range all {
 		leader := d.agentDisplayName(ctx, sq.LeaderID)
 		members, _ := d.squadSvc.ListMembers(ctx, sq.ID)
-		fmt.Fprintf(&b, "- %s（%s）leader: %s", sq.Name, shortID(sq.ID), leader)
+		nameID := fmt.Sprintf("%s（%s）", sq.Name, shortID(sq.ID))
+		detail := "leader: " + leader
 		if n := len(members); n > 0 {
-			fmt.Fprintf(&b, "，成员 %d 人", n)
+			detail += fmt.Sprintf("，成员 %d 人", n)
 		}
-		b.WriteString("\n")
+		fmt.Fprintf(&b, "- %s | %s\n", nameID, detail)
 	}
 	b.WriteString("\n查看详情：发送「查看 squad <名字>」")
 	return b.String()
@@ -877,20 +903,27 @@ func (d *Daemon) intakeSquadRemoveMember(ctx context.Context, parsed intakeActio
 }
 
 // intakeSquadDelete deletes a squad. Goals assigned to it fall back to human
-// (the service layer handles this).
+// (the service layer handles this). Supports comma-separated batch delete.
 func (d *Daemon) intakeSquadDelete(ctx context.Context, parsed intakeAction) string {
-	name := strings.TrimSpace(parsed.Squad.Name)
-	if name == "" {
+	raw := strings.TrimSpace(parsed.Squad.Name)
+	if raw == "" {
 		return "删除 squad 需要名字（如：删除 squad 审查组）"
 	}
-	sq, err := d.resolveSquadByName(ctx, name)
-	if err != nil {
-		return err.Error()
+	deleteOne := func(name string) string {
+		sq, err := d.resolveSquadByName(ctx, name)
+		if err != nil {
+			return err.Error()
+		}
+		if err := d.squadSvc.Delete(ctx, sq.ID); err != nil {
+			return "删除 squad 失败：" + err.Error()
+		}
+		return fmt.Sprintf("✅ 已删除 squad：%s（%s）", sq.Name, shortID(sq.ID))
 	}
-	if err := d.squadSvc.Delete(ctx, sq.ID); err != nil {
-		return "删除 squad 失败：" + err.Error()
+	names := splitAndTrim(raw)
+	if len(names) == 1 {
+		return deleteOne(names[0])
 	}
-	return fmt.Sprintf("✅ 已删除 squad：%s（%s）", sq.Name, shortID(sq.ID))
+	return batchDelete(names, deleteOne)
 }
 
 // intakeImportTeam triggers a team-repo import from a git URL parsed out of
@@ -933,7 +966,8 @@ func (d *Daemon) intakeListGoals(ctx context.Context) string {
 	fmt.Fprintf(&b, "📋 任务列表（显示最近 %d 个）：\n", len(goals))
 	for _, g := range goals {
 		assignee := d.assigneeDisplayName(ctx, g.AssigneeType, g.AssigneeID)
-		fmt.Fprintf(&b, "- %s（%s）[%s] 执行者：%s\n", g.Title, shortID(g.ID), g.Status, assignee)
+		nameID := fmt.Sprintf("%s（%s）", g.Title, shortID(g.ID))
+		fmt.Fprintf(&b, "- %s | [%s] | 执行者：%s\n", nameID, g.Status, assignee)
 	}
 	b.WriteString("\n查询详情：发送「查询任务状态 <id>」")
 	return b.String()
@@ -997,11 +1031,13 @@ func (d *Daemon) intakeListAgents(ctx context.Context) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "🤖 agent 列表（%d 个）：\n", len(agents))
 	for _, a := range agents {
-		line := fmt.Sprintf("- %s（%s）", a.Name, shortID(a.ID))
-		if a.Description != "" {
-			line += " " + firstLineIn(a.Description)
+		nameID := fmt.Sprintf("%s（%s）", a.Name, shortID(a.ID))
+		desc := truncateIn(firstLineIn(a.Description), listDescLimit)
+		if desc != "" {
+			fmt.Fprintf(&b, "- %s | %s\n", nameID, desc)
+		} else {
+			fmt.Fprintf(&b, "- %s\n", nameID)
 		}
-		b.WriteString(line + "\n")
 	}
 	b.WriteString("\n配置/查看详情：打开 Web Agents 页面")
 	return b.String()
@@ -1010,19 +1046,28 @@ func (d *Daemon) intakeListAgents(ctx context.Context) string {
 // intakeDeleteAgent answers "删掉 agent <名字>" — resolves by name, then calls
 // the agent service's Delete (which has referential guards: goals, schedules,
 // squads, running runs all block the delete with a coded error).
+// Supports comma-separated batch delete: each result is reported on its own
+// line; a single name produces the original one-line reply (no summary).
 func (d *Daemon) intakeDeleteAgent(ctx context.Context, parsed intakeAction) string {
-	name := strings.TrimSpace(parsed.Agent.Name)
-	if name == "" {
+	raw := strings.TrimSpace(parsed.Agent.Name)
+	if raw == "" {
 		return "删除 agent 需要名字（如：删掉 agent worker1）"
 	}
-	existing, err := d.resolveAgentByName(ctx, name)
-	if err != nil {
-		return err.Error()
+	deleteOne := func(name string) string {
+		existing, err := d.resolveAgentByName(ctx, name)
+		if err != nil {
+			return err.Error()
+		}
+		if err := d.agentSvc.Delete(ctx, existing.ID); err != nil {
+			return "删除 agent 失败：" + err.Error()
+		}
+		return fmt.Sprintf("✅ 已删除 agent：%s（%s）", existing.Name, shortID(existing.ID))
 	}
-	if err := d.agentSvc.Delete(ctx, existing.ID); err != nil {
-		return "删除 agent 失败：" + err.Error()
+	names := splitAndTrim(raw)
+	if len(names) == 1 {
+		return deleteOne(names[0])
 	}
-	return fmt.Sprintf("✅ 已删除 agent：%s（%s）", existing.Name, shortID(existing.ID))
+	return batchDelete(names, deleteOne)
 }
 
 // intakeUpdateAgent answers "把 agent <名字> 的人设/描述改成 <新值>" — resolves
@@ -1125,14 +1170,239 @@ func (d *Daemon) intakeListDomains(ctx context.Context) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "📁 项目列表（%d 个）：\n", len(domains))
 	for _, dm := range domains {
-		line := fmt.Sprintf("- %s（%s）[%s]", dm.Name, shortID(dm.ID), dm.Type)
+		nameID := fmt.Sprintf("%s（%s）", dm.Name, shortID(dm.ID))
+		detail := fmt.Sprintf("[%s]", dm.Type)
 		if dm.GitURL != "" {
-			line += " " + dm.GitURL
+			detail += " " + dm.GitURL
 		}
-		b.WriteString(line + "\n")
+		fmt.Fprintf(&b, "- %s | %s\n", nameID, detail)
 	}
 	b.WriteString("\n创建任务时指定项目名即可")
 	return b.String()
+}
+
+// intakeReopenGoal answers "重开任务 <id>" — resolves the short id, then calls
+// the goal service's Reopen (which accepts only done/failed/cancelled goals).
+// goal.description carries the optional reopen reason.
+func (d *Daemon) intakeReopenGoal(ctx context.Context, parsed intakeAction) string {
+	id := strings.TrimSpace(parsed.GoalID)
+	if id == "" {
+		return "重开任务需要任务 id（如：重开任务 3f2a1b）"
+	}
+	v, err := d.qs.GoalStatus(ctx, id)
+	if err != nil {
+		return "重开失败：找不到该任务（" + err.Error() + "）"
+	}
+	reason := strings.TrimSpace(parsed.Goal.Description)
+	if _, err := d.goalSvc.Reopen(ctx, v.GoalID, reason, ""); err != nil {
+		return "重开失败：" + err.Error()
+	}
+	return fmt.Sprintf("✅ 已重开任务：%s（%s）", v.Title, shortID(v.GoalID))
+}
+
+// intakeDeleteGoal answers "删除任务 <id>" — resolves the short id for the
+// title (used in the reply), then calls the goal service's Delete (which
+// cascades to runs, sub-goals, comments, activity logs, etc.).
+// Supports comma-separated batch delete.
+func (d *Daemon) intakeDeleteGoal(ctx context.Context, id string) string {
+	raw := strings.TrimSpace(id)
+	if raw == "" {
+		return "删除任务需要任务 id（如：删除任务 3f2a1b）"
+	}
+	deleteOne := func(idOrShort string) string {
+		v, err := d.qs.GoalStatus(ctx, idOrShort)
+		if err != nil {
+			return "删除失败：找不到该任务（" + err.Error() + "）"
+		}
+		if err := d.goalSvc.Delete(ctx, v.GoalID); err != nil {
+			return "删除失败：" + err.Error()
+		}
+		logging.Infof("daemon: intake deleted goal %s (%s)", v.GoalID, v.Title)
+		return fmt.Sprintf("🗑 已删除任务：%s（%s）", v.Title, shortID(v.GoalID))
+	}
+	ids := splitAndTrim(raw)
+	if len(ids) == 1 {
+		return deleteOne(ids[0])
+	}
+	return batchDelete(ids, deleteOne)
+}
+
+// intakeScheduleEnable answers "启用定时任务 <名字>" — finds the disabled
+// schedule by name, re-enables it, and recomputes next_run_at from now (a
+// schedule stopped long ago has a stale next_run_at that would fire
+// immediately on the next dispatch tick).
+func (d *Daemon) intakeScheduleEnable(ctx context.Context, parsed intakeAction) string {
+	name := strings.TrimSpace(parsed.Schedule.Name)
+	if name == "" {
+		return "启用定时任务需要名字（如：启用定时任务 每小时巡检）"
+	}
+	all, err := d.schedSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+	var target *service.Schedule
+	for i := range all {
+		if !all[i].Enabled && all[i].Name == name {
+			target = &all[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Sprintf("没找到已停用的定时任务 %q——先「查看定时任务」确认名字", name)
+	}
+	s, err := d.schedSvc.SetEnabled(ctx, target.ID, true)
+	if err != nil {
+		return "启用失败：" + err.Error()
+	}
+	next, err := service.ComputeNextRun(s.CronExpression, s.Timezone, time.Now())
+	if err != nil {
+		logging.Warnf("daemon: schedule %s recompute next_run_at failed: %v", s.ID, err)
+	} else {
+		if _, err := d.st.DB().ExecContext(ctx,
+			`UPDATE schedule SET next_run_at=? WHERE id=?`,
+			next.Format(time.RFC3339Nano), s.ID); err != nil {
+			logging.Errorf("daemon: schedule %s update next_run_at: %v", s.ID, err)
+		}
+	}
+	nextStr := next.Format("01-02 15:04")
+	return fmt.Sprintf("▶️ 已启用定时任务：%s（%s），下次执行 %s（本地时间）", s.Name, s.CronExpression, nextStr)
+}
+
+// intakeScheduleDelete answers "删除定时任务 <名字>" — finds the schedule by
+// name (enabled or disabled), then calls the service's Delete (which removes
+// the row and its firing history). Derived goals keep their original
+// assignment. Supports comma-separated batch delete.
+func (d *Daemon) intakeScheduleDelete(ctx context.Context, parsed intakeAction) string {
+	raw := strings.TrimSpace(parsed.Schedule.Name)
+	if raw == "" {
+		return "删除定时任务需要名字（如：删除定时任务 每小时巡检）"
+	}
+	names := splitAndTrim(raw)
+	if len(names) == 1 {
+		return d.deleteScheduleByName(ctx, names[0])
+	}
+	return batchDelete(names, func(name string) string { return d.deleteScheduleByName(ctx, name) })
+}
+
+func (d *Daemon) deleteScheduleByName(ctx context.Context, name string) string {
+	all, err := d.schedSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+	var target *service.Schedule
+	for i := range all {
+		if all[i].Name == name {
+			target = &all[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Sprintf("没找到定时任务 %q", name)
+	}
+	if err := d.schedSvc.Delete(ctx, target.ID); err != nil {
+		return "删除失败：" + err.Error()
+	}
+	return fmt.Sprintf("🗑 已删除定时任务：%s（%s）", target.Name, target.CronExpression)
+}
+
+// intakeListSkills answers "查看 skill 列表" with all skill names (compact,
+// one per line — IM/chat readability over detail; descriptions are Web-only).
+func (d *Daemon) intakeListSkills(ctx context.Context) string {
+	if d.skillSvc == nil {
+		return "查询失败：skill 服务未接线"
+	}
+	skills, err := d.skillSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+	if len(skills) == 0 {
+		return "📭 当前没有 skill"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "🔧 skill 列表（%d 个）：\n", len(skills))
+	for _, sk := range skills {
+		fmt.Fprintf(&b, "- %s\n", sk.Name)
+	}
+	return b.String()
+}
+
+// intakeDeleteSkill answers "删掉 skill <名字>" — resolves by name, then calls
+// the skill service's Delete (which has a referential guard: skills selected
+// by any agent cannot be deleted). Supports comma-separated batch delete.
+func (d *Daemon) intakeDeleteSkill(ctx context.Context, parsed intakeAction) string {
+	if d.skillSvc == nil {
+		return "删除失败：skill 服务未接线"
+	}
+	raw := strings.TrimSpace(parsed.Skill.Name)
+	if raw == "" {
+		return "删除 skill 需要名字（如：删掉 skill git-helper）"
+	}
+	names := splitAndTrim(raw)
+	if len(names) == 1 {
+		return d.deleteSkillByName(ctx, names[0])
+	}
+	return batchDelete(names, func(name string) string { return d.deleteSkillByName(ctx, name) })
+}
+
+func (d *Daemon) deleteSkillByName(ctx context.Context, name string) string {
+	skills, err := d.skillSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+	var target *service.Skill
+	for i := range skills {
+		if skills[i].Name == name {
+			target = &skills[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Sprintf("没找到 skill %q", name)
+	}
+	if err := d.skillSvc.Delete(ctx, target.ID); err != nil {
+		return "删除 skill 失败：" + err.Error()
+	}
+	return fmt.Sprintf("🗑 已删除 skill：%s（%s）", target.Name, shortID(target.ID))
+}
+
+// intakeDeleteDomain answers "删除项目 <名字>" — resolves by name, then calls
+// the domain service's Delete (which has referential guards: goals or
+// schedules referencing the domain block the delete). Supports comma-separated
+// batch delete.
+func (d *Daemon) intakeDeleteDomain(ctx context.Context, parsed intakeAction) string {
+	if d.domainSvc == nil {
+		return "删除失败：domain 服务未接线"
+	}
+	raw := strings.TrimSpace(parsed.Domain.Name)
+	if raw == "" {
+		return "删除项目需要名字（如：删除项目 myrepo）"
+	}
+	names := splitAndTrim(raw)
+	if len(names) == 1 {
+		return d.deleteDomainByName(ctx, names[0])
+	}
+	return batchDelete(names, func(name string) string { return d.deleteDomainByName(ctx, name) })
+}
+
+func (d *Daemon) deleteDomainByName(ctx context.Context, name string) string {
+	domains, err := d.domainSvc.List(ctx)
+	if err != nil {
+		return "查询失败：" + err.Error()
+	}
+	var target *service.Domain
+	for i := range domains {
+		if domains[i].Name == name {
+			target = &domains[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Sprintf("没找到项目 %q", name)
+	}
+	if err := d.domainSvc.Delete(ctx, target.ID); err != nil {
+		return "删除项目失败：" + err.Error()
+	}
+	return fmt.Sprintf("🗑 已删除项目：%s（%s）", target.Name, shortID(target.ID))
 }
 
 // collectAndAsk builds ONE clarification message listing all missing required
@@ -1451,11 +1721,54 @@ func (d *Daemon) intakeAgentList(ctx context.Context) string {
 	return b.String()
 }
 
+// listDescLimit is the max character count for description fields in list
+// replies (IM/chat readability — full descriptions are on the Web).
+const listDescLimit = 40
+
 func shortID(id string) string {
 	if len(id) > 8 {
 		return id[:8]
 	}
 	return id
+}
+
+// splitAndTrim splits a comma-separated string into trimmed non-empty parts.
+func splitAndTrim(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// batchDelete runs deleteOne for each name and assembles a per-item result +
+// summary. deleteOne returns a string starting with a success emoji (🗑/✅) on
+// success, or an error message on failure. A single name skips the summary
+// line (caller handles that path); this is only called for 2+ names.
+func batchDelete(names []string, deleteOne func(name string) string) string {
+	var b strings.Builder
+	succeeded, failed := 0, 0
+	for _, name := range names {
+		r := deleteOne(name)
+		if isDeleteSuccess(r) {
+			b.WriteString(r + "\n")
+			succeeded++
+		} else {
+			fmt.Fprintf(&b, "❌ %s：%s\n", name, firstLineIn(r))
+			failed++
+		}
+	}
+	fmt.Fprintf(&b, "共 %d 个：成功 %d，失败 %d", len(names), succeeded, failed)
+	return b.String()
+}
+
+// isDeleteSuccess reports whether a deleteOne result string indicates success
+// (starts with the deletion/success emoji).
+func isDeleteSuccess(r string) bool {
+	return strings.HasPrefix(r, "🗑") || strings.HasPrefix(r, "✅")
 }
 
 func firstLineIn(s string) string {
