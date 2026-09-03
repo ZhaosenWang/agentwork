@@ -51,7 +51,7 @@ func (s *IntakeService) SetAgentService(as *service.AgentService) {
 // vague reply that still misses required fields fails at the service
 // layer (a terminal error) rather than re-asking.
 type IntakeDraft struct {
-	Kind      string `json:"kind"`    // "goal" | "agent" | "squad"
+	Kind      string `json:"kind"`    // "goal" | "agent" | "squad" | "domain"
 	Payload   string `json:"payload"` // JSON of the create_X sub-struct
 	CreatedAt string `json:"created_at"`
 }
@@ -70,13 +70,14 @@ func NewIntakeService(qs QueryStore, store SettingsStore, runSvc *service.RunSer
 func intakeSchemaBody() string {
 	return `intake.json 结构：
 {
-  "intent": "create_goal|review_list|goal_status|create_schedule|schedule_list|schedule_stop|create_agent|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|import_team|unknown",
+  "intent": "create_goal|goal_list|goal_cancel|goal_assign|goal_status|review_list|create_schedule|schedule_list|schedule_stop|create_agent|agent_list|agent_delete|agent_update|create_squad|squad_list|squad_detail|squad_update|squad_add_member|squad_remove_member|squad_delete|import_team|domain_create|domain_list|unknown",
   "goal": {"title": "", "description": "", "assignee_id": "", "assignee_type": "", "domain_id": ""},
   "goal_id": "",
   "schedule": {"name": "", "title": "", "description": "", "cron": "", "assignee_id": "", "assignee_type": "", "domain_id": ""},
   "agent": {"name": "", "runtime_id": "", "description": "", "system_prompt": "", "skills": [], "skills_specified": false},
   "squad": {"name": "", "leader_id": "", "description": "", "instructions": "", "member_ids": []},
-  "import_team": {"git_url": "", "branch": "", "credentials": ""}
+  "import_team": {"git_url": "", "branch": "", "credentials": ""},
+  "domain": {"name": "", "type": "", "git_url": "", "default_branch": "", "git_identity": "", "git_credentials": ""}
 }
 
 意图说明：
@@ -85,12 +86,18 @@ func intakeSchemaBody() string {
   domain_id 是【必要参数】：只有当用户的消息明确提到某个仓库/域（"在 test-repo 上做 xxx"、"给 agentwork 加个功能"）时才填；用户没明确指定时 domain_id 留空字符串（不要猜、不要选第一个）——平台会反问用户指定仓库。有多个可用域时尤其不能猜。
 - review_list：用户想查看待审批/卡点清单。不需要其他字段。
 - goal_status：用户问某个任务/目标的状态。goal_id 填用户提到的 id（可能是短 id，照抄）。
+- goal_list：用户想查看所有任务/目标列表。不需要其他字段。
+- goal_cancel：用户想取消某个任务。goal_id 填用户提到的任务 id（可能是短 id，照抄）。
+- goal_assign：用户想把某个任务转交给另一个 agent 或 squad。goal_id 填要转交的任务 id（可能是短 id，照抄）；goal.assignee_id 填新执行者的 id（从名单里选，必须真实存在）；goal.assignee_type 填 "agent" 或 "squad"（与 assignee_id 对应，默认 agent）；goal.description 填转交说明/原因（可选）。
 - create_schedule：用户想创建定时任务/周期性任务（"每 1 个小时做 xxx"、"每天 9 点跑 xxx"、"每周一 xxx"）。schedule.name 填简短任务名；schedule.title 填每次触发时创建的任务标题；schedule.cron 把自然语言频率转成 5 段标准 cron 表达式；schedule.assignee_id 和 schedule.domain_id 从名单里选（必须真实存在）；schedule.assignee_type 填 "agent" 或 "squad"（与 assignee_id 对应，默认 agent）。
 - schedule_list：用户想查看定时任务/计划任务清单。不需要其他字段。
 - schedule_stop：用户想停掉/取消某个定时任务。schedule.name 填用户提到的定时任务名（照抄用户说的名字，可以不完全匹配）。
 - create_agent：用户想创建/配置一个 agent（含人设）。agent.name 必填（中文或英文短名）；agent.runtime_id 从下面的 runtime 名单里选 id（必填，必须真实存在）；agent.description 一句话描述（该 agent 做什么）；agent.system_prompt 是人设/角色说明（你是什么角色、怎么回答、有什么限制），用户没给也要塞一段合理默认值。
   agent.skills 从下面的 skill 名单里选 id——用户明确说"不要 skills"则留空数组；用户完全没提 skills 时 skills 留空数组且 skills_specified=false（平台会反问是否要 skills）。用户指定了 skills（哪怕一个）或明确说不要时 skills_specified=true。
   技术参数（env/model/mcp_servers/max_concurrent）不填（留空），用户后续在 Web 配置。
+- agent_list：用户想查看所有 agent 列表。不需要其他字段。
+- agent_delete：用户想删除某个 agent。agent.name 填要删除的 agent 名字（照抄用户说的名字）。
+- agent_update：用户想修改某个 agent 的属性（人设/描述/运行时）。agent.name 填要修改的 agent 名字（照抄，不作为修改对象——改名请走 Web）；agent.description/system_prompt/runtime_id 填用户指定的新值（用户没提到的字段留空字符串——平台只改用户指定的字段）。技术参数（env/model/mcp_servers/max_concurrent/skills）不通过指令修改，请在 Web 配置。
 - create_squad：用户想创建一个 squad（团队）。squad.name 必填；squad.leader_id 从下面的 agent 名单里选 id（必填，必须真实存在）；squad.description 一句话描述；squad.instructions 是团队协作指令/规则（给 leader 看的子目标拆分与委派规则，用户没给也要塞一段合理默认值）；squad.member_ids 是成员 agent id 数组（不含 leader——leader 单独在 leader_id 里）。
 - squad_list：用户想查看所有 squad（团队）列表。不需要其他字段。
 - squad_detail：用户想查看某个 squad 的详情（成员、leader、协作规则）。squad.name 填用户提到的 squad 名字（照抄用户说的名字）。
@@ -99,6 +106,8 @@ func intakeSchemaBody() string {
 - squad_remove_member：用户想从某个 squad 移除成员。squad.name 填 squad 名字（照抄）；squad.member_ids 填要移除的 agent id 数组（从名单里选）。
 - squad_delete：用户想删除某个 squad。squad.name 填要删除的 squad 名字（照抄）。
 - import_team：用户想从 git 仓库导入团队定义。import_team.git_url 必填（用户消息中提到的仓库地址）；import_team.branch 可选（留空用默认分支）；import_team.credentials 可选（私有仓库才需要）。例如："根据 https://gitcode.com/xiaozoom/demo-team.git 创建一个team"。
+- domain_create：用户想创建一个项目/仓库域。domain.name 必填；domain.type 填 "repo"（默认）或 "scratch"（无仓库项目）；domain.git_url 对 repo 类型必填（仓库地址）；domain.default_branch 可选（留空默认 main）；domain.git_identity 和 domain.git_credentials 可选（留空，后续在 Web 配置）。
+- domain_list：用户想查看所有项目/域列表。不需要其他字段。
 - unknown：无法归入以上意图（闲聊、问候、无关话题）。
 
 cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时间 Asia/Shanghai）：
@@ -111,14 +120,17 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 - 每月 X 日 Y 点：Y X X * *
 - 无法可靠转换就 intent=unknown，别编造 cron。
 
-规则：intent 只能填上面十六个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
+规则：intent 只能填上面二十四个值之一；id 只能从名单里选，不得编造；无法确定就 unknown。
 `
 }
 
-// rosterBody queries the platform's agents/domains/runtimes/skills and
-// returns a formatted roster string. Shared by BuildPrompt and
-// BuildStewardChatBrief so both paths see the same capability list.
-func (s *IntakeService) rosterBody(ctx context.Context) string {
+// RosterBody returns the current platform roster (agents/domains/runtimes/
+// skills/squads). Shared by BuildPrompt, BuildStewardChatBrief, and the
+// daemon's chat relay (injectStewardRoster) so all paths see the same
+// capability list. The chat relay injects it into session/prompt frames
+// because the AGENTS.md brief is session-fixed and does not reflect
+// entities created after the chat opened.
+func (s *IntakeService) RosterBody(ctx context.Context) string {
 	var b strings.Builder
 	b.WriteString("\n当前可用 agent（id: name）：\n")
 	if agents, err := s.qs.Agents(ctx); err == nil {
@@ -191,7 +203,7 @@ func (s *IntakeService) BuildPrompt(ctx context.Context, text string) (string, e
 	}
 	b.WriteString("用户消息：\n" + text + "\n\n")
 	b.WriteString(intakeSchemaBody())
-	b.WriteString(s.rosterBody(ctx))
+	b.WriteString(s.RosterBody(ctx))
 	b.WriteString("\n完成后用一句话说明解析依据。")
 	return b.String(), nil
 }
@@ -273,9 +285,10 @@ func (s *IntakeService) LoadDraft(ctx context.Context) (*IntakeDraft, bool) {
 // side (BuildPrompt context) lists skills as missing only when the draft's
 // skills_specified is false, which missingFields checks inline.
 var requiredFields = map[string][]string{
-	"goal":  {"title", "domain_id", "assignee_id"},
-	"agent": {"name", "runtime_id"},
-	"squad": {"name", "leader_id"},
+	"goal":   {"title", "domain_id", "assignee_id"},
+	"agent":  {"name", "runtime_id"},
+	"squad":  {"name", "leader_id"},
+	"domain": {"name", "git_url"},
 }
 
 // payloadMap unmarshals a draft payload into a generic map. The draft payload
@@ -377,6 +390,25 @@ func knownFieldsBody(kind, payload string) string {
 		if v := strField(m, "instructions"); v != "" {
 			fmt.Fprintf(&b, "- instructions：%s\n", v)
 		}
+	case "domain":
+		if v := strField(m, "name"); v != "" {
+			fmt.Fprintf(&b, "- name：%s\n", v)
+		}
+		if v := strField(m, "type"); v != "" {
+			fmt.Fprintf(&b, "- type：%s\n", v)
+		}
+		if v := strField(m, "git_url"); v != "" {
+			fmt.Fprintf(&b, "- git_url：%s\n", v)
+		}
+		if v := strField(m, "default_branch"); v != "" {
+			fmt.Fprintf(&b, "- default_branch：%s\n", v)
+		}
+		if v := strField(m, "git_identity"); v != "" {
+			fmt.Fprintf(&b, "- git_identity：%s\n", v)
+		}
+		if v := strField(m, "git_credentials"); v != "" {
+			fmt.Fprintf(&b, "- git_credentials：%s\n", v)
+		}
 	}
 	return b.String()
 }
@@ -385,9 +417,10 @@ func knownFieldsBody(kind, payload string) string {
 // "缺失字段" list. Falls back to the key itself.
 func fieldName(kind, key string) string {
 	names := map[string]map[string]string{
-		"goal":  {"title": "标题", "domain_id": "项目/仓库", "assignee_id": "执行的 agent"},
-		"agent": {"name": "名称", "runtime_id": "运行时"},
-		"squad": {"name": "名称", "leader_id": "leader agent"},
+		"goal":   {"title": "标题", "domain_id": "项目/仓库", "assignee_id": "执行的 agent"},
+		"agent":  {"name": "名称", "runtime_id": "运行时"},
+		"squad":  {"name": "名称", "leader_id": "leader agent"},
+		"domain": {"name": "名称", "git_url": "仓库地址"},
 	}
 	if ks, ok := names[kind]; ok {
 		if n, ok := ks[key]; ok {
@@ -428,20 +461,21 @@ func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
 func (s *IntakeService) BuildStewardChatBrief(ctx context.Context) (string, error) {
 	var b strings.Builder
 	b.WriteString("# Steward Chat Context\n\n")
-	b.WriteString("你是管家 agent，正在与用户直接对话。你可以正常聊天，但当用户的消息是平台指令时（创建任务/查看状态/创建定时任务/创建 agent/创建 squad 等），请按下面的 schema 解析意图，并在回复末尾输出结构化标记。\n\n")
+	b.WriteString("你是管家 agent，正在与用户直接对话。你可以正常聊天，但当用户的消息是平台指令时（创建/查看/取消/转交任务、查看待审批、创建/查看定时任务、创建/查看/删除/修改 agent、创建/查看/修改/删除 squad、创建/查看项目、导入团队 等），请按下面的 schema 解析意图，并在回复末尾输出结构化标记。\n\n")
 	b.WriteString("判断规则：\n")
 	b.WriteString("- 如果用户消息是平台指令 → 按 schema 解析意图，输出标记\n")
 	b.WriteString("- 如果用户消息是闲聊/问候/技术讨论 → 正常回复，不输出标记\n")
-	b.WriteString("- 不确定时可以反问用户\n\n")
+	b.WriteString("- 不确定时可以反问用户\n")
+	b.WriteString("- 创建/修改类指令（create_goal/create_agent/create_squad/domain_create 等）：如果用户消息中缺少必填字段，不要直接输出 create_X 意图——先用 chat 意图追问用户补齐缺失信息，等收集到所有必填字段后再输出完整的 create_X 意图。你可以基于对话历史判断信息是否完整——用户可能在后续消息中逐步补充信息。\n\n")
 	b.WriteString(intakeSchemaBody())
-	b.WriteString(s.rosterBody(ctx))
+	b.WriteString(s.RosterBody(ctx))
 	b.WriteString("\n输出格式（仅当判断为指令时）：\n")
 	b.WriteString("1. 先用一句话说明解析依据\n")
 	b.WriteString("2. 然后输出标记，格式为：\n")
 	b.WriteString("<<<INTAKE_JSON>>>{完整 JSON 对象}<<<END>>>\n")
 	b.WriteString("示例：\n")
 	b.WriteString("已解析意图：create_goal\n")
-	b.WriteString(`<<<INTAKE_JSON>>>{"intent":"create_goal","goal":{"title":"优化README","description":"","assignee_id":"agent_xxx","domain_id":"domain_xxx"},"goal_id":"","schedule":{"name":"","title":"","description":"","cron":"","assignee_id":"","domain_id":""},"agent":{"name":"","runtime_id":"","description":"","system_prompt":"","skills":[],"skills_specified":false},"squad":{"name":"","leader_id":"","description":"","instructions":"","member_ids":[]},"import_team":{"git_url":"","branch":"","credentials":""}}<<<END>>>`)
+	b.WriteString(`<<<INTAKE_JSON>>>{"intent":"create_goal","goal":{"title":"优化README","description":"","assignee_id":"agent_xxx","domain_id":"domain_xxx"},"goal_id":"","schedule":{"name":"","title":"","description":"","cron":"","assignee_id":"","domain_id":""},"agent":{"name":"","runtime_id":"","description":"","system_prompt":"","skills":[],"skills_specified":false},"squad":{"name":"","leader_id":"","description":"","instructions":"","member_ids":[]},"import_team":{"git_url":"","branch":"","credentials":""},"domain":{"name":"","type":"","git_url":"","default_branch":"","git_identity":"","git_credentials":""}}<<<END>>>`)
 	b.WriteString("\n")
 	return b.String(), nil
 }
