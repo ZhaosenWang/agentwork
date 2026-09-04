@@ -746,18 +746,28 @@ func callRPC(peer *link.Peer, method string, params, out any, timeout time.Durat
 }
 
 // sanitizeName strips path-hostile characters from a domain name for the
-// local directory layout (mirrors the daemon's scratch sanitizer).
+// local directory layout. It MUST mirror the daemon's sanitizeDirName
+// (internal/daemon/daemon.go): the daemon embeds ITS computed path into the
+// run's AGENTS.md ("your artifacts live in <that dir>") and the agent obeys
+// that absolute path over the spawn cwd — a mismatch between the two
+// sanitizers makes the agent write its artifacts one directory tree away
+// from where the CLI then looks for them (a CJK domain name diverges: the
+// old ASCII-only sanitizer produced AI____ while the daemon meant AI知识精选).
 func sanitizeName(s string) string {
-	repl := func(r rune) rune {
+	var b strings.Builder
+	for _, r := range s {
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
-			return r
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r >= 0x4e00 && r <= 0x9fff, // CJK unified — kept, like the daemon's
+			r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
 		}
-		return '_'
 	}
-	out := strings.Map(repl, s)
-	if len(out) > 40 {
-		out = out[:40]
+	out := strings.Trim(b.String(), "_-")
+	if len(out) > 64 {
+		out = out[:64]
 	}
 	if out == "" {
 		out = "domain"

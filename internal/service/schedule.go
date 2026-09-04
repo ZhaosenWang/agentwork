@@ -162,6 +162,11 @@ func (s *ScheduleService) Update(ctx context.Context, id string, sch Schedule) (
 }
 
 func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
+	// The marker read MUST come before the main query: the returned rows
+	// hold their pooled connection until Close, and an in-memory test store
+	// pools exactly one connection — a second query inside the open rows
+	// deadlocks. The marker is set at daemon startup (static for the call).
+	marker := s.builtInMarkerID(ctx)
 	rows, err := s.st.DB().QueryContext(ctx,
 		`SELECT id,name,title_template,description,assignee_type,assignee_id,domain_id,cron_expression,timezone,enabled,next_run_at,last_run_at,created_at
 		 FROM schedule ORDER BY created_at DESC`)
@@ -169,8 +174,7 @@ func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
 		return nil, err
 	}
 	defer rows.Close()
-	// One marker read for the whole list — BuiltIn is per-row computed.
-	marker := s.builtInMarkerID(ctx)
+	// BuiltIn is per-row computed from the marker read above.
 	out := []Schedule{}
 	for rows.Next() {
 		var sch Schedule
