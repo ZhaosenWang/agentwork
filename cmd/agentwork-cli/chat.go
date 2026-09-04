@@ -135,25 +135,88 @@ func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, pe
 	// stamped with a per-chat monotonic seq — the daemon's relay dispatch
 	// races concurrent frames, and the seq lets its writer pump re-order
 	// them (a reply flood must not read scrambled).
+	//
+	// A watchdog wraps the scan loop: stdio pipes do not close when an agent
+	// process merely hangs (deadlock, model API stall), so scanner.Scan()
+	// would otherwise block forever and chat.closed would never fire. The
+	// watchdog kills the process after chatSilentTimeout of ZERO output —
+	// not of "no reply to the current prompt" (a slow turn still emits
+	// session/update chunks, which reset the timer). Killing the process
+	// closes the pipe, the scan loop returns, and the normal chat.closed
+	// teardown runs exactly as if the CLI had exited on its own.
 	go func() {
 		scanner := bufio.NewScanner(conn.R)
 		scanner.Buffer(make([]byte, 64*1024), 4<<20)
 		seq := int64(0)
-		for scanner.Scan() {
-			line := bytes.TrimSpace(scanner.Bytes())
-			if len(line) == 0 {
-				continue
+		// lineCh carries each scanned line (and is closed when the scan
+		// loop exits — by EOF, pipe close, or scan error). Buffered 1 so
+		// the scan loop never blocks on a slow consumer while the
+		// watchdog is armed.
+		lineCh := make(chan []byte, 1)
+		scanErr := error(nil)
+		var scanErrMu sync.Mutex
+		go func() {
+			defer close(lineCh)
+			for scanner.Scan() {
+				line := bytes.TrimSpace(scanner.Bytes())
+				if len(line) == 0 {
+					continue
+				}
+				select {
+				case lineCh <- line:
+				case <-ctx.Done():
+					return
+				}
 			}
-			seq++
-			_ = peer.Notify(ctx, link.MethodChatFrame, link.ChatFrameParams{
-				ChatID: chatID,
-				Seq:    seq,
-				Frame:  append(json.RawMessage(nil), line...),
-			})
+			scanErrMu.Lock()
+			scanErr = scanner.Err()
+			scanErrMu.Unlock()
+		}()
+
+		watchdog := time.NewTimer(chatSilentTimeout)
+		defer watchdog.Stop()
+		silent := false
+		for {
+			select {
+			case line, ok := <-lineCh:
+				if !ok {
+					// Scan loop ended (EOF / pipe close / error) — fall
+					// through to the normal chat.closed path.
+					goto closed
+				}
+				watchdog.Reset(chatSilentTimeout)
+				seq++
+				_ = peer.Notify(ctx, link.MethodChatFrame, link.ChatFrameParams{
+					ChatID: chatID,
+					Seq:    seq,
+					Frame:  append(json.RawMessage(nil), line...),
+				})
+			case <-watchdog.C:
+				// No stdout for chatSilentTimeout — the agent is wedged.
+				// Kill the process: the pipe closes, the scan loop
+				// returns, lineCh closes, and we reach `closed` below to
+				// fire chat.closed (NOT a silent drop — the web learns).
+				silent = true
+				cliLogf("chat: %s agent silent for %s — killing", chatID, chatSilentTimeout)
+				_ = conn.Close()
+				// Drain any final frames the scan loop emits before the
+				// pipe close propagates, then proceed to closed.
+				for range lineCh {
+				}
+				goto closed
+			}
+		}
+	closed:
+		scanErrMu.Lock()
+		err := scanErr
+		scanErrMu.Unlock()
+		reason := fmt.Sprintf("cli exited: %v", err)
+		if silent {
+			reason = fmt.Sprintf("agent silent for %s, killed", chatSilentTimeout)
 		}
 		_ = peer.Notify(ctx, link.MethodChatClosed, link.ChatClosedParams{
 			ChatID: chatID,
-			Reason: fmt.Sprintf("cli exited: %v", scanner.Err()),
+			Reason: reason,
 		})
 		b.cleanup(chatID)
 	}()
@@ -257,6 +320,20 @@ func (b *chatBridge) handleChatClose(ctx context.Context, raw json.RawMessage) (
 // gracefulExitWait is how long a chat process gets to exit on its own
 // after its stdin closes before the force-kill lands.
 const gracefulExitWait = 3 * time.Second
+
+// chatSilentTimeout is the longest the stdout pump goes without ANY output
+// from the agent before it declares the process wedged and tears it down.
+// An agent turn can run long (multi-step reasoning + tool calls), but a
+// healthy turn is NEVER silent: session/update chunks, thought streams, and
+// tool_call notifications flow continuously. Total silence means the process
+// is hung (deadlock, model API stall, bwrap sandbox frozen) — and since the
+// stdio pipe does not close in that state, scanner.Scan() would block
+// forever, chat.closed would never fire, the daemon would never learn the
+// agent was dead, and the web's in-flight prompt would hang for minutes
+// until the OS finally reaped the pipe. The watchdog breaks that: it kills
+// the process on timeout, the pipe closes, scanner returns, and the normal
+// chat.closed → web-socket-close → user-reopens path takes over.
+const chatSilentTimeout = 120 * time.Second
 
 // cleanup removes the chat entry and tears the process down GRACEFULLY:
 // stdin is closed first — a well-behaved ACP server exits on EOF and
