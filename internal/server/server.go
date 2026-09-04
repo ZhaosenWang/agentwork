@@ -43,10 +43,6 @@ type Server struct {
 	intakeSvc     *notify.IntakeService
 }
 
-// stewardSeedCLIName is the probed CLI name that triggers auto-seeding of
-// the steward agent at machine register / probe_update time.
-var stewardSeedCLIName = "hwcloud"
-
 // statusWriter captures the response status for request logging (the MCP
 // handshake's health is only visible through which requests return what).
 type statusWriter struct {
@@ -98,13 +94,13 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		},
 	}
 
-	// seedStewardIfCLI scans probed CLIs for a stewardSeedCLIName entry and seeds
+	// seedStewardIfCLI scans probed CLIs for a StewardSeedCLIName entry and seeds
 	// the steward agent on its runtime. Shared by register and probe_update.
 	seedStewardIfCLI := func(ctx context.Context, machineName string, clis []link.ProbeCLI) {
 		for _, c := range clis {
-			if c.Name == stewardSeedCLIName {
-				if err := h.Agent.SeedStewardForRuntime(ctx, stewardSeedCLIName+"@"+machineName); err != nil {
-					logging.Warnf("connect: seed steward for %s: %v", stewardSeedCLIName, err)
+			if c.Name == service.StewardSeedCLIName {
+				if err := h.Agent.SeedStewardForRuntime(ctx, service.StewardSeedCLIName+"@"+machineName); err != nil {
+					logging.Warnf("connect: seed steward for %s: %v", service.StewardSeedCLIName, err)
 				}
 				return
 			}
@@ -312,8 +308,12 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			// the instant the read loop sees the close frame, racing the
 			// DB write. Use a detached context so MarkOffline completes
 			// even as the connection tears down.
-			if err := machineSvc.MarkOffline(context.Background(), p.MachineID); err != nil {
+			flipped, err := machineSvc.MarkOffline(context.Background(), p.MachineID)
+			if err != nil {
 				return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
+			}
+			if flipped {
+				s.bus.Publish(context.Background(), events.Event{Topic: "machine:offline", Payload: map[string]string{"machine_id": p.MachineID}})
 			}
 			logging.Infof("connect: machine %s marked offline (graceful shutdown)", p.MachineID)
 			return nil, nil // notification — no reply
@@ -732,11 +732,16 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				n, err := machineSvc.MarkStale(ctx, time.Now().Add(-90*time.Second))
+				ids, err := machineSvc.MarkStale(ctx, time.Now().Add(-90*time.Second))
 				if err != nil {
 					logging.Infof("connect: machine stale sweep: %v", err)
-				} else if n > 0 {
-					logging.Infof("connect: %d machine(s) offline", n)
+				} else {
+					for _, id := range ids {
+						s.bus.Publish(ctx, events.Event{Topic: "machine:offline", Payload: map[string]string{"machine_id": id}})
+					}
+					if len(ids) > 0 {
+						logging.Infof("connect: %d machine(s) offline", len(ids))
+					}
 				}
 			}
 		}

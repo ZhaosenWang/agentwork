@@ -31,6 +31,7 @@ var topics = []string{
 	// the daemon's live log tail — the Web logs panel's real-time pane
 	"log:line",
 	"agent:created", "agent:deleted", "agent:pin_changed",
+	"machine:offline",
 	"squad:created", "squad:deleted", "squad:member_added", "squad:member_removed",
 	"schedule:created", "schedule:fired",
 	"domain:created", "domain:deleted", "domain:compiled", "domain:compile_failed",
