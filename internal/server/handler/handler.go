@@ -529,7 +529,9 @@ func (h *Handlers) setScheduleEnabled(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.Schedule.SetEnabled(r.Context(), r.PathValue("id"), body.Enabled)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		// writeJSON (not a hardcoded 500): validation errors (coded, e.g. the
+		// built-in guard if it ever lands here) map to 400, ErrNotFound to 404.
+		writeJSON(w, nil, err)
 		return
 	}
 	writeJSON(w, out, nil)

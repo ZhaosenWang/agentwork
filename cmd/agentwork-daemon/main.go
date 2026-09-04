@@ -110,6 +110,14 @@ func main() {
 	teamImportSvc := service.NewTeamImportService(st, bus)
 	teamImportSvc.SetDependencies(runSvc, agentSvc, skillSvc, squadSvc)
 
+	// Seed the built-in digest schedule (每日AI知识精选): fires every 6 hours
+	// on the steward (AI SHELL), collects AI news into ~/.agentwork/digest/.
+	// Idempotent; skipped when no steward exists yet (no active runtime) —
+	// re-run on machine registration (server seedStewardIfCLI).
+	if err := service.SeedDigestSchedule(context.Background(), st, agentSvc, domainSvc, schedSvc); err != nil {
+		logging.Warnf("seed digest schedule: %v", err)
+	}
+
 	// M3 IM: the approval-card callbacks resolve through the goal layer; the
 	// owner's inbound messages become intake parse runs on the configured
 	// global parser agent (app_settings platform.intake_agent). The ask-card

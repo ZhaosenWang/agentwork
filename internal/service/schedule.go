@@ -27,9 +27,13 @@ type Schedule struct {
 	CronExpression string `json:"cron_expression"`
 	Timezone       string `json:"timezone"`
 	Enabled        bool   `json:"enabled"`
-	NextRunAt      string `json:"next_run_at"`
-	LastRunAt      string `json:"last_run_at"`
-	CreatedAt      string `json:"created_at"`
+	// BuiltIn marks the system-seeded schedule (每日AI知识精选): the API
+	// guards reject edit/delete on it. Computed per read from the
+	// app_settings marker — not a column (no migration tooling).
+	BuiltIn   bool   `json:"built_in"`
+	NextRunAt string `json:"next_run_at"`
+	LastRunAt string `json:"last_run_at"`
+	CreatedAt string `json:"created_at"`
 }
 
 type ScheduleService struct {
@@ -131,6 +135,11 @@ func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, 
 // (empty string) are still subject to the required-field checks, so the
 // caller must send the full intended value set, not a partial patch.
 func (s *ScheduleService) Update(ctx context.Context, id string, sch Schedule) (*Schedule, error) {
+	// Built-in guard first: the seeded digest schedule is not user-editable
+	// (a coded 4xx, the handler maps CodedError → 400 + body.code).
+	if s.builtInMarkerID(ctx) == id {
+		return nil, NewCodedError(CodeScheduleBuiltIn, "内置自动化任务不可编辑")
+	}
 	existing, err := s.Get(ctx, id)
 	if err != nil {
 		return nil, err // ErrNotFound propagates
@@ -160,6 +169,8 @@ func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	// One marker read for the whole list — BuiltIn is per-row computed.
+	marker := s.builtInMarkerID(ctx)
 	out := []Schedule{}
 	for rows.Next() {
 		var sch Schedule
@@ -168,6 +179,7 @@ func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
 			return nil, err
 		}
 		sch.Enabled = enabled != 0
+		sch.BuiltIn = marker != "" && sch.ID == marker
 		out = append(out, sch)
 	}
 	return out, rows.Err()
@@ -187,6 +199,7 @@ func (s *ScheduleService) Get(ctx context.Context, id string) (*Schedule, error)
 		return nil, err
 	}
 	sch.Enabled = enabled != 0
+	sch.BuiltIn = s.builtInMarkerID(ctx) == sch.ID
 	return &sch, nil
 }
 
@@ -244,6 +257,10 @@ func (s *ScheduleService) SetEnabled(ctx context.Context, id string, enabled boo
 }
 
 func (s *ScheduleService) Delete(ctx context.Context, id string) error {
+	// Built-in guard: the seeded digest schedule is not user-deletable.
+	if s.builtInMarkerID(ctx) == id {
+		return NewCodedError(CodeScheduleBuiltIn, "内置自动化任务不可删除")
+	}
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -258,4 +275,13 @@ func (s *ScheduleService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("delete schedule: %w", err)
 	}
 	return tx.Commit()
+}
+
+// builtInMarkerID returns the seeded built-in schedule's id ('' = none).
+// The marker lives in app_settings (key builtin.digest.schedule_id, written
+// by SeedDigestSchedule) — bare SQL here, matching the daemon's settings
+// reads. Update/Delete consult it for the built-in guard; List/Get for the
+// computed built_in flag.
+func (s *ScheduleService) builtInMarkerID(ctx context.Context) string {
+	return digestMarkerValue(ctx, s.st, digestKeySchedule)
 }

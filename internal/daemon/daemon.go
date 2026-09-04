@@ -418,6 +418,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if n > 0 {
 		logging.Infof("daemon: recovered %d review window(s)", n)
 	}
+	// The digest goals' review checkpoint is auto-approved, never human — a
+	// crash between Finish (articles collected) and the approve leaves them
+	// parked in review with no one to act. Sweep them closed at startup.
+	d.sweepStuckDigestGoals(ctx)
 	// Decision 2-9, trigger side: an approve followed by a crash leaves the
 	// goal in review with the approve recorded and no deliver — re-run the
 	// deliver (its merge/push idempotency makes the replay safe).
@@ -1848,6 +1852,13 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		if runRole == "owner" || runRole == "subgoal" {
 			priorSession, priorWorkdir = d.priorSessionFor(ctx, q.GoalID, q.AgentID, subGoalID)
 		}
+		// Digest firings upload their articles (manifest + md files) with
+		// run.finished — the sandbox is opaque to the daemon, the artifacts
+		// are the only channel back. Other runs dispatch without the list.
+		var artifactFiles []string
+		if d.isDigestGoal(ctx, q.GoalID) {
+			artifactFiles = service.DigestArtifactFiles
+		}
 		d.dispatchToMachine(ctx, q, link.RunDispatchParams{
 			RunID: q.RunID, GoalID: q.GoalID, AgentID: q.AgentID,
 			Role: runRole, SubGoalID: subGoalID, Attempt: q.Attempt,
@@ -1856,6 +1867,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			DomainID: domainID, GitURL: gitURL, GitCredentials: gitCredentials,
 			DefaultBranch: defaultBranch, GitIdentity: gitIdentity,
 			ACPSpawn: args, Env: dispatchEnv,
+			ArtifactFiles:    artifactFiles,
 			ProjectSkillsDir: d.projectSkillsDirFor(ctx, runtimeMachineID, args),
 			RunProfile:       d.buildRunProfile(ctx, q.GoalID, q.AgentID, agentName, runRole, goalTitle, policyText, domainType, domainName, issueSection),
 			PriorSessionID:   priorSession,
@@ -2650,6 +2662,20 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 	plannedAt := r.NextRunAt
 	goalID := uuid.NewString()
 	ts := time.Now().UTC().Format(time.RFC3339Nano)
+	// The built-in digest schedule picks its executor at fire time: the
+	// steward when its runtime+machine are up, else any standard agent.
+	// ok=false = nobody available → skip this firing (the next_run_at still
+	// advances — same semantics as a miss, nothing queues up).
+	assigneeType, assigneeID := r.AssigneeType, r.AssigneeID
+	if r.AssigneeType == "agent" {
+		var ok bool
+		assigneeType, assigneeID, ok = d.maybePickDigestExecutor(ctx, r.ScheduleID, r.AssigneeType, r.AssigneeID)
+		if !ok {
+			logging.Infof("daemon: digest schedule %s skipped at %s — no available agent this tick", r.ScheduleID, plannedAt)
+			d.advanceScheduleNextRun(ctx, r, plannedAt)
+			return
+		}
+	}
 	tx, err := d.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		logging.Infof("daemon: schedule %s begin tx: %v", r.ScheduleID, err)
@@ -2660,7 +2686,7 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 	// assignee_type,assignee_id as parameters; status='active',
 	// handoff_note='', created_by_type='system' literal; created_by_id=
 	// schedule id, created_at=ts as parameters.
-	if err := insertFiredGoal(ctx, tx, goalID, r.TitleTemplate, r.Description, r.DomainID, r.AssigneeType, r.AssigneeID, r.ScheduleID, ts); err != nil {
+	if err := insertFiredGoal(ctx, tx, goalID, r.TitleTemplate, r.Description, r.DomainID, assigneeType, assigneeID, r.ScheduleID, ts); err != nil {
 		logging.Infof("daemon: schedule %s insert goal: %v", r.ScheduleID, err)
 		return
 	}
@@ -2686,7 +2712,7 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 	// transaction — a crash after the commit can no longer leave a run-less
 	// active goal.
 	_, runEv, err := d.runSvc.EnqueueForGoalTx(ctx, tx, service.Goal{
-		ID: goalID, AssigneeType: r.AssigneeType, AssigneeID: r.AssigneeID,
+		ID: goalID, AssigneeType: assigneeType, AssigneeID: assigneeID,
 	})
 	if err != nil {
 		logging.Infof("daemon: schedule %s enqueue run: %v", r.ScheduleID, err)

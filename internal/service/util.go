@@ -61,6 +61,16 @@ func NewFieldRequiredError(field string) error {
 	return NewCodedErrorDetail(CodeFieldRequired, field+" is required", map[string]any{"field": field})
 }
 
+// IsRetryableReviewWait reports whether a ResolveReview error is the
+// "goal is not in review YET" race — the auto-approval caller (digest) may
+// legitimately retry: the reconcile that parks the goal into review can
+// land a beat after the caller's Finish. Every other review error (already
+// approved, wrong decision) is terminal for the caller.
+func IsRetryableReviewWait(err error) bool {
+	var ce CodedError
+	return errors.As(err, &ce) && ce.Code() == CodeGoalNotInReview
+}
+
 // CodedError is the interface a handler uses to extract the code. Both
 // validationError and the not-found path satisfy it (writeErr falls back to
 // CodeNotFound for ErrNotFound when the error has no Code() of its own).

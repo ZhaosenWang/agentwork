@@ -408,6 +408,16 @@ func (d *Daemon) finishMachineRun(ctx context.Context, p link.RunFinishedParams,
 		d.ingestProcessorFinished(ctx, p, runType, domainID)
 		return
 	}
+	// Digest collection BEFORE Finish: the uploaded articles land in
+	// ~/.agentwork/digest/ regardless of what the goal reconcile decides
+	// next (idempotent per goal — a retried report re-collects harmlessly).
+	digestGoalID := ""
+	if p.Status == "completed" {
+		if gid := d.digestGoalIDForRun(ctx, p.RunID); gid != "" {
+			digestGoalID = gid
+			d.collectDigestBatch(ctx, gid, p.Artifacts)
+		}
+	}
 	if p.Status == "completed" {
 		// The platform verifies (invariant 9 — the worker never verifies
 		// its own work): setup+verify+guards run on the adopted branch,
@@ -429,6 +439,12 @@ func (d *Daemon) finishMachineRun(ctx context.Context, p link.RunFinishedParams,
 		return
 	}
 	logging.Infof("machine: run %s finished (%s)", p.RunID, p.Status)
+	// Digest auto-approval AFTER Finish: the reconcile inside Finish parks
+	// the goal into review (the scratch checkpoint) — close it immediately
+	// (maybeFireReviewReady skips digest goals, no card ever fires).
+	if digestGoalID != "" && p.Status == "completed" {
+		d.approveDigestGoal(ctx, digestGoalID, p.RunID)
+	}
 }
 
 // ingestProcessorFinished completes a machine-dispatched processor run

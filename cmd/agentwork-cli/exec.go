@@ -420,9 +420,11 @@ loop:
 		headSHA = sha
 	}
 	// Processor runs upload their FILE results (the platform reads
-	// structured side effects, never agent stdout).
+	// structured side effects, never agent stdout). Digest goal runs too:
+	// the dispatch lists the goal-directory files (manifest + articles) the
+	// daemon collects — same channel, not a processor run.
 	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output, Token: p.Token, HeadSHA: headSHA, SessionID: sessionID, WorkDir: workdir}
-	if p.Proc && status == "completed" {
+	if (p.Proc || len(p.ArtifactFiles) > 0) && status == "completed" {
 		finishParams.Artifacts = map[string]string{}
 		for _, f := range p.ArtifactFiles {
 			if b, err := os.ReadFile(filepath.Join(workdir, f)); err == nil {
