@@ -118,36 +118,49 @@ func (s *MachineService) List(ctx context.Context) ([]Machine, error) {
 }
 
 // MarkStale flips connected machines whose last heartbeat is older than
-// the cutoff to offline. Returns how many were flipped.
-func (s *MachineService) MarkStale(ctx context.Context, cutoff time.Time) (int, error) {
+// the cutoff to offline. Returns the IDs of machines that were flipped,
+// so callers can publish machine:offline events for each.
+func (s *MachineService) MarkStale(ctx context.Context, cutoff time.Time) ([]string, error) {
 	// last_seen_at is stored in UTC (now()); the cutoff MUST match or the
 	// lexicographic comparison lies — a local-zone cutoff (+08:00) compared
 	// against UTC (Z) made every connected machine look stale, and the
 	// sweep flapped offline→connected forever (live: an offline log every
 	// 30s while the CLI kept heartbeating).
-	res, err := s.st.DB().ExecContext(ctx,
-		`UPDATE machine SET status='offline' WHERE status='connected' AND last_seen_at != '' AND last_seen_at < ?`,
+	rows, err := s.st.DB().QueryContext(ctx,
+		`UPDATE machine SET status='offline' WHERE status='connected' AND last_seen_at != '' AND last_seen_at < ?
+		 RETURNING id`,
 		cutoff.UTC().Format(time.RFC3339Nano))
 	if err != nil {
-		return 0, fmt.Errorf("mark stale machines: %w", err)
+		return nil, fmt.Errorf("mark stale machines: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // MarkOffline marks one machine offline immediately (graceful CLI shutdown via
 // machine.offline notification). Idempotent: only a connected machine flips,
-// so a second notification is a no-op. Does not touch last_seen_at — the
-// stale sweep still owns that field. A notification from a dead link that
-// races a reconnect can clobber the new connected state, but the next
-// heartbeat (≤5s) restores it — a tolerable flap vs the 90s it replaces.
-func (s *MachineService) MarkOffline(ctx context.Context, machineID string) error {
-	_, err := s.st.DB().ExecContext(ctx,
+// so a second notification is a no-op. Returns true when the machine was
+// actually flipped (so the caller can publish machine:offline). Does not
+// touch last_seen_at — the stale sweep still owns that field. A notification
+// from a dead link that races a reconnect can clobber the new connected
+// state, but the next heartbeat (≤5s) restores it — a tolerable flap vs
+// the 90s it replaces.
+func (s *MachineService) MarkOffline(ctx context.Context, machineID string) (bool, error) {
+	res, err := s.st.DB().ExecContext(ctx,
 		`UPDATE machine SET status='offline' WHERE id=? AND status='connected'`, machineID)
 	if err != nil {
-		return fmt.Errorf("mark machine offline: %w", err)
+		return false, fmt.Errorf("mark machine offline: %w", err)
 	}
-	return nil
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // MarshalProbedCLIs encodes a probe report for storage.

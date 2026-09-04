@@ -294,6 +294,11 @@ func New(st *store.Store, bus *events.Bus, addr string, protoReg *proto.Registry
 	// captured before the cascade removed their rows (the DB can no longer
 	// answer the query by the time this handler fires).
 	bus.Subscribe("goal:deleted", d.onGoalDeleted)
+	// machine:offline — a machine went offline (graceful shutdown or stale
+	// sweep). The steward's runtime may now be unusable; EnsureStewardRuntime
+	// reassigns to a hwcloud runtime on another machine, or leaves the
+	// steward waiting if none is available.
+	bus.Subscribe("machine:offline", d.onMachineOffline)
 	// M4-B: a delivered issue-sourced goal closes its GitHub issue (the
 	// work is merged — the issue is done). The fix commits (structured, from
 	// the deliver) travel into the close comment so the issue records WHAT
@@ -727,6 +732,12 @@ func (d *Daemon) onSubGoalStateChanged(_ context.Context, e events.Event) {
 // already gone (the Delete cascade removed them), so the ids come from the
 // event payload — the cut is pure resource reclamation: the processes must
 // not keep burning compute writing into rows that no longer exist.
+func (d *Daemon) onMachineOffline(_ context.Context, e events.Event) {
+	if err := d.agentSvc.EnsureStewardRuntime(context.Background()); err != nil {
+		logging.Warnf("daemon: machine offline — ensure steward: %v", err)
+	}
+}
+
 func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
 	m, ok := e.Payload.(map[string]any)
 	if !ok {

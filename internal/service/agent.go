@@ -19,6 +19,11 @@ import (
 // completion, and reports back faithfully.
 const stewardSystemPrompt = "你是一位严谨周到的管家。职责：接收主人指令、拆解并委派给合适的执行者、跟进直到闭环、如实汇报结果。不确定时先问清需求，绝不擅自假设。回复简明扼要。"
 
+// StewardSeedCLIName is the probed CLI name that triggers auto-seeding of
+// the steward agent and the only CLI the steward will bind to. The steward
+// waits for this CLI to (re)appear rather than falling back to any other.
+const StewardSeedCLIName = "hwcloud"
+
 // stewardDescription is the human-facing one-liner shown in the web agent
 // list — what the steward does at a glance.
 const stewardDescription = "系统内部解析 agent：team-import / intake 处理器"
@@ -392,26 +397,37 @@ func (s *AgentService) GetSteward(ctx context.Context) (*Agent, error) {
 }
 
 // EnsureStewardRuntime checks whether the steward agent's runtime is still
-// active. If not, it reassigns the steward to the first active runtime. Returns
-// an error if no active runtime exists. Called at daemon startup (seed) and at
-// import time (safety check).
+// usable: runtime.status='active' AND the owning machine is connected (or
+// the runtime has no machine — legacy/local). If usable, the steward is
+// left in place regardless of runtime name — a historical steward on a
+// non-hwcloud runtime is not migrated while it still works. If not usable,
+// the steward is reassigned to the first usable hwcloud runtime. If no
+// usable hwcloud runtime exists, the steward stays on its current (dead)
+// runtime — the claim gate rejects its runs, making the steward unavailable
+// until hwcloud reappears. The availability test mirrors the claim gate
+// (run.go: rt.status != 'absent' AND machine online).
 func (s *AgentService) EnsureStewardRuntime(ctx context.Context) error {
 	st, err := s.GetSteward(ctx)
 	if err != nil {
 		return err
 	}
-	var status string
-	if err := s.st.DB().QueryRowContext(ctx, `SELECT status FROM runtime WHERE id=?`, st.RuntimeID).Scan(&status); err != nil {
+	var rtStatus, machineStatus string
+	if err := s.st.DB().QueryRowContext(ctx,
+		`SELECT r.status, COALESCE(m.status,'') FROM runtime r LEFT JOIN machine m ON m.id=r.machine_id WHERE r.id=?`,
+		st.RuntimeID).Scan(&rtStatus, &machineStatus); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return NewValidationError("steward agent's runtime no longer exists")
 		}
 		return fmt.Errorf("check steward runtime: %w", err)
 	}
-	if status == "active" {
+	if rtStatus == "active" && (machineStatus == "" || machineStatus == "connected") {
 		return nil
 	}
-	activeID, err := s.firstActiveRuntimeID(ctx)
+	activeID, err := s.firstHwcloudRuntimeID(ctx)
 	if err != nil {
+		if errors.Is(err, ErrValidation) {
+			return nil
+		}
 		return err
 	}
 	if _, err := s.st.DB().ExecContext(ctx, `UPDATE agent SET runtime_id=? WHERE id=?`, activeID, st.ID); err != nil {
@@ -420,16 +436,22 @@ func (s *AgentService) EnsureStewardRuntime(ctx context.Context) error {
 	return nil
 }
 
-// firstActiveRuntimeID returns the ID of the first active runtime by creation
-// order, or an error if none exist.
-func (s *AgentService) firstActiveRuntimeID(ctx context.Context) (string, error) {
+// firstHwcloudRuntimeID returns the ID of the first usable hwcloud runtime
+// by creation order — runtime.status='active' AND the owning machine is
+// connected (or the runtime has no machine — legacy/local) AND the runtime
+// name starts with the steward seed CLI prefix. This mirrors the claim
+// gate's availability test so the steward never migrates to a runtime that
+// dispatch would reject. Returns an error if none exist.
+func (s *AgentService) firstHwcloudRuntimeID(ctx context.Context) (string, error) {
 	var id string
 	if err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id FROM runtime WHERE status='active' ORDER BY created_at LIMIT 1`).Scan(&id); err != nil {
+		`SELECT r.id FROM runtime r LEFT JOIN machine m ON m.id=r.machine_id
+		 WHERE r.status='active' AND r.name LIKE ? AND (r.machine_id='' OR m.status='connected')
+		 ORDER BY r.created_at LIMIT 1`, StewardSeedCLIName+"@%").Scan(&id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", NewValidationError("no active runtime available — connect a machine first")
+			return "", NewValidationError("no active hwcloud runtime available — connect a machine with the CLI first")
 		}
-		return "", fmt.Errorf("find active runtime: %w", err)
+		return "", fmt.Errorf("find active hwcloud runtime: %w", err)
 	}
 	return id, nil
 }
@@ -474,10 +496,10 @@ func (s *AgentService) ListActiveRuntimeIDs(ctx context.Context) ([]string, erro
 }
 
 // SeedSteward inserts the system-internal steward agent if none exists. Called
-// at daemon startup. The steward is bound to the first active runtime; if no
-// active runtime exists, the seed is skipped (ImportTeam will report the error
-// when the user tries to import). If the steward already exists but its
-// runtime is no longer active, it is reassigned.
+// at daemon startup. The steward is bound to the first active hwcloud runtime;
+// if no hwcloud runtime is active, the seed is skipped (ImportTeam will report
+// the error when the user tries to import). If the steward already exists but
+// its runtime is no longer usable, EnsureStewardRuntime reassigns or waits.
 func (s *AgentService) SeedSteward(ctx context.Context) error {
 	_, err := s.GetSteward(ctx)
 	if err == nil {
@@ -486,9 +508,8 @@ func (s *AgentService) SeedSteward(ctx context.Context) error {
 	if !errors.Is(err, ErrNotFound) {
 		return err
 	}
-	activeID, err := s.firstActiveRuntimeID(ctx)
+	activeID, err := s.firstHwcloudRuntimeID(ctx)
 	if err != nil {
-		// No active runtime yet — skip seed; ImportTeam will report the error.
 		if errors.Is(err, ErrValidation) {
 			return nil
 		}
@@ -503,13 +524,15 @@ func (s *AgentService) SeedSteward(ctx context.Context) error {
 // SeedStewardForRuntime seeds the steward agent bound to a specific runtime
 // (by runtime name, e.g. "hwcloud@laptop"). Called when a machine registers
 // or updates its probe with a hwcloud CLI — the steward is auto-created if
-// it doesn't already exist. Idempotent: if a steward already exists (even on
-// a different runtime), this is a no-op. Returns an error only if the named
-// runtime doesn't exist or isn't active.
+// it doesn't already exist. If a steward already exists, its runtime is
+// checked: a steward left on a dead runtime (the machine renamed, the CLI
+// uninstalled) is reassigned to an active one. Returns an error only if the
+// named runtime doesn't exist or isn't active (seed path), or no active
+// runtime is available (self-heal path).
 func (s *AgentService) SeedStewardForRuntime(ctx context.Context, runtimeName string) error {
 	_, err := s.GetSteward(ctx)
 	if err == nil {
-		return nil // steward already exists — idempotent no-op
+		return s.EnsureStewardRuntime(ctx)
 	}
 	if !errors.Is(err, ErrNotFound) {
 		return err

@@ -51,8 +51,8 @@ func TestMachineRegistry(t *testing.T) {
 	// A FRESH machine must NOT be swept (the timezone-comparison regression:
 	// a local-zone cutoff made every connected machine look stale and the
 	// sweep flapped offline every tick while heartbeats re-marked it).
-	if n, err := svc.MarkStale(ctx, time.Now().UTC().Add(-90*time.Second)); err != nil || n != 0 {
-		t.Fatalf("fresh machine must survive the sweep: n=%d err=%v", n, err)
+	if ids, err := svc.MarkStale(ctx, time.Now().UTC().Add(-90*time.Second)); err != nil || len(ids) != 0 {
+		t.Fatalf("fresh machine must survive the sweep: ids=%v err=%v", ids, err)
 	}
 
 	// Backdate the row (heartbeats stopped an hour ago), then sweep.
@@ -61,8 +61,8 @@ func TestMachineRegistry(t *testing.T) {
 		time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)); err != nil {
 		t.Fatalf("backdate: %v", err)
 	}
-	if n, err := svc.MarkStale(ctx, time.Now().UTC().Add(-90*time.Second)); err != nil || n != 1 {
-		t.Fatalf("stale sweep: n=%d err=%v", n, err)
+	if ids, err := svc.MarkStale(ctx, time.Now().UTC().Add(-90*time.Second)); err != nil || len(ids) != 1 {
+		t.Fatalf("stale sweep: ids=%v err=%v", ids, err)
 	}
 	list, _ = svc.List(ctx)
 	if list[0].Status != "offline" {
@@ -108,8 +108,9 @@ func TestMarkOffline(t *testing.T) {
 	}
 
 	// Graceful shutdown: connected → offline, immediately.
-	if err := svc.MarkOffline(ctx, "m1"); err != nil {
-		t.Fatalf("mark offline: %v", err)
+	flipped, err := svc.MarkOffline(ctx, "m1")
+	if err != nil || !flipped {
+		t.Fatalf("mark offline: flipped=%v err=%v", flipped, err)
 	}
 	list, _ := svc.List(ctx)
 	if list[0].Status != "offline" {
@@ -118,8 +119,9 @@ func TestMarkOffline(t *testing.T) {
 
 	// Idempotent: a second call on an offline machine is a no-op (no row
 	// matches WHERE status='connected').
-	if err := svc.MarkOffline(ctx, "m1"); err != nil {
-		t.Fatalf("second mark offline: %v", err)
+	flipped2, err := svc.MarkOffline(ctx, "m1")
+	if err != nil || flipped2 {
+		t.Fatalf("second mark offline: flipped=%v err=%v", flipped2, err)
 	}
 	list, _ = svc.List(ctx)
 	if list[0].Status != "offline" {
@@ -136,8 +138,9 @@ func TestMarkOffline(t *testing.T) {
 	if list[0].Status != "connected" {
 		t.Fatalf("heartbeat must re-mark connected, got %s", list[0].Status)
 	}
-	if err := svc.MarkOffline(ctx, "m1"); err != nil {
-		t.Fatalf("mark offline after reconnect: %v", err)
+	flipped3, err := svc.MarkOffline(ctx, "m1")
+	if err != nil || !flipped3 {
+		t.Fatalf("mark offline after reconnect: flipped=%v err=%v", flipped3, err)
 	}
 	list, _ = svc.List(ctx)
 	if list[0].Status != "offline" {
