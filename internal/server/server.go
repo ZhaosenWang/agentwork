@@ -409,6 +409,16 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			}
 			if err := s.d.ChatWrite(chatID, msg); err != nil {
 				logging.Infof("chat: %s web→machine: %v", chatID, err)
+				// The machine-side chat died (sandbox restart → the new
+				// CLI returns "unknown chat", or the link dropped
+				// mid-turn). The relay can no longer forward, but the
+				// web socket is still open and the frontend's prompt
+				// Promise is pending on onclose. Close NOW so the
+				// browser reconnects in seconds instead of hanging
+				// ~5 min for the proxy idle timeout to drop the silent
+				// socket. CloseChat (deferred) tears down the
+				// machine-side entry; this closes the WEB side.
+				_ = conn.Close()
 				return
 			}
 		}

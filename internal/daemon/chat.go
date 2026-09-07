@@ -452,5 +452,14 @@ func (d *Daemon) CloseChat(chatID string) {
 	if peer := d.MachinePeer(e.machineID); peer != nil {
 		_ = peer.Notify(context.Background(), link.MethodChatClose, link.ChatCloseParams{ChatID: chatID})
 	}
+	if e.close != nil {
+		// Close the web socket — mirrors MachineChatClosed. The "web
+		// socket disconnected" premise in the doc comment holds on the
+		// normal path (user closed the panel, read errored), but NOT on
+		// the ChatWrite error path, where the handler returns with the
+		// socket still open. Without this the frontend's prompt Promise
+		// hangs until the proxy idle timeout drops the silent socket.
+		e.close()
+	}
 	logging.Infof("chat: %s closed (web-side)", chatID)
 }
