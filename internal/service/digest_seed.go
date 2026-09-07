@@ -183,7 +183,15 @@ func SeedDigestSchedule(ctx context.Context, st *store.Store, agentSvc *AgentSer
 		return fmt.Errorf("create digest schedule: %w", err)
 	}
 	setDigestMarker(ctx, st, digestKeySchedule, sch.ID)
-	logging.Infof("seed digest: schedule %q created (%s, cron %s %s)", digestScheduleName, sch.ID, digestCron, digestTimezone)
+	// 首次创建即先跑一次：stamp next_run_at to now so the daemon's schedule
+	// tick fires the digest within seconds of the seed — the user does not
+	// wait six hours for the first batch. fireSchedule re-derives the
+	// next_run_at from the cron afterwards, so the 6-hour cadence is intact.
+	if err := schedSvc.FireNow(ctx, sch.ID); err != nil {
+		// Best-effort: the schedule still fires at its first cron boundary.
+		logging.Warnf("seed digest: fire-now %s: %v", sch.ID, err)
+	}
+	logging.Infof("seed digest: schedule %q created (%s, cron %s %s) — first run dispatched now", digestScheduleName, sch.ID, digestCron, digestTimezone)
 	return nil
 }
 

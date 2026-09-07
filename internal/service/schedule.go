@@ -260,6 +260,26 @@ func (s *ScheduleService) SetEnabled(ctx context.Context, id string, enabled boo
 	return s.Get(ctx, id)
 }
 
+// FireNow stamps a schedule's next_run_at to the current instant so the
+// daemon's schedule tick fires it within seconds. This is a FIRST-RUN
+// convenience ("创建即先跑一次"), not a general reschedule: the daemon's
+// fireSchedule re-derives next_run_at from the cron after firing, so the
+// normal cadence is untouched. The dispatchSchedules miss-grace (1 min)
+// covers a daemon down between this stamp and its restart; the
+// uq_schedule_run_planned unique index dedupes a stamp that raced a firing.
+func (s *ScheduleService) FireNow(ctx context.Context, id string) error {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE schedule SET next_run_at=? WHERE id=?`,
+		time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return fmt.Errorf("fire-now schedule %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *ScheduleService) Delete(ctx context.Context, id string) error {
 	// Built-in guard: the seeded digest schedule is not user-deletable.
 	if s.builtInMarkerID(ctx) == id {

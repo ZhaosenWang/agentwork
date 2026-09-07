@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
@@ -71,6 +72,16 @@ func TestSeedDigestScheduleCreatesAndIsIdempotent(t *testing.T) {
 	if sch.CronExpression != digestCron || sch.Timezone != digestTimezone {
 		t.Fatalf("cron/tz = %s/%s, want %s/%s", sch.CronExpression, sch.Timezone, digestCron, digestTimezone)
 	}
+	// 首次创建即先跑一次: the fresh schedule's next_run_at was stamped to
+	// "now" (FireNow) so the daemon's tick fires it within seconds — the
+	// user does not wait six hours for the first digest batch.
+	first, err := time.Parse(time.RFC3339Nano, sch.NextRunAt)
+	if err != nil {
+		t.Fatalf("next_run_at %q unparseable: %v", sch.NextRunAt, err)
+	}
+	if d := time.Since(first); d < -30*time.Second || d > time.Minute {
+		t.Fatalf("fresh next_run_at = %s (Δ%s), want ~now (first run fired immediately)", sch.NextRunAt, d)
+	}
 	steward, err := agentSvc.GetSteward(context.Background())
 	if err != nil || sch.AssigneeID != steward.ID {
 		t.Fatalf("assignee = %q, want steward %q (err=%v)", sch.AssigneeID, steward.ID, err)
@@ -85,6 +96,7 @@ func TestSeedDigestScheduleCreatesAndIsIdempotent(t *testing.T) {
 	if _, err := schedSvc.SetEnabled(context.Background(), sch.ID, false); err != nil {
 		t.Fatalf("disable: %v", err)
 	}
+	before := sch.NextRunAt
 	if err := SeedDigestSchedule(context.Background(), st, agentSvc, domainSvc, schedSvc); err != nil {
 		t.Fatalf("reseed: %v", err)
 	}
@@ -94,6 +106,12 @@ func TestSeedDigestScheduleCreatesAndIsIdempotent(t *testing.T) {
 	}
 	if schs2[0].Enabled {
 		t.Fatalf("reseed re-enabled a user-disabled schedule")
+	}
+	// Idempotent reseed must NOT re-fire-now or otherwise touch next_run_at
+	// (a restart would otherwise run the digest at every daemon boot,
+	// six-hourly schedule or not).
+	if schs2[0].NextRunAt != before {
+		t.Fatalf("reseed moved next_run_at: %s → %s — idempotent seed must not re-fire", before, schs2[0].NextRunAt)
 	}
 }
 
