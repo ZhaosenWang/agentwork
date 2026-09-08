@@ -41,7 +41,7 @@ func main() {
 		fmt.Printf("v%s\n", daemon.DaemonVersion)
 		return
 	}
-	addr := flag.String("addr", ":7373", "HTTP listen address")
+	addr := flag.String("addr", "127.0.0.1:7373", "HTTP listen address")
 	dbPath := flag.String("db", "", "SQLite path (default ~/.agentwork/agentwork.db)")
 	flag.Parse()
 
