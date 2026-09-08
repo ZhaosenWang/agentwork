@@ -323,8 +323,3 @@ export const importTeam = (body: {
   default_branch?: string;
 }) => api<TeamImportResponse>("/teams/import", { method: "POST", body: JSON.stringify(body) });
 
-// ── Intake (Web assistant dialog) ──
-export const sendIntake = (text: string) =>
-  api<{ run_id: string }>("/intake", { method: "POST", body: JSON.stringify({ text }) });
-export const getIntakeResult = (runId: string) =>
-  api<{ status: string; result_summary: string }>(`/intake/${runId}`);

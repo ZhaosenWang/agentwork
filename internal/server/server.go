@@ -27,17 +27,17 @@ import (
 )
 
 type Server struct {
-	st         *store.Store
-	bus        *events.Bus
-	d          *daemon.Daemon
-	hub        *ws.Hub
-	goalSvc    *service.GoalService
-	runSvc     *service.RunService
-	commentSvc *service.CommentService
-	squadSvc   *service.SquadService
-	schedSvc   *service.ScheduleService
-	domainSvc  *service.DomainService
-	imConn     *notify.Connector
+	st            *store.Store
+	bus           *events.Bus
+	d             *daemon.Daemon
+	hub           *ws.Hub
+	goalSvc       *service.GoalService
+	runSvc        *service.RunService
+	commentSvc    *service.CommentService
+	squadSvc      *service.SquadService
+	schedSvc      *service.ScheduleService
+	domainSvc     *service.DomainService
+	imConn        *notify.Connector
 	teamImportSvc *service.TeamImportService
 	skillSvc      *service.SkillService
 	intakeSvc     *notify.IntakeService
@@ -64,18 +64,18 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	settingsSvc := service.NewSettingsService(s.st)
 	machineSvc := service.NewMachineService(s.st)
 	h := &handler.Handlers{
-		Runtime:  service.NewRuntimeService(s.st),
-		Agent:    service.NewAgentService(s.st, s.bus),
-		Goal:     s.goalSvc,
-		Run:      s.runSvc,
-		Comment:  s.commentSvc,
-		Squad:    s.squadSvc,
-		Schedule: s.schedSvc,
-		Domain:   s.domainSvc,
-		Settings: settingsSvc,
-		IM:       s.imConn,
-		Daemon:   s.d,
-		Machines: machineSvc,
+		Runtime:    service.NewRuntimeService(s.st),
+		Agent:      service.NewAgentService(s.st, s.bus),
+		Goal:       s.goalSvc,
+		Run:        s.runSvc,
+		Comment:    s.commentSvc,
+		Squad:      s.squadSvc,
+		Schedule:   s.schedSvc,
+		Domain:     s.domainSvc,
+		Settings:   settingsSvc,
+		IM:         s.imConn,
+		Daemon:     s.d,
+		Machines:   machineSvc,
 		Skills:     s.skillSvc,
 		AgentPin:   service.NewAgentPinService(s.st, s.bus),
 		TeamImport: s.teamImportSvc,
@@ -336,9 +336,8 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		peer.Wait()
 	})
 	// Chat keepalive: the ACP relay has no inherent traffic during an agent's
-	// turn — the steward chat is worse, because the daemon BUFFERS the steward's
-	// session/update frames (chat_steward.go) and injects synthetic frames only
-	// on turn completion. A reverse proxy's idle timeout (nginx 300s default)
+	// turn (all chats are pure pass-through — 决策7-5). A reverse proxy's
+	// idle timeout (nginx 300s default)
 	// drops the silently idle WebSocket, surfacing as 1006 abnormal closure on
 	// both ends. The ping/pong pair mirrors /ws's ws/client.go: a 30s server
 	// ping refreshes the proxy's idle timer; the browser's native WebSocket

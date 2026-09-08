@@ -13,11 +13,14 @@ import (
 	"github.com/eushing/agentwork/internal/store"
 )
 
-// stewardSystemPrompt is the default persona shipped to the steward agent
-// (AI SHELL) at seed time. The steward receives the owner's instructions,
+// StewardSystemPrompt is the platform-fixed persona shipped to the steward
+// agent at seed time. The steward receives the owner's instructions,
 // decomposes and delegates them to the right worker agent, tracks them to
-// completion, and reports back faithfully.
-const stewardSystemPrompt = "你是一位严谨周到的管家。职责：接收主人指令、拆解并委派给合适的执行者、跟进直到闭环、如实汇报结果。不确定时先问清需求，绝不擅自假设。回复简明扼要。"
+// completion, and reports back faithfully. Exported so the chat relay can
+// inject it for ANY steward (including one the user manually created with
+// an empty system_prompt) — the platform owns this persona, the user's DB
+// system_prompt (if filled) is an addendum, not a replacement.
+const StewardSystemPrompt = "你是一位严谨周到的管家。职责：接收主人指令、拆解并委派给合适的执行者、跟进直到闭环、如实汇报结果。不确定时先问清需求，绝不擅自假设。回复简明扼要。"
 
 // StewardSeedCLIName is the probed CLI name that triggers auto-seeding of
 // the steward agent and the only CLI the steward will bind to. The steward
@@ -33,11 +36,11 @@ const stewardDescription = "系统内部解析 agent：team-import / intake 处�
 // status/pid columns are deliberately gone — they belong to the future
 // long-lived-session model and would be dead columns today.
 type Agent struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
 	// Type: standard (user-created, the default) | steward (system-internal
 	// parser agent for team-import / intake; auto-seeded at daemon startup).
-	Type         string            `json:"type"`
+	Type string `json:"type"`
 	// Description is a human-facing one-liner shown in the web list — what
 	// this agent does in a glance. Distinct from SystemPrompt (the persona
 	// shipped to the model): description is for the operator browsing agents,
@@ -51,12 +54,12 @@ type Agent struct {
 	// the platform's workspace server — the agent's own tools (browser,
 	// database, an external ACP agent via an MCP bridge, ...). Type speaks
 	// acp.McpServer (type stdio|http|sse, name, url or command/args).
-	McpServers    []acp.McpServer `json:"mcp_servers"`
+	McpServers []acp.McpServer `json:"mcp_servers"`
 	// Skills are the platform-managed skill ids selected for this agent
 	// (CLI 分支 Phase 4) — pushed to the agent's machine via config.push.
-	Skills        []string        `json:"skills"`
-	MaxConcurrent int             `json:"max_concurrent"`
-	CreatedAt     string          `json:"created_at"`
+	Skills        []string `json:"skills"`
+	MaxConcurrent int      `json:"max_concurrent"`
+	CreatedAt     string   `json:"created_at"`
 }
 
 type AgentService struct {
@@ -170,7 +173,6 @@ func (s *AgentService) Update(ctx context.Context, id string, a Agent) (*Agent, 
 	return s.Get(ctx, id)
 }
 
-
 // UpsertByName creates or updates an agent by name (the team-import path).
 // When the agent exists, its description/system_prompt/skills are updated;
 // runtime_id is left unchanged (the team repo does not define machines). When
@@ -198,11 +200,11 @@ func (s *AgentService) UpsertByName(ctx context.Context, name, description, syst
 		return nil, NewValidationError(fmt.Sprintf("runtime_id is required for new agent %q", name))
 	}
 	a := Agent{
-		Name:         name,
-		Description:  description,
-		RuntimeID:    runtimeID,
-		SystemPrompt: systemPrompt,
-		Skills:       skillIDs,
+		Name:          name,
+		Description:   description,
+		RuntimeID:     runtimeID,
+		SystemPrompt:  systemPrompt,
+		Skills:        skillIDs,
 		MaxConcurrent: 1,
 	}
 	return s.Create(ctx, a)
@@ -565,7 +567,7 @@ func (s *AgentService) insertSteward(ctx context.Context, runtimeID string) erro
 	if _, err := s.st.DB().ExecContext(ctx,
 		`INSERT INTO agent (id,name,type,description,runtime_id,system_prompt,model,env,mcp_servers,skills,max_concurrent,created_at)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-		id, "AI SHELL", "steward", stewardDescription, runtimeID, stewardSystemPrompt, "", "{}", "[]", "[]", 3, now()); err != nil {
+		id, "AI SHELL", "steward", stewardDescription, runtimeID, StewardSystemPrompt, "", "{}", "[]", "[]", 3, now()); err != nil {
 		return err
 	}
 	a, err := s.Get(ctx, id)

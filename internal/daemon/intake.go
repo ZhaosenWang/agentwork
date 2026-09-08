@@ -213,10 +213,68 @@ type domainAction struct {
 	GitCredentials string `json:"git_credentials"`
 }
 
+// IntakeResult is the structured outcome of one intake dispatch (决策7-5):
+// decouples the platform action (logic) from the human-readable reply
+// (display). IM path consumes Message (Chinese text for Feishu); the
+// chat-as-tool path consumes Status/Entity/Missing (structured, so the
+// steward agent can parse a created goal's id for follow-up operations).
+//
+// Status values:
+//   - "created"      — a create_X succeeded; Entity holds the created row
+//     (service.Goal / service.Agent / service.Squad / ...).
+//   - "need_fields"  — a create_X is missing required fields; Missing lists
+//     their human names, Message carries the ask (for the user),
+//     PlatformHint carries the roster (for the steward LLM, wrapped in
+//     <system-reminder>). A draft is saved.
+//   - "replied"      — a query/delete/cancel/assign/etc. completed; Message
+//     is the Chinese reply (no structured entity). These
+//     intents serve IM; chat-as-tool uses HTTP CRUD directly.
+//   - "failed"       — the action failed; Message is the Chinese error.
+type IntakeResult struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	// Entity is the created row (only for Status="created"). Marshaled as
+	// the service-layer object (Goal/Agent/Squad/Domain/Schedule/...).
+	Entity  any      `json:"entity,omitempty"`
+	Missing []string `json:"missing,omitempty"`
+	// PlatformHint is platform context for the steward LLM (only for
+	// Status="need_fields"). Wrapped in <system-reminder> tags — the steward
+	// brief tells the LLM these tags carry platform instructions, not user
+	// text to relay verbatim. IM path ignores this field (it only sends
+	// Message).
+	PlatformHint string `json:"platform_hint,omitempty"`
+}
+
+// intakeResult is the internal alias (used by helpers below).
+type intakeResult = IntakeResult
+
+// reply wraps a human-readable Chinese string as a terminal intakeResult
+// (query/delete/cancel/assign/etc. — no structured entity). These intents
+// serve IM; chat-as-tool uses HTTP CRUD endpoints directly.
+func reply(msg string) intakeResult { return intakeResult{Status: "replied", Message: msg} }
+
+// created wraps a successful create_X: the service-layer row (for the
+// chat-as-tool path to parse the id) plus the Chinese confirmation message
+// (for IM).
+func created(entity any, msg string) intakeResult {
+	return intakeResult{Status: "created", Entity: entity, Message: msg}
+}
+
+// needFields wraps a need_fields result: the missing field names (structured
+// for chat-as-tool), the ask message (for the user / IM), and the platform
+// hint (roster context for the steward LLM, wrapped in <system-reminder>).
+func needFields(missing []string, msg, platformHint string) intakeResult {
+	hint := ""
+	if strings.TrimSpace(platformHint) != "" {
+		hint = "<system-reminder>\n" + platformHint + "\n</system-reminder>"
+	}
+	return intakeResult{Status: "need_fields", Missing: missing, Message: msg, PlatformHint: hint}
+}
+
 // intakeHandler is the uniform dispatch signature: each intake intent's
 // adapter closure conforms to it, absorbing the handlers' non-uniform
 // actual signatures (some take parsed, some take GoalID, some take nothing).
-type intakeHandler func(d *Daemon, ctx context.Context, parsed intakeAction) string
+type intakeHandler func(d *Daemon, ctx context.Context, parsed intakeAction) intakeResult
 
 // intakeCommand describes one IM intent: its hint text (for the fallback
 // prompt) and its handler (for dispatch). One structure drives both —
@@ -241,78 +299,94 @@ type intakeRegistry struct {
 // intents are mutually exclusive strings).
 var intakeReg = &intakeRegistry{cmds: []intakeCommand{
 	{"create_goal", func() string { return "创建任务 <标题>，让 <agent> 在 <domain> 上做 <描述>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateGoal(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeCreateGoal(ctx, p) }},
 	{"goal_list", func() string { return "查看任务列表" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeListGoals(ctx) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeListGoals(ctx) }},
 	{"goal_cancel", func() string { return "取消任务 <id>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCancelGoal(ctx, p.GoalID) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult {
+			return d.intakeCancelGoal(ctx, p.GoalID)
+		}},
 	{"goal_assign", func() string { return "把任务 <id> 转给 <agent>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeAssignGoal(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeAssignGoal(ctx, p) }},
 	{"review_list", func() string { return "查看待审批" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeReviewList(ctx) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeReviewList(ctx) }},
 	{"goal_status", func() string { return "查询任务状态 <id>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeGoalStatus(ctx, p.GoalID) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult {
+			return d.intakeGoalStatus(ctx, p.GoalID)
+		}},
 	{"create_schedule", func() string { return "每 1 个小时做 <任务>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateSchedule(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult {
+			return d.intakeCreateSchedule(ctx, p)
+		}},
 	{"schedule_list", func() string { return "查看定时任务" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeScheduleList(ctx) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeScheduleList(ctx) }},
 	{"schedule_stop", func() string { return "停掉定时任务 <名字>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeScheduleStop(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeScheduleStop(ctx, p) }},
 	{"create_agent", func() string { return "创建 agent <名字>，用 <运行时>，<人设描述>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateAgent(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeCreateAgent(ctx, p) }},
 	{"agent_list", func() string { return "查看 agent 列表" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeListAgents(ctx) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeListAgents(ctx) }},
 	{"agent_delete", func() string { return "删掉 agent <名字>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeDeleteAgent(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeDeleteAgent(ctx, p) }},
 	{"agent_update", func() string { return "把 agent <名字> 的人设/描述改成 <新值>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeUpdateAgent(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeUpdateAgent(ctx, p) }},
 	{"create_squad", func() string { return "创建 squad <名字>，leader 是 <agent>，成员有 <agent1> <agent2>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateSquad(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeCreateSquad(ctx, p) }},
 	{"squad_list", func() string { return "查看 squad 列表" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadList(ctx) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeSquadList(ctx) }},
 	{"squad_detail", func() string { return "查看 squad <名字>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadDetail(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeSquadDetail(ctx, p) }},
 	{"squad_update", func() string { return "修改 squad <名字>，leader 换成 <agent> / 描述改成 <描述>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadUpdate(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeSquadUpdate(ctx, p) }},
 	{"squad_add_member", func() string { return "给 squad <名字> 加成员 <agent>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadAddMember(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult {
+			return d.intakeSquadAddMember(ctx, p)
+		}},
 	{"squad_remove_member", func() string { return "从 squad <名字> 移除成员 <agent>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadRemoveMember(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult {
+			return d.intakeSquadRemoveMember(ctx, p)
+		}},
 	{"squad_delete", func() string { return "删除 squad <名字>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeSquadDelete(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeSquadDelete(ctx, p) }},
 	{"import_team", func() string { return "根据 <git URL> 创建一个 team" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeImportTeam(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeImportTeam(ctx, p) }},
 	{"domain_create", func() string { return "创建项目 <名字>，仓库地址 <git url>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeCreateDomain(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeCreateDomain(ctx, p) }},
 	{"domain_list", func() string { return "查看项目列表" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeListDomains(ctx) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeListDomains(ctx) }},
 	{"goal_reopen", func() string { return "重开任务 <id>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeReopenGoal(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeReopenGoal(ctx, p) }},
 	{"goal_delete", func() string { return "删除任务 <id>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeDeleteGoal(ctx, p.GoalID) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult {
+			return d.intakeDeleteGoal(ctx, p.GoalID)
+		}},
 	{"schedule_enable", func() string { return "启用定时任务 <名字>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeScheduleEnable(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult {
+			return d.intakeScheduleEnable(ctx, p)
+		}},
 	{"schedule_delete", func() string { return "删除定时任务 <名字>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeScheduleDelete(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult {
+			return d.intakeScheduleDelete(ctx, p)
+		}},
 	{"skill_list", func() string { return "查看 skill 列表" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeListSkills(ctx) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeListSkills(ctx) }},
 	{"skill_delete", func() string { return "删掉 skill <名字>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeDeleteSkill(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeDeleteSkill(ctx, p) }},
 	{"domain_delete", func() string { return "删除项目 <名字>" },
-		func(d *Daemon, ctx context.Context, p intakeAction) string { return d.intakeDeleteDomain(ctx, p) }},
+		func(d *Daemon, ctx context.Context, p intakeAction) intakeResult { return d.intakeDeleteDomain(ctx, p) }},
 }}
 
 // dispatch finds the intent in the registry and calls its handler; if not
 // found (parser returned unknown or a hallucinated intent), returns the
 // fallback prompt. This replaces the former switch in replyIntake — the
 // registry is now the single source of truth for both routing and hint.
-func (r *intakeRegistry) dispatch(d *Daemon, ctx context.Context, parsed intakeAction) string {
+func (r *intakeRegistry) dispatch(d *Daemon, ctx context.Context, parsed intakeAction) intakeResult {
 	for _, c := range r.cmds {
 		if c.intent == parsed.Intent {
 			return c.handle(d, ctx, parsed)
 		}
 	}
-	return r.fallbackReply()
+	return reply(r.fallbackReply())
 }
 
 // fallbackReply assembles the "didn't understand" prompt by iterating the
@@ -326,18 +400,51 @@ func (r *intakeRegistry) fallbackReply() string {
 	return "没听懂这条指令 😅 你可以这样问我：\n" + strings.Join(lines, "\n")
 }
 
+// DispatchIntake is the chat-as-tool entry point (决策7-5): the steward agent
+// calls `agentwork create goal` etc., which hits POST /intake/dispatch, which
+// calls this. It receives a full intakeAction JSON (the same contract the IM
+// processor-run path produces from intake.json) and dispatches it through
+// intakeReg — the SAME handlers + draft/merge/collectAndAsk logic. No kind→intent
+// mapping or per-kind unmarshaling here: the caller (CLI) constructs the
+// intakeAction with the correct intent string and sub-struct, and this method
+// is a thin pass-through to dispatch. Adding a new create intent requires zero
+// changes here — only the CLI's flag→JSON mapping and the intakeReg entry.
+func (d *Daemon) DispatchIntake(ctx context.Context, raw json.RawMessage) (IntakeResult, error) {
+	var parsed intakeAction
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return reply("参数格式错误：" + err.Error()), err
+	}
+	if parsed.Intent == "" {
+		return reply("缺少 intent"), fmt.Errorf("intake dispatch: empty intent")
+	}
+	return intakeReg.dispatch(d, ctx, parsed), nil
+}
+
 // replyIntake executes the parsed action and replies over IM. The run row is
 // stamped completed here (the daemon owns processor-run finishing).
 func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed intakeAction, runType string) {
-	reply := intakeReg.dispatch(d, ctx, parsed)
+	result := intakeReg.dispatch(d, ctx, parsed)
+	// IM path: the user needs both the ask (Message) and the roster
+	// (PlatformHint) to fill the missing fields — concatenate them, stripping
+	// the <system-reminder> wrapper (that tag is for the steward LLM, not for
+	// a human reading Feishu). The chat-as-tool path keeps them separate
+	// (DispatchIntake returns the structured IntakeResult).
+	msg := result.Message
+	if result.PlatformHint != "" {
+		hint := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(
+			result.PlatformHint, "<system-reminder>", ""), "</system-reminder>", ""))
+		if hint != "" {
+			msg = msg + "\n" + hint
+		}
+	}
 	if _, err := d.st.DB().ExecContext(ctx,
 		`UPDATE run SET status='completed', result_summary=?, finished_at=? WHERE id=?`,
-		reply, nowStr(), q.RunID); err != nil {
+		msg, nowStr(), q.RunID); err != nil {
 		logging.Infof("daemon: finish intake run %s: %v", q.RunID, err)
 	}
 	if runType != "intake_web" {
 		if n := d.imNotifier(); n != nil {
-			if err := n.Send(reply); err != nil {
+			if err := n.Send(msg); err != nil {
 				logging.Errorf("daemon: intake reply: %v", err)
 			}
 		}
@@ -350,7 +457,7 @@ func (d *Daemon) replyIntake(ctx context.Context, q *service.ClaimedRow, parsed 
 // hallucinating an id fails here with the validator's message, not a
 // platform crash. Two-branch ask-once structure: merge-from-draft on the
 // clarification turn, else collect ALL missing fields and ask once.
-func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) intakeResult {
 	g := parsed.Goal
 	hasAgents := d.platformHasAgents(ctx)
 	if draft, ok := d.loadDraftOfKind(ctx, "goal"); ok {
@@ -364,81 +471,99 @@ func (d *Daemon) intakeCreateGoal(ctx context.Context, parsed intakeAction) stri
 		// No agents at all → there is nothing to ask about (the assignee slot
 		// is empty and the roster is empty); surface the setup hint, not an ask.
 		if !hasAgents && strings.TrimSpace(g.AssigneeID) == "" {
-			return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
+			return reply("创建任务失败：没有可用的 agent")
 		}
-		return d.collectAndAsk(ctx, "goal", mustMarshal(g), missing)
+		msg, hint := d.collectAndAsk(ctx, "goal", mustMarshal(g), missing)
+		return needFields(missing, msg, hint)
 	}
 	return d.doCreateGoal(ctx, g, hasAgents)
 }
 
-// doCreateGoal calls the service layer and returns the reply. P0-2
+// doCreateGoal calls the service layer and returns the result. P0-2
 // (决策 6-15②): the active goal's first run is born in Create's transaction
 // — no separate enqueue. hasAgents gates the assignee check: a merge that
 // still lacks an assignee (vague reply) fails here only when agents exist
 // (otherwise the goal layer would reject it; we surface the clearer message).
-func (d *Daemon) doCreateGoal(ctx context.Context, g goalAction, hasAgents bool) string {
+func (d *Daemon) doCreateGoal(ctx context.Context, g goalAction, hasAgents bool) intakeResult {
 	if strings.TrimSpace(g.Title) == "" {
-		return "创建任务失败：缺少标题"
+		return reply("创建任务失败：缺少标题")
 	}
 	if strings.TrimSpace(g.DomainID) == "" {
-		return "创建任务失败：缺少项目/仓库"
+		return reply("创建任务失败：缺少项目/仓库")
+	}
+	// Resolve domain name→id (the steward CLI may pass either). If the value
+	// is neither a valid id nor a known name, pass it through unchanged — the
+	// service layer rejects it with its own validation message.
+	domainID := g.DomainID
+	if !d.domainIDExists(ctx, domainID) {
+		if resolved, err := d.resolveDomainByName(ctx, domainID); err == nil {
+			domainID = resolved
+		}
 	}
 	assigneeType := g.AssigneeType
 	if strings.TrimSpace(assigneeType) == "" {
 		assigneeType = "agent"
 	}
 	if assigneeType == "agent" && hasAgents && strings.TrimSpace(g.AssigneeID) == "" {
-		return "创建任务失败：没有可用的 agent（先在 Web 配置 agent）"
+		return reply("创建任务失败：没有可用的 agent")
 	}
-	created, err := d.goalSvc.Create(ctx, service.Goal{
+	// Resolve assignee name→id for agent/squad.
+	assigneeID := g.AssigneeID
+	if assigneeID != "" {
+		assigneeID = d.resolveAssigneeID(ctx, assigneeType, assigneeID)
+	}
+	createdGoal, err := d.goalSvc.Create(ctx, service.Goal{
 		Title:         g.Title,
 		Description:   g.Description,
-		DomainID:      g.DomainID,
+		DomainID:      domainID,
 		AssigneeType:  assigneeType,
-		AssigneeID:    g.AssigneeID,
+		AssigneeID:    assigneeID,
 		Status:        "active",
 		CreatedByType: "human",
 	})
 	if err != nil {
-		return "创建任务失败：" + err.Error()
+		return reply("创建任务失败：" + err.Error())
 	}
-	return fmt.Sprintf("✅ 已创建任务：%s（goal %s），%s 开始执行", created.Title, shortID(created.ID), assigneeType)
+	return created(createdGoal, fmt.Sprintf("✅ 已创建任务：%s（goal %s），%s 开始执行", createdGoal.Title, shortID(createdGoal.ID), assigneeType))
 }
 
 // intakeDomainList lists the available domains for the clarification ask.
+// intakeDomainList lists the available domains for the clarification ask.
+// Lists id: name so the caller can pass the id to create goal (domain_id
+// is required and validated by id).
 func (d *Daemon) intakeDomainList(ctx context.Context) string {
 	var b strings.Builder
-	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM domain ORDER BY name`)
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name FROM domain ORDER BY name`)
 	if err != nil {
-		return "（当前没有可用项目——先在 Web 建域）"
+		return "（当前没有可用项目）"
 	}
 	defer rows.Close()
 	n := 0
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
 			continue
 		}
-		fmt.Fprintf(&b, "- %s\n", name)
+		fmt.Fprintf(&b, "- %s: %s\n", id, name)
 		n++
 	}
 	if n == 0 {
-		return "（当前没有可用项目——先在 Web 建域）"
+		return "（当前没有可用项目）"
 	}
 	return b.String()
 }
 
 // intakeReviewList answers "待审批" with the current checkpoint queue.
-func (d *Daemon) intakeReviewList(ctx context.Context) string {
+func (d *Daemon) intakeReviewList(ctx context.Context) intakeResult {
 	if d.qs == nil {
-		return "平台未就绪（store 未接线）"
+		return reply("平台未就绪（store 未接线）")
 	}
 	goals, err := d.qs.ReviewGoals(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	if len(goals) == 0 {
-		return "✅ 当前没有待审批的卡点"
+		return reply("✅ 当前没有待审批的卡点")
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔔 待审批（%d 个）：\n", len(goals))
@@ -446,22 +571,22 @@ func (d *Daemon) intakeReviewList(ctx context.Context) string {
 		nameID := fmt.Sprintf("%s（%s）", g.Title, shortID(g.GoalID))
 		fmt.Fprintf(&b, "- %s | %s\n", nameID, truncateIn(firstLineIn(g.Reason), listDescLimit))
 	}
-	b.WriteString("\n在飞书里点对应卡片的按钮，或打开 Web 审批队列处理。")
-	return b.String()
+	b.WriteString("")
+	return reply(b.String())
 }
 
 // intakeGoalStatus answers "状态 <id>" (id or short id) with the goal's
 // state and its last run's outcome.
-func (d *Daemon) intakeGoalStatus(ctx context.Context, id string) string {
+func (d *Daemon) intakeGoalStatus(ctx context.Context, id string) intakeResult {
 	if d.qs == nil {
-		return "平台未就绪（store 未接线）"
+		return reply("平台未就绪（store 未接线）")
 	}
 	if strings.TrimSpace(id) == "" {
-		return "查询任务状态需要任务 id（如：查询任务状态 3f2a1b）"
+		return reply("查询任务状态需要任务 id（如：查询任务状态 3f2a1b）")
 	}
 	v, err := d.qs.GoalStatus(ctx, strings.TrimSpace(id))
 	if err != nil {
-		return "查询失败：找不到该任务（" + err.Error() + "）"
+		return reply("查询失败：找不到该任务（" + err.Error() + "）")
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "📌 %s（%s）\n状态：%s", v.Title, shortID(v.GoalID), v.Status)
@@ -471,31 +596,39 @@ func (d *Daemon) intakeGoalStatus(ctx context.Context, id string) string {
 	if v.Summary != "" {
 		b.WriteString("\n最近结果：" + truncateIn(v.Summary, 200))
 	}
-	return b.String()
+	return reply(b.String())
 }
 
 // intakeCreateSchedule creates a cron schedule through the service layer —
 // the parser converts natural-language frequency to cron, the platform
 // validates (cron syntax, assignee/domain existence) and computes the first
 // next_run_at.
-func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) intakeResult {
 	sch := parsed.Schedule
 	if strings.TrimSpace(sch.Name) == "" || strings.TrimSpace(sch.Title) == "" {
-		return "创建定时任务失败：缺少任务名或任务标题"
+		return reply("创建定时任务失败：缺少任务名或任务标题")
 	}
 	if strings.TrimSpace(sch.Cron) == "" {
-		return "创建定时任务失败：缺少 cron 表达式（没听懂频率？）"
+		return reply("创建定时任务失败：缺少 cron 表达式（没听懂频率？）")
 	}
 	if strings.TrimSpace(sch.DomainID) == "" {
-		return "创建定时任务失败：没有可用的 domain（先在 Web 建域并配置验收策略）"
+		return reply("创建定时任务失败：没有可用的 domain")
 	}
 	if strings.TrimSpace(sch.AssigneeID) == "" {
-		return "创建定时任务失败：缺少执行者（agent 或 squad）"
+		return reply("创建定时任务失败：缺少执行者（agent 或 squad）")
 	}
 	assigneeType := sch.AssigneeType
 	if strings.TrimSpace(assigneeType) == "" {
 		assigneeType = "agent"
 	}
+	// Resolve domain name→id and assignee name→id (steward CLI may pass either).
+	domainID := sch.DomainID
+	if domainID != "" && !d.domainIDExists(ctx, domainID) {
+		if resolved, err := d.resolveDomainByName(ctx, domainID); err == nil {
+			domainID = resolved
+		}
+	}
+	assigneeID := d.resolveAssigneeID(ctx, assigneeType, sch.AssigneeID)
 	// The schedule runs on the daemon machine's OWN local time — the owner
 	// speaks in their local hours ("每天 9 点"), and on a single-user machine
 	// that IS the daemon's zone. Hardcoding a zone (e.g. Asia/Shanghai)
@@ -509,14 +642,14 @@ func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) 
 		TitleTemplate:  sch.Title,
 		Description:    sch.Description,
 		AssigneeType:   assigneeType,
-		AssigneeID:     sch.AssigneeID,
-		DomainID:       sch.DomainID,
+		AssigneeID:     assigneeID,
+		DomainID:       domainID,
 		CronExpression: sch.Cron,
 		Timezone:       timezone,
 		Enabled:        true,
 	})
 	if err != nil {
-		return "创建定时任务失败：" + err.Error()
+		return reply("创建定时任务失败：" + err.Error())
 	}
 	next := s.NextRunAt
 	if next != "" {
@@ -524,14 +657,14 @@ func (d *Daemon) intakeCreateSchedule(ctx context.Context, parsed intakeAction) 
 			next = t.Local().Format("01-02 15:04")
 		}
 	}
-	return fmt.Sprintf("✅ 已创建定时任务：%s（%s），下次执行 %s（本地时间）", s.Name, s.CronExpression, next)
+	return created(s, fmt.Sprintf("✅ 已创建定时任务：%s（%s），下次执行 %s（本地时间）", s.Name, s.CronExpression, next))
 }
 
 // intakeScheduleList answers "查看定时任务" with the enabled schedules.
-func (d *Daemon) intakeScheduleList(ctx context.Context) string {
+func (d *Daemon) intakeScheduleList(ctx context.Context) intakeResult {
 	all, err := d.schedSvc.List(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	enabled := []service.Schedule{}
 	for _, s := range all {
@@ -540,7 +673,7 @@ func (d *Daemon) intakeScheduleList(ctx context.Context) string {
 		}
 	}
 	if len(enabled) == 0 {
-		return "📭 当前没有启用的定时任务"
+		return reply("📭 当前没有启用的定时任务")
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "📅 启用的定时任务（%d 个）：\n", len(enabled))
@@ -554,19 +687,19 @@ func (d *Daemon) intakeScheduleList(ctx context.Context) string {
 		}
 	}
 	b.WriteString("\n停掉某个：发送“停掉定时任务 <名字>”")
-	return b.String()
+	return reply(b.String())
 }
 
 // intakeScheduleStop disables a schedule by name (the row and firing history
 // stay; dispatchSchedules only fires enabled rows).
-func (d *Daemon) intakeScheduleStop(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeScheduleStop(ctx context.Context, parsed intakeAction) intakeResult {
 	name := strings.TrimSpace(parsed.Schedule.Name)
 	if name == "" {
-		return "停掉定时任务需要名字（如：停掉定时任务 每小时巡检）"
+		return reply("停掉定时任务需要名字（如：停掉定时任务 每小时巡检）")
 	}
 	all, err := d.schedSvc.List(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	var target *service.Schedule
 	for i := range all {
@@ -576,12 +709,12 @@ func (d *Daemon) intakeScheduleStop(ctx context.Context, parsed intakeAction) st
 		}
 	}
 	if target == nil {
-		return fmt.Sprintf("没找到启用的定时任务 %q——先“查看定时任务”确认名字", name)
+		return reply(fmt.Sprintf("没找到启用的定时任务 %q——先“查看定时任务”确认名字", name))
 	}
 	if _, err := d.schedSvc.SetEnabled(ctx, target.ID, false); err != nil {
-		return "停用失败：" + err.Error()
+		return reply("停用失败：" + err.Error())
 	}
-	return fmt.Sprintf("⏹ 已停用定时任务：%s（%s）", target.Name, target.CronExpression)
+	return reply(fmt.Sprintf("⏹ 已停用定时任务：%s（%s）", target.Name, target.CronExpression))
 }
 
 // intakeCreateAgent creates an agent (persona + runtime + optional skills)
@@ -592,7 +725,7 @@ func (d *Daemon) intakeScheduleStop(ctx context.Context, parsed intakeAction) st
 //     it never re-asks.
 //   - Fresh create: collect ALL missing required fields at once, save the
 //     parser's partial output as a draft, and ask in ONE message.
-func (d *Daemon) intakeCreateAgent(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeCreateAgent(ctx context.Context, parsed intakeAction) intakeResult {
 	a := parsed.Agent
 	if draft, ok := d.loadDraftOfKind(ctx, "agent"); ok {
 		merged := mergeAgent(draft.Payload, a)
@@ -602,32 +735,42 @@ func (d *Daemon) intakeCreateAgent(ctx context.Context, parsed intakeAction) str
 		return d.doCreateAgent(ctx, merged)
 	}
 	if missing := agentMissingFields(a, d.platformHasSkills(ctx)); len(missing) > 0 {
-		return d.collectAndAsk(ctx, "agent", mustMarshal(a), missing)
+		msg, hint := d.collectAndAsk(ctx, "agent", mustMarshal(a), missing)
+		return needFields(missing, msg, hint)
 	}
 	return d.doCreateAgent(ctx, a)
 }
 
-// doCreateAgent calls the service layer and returns the reply — no
+// doCreateAgent calls the service layer and returns the result — no
 // validation, no draft logic. The service validates name/runtime_id and the
 // runtime's existence; a hallucinated or still-empty id fails here with the
 // validator's message (a terminal error, not a re-ask).
-func (d *Daemon) doCreateAgent(ctx context.Context, a agentAction) string {
-	created, err := d.agentSvc.Create(ctx, service.Agent{
+func (d *Daemon) doCreateAgent(ctx context.Context, a agentAction) intakeResult {
+	// The steward CLI may pass a runtime id OR name — resolve name→id if the
+	// value is not already a valid id. If neither, pass it through unchanged —
+	// the service layer rejects it with its own validation message.
+	runtimeID := a.RuntimeID
+	if runtimeID != "" && !d.runtimeIDExists(ctx, runtimeID) {
+		if resolved, err := d.resolveRuntimeByName(ctx, runtimeID); err == nil {
+			runtimeID = resolved
+		}
+	}
+	createdAgent, err := d.agentSvc.Create(ctx, service.Agent{
 		Name:         a.Name,
-		RuntimeID:    a.RuntimeID,
+		RuntimeID:    runtimeID,
 		Description:  a.Description,
 		SystemPrompt: a.SystemPrompt,
 		Skills:       a.Skills,
 	})
 	if err != nil {
-		return "创建 agent 失败：" + err.Error()
+		return reply("创建 agent 失败：" + err.Error())
 	}
-	return fmt.Sprintf("✅ 已创建 agent：%s（%s）", created.Name, shortID(created.ID))
+	return created(createdAgent, fmt.Sprintf("✅ 已创建 agent：%s（%s）", createdAgent.Name, shortID(createdAgent.ID)))
 }
 
 // intakeCreateSquad creates a squad (leader + optional members). Same
 // two-branch ask-once structure as the agent handler.
-func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) intakeResult {
 	sq := parsed.Squad
 	if draft, ok := d.loadDraftOfKind(ctx, "squad"); ok {
 		merged := mergeSquad(draft.Payload, sq)
@@ -637,7 +780,8 @@ func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) str
 		return d.doCreateSquad(ctx, merged)
 	}
 	if missing := squadMissingFields(sq); len(missing) > 0 {
-		return d.collectAndAsk(ctx, "squad", mustMarshal(sq), missing)
+		msg, hint := d.collectAndAsk(ctx, "squad", mustMarshal(sq), missing)
+		return needFields(missing, msg, hint)
 	}
 	return d.doCreateSquad(ctx, sq)
 }
@@ -645,15 +789,15 @@ func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) str
 // doCreateSquad creates the squad then attaches members (skipping the leader,
 // which is already squad.leader_id). Hallucinated members surface as a
 // partial-success reply.
-func (d *Daemon) doCreateSquad(ctx context.Context, sq squadAction) string {
-	created, err := d.squadSvc.Create(ctx, service.Squad{
+func (d *Daemon) doCreateSquad(ctx context.Context, sq squadAction) intakeResult {
+	createdSquad, err := d.squadSvc.Create(ctx, service.Squad{
 		Name:         sq.Name,
 		LeaderID:     sq.LeaderID,
 		Description:  sq.Description,
 		Instructions: sq.Instructions,
 	})
 	if err != nil {
-		return "创建 squad 失败：" + err.Error()
+		return reply("创建 squad 失败：" + err.Error())
 	}
 	var failed []string
 	for _, mid := range sq.MemberIDs {
@@ -661,14 +805,75 @@ func (d *Daemon) doCreateSquad(ctx context.Context, sq squadAction) string {
 		if mid == "" || mid == sq.LeaderID {
 			continue
 		}
-		if _, err := d.squadSvc.AddMember(ctx, created.ID, "agent", mid, "member"); err != nil {
+		if _, err := d.squadSvc.AddMember(ctx, createdSquad.ID, "agent", mid, "member"); err != nil {
 			failed = append(failed, mid)
 		}
 	}
 	if len(failed) > 0 {
-		return fmt.Sprintf("⚠️ 已创建 squad：%s（%s），但以下成员添加失败：%s", created.Name, shortID(created.ID), strings.Join(failed, "、"))
+		return reply(fmt.Sprintf("⚠️ 已创建 squad：%s（%s），但以下成员添加失败：%s", createdSquad.Name, shortID(createdSquad.ID), strings.Join(failed, "、")))
 	}
-	return fmt.Sprintf("✅ 已创建 squad：%s（%s）", created.Name, shortID(created.ID))
+	return created(createdSquad, fmt.Sprintf("✅ 已创建 squad：%s（%s）", createdSquad.Name, shortID(createdSquad.ID)))
+}
+
+// runtimeIDExists checks whether a runtime id is valid (used to decide
+// whether to fall back to name resolution).
+func (d *Daemon) runtimeIDExists(ctx context.Context, id string) bool {
+	var n int
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime WHERE id=?`, id).Scan(&n)
+	return n > 0
+}
+
+// domainIDExists checks whether a domain id is valid.
+func (d *Daemon) domainIDExists(ctx context.Context, id string) bool {
+	var n int
+	_ = d.st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM domain WHERE id=?`, id).Scan(&n)
+	return n > 0
+}
+
+// resolveAssigneeID resolves an agent or squad assignee from name→id. If the
+// value is already a valid id, it is returned unchanged; otherwise the entity
+// is looked up by name. Returns the original value (let the service layer
+// reject it) if resolution fails — the error surfaces from Create.
+func (d *Daemon) resolveAssigneeID(ctx context.Context, assigneeType, idOrName string) string {
+	idOrName = strings.TrimSpace(idOrName)
+	if idOrName == "" {
+		return ""
+	}
+	switch assigneeType {
+	case "agent":
+		if agent, err := d.resolveAgentByName(ctx, idOrName); err == nil && agent != nil {
+			return agent.ID
+		}
+	case "squad":
+		if sq, err := d.resolveSquadByName(ctx, idOrName); err == nil && sq != nil {
+			return sq.ID
+		}
+	}
+	return idOrName // not resolved — let the service layer reject it
+}
+
+// resolveRuntimeByName finds a runtime by exact name (the steward CLI may
+// pass either an id or a name — ids are tried first by the service layer,
+// names here). Same lookup pattern as resolveAgentByName.
+func (d *Daemon) resolveRuntimeByName(ctx context.Context, name string) (string, error) {
+	var id string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT id FROM runtime WHERE name=? AND status='active'`, name).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("没找到运行时 %q——先「查看可用运行时」确认名字", name)
+	}
+	return id, nil
+}
+
+// resolveDomainByName finds a domain by exact name. Same lookup pattern.
+func (d *Daemon) resolveDomainByName(ctx context.Context, name string) (string, error) {
+	var id string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT id FROM domain WHERE name=?`, name).Scan(&id)
+	if err != nil {
+		return "", fmt.Errorf("没找到项目 %q——先「查看项目列表」确认名字", name)
+	}
+	return id, nil
 }
 
 // resolveSquadByName finds a squad by exact name (the parser copies the
@@ -732,13 +937,13 @@ func (d *Daemon) assigneeDisplayName(ctx context.Context, assigneeType, assignee
 
 // intakeSquadList answers "查看 squad 列表" with all squads, their leader
 // name, and member count.
-func (d *Daemon) intakeSquadList(ctx context.Context) string {
+func (d *Daemon) intakeSquadList(ctx context.Context) intakeResult {
 	all, err := d.squadSvc.List(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	if len(all) == 0 {
-		return "📭 当前没有 squad"
+		return reply("📭 当前没有 squad")
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "👥 squad 列表（%d 个）：\n", len(all))
@@ -753,16 +958,16 @@ func (d *Daemon) intakeSquadList(ctx context.Context) string {
 		fmt.Fprintf(&b, "- %s | %s\n", nameID, detail)
 	}
 	b.WriteString("\n查看详情：发送「查看 squad <名字>」")
-	return b.String()
+	return reply(b.String())
 }
 
 // intakeSquadDetail answers "查看 squad <名字>" with the full roster.
-func (d *Daemon) intakeSquadDetail(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeSquadDetail(ctx context.Context, parsed intakeAction) intakeResult {
 	name := strings.TrimSpace(parsed.Squad.Name)
 	if name == "" {
-		return "查看 squad 详情需要名字（如：查看 squad 审查组）"
+		return reply("查看 squad 详情需要名字（如：查看 squad 审查组）")
 	}
-	return d.squadDetailText(ctx, name)
+	return reply(d.squadDetailText(ctx, name))
 }
 
 func (d *Daemon) squadDetailText(ctx context.Context, name string) string {
@@ -794,14 +999,14 @@ func (d *Daemon) squadDetailText(ctx context.Context, name string) string {
 // intakeSquadUpdate updates a squad's leader/description/instructions. Only
 // non-empty parsed fields are applied (partial update); rename is Web-only
 // (squad.name is the lookup key, not the new name).
-func (d *Daemon) intakeSquadUpdate(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeSquadUpdate(ctx context.Context, parsed intakeAction) intakeResult {
 	name := strings.TrimSpace(parsed.Squad.Name)
 	if name == "" {
-		return "修改 squad 需要名字（如：把审查组的 leader 换成 agent2）"
+		return reply("修改 squad 需要名字（如：把审查组的 leader 换成 agent2）")
 	}
 	sq, err := d.resolveSquadByName(ctx, name)
 	if err != nil {
-		return err.Error()
+		return reply(err.Error())
 	}
 	leaderID, description, instructions := sq.LeaderID, sq.Description, sq.Instructions
 	changed := false
@@ -818,29 +1023,29 @@ func (d *Daemon) intakeSquadUpdate(ctx context.Context, parsed intakeAction) str
 		changed = true
 	}
 	if !changed {
-		return "修改 squad 需要指定改什么（如：把审查组的 leader 换成 agent2 / 把审查组的描述改成 xxx）"
+		return reply("修改 squad 需要指定改什么（如：把审查组的 leader 换成 agent2 / 把审查组的描述改成 xxx）")
 	}
 	updated, err := d.squadSvc.Update(ctx, sq.ID, service.Squad{
 		Name: sq.Name, LeaderID: leaderID, Description: description, Instructions: instructions,
 	})
 	if err != nil {
-		return "修改 squad 失败：" + err.Error()
+		return reply("修改 squad 失败：" + err.Error())
 	}
-	return fmt.Sprintf("✅ 已更新 squad：%s（%s）", updated.Name, shortID(updated.ID))
+	return reply(fmt.Sprintf("✅ 已更新 squad：%s（%s）", updated.Name, shortID(updated.ID)))
 }
 
 // intakeSquadAddMember attaches agent members to an existing squad.
-func (d *Daemon) intakeSquadAddMember(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeSquadAddMember(ctx context.Context, parsed intakeAction) intakeResult {
 	name := strings.TrimSpace(parsed.Squad.Name)
 	if name == "" {
-		return "添加成员需要 squad 名字（如：给审查组加成员 agent2）"
+		return reply("添加成员需要 squad 名字（如：给审查组加成员 agent2）")
 	}
 	sq, err := d.resolveSquadByName(ctx, name)
 	if err != nil {
-		return err.Error()
+		return reply(err.Error())
 	}
 	if len(parsed.Squad.MemberIDs) == 0 {
-		return "添加成员需要指定 agent（如：给审查组加成员 agent2）"
+		return reply("添加成员需要指定 agent（如：给审查组加成员 agent2）")
 	}
 	var failed []string
 	for _, mid := range parsed.Squad.MemberIDs {
@@ -853,24 +1058,24 @@ func (d *Daemon) intakeSquadAddMember(ctx context.Context, parsed intakeAction) 
 		}
 	}
 	if len(failed) > 0 {
-		return fmt.Sprintf("⚠️ 已添加部分成员到 squad %s，但以下添加失败：%s", sq.Name, strings.Join(failed, "、"))
+		return reply(fmt.Sprintf("⚠️ 已添加部分成员到 squad %s，但以下添加失败：%s", sq.Name, strings.Join(failed, "、")))
 	}
-	return fmt.Sprintf("✅ 已添加成员到 squad：%s（%s）", sq.Name, shortID(sq.ID))
+	return reply(fmt.Sprintf("✅ 已添加成员到 squad：%s（%s）", sq.Name, shortID(sq.ID)))
 }
 
 // intakeSquadRemoveMember detaches members from a squad. Reports "not in
 // squad" for members that aren't attached (not a silent no-op).
-func (d *Daemon) intakeSquadRemoveMember(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeSquadRemoveMember(ctx context.Context, parsed intakeAction) intakeResult {
 	name := strings.TrimSpace(parsed.Squad.Name)
 	if name == "" {
-		return "移除成员需要 squad 名字（如：从审查组移除 agent2）"
+		return reply("移除成员需要 squad 名字（如：从审查组移除 agent2）")
 	}
 	sq, err := d.resolveSquadByName(ctx, name)
 	if err != nil {
-		return err.Error()
+		return reply(err.Error())
 	}
 	if len(parsed.Squad.MemberIDs) == 0 {
-		return "移除成员需要指定 agent（如：从审查组移除 agent2）"
+		return reply("移除成员需要指定 agent（如：从审查组移除 agent2）")
 	}
 	current, _ := d.squadSvc.ListMembers(ctx, sq.ID)
 	memberSet := make(map[string]bool, len(current))
@@ -899,15 +1104,15 @@ func (d *Daemon) intakeSquadRemoveMember(ctx context.Context, parsed intakeActio
 	if len(failed) > 0 {
 		fmt.Fprintf(&b, "（以下移除失败：%s）", strings.Join(failed, "、"))
 	}
-	return b.String()
+	return reply(b.String())
 }
 
 // intakeSquadDelete deletes a squad. Goals assigned to it fall back to human
 // (the service layer handles this). Supports comma-separated batch delete.
-func (d *Daemon) intakeSquadDelete(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeSquadDelete(ctx context.Context, parsed intakeAction) intakeResult {
 	raw := strings.TrimSpace(parsed.Squad.Name)
 	if raw == "" {
-		return "删除 squad 需要名字（如：删除 squad 审查组）"
+		return reply("删除 squad 需要名字（如：删除 squad 审查组）")
 	}
 	deleteOne := func(name string) string {
 		sq, err := d.resolveSquadByName(ctx, name)
@@ -921,22 +1126,22 @@ func (d *Daemon) intakeSquadDelete(ctx context.Context, parsed intakeAction) str
 	}
 	names := splitAndTrim(raw)
 	if len(names) == 1 {
-		return deleteOne(names[0])
+		return reply(deleteOne(names[0]))
 	}
-	return batchDelete(names, deleteOne)
+	return reply(batchDelete(names, deleteOne))
 }
 
 // intakeImportTeam triggers a team-repo import from a git URL parsed out of
 // the owner's NL message. The import run is enqueued via TeamImportService —
 // the steward explores the repo and produces team.json in a separate
 // processor run (run_type="import"); this intake run merely starts it.
-func (d *Daemon) intakeImportTeam(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeImportTeam(ctx context.Context, parsed intakeAction) intakeResult {
 	it := parsed.ImportTeam
 	if strings.TrimSpace(it.GitURL) == "" {
-		return "导入失败：缺少 git 仓库地址"
+		return reply("导入失败：缺少 git 仓库地址")
 	}
 	if d.teamImportSvc == nil {
-		return "导入失败：team import 服务未接线"
+		return reply("导入失败：team import 服务未接线")
 	}
 	ti, _, err := d.teamImportSvc.ImportTeam(ctx, service.ImportRequest{
 		GitURL:         it.GitURL,
@@ -944,20 +1149,20 @@ func (d *Daemon) intakeImportTeam(ctx context.Context, parsed intakeAction) stri
 		GitCredentials: it.Credentials,
 	})
 	if err != nil {
-		return "导入失败：" + err.Error()
+		return reply("导入失败：" + err.Error())
 	}
-	return fmt.Sprintf("✅ 团队导入已启动（%s），完成后会通知你", shortID(ti.ID))
+	return reply(fmt.Sprintf("✅ 团队导入已启动（%s），完成后会通知你", shortID(ti.ID)))
 }
 
 // intakeListGoals answers "查看任务列表" with all goals (capped at 20 for IM
 // readability), showing title, short id, status, and assignee display name.
-func (d *Daemon) intakeListGoals(ctx context.Context) string {
+func (d *Daemon) intakeListGoals(ctx context.Context) intakeResult {
 	goals, err := d.goalSvc.List(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	if len(goals) == 0 {
-		return "📭 当前没有任务"
+		return reply("📭 当前没有任务")
 	}
 	if len(goals) > 20 {
 		goals = goals[:20]
@@ -970,41 +1175,41 @@ func (d *Daemon) intakeListGoals(ctx context.Context) string {
 		fmt.Fprintf(&b, "- %s | [%s] | 执行者：%s\n", nameID, g.Status, assignee)
 	}
 	b.WriteString("\n查询详情：发送「查询任务状态 <id>」")
-	return b.String()
+	return reply(b.String())
 }
 
 // intakeCancelGoal answers "取消任务 <id>" — resolves the short id via the
 // query store, then calls the goal service's Cancel (which refuses terminal
 // goals and cascades to queued runs and active sub-goals).
-func (d *Daemon) intakeCancelGoal(ctx context.Context, id string) string {
+func (d *Daemon) intakeCancelGoal(ctx context.Context, id string) intakeResult {
 	if strings.TrimSpace(id) == "" {
-		return "取消任务需要任务 id（如：取消任务 3f2a1b）"
+		return reply("取消任务需要任务 id（如：取消任务 3f2a1b）")
 	}
 	v, err := d.qs.GoalStatus(ctx, strings.TrimSpace(id))
 	if err != nil {
-		return "取消失败：找不到该任务（" + err.Error() + "）"
+		return reply("取消失败：找不到该任务（" + err.Error() + "）")
 	}
 	if _, err := d.goalSvc.Cancel(ctx, v.GoalID); err != nil {
-		return "取消失败：" + err.Error()
+		return reply("取消失败：" + err.Error())
 	}
-	return fmt.Sprintf("⏹ 已取消任务：%s（%s）", v.Title, shortID(v.GoalID))
+	return reply(fmt.Sprintf("⏹ 已取消任务：%s（%s）", v.Title, shortID(v.GoalID)))
 }
 
 // intakeAssignGoal answers "把任务 <id> 转给 <agent>" — resolves the short id,
 // then calls the goal service's Assign (human actor, single-user platform).
 // goal.description carries the optional handoff note.
-func (d *Daemon) intakeAssignGoal(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeAssignGoal(ctx context.Context, parsed intakeAction) intakeResult {
 	id := strings.TrimSpace(parsed.GoalID)
 	if id == "" {
-		return "转交任务需要任务 id（如：把任务 3f2a1b 转给 agent2）"
+		return reply("转交任务需要任务 id（如：把任务 3f2a1b 转给 agent2）")
 	}
 	v, err := d.qs.GoalStatus(ctx, id)
 	if err != nil {
-		return "转交失败：找不到该任务（" + err.Error() + "）"
+		return reply("转交失败：找不到该任务（" + err.Error() + "）")
 	}
 	assigneeID := strings.TrimSpace(parsed.Goal.AssigneeID)
 	if assigneeID == "" {
-		return "转交任务需要指定执行者（如：把任务 3f2a1b 转给 agent2）"
+		return reply("转交任务需要指定执行者（如：把任务 3f2a1b 转给 agent2）")
 	}
 	assigneeType := parsed.Goal.AssigneeType
 	if strings.TrimSpace(assigneeType) == "" {
@@ -1012,21 +1217,21 @@ func (d *Daemon) intakeAssignGoal(ctx context.Context, parsed intakeAction) stri
 	}
 	if _, err := d.goalSvc.Assign(ctx, v.GoalID, assigneeType, assigneeID,
 		parsed.Goal.Description, "human", ""); err != nil {
-		return "转交失败：" + err.Error()
+		return reply("转交失败：" + err.Error())
 	}
-	return fmt.Sprintf("✅ 已转交任务：%s（%s）→ %s",
-		v.Title, shortID(v.GoalID), d.assigneeDisplayName(ctx, assigneeType, assigneeID))
+	return reply(fmt.Sprintf("✅ 已转交任务：%s（%s）→ %s",
+		v.Title, shortID(v.GoalID), d.assigneeDisplayName(ctx, assigneeType, assigneeID)))
 }
 
 // intakeListAgents answers "查看 agent 列表" with all agents and their
 // descriptions.
-func (d *Daemon) intakeListAgents(ctx context.Context) string {
+func (d *Daemon) intakeListAgents(ctx context.Context) intakeResult {
 	agents, err := d.agentSvc.List(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	if len(agents) == 0 {
-		return "📭 当前没有 agent（先创建一个：发送「创建 agent ...」）"
+		return reply("📭 当前没有 agent（先创建一个：发送「创建 agent ...」）")
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "🤖 agent 列表（%d 个）：\n", len(agents))
@@ -1039,8 +1244,8 @@ func (d *Daemon) intakeListAgents(ctx context.Context) string {
 			fmt.Fprintf(&b, "- %s\n", nameID)
 		}
 	}
-	b.WriteString("\n配置/查看详情：打开 Web Agents 页面")
-	return b.String()
+	b.WriteString("")
+	return reply(b.String())
 }
 
 // intakeDeleteAgent answers "删掉 agent <名字>" — resolves by name, then calls
@@ -1048,10 +1253,10 @@ func (d *Daemon) intakeListAgents(ctx context.Context) string {
 // squads, running runs all block the delete with a coded error).
 // Supports comma-separated batch delete: each result is reported on its own
 // line; a single name produces the original one-line reply (no summary).
-func (d *Daemon) intakeDeleteAgent(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeDeleteAgent(ctx context.Context, parsed intakeAction) intakeResult {
 	raw := strings.TrimSpace(parsed.Agent.Name)
 	if raw == "" {
-		return "删除 agent 需要名字（如：删掉 agent worker1）"
+		return reply("删除 agent 需要名字（如：删掉 agent worker1）")
 	}
 	deleteOne := func(name string) string {
 		existing, err := d.resolveAgentByName(ctx, name)
@@ -1065,9 +1270,9 @@ func (d *Daemon) intakeDeleteAgent(ctx context.Context, parsed intakeAction) str
 	}
 	names := splitAndTrim(raw)
 	if len(names) == 1 {
-		return deleteOne(names[0])
+		return reply(deleteOne(names[0]))
 	}
-	return batchDelete(names, deleteOne)
+	return reply(batchDelete(names, deleteOne))
 }
 
 // intakeUpdateAgent answers "把 agent <名字> 的人设/描述改成 <新值>" — resolves
@@ -1075,14 +1280,14 @@ func (d *Daemon) intakeDeleteAgent(ctx context.Context, parsed intakeAction) str
 // only non-empty parsed fields are applied), then calls the service's Update.
 // Technical config (env/model/mcp_servers/skills/max_concurrent) is preserved
 // from the existing row — NL only edits persona-level fields.
-func (d *Daemon) intakeUpdateAgent(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeUpdateAgent(ctx context.Context, parsed intakeAction) intakeResult {
 	name := strings.TrimSpace(parsed.Agent.Name)
 	if name == "" {
-		return "修改 agent 需要名字（如：把 worker1 的描述改成 xxx）"
+		return reply("修改 agent 需要名字（如：把 worker1 的描述改成 xxx）")
 	}
 	existing, err := d.resolveAgentByName(ctx, name)
 	if err != nil {
-		return err.Error()
+		return reply(err.Error())
 	}
 	updated := *existing
 	changed := false
@@ -1099,19 +1304,19 @@ func (d *Daemon) intakeUpdateAgent(ctx context.Context, parsed intakeAction) str
 		changed = true
 	}
 	if !changed {
-		return "修改 agent 需要指定改什么（如：把 worker1 的描述改成 xxx / 人设改成 yyy）"
+		return reply("修改 agent 需要指定改什么（如：把 worker1 的描述改成 xxx / 人设改成 yyy）")
 	}
 	result, err := d.agentSvc.Update(ctx, existing.ID, updated)
 	if err != nil {
-		return "修改 agent 失败：" + err.Error()
+		return reply("修改 agent 失败：" + err.Error())
 	}
-	return fmt.Sprintf("✅ 已更新 agent：%s（%s）", result.Name, shortID(result.ID))
+	return reply(fmt.Sprintf("✅ 已更新 agent：%s（%s）", result.Name, shortID(result.ID)))
 }
 
 // intakeCreateDomain answers "创建项目 <名字>，仓库地址 <git url>" — same
 // two-branch ask-once structure as the other create handlers: merge-from-draft
 // on the clarification turn, else collect ALL missing fields and ask once.
-func (d *Daemon) intakeCreateDomain(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeCreateDomain(ctx context.Context, parsed intakeAction) intakeResult {
 	dm := parsed.Domain
 	if draft, ok := d.loadDraftOfKind(ctx, "domain"); ok {
 		merged := mergeDomain(draft.Payload, dm)
@@ -1121,27 +1326,28 @@ func (d *Daemon) intakeCreateDomain(ctx context.Context, parsed intakeAction) st
 		return d.doCreateDomain(ctx, merged)
 	}
 	if missing := domainMissingFields(dm); len(missing) > 0 {
-		return d.collectAndAsk(ctx, "domain", mustMarshal(dm), missing)
+		msg, hint := d.collectAndAsk(ctx, "domain", mustMarshal(dm), missing)
+		return needFields(missing, msg, hint)
 	}
 	return d.doCreateDomain(ctx, dm)
 }
 
-// doCreateDomain calls the service layer and returns the reply.
-func (d *Daemon) doCreateDomain(ctx context.Context, dm domainAction) string {
+// doCreateDomain calls the service layer and returns the result.
+func (d *Daemon) doCreateDomain(ctx context.Context, dm domainAction) intakeResult {
 	if strings.TrimSpace(dm.Name) == "" {
-		return "创建项目失败：缺少名称"
+		return reply("创建项目失败：缺少名称")
 	}
 	domainType := dm.Type
 	if strings.TrimSpace(domainType) == "" {
 		domainType = "repo"
 	}
 	if domainType == "repo" && strings.TrimSpace(dm.GitURL) == "" {
-		return "创建项目失败：缺少仓库地址"
+		return reply("创建项目失败：缺少仓库地址")
 	}
 	if d.domainSvc == nil {
-		return "创建项目失败：domain 服务未接线"
+		return reply("创建项目失败：domain 服务未接线")
 	}
-	created, err := d.domainSvc.Create(ctx, service.Domain{
+	createdDomain, err := d.domainSvc.Create(ctx, service.Domain{
 		Name:           dm.Name,
 		Type:           domainType,
 		GitURL:         dm.GitURL,
@@ -1150,22 +1356,22 @@ func (d *Daemon) doCreateDomain(ctx context.Context, dm domainAction) string {
 		GitCredentials: dm.GitCredentials,
 	})
 	if err != nil {
-		return "创建项目失败：" + err.Error()
+		return reply("创建项目失败：" + err.Error())
 	}
-	return fmt.Sprintf("✅ 已创建项目：%s（%s）", created.Name, shortID(created.ID))
+	return created(createdDomain, fmt.Sprintf("✅ 已创建项目：%s（%s）", createdDomain.Name, shortID(createdDomain.ID)))
 }
 
 // intakeListDomains answers "查看项目列表" with all domains.
-func (d *Daemon) intakeListDomains(ctx context.Context) string {
+func (d *Daemon) intakeListDomains(ctx context.Context) intakeResult {
 	if d.domainSvc == nil {
-		return "查询失败：domain 服务未接线"
+		return reply("查询失败：domain 服务未接线")
 	}
 	domains, err := d.domainSvc.List(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	if len(domains) == 0 {
-		return "📭 当前没有项目（先创建一个：发送「创建项目 ...」）"
+		return reply("📭 当前没有项目（先创建一个：发送「创建项目 ...」）")
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "📁 项目列表（%d 个）：\n", len(domains))
@@ -1178,36 +1384,36 @@ func (d *Daemon) intakeListDomains(ctx context.Context) string {
 		fmt.Fprintf(&b, "- %s | %s\n", nameID, detail)
 	}
 	b.WriteString("\n创建任务时指定项目名即可")
-	return b.String()
+	return reply(b.String())
 }
 
 // intakeReopenGoal answers "重开任务 <id>" — resolves the short id, then calls
 // the goal service's Reopen (which accepts only done/failed/cancelled goals).
 // goal.description carries the optional reopen reason.
-func (d *Daemon) intakeReopenGoal(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeReopenGoal(ctx context.Context, parsed intakeAction) intakeResult {
 	id := strings.TrimSpace(parsed.GoalID)
 	if id == "" {
-		return "重开任务需要任务 id（如：重开任务 3f2a1b）"
+		return reply("重开任务需要任务 id（如：重开任务 3f2a1b）")
 	}
 	v, err := d.qs.GoalStatus(ctx, id)
 	if err != nil {
-		return "重开失败：找不到该任务（" + err.Error() + "）"
+		return reply("重开失败：找不到该任务（" + err.Error() + "）")
 	}
 	reason := strings.TrimSpace(parsed.Goal.Description)
 	if _, err := d.goalSvc.Reopen(ctx, v.GoalID, reason, ""); err != nil {
-		return "重开失败：" + err.Error()
+		return reply("重开失败：" + err.Error())
 	}
-	return fmt.Sprintf("✅ 已重开任务：%s（%s）", v.Title, shortID(v.GoalID))
+	return reply(fmt.Sprintf("✅ 已重开任务：%s（%s）", v.Title, shortID(v.GoalID)))
 }
 
 // intakeDeleteGoal answers "删除任务 <id>" — resolves the short id for the
 // title (used in the reply), then calls the goal service's Delete (which
 // cascades to runs, sub-goals, comments, activity logs, etc.).
 // Supports comma-separated batch delete.
-func (d *Daemon) intakeDeleteGoal(ctx context.Context, id string) string {
+func (d *Daemon) intakeDeleteGoal(ctx context.Context, id string) intakeResult {
 	raw := strings.TrimSpace(id)
 	if raw == "" {
-		return "删除任务需要任务 id（如：删除任务 3f2a1b）"
+		return reply("删除任务需要任务 id（如：删除任务 3f2a1b）")
 	}
 	deleteOne := func(idOrShort string) string {
 		v, err := d.qs.GoalStatus(ctx, idOrShort)
@@ -1222,23 +1428,23 @@ func (d *Daemon) intakeDeleteGoal(ctx context.Context, id string) string {
 	}
 	ids := splitAndTrim(raw)
 	if len(ids) == 1 {
-		return deleteOne(ids[0])
+		return reply(deleteOne(ids[0]))
 	}
-	return batchDelete(ids, deleteOne)
+	return reply(batchDelete(ids, deleteOne))
 }
 
 // intakeScheduleEnable answers "启用定时任务 <名字>" — finds the disabled
 // schedule by name, re-enables it, and recomputes next_run_at from now (a
 // schedule stopped long ago has a stale next_run_at that would fire
 // immediately on the next dispatch tick).
-func (d *Daemon) intakeScheduleEnable(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeScheduleEnable(ctx context.Context, parsed intakeAction) intakeResult {
 	name := strings.TrimSpace(parsed.Schedule.Name)
 	if name == "" {
-		return "启用定时任务需要名字（如：启用定时任务 每小时巡检）"
+		return reply("启用定时任务需要名字（如：启用定时任务 每小时巡检）")
 	}
 	all, err := d.schedSvc.List(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	var target *service.Schedule
 	for i := range all {
@@ -1248,11 +1454,11 @@ func (d *Daemon) intakeScheduleEnable(ctx context.Context, parsed intakeAction) 
 		}
 	}
 	if target == nil {
-		return fmt.Sprintf("没找到已停用的定时任务 %q——先「查看定时任务」确认名字", name)
+		return reply(fmt.Sprintf("没找到已停用的定时任务 %q——先「查看定时任务」确认名字", name))
 	}
 	s, err := d.schedSvc.SetEnabled(ctx, target.ID, true)
 	if err != nil {
-		return "启用失败：" + err.Error()
+		return reply("启用失败：" + err.Error())
 	}
 	next, err := service.ComputeNextRun(s.CronExpression, s.Timezone, time.Now())
 	if err != nil {
@@ -1265,23 +1471,23 @@ func (d *Daemon) intakeScheduleEnable(ctx context.Context, parsed intakeAction) 
 		}
 	}
 	nextStr := next.Format("01-02 15:04")
-	return fmt.Sprintf("▶️ 已启用定时任务：%s（%s），下次执行 %s（本地时间）", s.Name, s.CronExpression, nextStr)
+	return reply(fmt.Sprintf("▶️ 已启用定时任务：%s（%s），下次执行 %s（本地时间）", s.Name, s.CronExpression, nextStr))
 }
 
 // intakeScheduleDelete answers "删除定时任务 <名字>" — finds the schedule by
 // name (enabled or disabled), then calls the service's Delete (which removes
 // the row and its firing history). Derived goals keep their original
 // assignment. Supports comma-separated batch delete.
-func (d *Daemon) intakeScheduleDelete(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeScheduleDelete(ctx context.Context, parsed intakeAction) intakeResult {
 	raw := strings.TrimSpace(parsed.Schedule.Name)
 	if raw == "" {
-		return "删除定时任务需要名字（如：删除定时任务 每小时巡检）"
+		return reply("删除定时任务需要名字（如：删除定时任务 每小时巡检）")
 	}
 	names := splitAndTrim(raw)
 	if len(names) == 1 {
-		return d.deleteScheduleByName(ctx, names[0])
+		return reply(d.deleteScheduleByName(ctx, names[0]))
 	}
-	return batchDelete(names, func(name string) string { return d.deleteScheduleByName(ctx, name) })
+	return reply(batchDelete(names, func(name string) string { return d.deleteScheduleByName(ctx, name) }))
 }
 
 func (d *Daemon) deleteScheduleByName(ctx context.Context, name string) string {
@@ -1307,41 +1513,41 @@ func (d *Daemon) deleteScheduleByName(ctx context.Context, name string) string {
 
 // intakeListSkills answers "查看 skill 列表" with all skill names (compact,
 // one per line — IM/chat readability over detail; descriptions are Web-only).
-func (d *Daemon) intakeListSkills(ctx context.Context) string {
+func (d *Daemon) intakeListSkills(ctx context.Context) intakeResult {
 	if d.skillSvc == nil {
-		return "查询失败：skill 服务未接线"
+		return reply("查询失败：skill 服务未接线")
 	}
 	skills, err := d.skillSvc.List(ctx)
 	if err != nil {
-		return "查询失败：" + err.Error()
+		return reply("查询失败：" + err.Error())
 	}
 	if len(skills) == 0 {
-		return "📭 当前没有 skill"
+		return reply("📭 当前没有 skill")
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "🔧 skill 列表（%d 个）：\n", len(skills))
 	for _, sk := range skills {
 		fmt.Fprintf(&b, "- %s\n", sk.Name)
 	}
-	return b.String()
+	return reply(b.String())
 }
 
 // intakeDeleteSkill answers "删掉 skill <名字>" — resolves by name, then calls
 // the skill service's Delete (which has a referential guard: skills selected
 // by any agent cannot be deleted). Supports comma-separated batch delete.
-func (d *Daemon) intakeDeleteSkill(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeDeleteSkill(ctx context.Context, parsed intakeAction) intakeResult {
 	if d.skillSvc == nil {
-		return "删除失败：skill 服务未接线"
+		return reply("删除失败：skill 服务未接线")
 	}
 	raw := strings.TrimSpace(parsed.Skill.Name)
 	if raw == "" {
-		return "删除 skill 需要名字（如：删掉 skill git-helper）"
+		return reply("删除 skill 需要名字（如：删掉 skill git-helper）")
 	}
 	names := splitAndTrim(raw)
 	if len(names) == 1 {
-		return d.deleteSkillByName(ctx, names[0])
+		return reply(d.deleteSkillByName(ctx, names[0]))
 	}
-	return batchDelete(names, func(name string) string { return d.deleteSkillByName(ctx, name) })
+	return reply(batchDelete(names, func(name string) string { return d.deleteSkillByName(ctx, name) }))
 }
 
 func (d *Daemon) deleteSkillByName(ctx context.Context, name string) string {
@@ -1369,19 +1575,19 @@ func (d *Daemon) deleteSkillByName(ctx context.Context, name string) string {
 // the domain service's Delete (which has referential guards: goals or
 // schedules referencing the domain block the delete). Supports comma-separated
 // batch delete.
-func (d *Daemon) intakeDeleteDomain(ctx context.Context, parsed intakeAction) string {
+func (d *Daemon) intakeDeleteDomain(ctx context.Context, parsed intakeAction) intakeResult {
 	if d.domainSvc == nil {
-		return "删除失败：domain 服务未接线"
+		return reply("删除失败：domain 服务未接线")
 	}
 	raw := strings.TrimSpace(parsed.Domain.Name)
 	if raw == "" {
-		return "删除项目需要名字（如：删除项目 myrepo）"
+		return reply("删除项目需要名字（如：删除项目 myrepo）")
 	}
 	names := splitAndTrim(raw)
 	if len(names) == 1 {
-		return d.deleteDomainByName(ctx, names[0])
+		return reply(d.deleteDomainByName(ctx, names[0]))
 	}
-	return batchDelete(names, func(name string) string { return d.deleteDomainByName(ctx, name) })
+	return reply(batchDelete(names, func(name string) string { return d.deleteDomainByName(ctx, name) }))
 }
 
 func (d *Daemon) deleteDomainByName(ctx context.Context, name string) string {
@@ -1409,44 +1615,48 @@ func (d *Daemon) deleteDomainByName(ctx context.Context, name string) string {
 // fields + the relevant rosters, saves the parser's partial output as a draft,
 // and returns the message. The rosters included depend on kind and which
 // fields are missing.
-func (d *Daemon) collectAndAsk(ctx context.Context, kind, payloadJSON string, missing []string) string {
-	var b strings.Builder
+// collectAndAsk builds the need_fields ask: the missing-field prompt (for the
+// user) and the roster context (for the steward LLM). Returns (message,
+// platformHint) — the caller wraps platformHint in <system-reminder> via
+// needFields. IM path concatenates them (roster in the IM reply); the
+// chat-as-tool path keeps them separate so the steward knows what to relay
+// vs what is platform context.
+func (d *Daemon) collectAndAsk(ctx context.Context, kind, payloadJSON string, missing []string) (string, string) {
+	var msg, hint strings.Builder
 	switch kind {
 	case "goal":
-		b.WriteString("创建任务还需要以下信息：\n")
+		msg.WriteString("创建任务还需要以下信息：\n")
 	case "agent":
-		b.WriteString("创建 agent 还需要以下信息：\n")
+		msg.WriteString("创建 agent 还需要以下信息：\n")
 	case "squad":
-		b.WriteString("创建 squad 还需要以下信息：\n")
+		msg.WriteString("创建 squad 还需要以下信息：\n")
 	case "domain":
-		b.WriteString("创建项目还需要以下信息：\n")
+		msg.WriteString("创建项目还需要以下信息：\n")
 	}
 	for _, f := range missing {
-		b.WriteString("- " + f + "\n")
+		msg.WriteString("- " + f + "\n")
 	}
-	b.WriteString("\n")
-	// Rosters relevant to the kind.
+	// Rosters relevant to the kind (platform context for the LLM).
 	switch kind {
 	case "goal":
-		b.WriteString("当前可用项目：\n" + d.intakeDomainList(ctx))
+		hint.WriteString("当前可用项目：\n" + d.intakeDomainList(ctx))
 		if d.platformHasAgents(ctx) {
-			b.WriteString("当前可用 agent：\n" + d.intakeAgentList(ctx))
+			hint.WriteString("当前可用 agent：\n" + d.intakeAgentList(ctx))
 		}
 	case "agent":
-		b.WriteString("当前可用运行时：\n" + d.intakeRuntimeList(ctx))
+		hint.WriteString("当前可用运行时：\n" + d.intakeRuntimeList(ctx))
 		if d.platformHasSkills(ctx) {
-			b.WriteString("\n平台 skill（选配，回复里带上要配的 skill 名，或明确回复“不要”）：\n" + d.intakeSkillList(ctx))
+			hint.WriteString("\n平台 skill（选配，回复里带上要配的 skill 名，或明确回复“不要”）：\n" + d.intakeSkillList(ctx))
 		}
 	case "squad":
-		b.WriteString("当前可用 agent：\n" + d.intakeAgentList(ctx))
+		hint.WriteString("当前可用 agent：\n" + d.intakeAgentList(ctx))
 	}
-	b.WriteString("\n请一条消息回复所有信息。")
 	if d.intakeSvc != nil {
 		_ = d.intakeSvc.SaveDraft(ctx, notify.IntakeDraft{
 			Kind: kind, Payload: payloadJSON, CreatedAt: nowStr(),
 		})
 	}
-	return b.String()
+	return msg.String(), hint.String()
 }
 
 // loadDraftOfKind returns the pending draft if its Kind matches. Other kinds
@@ -1653,31 +1863,34 @@ func (d *Daemon) platformHasAgents(ctx context.Context) bool {
 }
 
 // intakeRuntimeList lists the active runtimes for the clarification ask.
+// Lists id: name so the caller (steward CLI) can pass the id to create
+// (the service layer validates runtime_id by id, not name).
 func (d *Daemon) intakeRuntimeList(ctx context.Context) string {
-	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM runtime WHERE status='active' ORDER BY name`)
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name FROM runtime WHERE status='active' ORDER BY name`)
 	if err != nil {
-		return "（当前没有可用运行时——先在 Web 配置 runtime）"
+		return "（当前没有可用运行时）"
 	}
 	defer rows.Close()
 	var b strings.Builder
 	n := 0
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
 			continue
 		}
-		fmt.Fprintf(&b, "- %s\n", name)
+		fmt.Fprintf(&b, "- %s: %s\n", id, name)
 		n++
 	}
 	if n == 0 {
-		return "（当前没有可用运行时——先在 Web 配置 runtime）"
+		return "（当前没有可用运行时）"
 	}
 	return b.String()
 }
 
 // intakeSkillList lists the platform skill library for the clarification ask.
+// Lists id: name so the caller can pass skill ids to create agent.
 func (d *Daemon) intakeSkillList(ctx context.Context) string {
-	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM skill ORDER BY name`)
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name FROM skill ORDER BY name`)
 	if err != nil {
 		return "（查询 skill 失败）"
 	}
@@ -1685,11 +1898,11 @@ func (d *Daemon) intakeSkillList(ctx context.Context) string {
 	var b strings.Builder
 	n := 0
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
 			continue
 		}
-		fmt.Fprintf(&b, "- %s\n", name)
+		fmt.Fprintf(&b, "- %s: %s\n", id, name)
 		n++
 	}
 	if n == 0 {
@@ -1699,24 +1912,25 @@ func (d *Daemon) intakeSkillList(ctx context.Context) string {
 }
 
 // intakeAgentList lists the agents for the squad-leader / goal-assignee ask.
+// Lists id: name so the caller can pass the id to create goal/squad.
 func (d *Daemon) intakeAgentList(ctx context.Context) string {
-	rows, err := d.st.DB().QueryContext(ctx, `SELECT name FROM agent ORDER BY name`)
+	rows, err := d.st.DB().QueryContext(ctx, `SELECT id, name FROM agent ORDER BY name`)
 	if err != nil {
-		return "（当前没有可用 agent——先在 Web 配置 agent）"
+		return "（当前没有可用 agent）"
 	}
 	defer rows.Close()
 	var b strings.Builder
 	n := 0
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
 			continue
 		}
-		fmt.Fprintf(&b, "- %s\n", name)
+		fmt.Fprintf(&b, "- %s: %s\n", id, name)
 		n++
 	}
 	if n == 0 {
-		return "（当前没有可用 agent——先在 Web 配置 agent）"
+		return "（当前没有可用 agent）"
 	}
 	return b.String()
 }

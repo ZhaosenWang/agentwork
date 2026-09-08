@@ -175,37 +175,44 @@ func TestMergeProbeTablesAdd(t *testing.T) {
 }
 
 // TestMergeProbeTablesBuiltinUnchanged: a builtin not mentioned in custom
-// keeps its original values.
+// keeps its original values. Uses the FIRST builtin (whatever it is) so the
+// test does not break when the builtin table changes.
 func TestMergeProbeTablesBuiltinUnchanged(t *testing.T) {
+	if len(builtinProbeTable) == 0 {
+		t.Fatal("builtinProbeTable must not be empty")
+	}
+	first := builtinProbeTable[0]
 	custom := []probeEntry{{Name: "myagent", ProbeCmd: "x", ACPSpawn: []string{"x"}}}
 	merged := mergeProbeTables(builtinProbeTable, custom)
-	var openagent probeEntry
+	var got probeEntry
 	for _, e := range merged {
-		if e.Name == "openagent" {
-			openagent = e
+		if e.Name == first.Name {
+			got = e
 		}
 	}
-	if !slices.Equal(openagent.ACPSpawn, []string{"openagent", "serve", "--acp"}) {
-		t.Fatalf("unmentioned builtin must keep its spawn, got %v", openagent.ACPSpawn)
+	if !slices.Equal(got.ACPSpawn, first.ACPSpawn) {
+		t.Fatalf("unmentioned builtin %s must keep its spawn %v, got %v", first.Name, first.ACPSpawn, got.ACPSpawn)
 	}
 }
 
 // TestMergeProbeTablesOrdering: builtins first (original order), then new
-// custom entries (config-file order).
+// custom entries (config-file order). Derives expectations from
+// builtinProbeTable so it survives table changes.
 func TestMergeProbeTablesOrdering(t *testing.T) {
 	custom := []probeEntry{
 		{Name: "zagent", ProbeCmd: "z", ACPSpawn: []string{"z"}},
 		{Name: "aagent", ProbeCmd: "a", ACPSpawn: []string{"a"}},
 	}
 	merged := mergeProbeTables(builtinProbeTable, custom)
-	// First three are the builtins in original order.
-	for i, want := range []string{"claude", "opencode", "openagent"} {
-		if merged[i].Name != want {
-			t.Fatalf("builtin %d must be %s, got %s (merged=%v)", i, want, merged[i].Name, merged)
+	// Builtins come first in their original order.
+	for i, want := range builtinProbeTable {
+		if merged[i].Name != want.Name {
+			t.Fatalf("builtin %d must be %s, got %s (merged=%v)", i, want.Name, merged[i].Name, merged)
 		}
 	}
 	// New entries follow in config-file order (zagent before aagent).
-	if len(merged) != 5 || merged[3].Name != "zagent" || merged[4].Name != "aagent" {
+	offset := len(builtinProbeTable)
+	if len(merged) != offset+2 || merged[offset].Name != "zagent" || merged[offset+1].Name != "aagent" {
 		t.Fatalf("new entries must follow in config order, got %v", merged)
 	}
 }

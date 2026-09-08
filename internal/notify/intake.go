@@ -64,9 +64,8 @@ func NewIntakeService(qs QueryStore, store SettingsStore, runSvc *service.RunSer
 }
 
 // intakeSchemaBody returns the intake.json schema, intent descriptions, cron
-// conversion rules, and parsing rules — the shared capability contract used
-// by both BuildPrompt (intake processor) and BuildStewardChatBrief (steward
-// chat). Extracted so the two prompts cannot drift.
+// conversion rules, and parsing rules — the capability contract used by
+// BuildPrompt (intake processor run, IM + Web assistant paths).
 func intakeSchemaBody() string {
 	return `intake.json 结构：
 {
@@ -133,11 +132,8 @@ cron 转换规则（自然语言频率 → 5 段 cron，时区按用户本地时
 }
 
 // RosterBody returns the current platform roster (agents/domains/runtimes/
-// skills/squads). Shared by BuildPrompt, BuildStewardChatBrief, and the
-// daemon's chat relay (injectStewardRoster) so all paths see the same
-// capability list. The chat relay injects it into session/prompt frames
-// because the AGENTS.md brief is session-fixed and does not reflect
-// entities created after the chat opened.
+// skills/squads). Shared by BuildPrompt (intake processor) and collectAndAsk
+// (draft clarification) so all paths see the same capability list.
 func (s *IntakeService) RosterBody(ctx context.Context) string {
 	var b strings.Builder
 	b.WriteString("\n当前可用 agent（id: name）：\n")
@@ -451,40 +447,4 @@ func (s *IntakeService) intakeAgent(ctx context.Context) (string, error) {
 		return "", errors.New("steward agent does not exist — connect a machine and restart the daemon")
 	}
 	return agent.ID, nil
-}
-
-// BuildStewardChatBrief assembles the chat-surface brief for the steward
-// agent: the intake schema + roster (shared with BuildPrompt) framed for
-// conversational use. The steward decides whether the user's message is a
-// platform instruction, and if so outputs a structured marker
-// (<<<INTAKE_JSON>>>{...}<<<END>>>) the daemon relay extracts and dispatches.
-// Non-instruction messages get a normal reply (no marker).
-//
-// Unlike BuildPrompt (which creates a processor run that writes intake.json
-// to a file), the chat path embeds the schema in the session-fixed AGENTS.md
-// brief and reads the parsed intent from the steward's text output — no run,
-// no file, no autopermit. The daemon's chat relay buffers the steward's
-// agent_message_chunk frames, scans for the marker on turn completion, and
-// dispatches through the same intakeReg handlers as the IM/Web path.
-func (s *IntakeService) BuildStewardChatBrief(ctx context.Context) (string, error) {
-	var b strings.Builder
-	b.WriteString("# Steward Chat Context\n\n")
-	b.WriteString("你是管家 agent，正在与用户直接对话。你可以正常聊天，但当用户的消息是平台指令时（创建/查看/取消/转交/重开/删除任务、查看待审批、创建/查看/停用/启用/删除定时任务、创建/查看/删除/修改 agent、创建/查看/修改/删除 squad、创建/查看/删除项目、查看/删除 skill、导入团队 等），请按下面的 schema 解析意图，并在回复末尾输出结构化标记。\n\n")
-	b.WriteString("判断规则：\n")
-	b.WriteString("- 如果用户消息是平台指令 → 按 schema 解析意图，输出标记\n")
-	b.WriteString("- 如果用户消息是闲聊/问候/技术讨论 → 正常回复，不输出标记\n")
-	b.WriteString("- 不确定时可以反问用户\n")
-	b.WriteString("- 创建/修改类指令（create_goal/create_agent/create_squad/domain_create 等）：如果用户消息中缺少必填字段，不要直接输出 create_X 意图——先用 chat 意图追问用户补齐缺失信息，等收集到所有必填字段后再输出完整的 create_X 意图。你可以基于对话历史判断信息是否完整——用户可能在后续消息中逐步补充信息。\n\n")
-	b.WriteString(intakeSchemaBody())
-	b.WriteString(s.RosterBody(ctx))
-	b.WriteString("\n输出格式（仅当判断为指令时）：\n")
-	b.WriteString("1. 先用一句话说明解析依据\n")
-	b.WriteString("2. 然后输出标记，格式为：\n")
-	b.WriteString("<<<INTAKE_JSON>>>{完整 JSON 对象}<<<END>>>\n")
-	b.WriteString("注意：只需输出 intent 字段和该意图涉及的子对象，其他字段省略。例如 domain_delete 只需 {\"intent\":\"domain_delete\",\"domain\":{\"name\":\"xxx\"}}\n")
-	b.WriteString("示例：\n")
-	b.WriteString("已解析意图：create_goal\n")
-	b.WriteString(`<<<INTAKE_JSON>>>{"intent":"create_goal","goal":{"title":"优化README","assignee_id":"agent_xxx","domain_id":"domain_xxx"}}<<<END>>>`)
-	b.WriteString("\n")
-	return b.String(), nil
 }

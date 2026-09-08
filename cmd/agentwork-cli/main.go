@@ -69,6 +69,8 @@ func main() {
 		subgoalCmd(os.Args[2:])
 	case "change":
 		changeCmd(os.Args[2:])
+	case "create":
+		createCmd(os.Args[2:])
 	case "issue":
 		issueCmd(goalID, os.Args[2:])
 	case "version":
@@ -379,7 +381,6 @@ func goalWait(goalID string, args []string) {
 	rpcPrintJSON(states)
 }
 
-
 // ── agent / squad ──
 
 func agentCmd(args []string) {
@@ -599,6 +600,125 @@ func postNoBody(url string, body any) {
 		rb, _ := io.ReadAll(resp.Body)
 		fail("POST %s: HTTP %d: %s", url, resp.StatusCode, rb)
 	}
+}
+
+// createCmd implements `agentwork create <kind> [flags]` — the chat-as-tool
+// entry point (决策7-5). The steward agent calls this to create platform
+// entities with draft/merge ask-once support. It parses kind-specific flags
+// into a full intakeAction JSON (intent + sub-struct) and POSTs it to
+// /intake/dispatch — the daemon's DispatchIntake is a thin pass-through to
+// intakeReg.dispatch, so no per-kind mapping on the daemon side.
+//
+// This is DISTINCT from `agentwork goal create` (which POSTs /goals directly
+// — used by run-path agents creating sub-goals with all fields known).
+func createCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork create <goal|agent|squad|domain|schedule|team> [flags]")
+		os.Exit(2)
+	}
+	kind := args[0]
+	body := buildCreateAction(kind, args[1:])
+	post(serverURL()+"/intake/dispatch", body)
+}
+
+// intentForKind maps a CLI kind to the intakeReg intent string. This is the
+// ONLY place that knows the mapping — the daemon side is mapping-free.
+func intentForKind(kind string) (string, bool) {
+	switch kind {
+	case "goal":
+		return "create_goal", true
+	case "agent":
+		return "create_agent", true
+	case "squad":
+		return "create_squad", true
+	case "domain":
+		return "domain_create", true
+	case "schedule":
+		return "create_schedule", true
+	case "team":
+		return "import_team", true
+	default:
+		return "", false
+	}
+}
+
+// buildCreateAction parses kind-specific flags into a full intakeAction JSON
+// (intent + the matching sub-struct). The daemon unmarshals this directly.
+func buildCreateAction(kind string, args []string) map[string]any {
+	intent, ok := intentForKind(kind)
+	if !ok {
+		fail("unknown create kind: %s (valid: goal, agent, squad, domain, schedule, team)", kind)
+	}
+	fs := flag.NewFlagSet("create "+kind, flag.ExitOnError)
+	var s1, s2, s3, s4, s5, s6, s7 string
+
+	switch kind {
+	case "goal":
+		fs.StringVar(&s1, "title", "", "goal title (required)")
+		fs.StringVar(&s2, "description", "", "goal description")
+		fs.StringVar(&s3, "assignee", "", "assignee agent/squad id or name")
+		fs.StringVar(&s4, "assignee_type", "", "agent (default) | squad")
+		fs.StringVar(&s5, "domain", "", "domain id or name (required)")
+		fs.Parse(args)
+		return map[string]any{"intent": intent, "goal": map[string]any{"title": s1, "description": s2, "assignee_id": s3, "assignee_type": s4, "domain_id": s5}}
+	case "agent":
+		fs.StringVar(&s1, "name", "", "agent name (required)")
+		fs.StringVar(&s2, "runtime", "", "runtime id or name (required)")
+		fs.StringVar(&s3, "description", "", "agent description")
+		fs.StringVar(&s4, "system_prompt", "", "agent persona/system prompt")
+		fs.StringVar(&s5, "skills", "", "comma-separated skill ids (optional; pass 'none' to decline)")
+		fs.Parse(args)
+		agentFields := map[string]any{"name": s1, "runtime_id": s2, "description": s3, "system_prompt": s4}
+		if s5 != "" {
+			if strings.TrimSpace(s5) == "none" {
+				agentFields["skills"] = []string{}
+				agentFields["skills_specified"] = true
+			} else {
+				var skills []string
+				for _, s := range strings.Split(s5, ",") {
+					if s = strings.TrimSpace(s); s != "" {
+						skills = append(skills, s)
+					}
+				}
+				agentFields["skills"] = skills
+				agentFields["skills_specified"] = true
+			}
+		}
+		return map[string]any{"intent": intent, "agent": agentFields}
+	case "squad":
+		fs.StringVar(&s1, "name", "", "squad name (required)")
+		fs.StringVar(&s2, "leader", "", "leader agent id or name (required)")
+		fs.StringVar(&s3, "description", "", "squad description")
+		fs.StringVar(&s4, "instructions", "", "squad collaboration instructions")
+		fs.Parse(args)
+		return map[string]any{"intent": intent, "squad": map[string]any{"name": s1, "leader_id": s2, "description": s3, "instructions": s4}}
+	case "domain":
+		fs.StringVar(&s1, "name", "", "domain name (required)")
+		fs.StringVar(&s2, "type", "", "repo (default) | scratch")
+		fs.StringVar(&s3, "git_url", "", "git repo URL (required for repo type)")
+		fs.StringVar(&s4, "default_branch", "", "default branch (default: main)")
+		fs.Parse(args)
+		return map[string]any{"intent": intent, "domain": map[string]any{"name": s1, "type": s2, "git_url": s3, "default_branch": s4}}
+	case "schedule":
+		fs.StringVar(&s1, "name", "", "schedule name (required)")
+		fs.StringVar(&s2, "title", "", "goal title template per trigger (required)")
+		fs.StringVar(&s3, "description", "", "schedule description")
+		fs.StringVar(&s4, "cron", "", "cron expression (required)")
+		fs.StringVar(&s5, "assignee", "", "assignee agent/squad id or name")
+		fs.StringVar(&s6, "assignee_type", "", "agent (default) | squad")
+		fs.StringVar(&s7, "domain", "", "domain id or name (required)")
+		fs.Parse(args)
+		return map[string]any{"intent": intent, "schedule": map[string]any{"name": s1, "title": s2, "description": s3, "cron": s4, "assignee_id": s5, "assignee_type": s6, "domain_id": s7}}
+	case "team":
+		fs.StringVar(&s1, "url", "", "git repo URL (required)")
+		fs.StringVar(&s2, "branch", "", "branch (default: repo default)")
+		fs.StringVar(&s3, "credentials", "", "git credentials (private repos)")
+		fs.Parse(args)
+		return map[string]any{"intent": intent, "import_team": map[string]any{"git_url": s1, "branch": s2, "credentials": s3}}
+	default:
+		fail("unknown create kind: %s (valid: goal, agent, squad, domain, schedule, team)", kind)
+	}
+	return nil
 }
 
 // versionCmd prints just the build version (e.g. "v0.0.2") on stdout — the

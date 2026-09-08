@@ -78,7 +78,7 @@ func TestIntakeCreateGoal(t *testing.T) {
 	ctx := context.Background()
 	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
 
-	reply := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("从飞书建的任务", "", "a1", domID)})
+	reply := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("从飞书建的任务", "", "a1", domID)}).Message
 	if !strings.Contains(reply, "已创建任务") {
 		t.Fatalf("expected creation reply, got %q", reply)
 	}
@@ -94,18 +94,18 @@ func TestIntakeCreateGoal(t *testing.T) {
 	// Missing title → the ask lists 标题 (the first call saved a goal draft
 	// for "从飞书建的任务"; clear it so this case asks fresh).
 	_ = d.intakeSvc.ClearDraft(ctx)
-	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("", "", "a1", domID)}); !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "标题") {
+	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("", "", "a1", domID)}).Message; !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "标题") {
 		t.Fatalf("missing title must ask with 标题, got %q", r)
 	}
 	// Hallucinated domain → service-layer validator message (all required
 	// fields present, so it goes straight to Create).
 	_ = d.intakeSvc.ClearDraft(ctx)
-	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("x", "", "a1", "nonexistent")}); !strings.Contains(r, "创建任务失败") {
+	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("x", "", "a1", "nonexistent")}).Message; !strings.Contains(r, "创建任务失败") {
 		t.Fatalf("hallucinated domain must fail via the validator, got %q", r)
 	}
 	// Missing domain (title present) → the ask lists 项目/仓库 + the domain roster.
 	_ = d.intakeSvc.ClearDraft(ctx)
-	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("修一下", "", "a1", "")}); !strings.Contains(r, "项目/仓库") {
+	if r := d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("修一下", "", "a1", "")}).Message; !strings.Contains(r, "项目/仓库") {
 		t.Fatalf("missing domain must ask with 项目/仓库, got %q", r)
 	}
 }
@@ -126,16 +126,16 @@ func TestIntakeReviewListAndStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reply := d.intakeReviewList(ctx)
+	reply := d.intakeReviewList(ctx).Message
 	if !strings.Contains(reply, "待审") || !strings.Contains(reply, "待审批") {
 		t.Fatalf("review list must carry the pending goal: %q", reply)
 	}
 
-	status := d.intakeGoalStatus(ctx, g.ID[:8])
+	status := d.intakeGoalStatus(ctx, g.ID[:8]).Message
 	if !strings.Contains(status, "review") || !strings.Contains(status, "待审") {
 		t.Fatalf("status query must resolve the short id: %q", status)
 	}
-	if r := d.intakeGoalStatus(ctx, "zzzzzzzz"); !strings.Contains(r, "查询失败") {
+	if r := d.intakeGoalStatus(ctx, "zzzzzzzz").Message; !strings.Contains(r, "查询失败") {
 		t.Fatalf("unknown id must fail cleanly: %q", r)
 	}
 }
@@ -156,7 +156,7 @@ func TestIntakeCreateSchedule(t *testing.T) {
 		AssigneeID   string `json:"assignee_id"`
 		AssigneeType string `json:"assignee_type"`
 		DomainID     string `json:"domain_id"`
-	}{Name: "每小时巡检", Title: "定时巡检", Cron: "0 * * * *", AssigneeID: "a1", DomainID: domID}})
+	}{Name: "每小时巡检", Title: "定时巡检", Cron: "0 * * * *", AssigneeID: "a1", DomainID: domID}}).Message
 	if !strings.Contains(reply, "已创建定时任务") {
 		t.Fatalf("expected creation reply, got %q", reply)
 	}
@@ -169,11 +169,11 @@ func TestIntakeCreateSchedule(t *testing.T) {
 		AssigneeID   string `json:"assignee_id"`
 		AssigneeType string `json:"assignee_type"`
 		DomainID     string `json:"domain_id"`
-	}{Name: "坏cron", Title: "x", Cron: "not-a-cron", AssigneeID: "a1", DomainID: domID}}); !strings.Contains(r, "创建定时任务失败") {
+	}{Name: "坏cron", Title: "x", Cron: "not-a-cron", AssigneeID: "a1", DomainID: domID}}).Message; !strings.Contains(r, "创建定时任务失败") {
 		t.Fatalf("bad cron must surface the validator message, got %q", r)
 	}
 
-	list := d.intakeScheduleList(ctx)
+	list := d.intakeScheduleList(ctx).Message
 	if !strings.Contains(list, "每小时巡检") || !strings.Contains(list, "0 * * * *") {
 		t.Fatalf("schedule list must carry the created schedule: %q", list)
 	}
@@ -186,7 +186,7 @@ func TestIntakeCreateSchedule(t *testing.T) {
 		AssigneeID   string `json:"assignee_id"`
 		AssigneeType string `json:"assignee_type"`
 		DomainID     string `json:"domain_id"`
-	}{Name: "每小时巡检"}})
+	}{Name: "每小时巡检"}}).Message
 	if !strings.Contains(stop, "已停用") {
 		t.Fatalf("expected stop reply, got %q", stop)
 	}
@@ -198,11 +198,11 @@ func TestIntakeCreateSchedule(t *testing.T) {
 		AssigneeID   string `json:"assignee_id"`
 		AssigneeType string `json:"assignee_type"`
 		DomainID     string `json:"domain_id"`
-	}{Name: "不存在"}}); !strings.Contains(r, "没找到") {
+	}{Name: "不存在"}}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("stopping an unknown schedule must say so, got %q", r)
 	}
 	// Disabled schedules drop out of the list.
-	if r := d.intakeScheduleList(ctx); strings.Contains(r, "每小时巡检") {
+	if r := d.intakeScheduleList(ctx).Message; strings.Contains(r, "每小时巡检") {
 		t.Fatalf("disabled schedule must leave the list: %q", r)
 	}
 }
@@ -254,7 +254,7 @@ func TestIntakeCreateAgent(t *testing.T) {
 	// --- No skills on the platform: created directly, no clarification. ---
 	d, st := newIntakeDaemon(t)
 	reply := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"代码审查", "rt1", "审查 PR 代码质量", "你是代码审查员", nil, false)})
+		"代码审查", "rt1", "审查 PR 代码质量", "你是代码审查员", nil, false)}).Message
 	if !strings.Contains(reply, "已创建 agent") {
 		t.Fatalf("expected creation reply, got %q", reply)
 	}
@@ -275,26 +275,27 @@ func TestIntakeCreateAgent(t *testing.T) {
 	// Missing name → the ask lists 名称 (no hard "缺少名称" anymore).
 	clearIntakeDraft()
 	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"", "rt1", "x", "y", nil, true)}); !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "名称") {
+		"", "rt1", "x", "y", nil, true)}).Message; !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "名称") {
 		t.Fatalf("missing name must ask with 名称, got %q", r)
 	}
-	// Missing runtime_id → the ask lists 运行时 + the runtime roster.
+	// Missing runtime_id → the ask lists 运行时 (in Message) + the runtime roster (in PlatformHint).
 	clearIntakeDraft()
-	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"无运行时", "", "x", "y", nil, true)}); !strings.Contains(r, "运行时") || !strings.Contains(r, "rt1") {
-		t.Fatalf("missing runtime must ask with the runtime roster, got %q", r)
+	res := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
+		"无运行时", "", "x", "y", nil, true)})
+	if !strings.Contains(res.Message, "运行时") || !strings.Contains(res.PlatformHint, "rt1") {
+		t.Fatalf("missing runtime must ask with the runtime roster, got msg=%q hint=%q", res.Message, res.PlatformHint)
 	}
 	// Missing BOTH name and runtime → one ask listing both (not two round-trips).
 	clearIntakeDraft()
 	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"", "", "", "", nil, true)}); !strings.Contains(r, "名称") || !strings.Contains(r, "运行时") {
+		"", "", "", "", nil, true)}).Message; !strings.Contains(r, "名称") || !strings.Contains(r, "运行时") {
 		t.Fatalf("missing name+runtime must ask for both at once, got %q", r)
 	}
 	// Hallucinated runtime_id → service-layer validator message (all fields
 	// present, so it goes straight to Create, which rejects the bad id).
 	clearIntakeDraft()
 	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"坏runtime", "nope", "x", "y", nil, true)}); !strings.Contains(r, "创建 agent 失败") {
+		"坏runtime", "nope", "x", "y", nil, true)}).Message; !strings.Contains(r, "创建 agent 失败") {
 		t.Fatalf("hallucinated runtime must fail via the validator, got %q", r)
 	}
 
@@ -303,12 +304,12 @@ func TestIntakeCreateAgent(t *testing.T) {
 	// and fails at the service layer (terminal error). No second ask.
 	clearIntakeDraft()
 	if r := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"", "", "", "", nil, true)}); !strings.Contains(r, "还需要以下信息") {
+		"", "", "", "", nil, true)}).Message; !strings.Contains(r, "还需要以下信息") {
 		t.Fatalf("setup: missing name+runtime must ask, got %q", r)
 	}
 	// Draft is now saved. Vague reply supplies nothing useful.
 	vague := d.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"", "", "", "", nil, true)})
+		"", "", "", "", nil, true)}).Message
 	if strings.Contains(vague, "还需要以下信息") {
 		t.Fatalf("vague reply must NOT re-ask (ask-at-most-once), got %q", vague)
 	}
@@ -326,10 +327,10 @@ func TestIntakeCreateAgent(t *testing.T) {
 		time.Now().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
-	reply = d2.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
+	skillRes := d2.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
 		"带skill的agent", "rt1", "x", "y", nil, false)})
-	if !strings.Contains(reply, "还需要以下信息") || !strings.Contains(reply, "skills") || !strings.Contains(reply, "git-helper") {
-		t.Fatalf("must ask for skills (listed as missing) and show the skill, got %q", reply)
+	if !strings.Contains(skillRes.Message, "还需要以下信息") || !strings.Contains(skillRes.Message, "skills") || !strings.Contains(skillRes.PlatformHint, "git-helper") {
+		t.Fatalf("must ask for skills (listed as missing) and show the skill, got msg=%q hint=%q", skillRes.Message, skillRes.PlatformHint)
 	}
 	// The draft is saved — the clarification turn must build from it.
 	if _, ok := d2.loadDraftOfKind(ctx, "agent"); !ok {
@@ -339,7 +340,7 @@ func TestIntakeCreateAgent(t *testing.T) {
 	// (the draft carried name/runtime/description/system_prompt; the reply
 	// supplies only skills).
 	reply = d2.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"", "", "", "", []string{"sk1"}, true)})
+		"", "", "", "", []string{"sk1"}, true)}).Message
 	if !strings.Contains(reply, "已创建 agent") {
 		t.Fatalf("clarification turn must create the agent, got %q", reply)
 	}
@@ -363,7 +364,7 @@ func TestIntakeCreateAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	reply = d3.intakeCreateAgent(ctx, intakeAction{Intent: "create_agent", Agent: agentSub(
-		"不要skill的agent", "rt1", "x", "y", nil, true)})
+		"不要skill的agent", "rt1", "x", "y", nil, true)}).Message
 	if !strings.Contains(reply, "已创建 agent") {
 		t.Fatalf("explicit decline must create directly, got %q", reply)
 	}
@@ -378,7 +379,7 @@ func TestIntakeCreateSquad(t *testing.T) {
 	// Bare squad (leader only) — the minimal viable squad.
 	d, st := newIntakeDaemon(t)
 	reply := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"审查组", "a1", "PR 审查小组", "leader 拆分并委派子目标", nil)})
+		"审查组", "a1", "PR 审查小组", "leader 拆分并委派子目标", nil)}).Message
 	if !strings.Contains(reply, "已创建 squad") {
 		t.Fatalf("expected creation reply, got %q", reply)
 	}
@@ -392,25 +393,26 @@ func TestIntakeCreateSquad(t *testing.T) {
 	// each missing case saves a squad draft on the shared daemon).
 	_ = d.intakeSvc.ClearDraft(ctx)
 	if r := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"", "a1", "x", "y", nil)}); !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "名称") {
+		"", "a1", "x", "y", nil)}).Message; !strings.Contains(r, "还需要以下信息") || !strings.Contains(r, "名称") {
 		t.Fatalf("missing name must ask with 名称, got %q", r)
 	}
-	// Missing leader_id → the ask lists leader agent + the agent roster.
+	// Missing leader_id → the ask lists leader agent (in Message) + the agent roster (in PlatformHint).
 	_ = d.intakeSvc.ClearDraft(ctx)
-	if r := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"无leader", "", "x", "y", nil)}); !strings.Contains(r, "leader agent") || !strings.Contains(r, "worker1") {
-		t.Fatalf("missing leader must ask with the agent roster, got %q", r)
+	sres := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
+		"无leader", "", "x", "y", nil)})
+	if !strings.Contains(sres.Message, "leader agent") || !strings.Contains(sres.PlatformHint, "worker1") {
+		t.Fatalf("missing leader must ask with the agent roster, got msg=%q hint=%q", sres.Message, sres.PlatformHint)
 	}
 	// Missing BOTH name and leader → one ask listing both.
 	_ = d.intakeSvc.ClearDraft(ctx)
 	if r := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"", "", "x", "y", nil)}); !strings.Contains(r, "名称") || !strings.Contains(r, "leader agent") {
+		"", "", "x", "y", nil)}).Message; !strings.Contains(r, "名称") || !strings.Contains(r, "leader agent") {
 		t.Fatalf("missing name+leader must ask for both at once, got %q", r)
 	}
 	// Hallucinated leader_id → service-layer validator message.
 	_ = d.intakeSvc.ClearDraft(ctx)
 	if r := d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"坏leader", "nope", "x", "y", nil)}); !strings.Contains(r, "创建 squad 失败") {
+		"坏leader", "nope", "x", "y", nil)}).Message; !strings.Contains(r, "创建 squad 失败") {
 		t.Fatalf("hallucinated leader must fail via the validator, got %q", r)
 	}
 
@@ -422,7 +424,7 @@ func TestIntakeCreateSquad(t *testing.T) {
 		t.Fatal(err)
 	}
 	reply = d2.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"带成员的组", "a1", "x", "y", []string{"a2"})})
+		"带成员的组", "a1", "x", "y", []string{"a2"})}).Message
 	if !strings.Contains(reply, "已创建 squad") {
 		t.Fatalf("squad with member must create, got %q", reply)
 	}
@@ -438,7 +440,7 @@ func TestIntakeCreateSquad(t *testing.T) {
 	// Hallucinated member → partial success (squad created, member failed).
 	d3, _ := newIntakeDaemon(t)
 	reply = d3.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"部分成功", "a1", "x", "y", []string{"ghost"})})
+		"部分成功", "a1", "x", "y", []string{"ghost"})}).Message
 	if !strings.Contains(reply, "已创建 squad") || !strings.Contains(reply, "添加失败") {
 		t.Fatalf("hallucinated member must be partial success, got %q", reply)
 	}
@@ -446,7 +448,7 @@ func TestIntakeCreateSquad(t *testing.T) {
 	// The leader id in member_ids is skipped (it is already squad.leader_id).
 	d4, st4 := newIntakeDaemon(t)
 	reply = d4.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
-		"leader重复", "a1", "x", "y", []string{"a1"})})
+		"leader重复", "a1", "x", "y", []string{"a1"})}).Message
 	if !strings.Contains(reply, "已创建 squad") {
 		t.Fatalf("leader-as-member must still create, got %q", reply)
 	}
@@ -498,7 +500,7 @@ func TestIntakeRegistryIntents(t *testing.T) {
 func TestIntakeDispatchUnknownReturnsFallback(t *testing.T) {
 	d, _ := newIntakeDaemon(t)
 	ctx := context.Background()
-	reply := intakeReg.dispatch(d, ctx, intakeAction{Intent: "totally_bogus"})
+	reply := intakeReg.dispatch(d, ctx, intakeAction{Intent: "totally_bogus"}).Message
 	if !strings.Contains(reply, "没听懂") {
 		t.Fatalf("unknown intent must return fallback, got %q", reply)
 	}
@@ -510,7 +512,7 @@ func TestIntakeSquadListDetail(t *testing.T) {
 	ctx := context.Background()
 
 	// Empty list.
-	if r := d.intakeSquadList(ctx); !strings.Contains(r, "没有 squad") {
+	if r := d.intakeSquadList(ctx).Message; !strings.Contains(r, "没有 squad") {
 		t.Fatalf("empty list, got %q", r)
 	}
 
@@ -524,7 +526,7 @@ func TestIntakeSquadListDetail(t *testing.T) {
 	d2.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
 		"审查组", "a1", "PR 审查", "leader 拆分委派", []string{"a2"})})
 
-	list := d2.intakeSquadList(ctx)
+	list := d2.intakeSquadList(ctx).Message
 	if !strings.Contains(list, "审查组") || !strings.Contains(list, "worker1") {
 		t.Fatalf("list must show squad name + leader name, got %q", list)
 	}
@@ -532,7 +534,7 @@ func TestIntakeSquadListDetail(t *testing.T) {
 		t.Fatalf("list must show member count, got %q", list)
 	}
 
-	detail := d2.intakeSquadDetail(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)})
+	detail := d2.intakeSquadDetail(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)}).Message
 	if !strings.Contains(detail, "审查组") || !strings.Contains(detail, "worker1") || !strings.Contains(detail, "worker2") {
 		t.Fatalf("detail must show squad + leader + member, got %q", detail)
 	}
@@ -541,12 +543,12 @@ func TestIntakeSquadListDetail(t *testing.T) {
 	}
 
 	// Detail on non-existent squad.
-	if r := d2.intakeSquadDetail(ctx, intakeAction{Squad: squadSub("不存在", "", "", "", nil)}); !strings.Contains(r, "没找到") {
+	if r := d2.intakeSquadDetail(ctx, intakeAction{Squad: squadSub("不存在", "", "", "", nil)}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("detail on missing squad must say so, got %q", r)
 	}
 
 	// Detail without name.
-	if r := d2.intakeSquadDetail(ctx, intakeAction{}); !strings.Contains(r, "需要名字") {
+	if r := d2.intakeSquadDetail(ctx, intakeAction{}).Message; !strings.Contains(r, "需要名字") {
 		t.Fatalf("detail without name must ask, got %q", r)
 	}
 }
@@ -564,7 +566,7 @@ func TestIntakeSquadUpdate(t *testing.T) {
 		"审查组", "a1", "PR 审查", "leader 拆分委派", nil)})
 
 	// Change leader a1 → a2.
-	reply := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("审查组", "a2", "", "", nil)})
+	reply := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("审查组", "a2", "", "", nil)}).Message
 	if !strings.Contains(reply, "已更新") {
 		t.Fatalf("update leader must succeed, got %q", reply)
 	}
@@ -577,11 +579,11 @@ func TestIntakeSquadUpdate(t *testing.T) {
 		t.Fatalf("leader must be a2 after update, got %q", leaderID)
 	}
 	// No fields specified → ask what to change.
-	if r := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)}); !strings.Contains(r, "需要指定") {
+	if r := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)}).Message; !strings.Contains(r, "需要指定") {
 		t.Fatalf("update with no changes must ask, got %q", r)
 	}
 	// Non-existent squad.
-	if r := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("不存在", "a1", "", "", nil)}); !strings.Contains(r, "没找到") {
+	if r := d.intakeSquadUpdate(ctx, intakeAction{Squad: squadSub("不存在", "a1", "", "", nil)}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("update on missing squad must say so, got %q", r)
 	}
 }
@@ -599,7 +601,7 @@ func TestIntakeSquadAddRemoveMember(t *testing.T) {
 		"审查组", "a1", "PR 审查", "拆分委派", nil)})
 
 	// Add a2.
-	reply := d.intakeSquadAddMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})})
+	reply := d.intakeSquadAddMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})}).Message
 	if !strings.Contains(reply, "已添加") {
 		t.Fatalf("add member must succeed, got %q", reply)
 	}
@@ -613,7 +615,7 @@ func TestIntakeSquadAddRemoveMember(t *testing.T) {
 	}
 
 	// Remove a2.
-	reply = d.intakeSquadRemoveMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})})
+	reply = d.intakeSquadRemoveMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})}).Message
 	if !strings.Contains(reply, "已从") || !strings.Contains(reply, "移除") {
 		t.Fatalf("remove member must succeed, got %q", reply)
 	}
@@ -626,12 +628,12 @@ func TestIntakeSquadAddRemoveMember(t *testing.T) {
 	}
 
 	// Remove a member not in the squad.
-	if r := d.intakeSquadRemoveMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})}); !strings.Contains(r, "不在") {
+	if r := d.intakeSquadRemoveMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", []string{"a2"})}).Message; !strings.Contains(r, "不在") {
 		t.Fatalf("removing a non-member must report it, got %q", r)
 	}
 
 	// Add without specifying member.
-	if r := d.intakeSquadAddMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)}); !strings.Contains(r, "需要指定") {
+	if r := d.intakeSquadAddMember(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)}).Message; !strings.Contains(r, "需要指定") {
 		t.Fatalf("add without member must ask, got %q", r)
 	}
 }
@@ -643,7 +645,7 @@ func TestIntakeSquadDelete(t *testing.T) {
 	d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub(
 		"审查组", "a1", "PR 审查", "拆分委派", nil)})
 
-	reply := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)})
+	reply := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("审查组", "", "", "", nil)}).Message
 	if !strings.Contains(reply, "已删除") {
 		t.Fatalf("delete must succeed, got %q", reply)
 	}
@@ -656,7 +658,7 @@ func TestIntakeSquadDelete(t *testing.T) {
 	}
 
 	// Delete non-existent.
-	if r := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("不存在", "", "", "", nil)}); !strings.Contains(r, "没找到") {
+	if r := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("不存在", "", "", "", nil)}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("delete on missing squad must say so, got %q", r)
 	}
 }
@@ -669,7 +671,7 @@ func TestIntakeSquadDeleteBatch(t *testing.T) {
 	d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub("组A", "a1", "", "", nil)})
 	d.intakeCreateSquad(ctx, intakeAction{Intent: "create_squad", Squad: squadSub("组B", "a1", "", "", nil)})
 
-	reply := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("组A, 组B, 不存在", "", "", "", nil)})
+	reply := d.intakeSquadDelete(ctx, intakeAction{Squad: squadSub("组A, 组B, 不存在", "", "", "", nil)}).Message
 	if !strings.Contains(reply, "组A") || !strings.Contains(reply, "组B") {
 		t.Fatalf("must report deleted squads, got %q", reply)
 	}
@@ -688,7 +690,7 @@ func TestIntakeListGoals(t *testing.T) {
 
 	// Empty.
 	d, _ := newIntakeDaemon(t)
-	if r := d.intakeListGoals(ctx); !strings.Contains(r, "没有任务") {
+	if r := d.intakeListGoals(ctx).Message; !strings.Contains(r, "没有任务") {
 		t.Fatalf("empty list, got %q", r)
 	}
 
@@ -696,7 +698,7 @@ func TestIntakeListGoals(t *testing.T) {
 	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
 	d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("任务A", "", "a1", domID)})
 	d.intakeCreateGoal(ctx, intakeAction{Goal: goalSub("任务B", "", "a1", domID)})
-	list := d.intakeListGoals(ctx)
+	list := d.intakeListGoals(ctx).Message
 	if !strings.Contains(list, "任务A") || !strings.Contains(list, "任务B") {
 		t.Fatalf("list must show both goals, got %q", list)
 	}
@@ -717,21 +719,21 @@ func TestIntakeCancelGoal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reply := d.intakeCancelGoal(ctx, g.ID[:8])
+	reply := d.intakeCancelGoal(ctx, g.ID[:8]).Message
 	if !strings.Contains(reply, "已取消") {
 		t.Fatalf("cancel must succeed, got %q", reply)
 	}
 
 	// Re-cancel → fails (goal is terminal).
-	if r := d.intakeCancelGoal(ctx, g.ID[:8]); !strings.Contains(r, "取消失败") {
+	if r := d.intakeCancelGoal(ctx, g.ID[:8]).Message; !strings.Contains(r, "取消失败") {
 		t.Fatalf("re-cancel must fail, got %q", r)
 	}
 	// No id.
-	if r := d.intakeCancelGoal(ctx, ""); !strings.Contains(r, "需要任务 id") {
+	if r := d.intakeCancelGoal(ctx, "").Message; !strings.Contains(r, "需要任务 id") {
 		t.Fatalf("no id must ask, got %q", r)
 	}
 	// Unknown id.
-	if r := d.intakeCancelGoal(ctx, "zzzzzzzz"); !strings.Contains(r, "找不到") {
+	if r := d.intakeCancelGoal(ctx, "zzzzzzzz").Message; !strings.Contains(r, "找不到") {
 		t.Fatalf("unknown id must say not found, got %q", r)
 	}
 }
@@ -754,7 +756,7 @@ func TestIntakeAssignGoal(t *testing.T) {
 	}
 
 	reply := d.intakeAssignGoal(ctx, intakeAction{
-		GoalID: g.ID[:8], Goal: goalAction{AssigneeID: "a2", AssigneeType: "agent"}})
+		GoalID: g.ID[:8], Goal: goalAction{AssigneeID: "a2", AssigneeType: "agent"}}).Message
 	if !strings.Contains(reply, "已转交") || !strings.Contains(reply, "worker2") {
 		t.Fatalf("assign must succeed with new assignee name, got %q", reply)
 	}
@@ -767,16 +769,16 @@ func TestIntakeAssignGoal(t *testing.T) {
 	}
 
 	// Missing assignee.
-	if r := d.intakeAssignGoal(ctx, intakeAction{GoalID: g.ID[:8]}); !strings.Contains(r, "需要指定执行者") {
+	if r := d.intakeAssignGoal(ctx, intakeAction{GoalID: g.ID[:8]}).Message; !strings.Contains(r, "需要指定执行者") {
 		t.Fatalf("missing assignee must ask, got %q", r)
 	}
 	// Missing goal id.
-	if r := d.intakeAssignGoal(ctx, intakeAction{}); !strings.Contains(r, "需要任务 id") {
+	if r := d.intakeAssignGoal(ctx, intakeAction{}).Message; !strings.Contains(r, "需要任务 id") {
 		t.Fatalf("missing id must ask, got %q", r)
 	}
 	// Hallucinated agent.
 	if r := d.intakeAssignGoal(ctx, intakeAction{
-		GoalID: g.ID[:8], Goal: goalAction{AssigneeID: "ghost", AssigneeType: "agent"}}); !strings.Contains(r, "转交失败") {
+		GoalID: g.ID[:8], Goal: goalAction{AssigneeID: "ghost", AssigneeType: "agent"}}).Message; !strings.Contains(r, "转交失败") {
 		t.Fatalf("hallucinated agent must fail, got %q", r)
 	}
 }
@@ -788,7 +790,7 @@ func TestIntakeListAgents(t *testing.T) {
 
 	// The test daemon seeds a1/worker1, so list is non-empty by default.
 	d, _ := newIntakeDaemon(t)
-	list := d.intakeListAgents(ctx)
+	list := d.intakeListAgents(ctx).Message
 	if !strings.Contains(list, "worker1") {
 		t.Fatalf("list must show seeded agent, got %q", list)
 	}
@@ -805,7 +807,7 @@ func TestIntakeDeleteAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reply := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker2", "rt1", "", "", nil, true)})
+	reply := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker2", "rt1", "", "", nil, true)}).Message
 	if !strings.Contains(reply, "已删除") {
 		t.Fatalf("delete must succeed, got %q", reply)
 	}
@@ -821,12 +823,12 @@ func TestIntakeDeleteAgent(t *testing.T) {
 	domID := firstID(t, ctx, d, `SELECT id FROM domain`)
 	d.goalSvc.Create(ctx, service.Goal{
 		Title: "占用a1", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
-	if r := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker1", "rt1", "", "", nil, true)}); !strings.Contains(r, "失败") {
+	if r := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker1", "rt1", "", "", nil, true)}).Message; !strings.Contains(r, "失败") {
 		t.Fatalf("agent with goal must fail, got %q", r)
 	}
 
 	// Non-existent.
-	if r := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("不存在", "rt1", "", "", nil, true)}); !strings.Contains(r, "没找到") {
+	if r := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("不存在", "rt1", "", "", nil, true)}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("non-existent must say so, got %q", r)
 	}
 }
@@ -853,7 +855,7 @@ func TestIntakeDeleteAgentBatch(t *testing.T) {
 		Title: "占用a1", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
 
 	// Batch: worker2 ✅, worker1 ❌ (guarded), worker3 ✅, ghost ❌ (not found).
-	reply := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker2, worker1, worker3, ghost", "", "", "", nil, true)})
+	reply := d.intakeDeleteAgent(ctx, intakeAction{Agent: agentSub("worker2, worker1, worker3, ghost", "", "", "", nil, true)}).Message
 	if !strings.Contains(reply, "worker2") || !strings.Contains(reply, "worker3") {
 		t.Fatalf("must report deleted agents, got %q", reply)
 	}
@@ -882,7 +884,7 @@ func TestIntakeUpdateAgent(t *testing.T) {
 	ctx := context.Background()
 
 	// Change description.
-	reply := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "新描述", "", nil, true)})
+	reply := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "新描述", "", nil, true)}).Message
 	if !strings.Contains(reply, "已更新") {
 		t.Fatalf("update must succeed, got %q", reply)
 	}
@@ -895,7 +897,7 @@ func TestIntakeUpdateAgent(t *testing.T) {
 	}
 
 	// Change system_prompt.
-	reply = d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "", "新人设", nil, true)})
+	reply = d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "", "新人设", nil, true)}).Message
 	if !strings.Contains(reply, "已更新") {
 		t.Fatalf("update system_prompt must succeed, got %q", reply)
 	}
@@ -908,12 +910,12 @@ func TestIntakeUpdateAgent(t *testing.T) {
 	}
 
 	// No fields specified.
-	if r := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "", "", nil, true)}); !strings.Contains(r, "需要指定") {
+	if r := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("worker1", "", "", "", nil, true)}).Message; !strings.Contains(r, "需要指定") {
 		t.Fatalf("no changes must ask, got %q", r)
 	}
 
 	// Non-existent.
-	if r := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("不存在", "", "x", "", nil, true)}); !strings.Contains(r, "没找到") {
+	if r := d.intakeUpdateAgent(ctx, intakeAction{Agent: agentSub("不存在", "", "x", "", nil, true)}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("non-existent must say so, got %q", r)
 	}
 }
@@ -926,7 +928,7 @@ func TestIntakeCreateDomain(t *testing.T) {
 
 	// Repo domain — full fields.
 	d, st := newIntakeDaemon(t)
-	reply := d.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("myrepo", "repo", "https://e.com/myrepo.git")})
+	reply := d.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("myrepo", "repo", "https://e.com/myrepo.git")}).Message
 	if !strings.Contains(reply, "已创建项目") {
 		t.Fatalf("repo domain must create, got %q", reply)
 	}
@@ -937,7 +939,7 @@ func TestIntakeCreateDomain(t *testing.T) {
 
 	// Scratch domain — no git_url needed.
 	d2, st2 := newIntakeDaemon(t)
-	reply = d2.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("myscratch", "scratch", "")})
+	reply = d2.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("myscratch", "scratch", "")}).Message
 	if !strings.Contains(reply, "已创建项目") {
 		t.Fatalf("scratch domain must create without git_url, got %q", reply)
 	}
@@ -952,14 +954,14 @@ func TestIntakeCreateDomain(t *testing.T) {
 	// Missing name → ask.
 	d3, _ := newIntakeDaemon(t)
 	_ = d3.intakeSvc.ClearDraft(ctx)
-	if r := d3.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("", "repo", "https://e.com/x.git")}); !strings.Contains(r, "还需要") || !strings.Contains(r, "名称") {
+	if r := d3.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("", "repo", "https://e.com/x.git")}).Message; !strings.Contains(r, "还需要") || !strings.Contains(r, "名称") {
 		t.Fatalf("missing name must ask, got %q", r)
 	}
 
 	// Missing git_url (repo) → ask.
 	d4, _ := newIntakeDaemon(t)
 	_ = d4.intakeSvc.ClearDraft(ctx)
-	if r := d4.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("no-url", "repo", "")}); !strings.Contains(r, "还需要") || !strings.Contains(r, "仓库地址") {
+	if r := d4.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("no-url", "repo", "")}).Message; !strings.Contains(r, "还需要") || !strings.Contains(r, "仓库地址") {
 		t.Fatalf("missing git_url must ask, got %q", r)
 	}
 
@@ -967,12 +969,12 @@ func TestIntakeCreateDomain(t *testing.T) {
 	// second message supplies git_url → create from draft.
 	d5, _ := newIntakeDaemon(t)
 	_ = d5.intakeSvc.ClearDraft(ctx)
-	ask := d5.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("draftrepo", "repo", "")})
+	ask := d5.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("draftrepo", "repo", "")}).Message
 	if !strings.Contains(ask, "仓库地址") {
 		t.Fatalf("draft setup must ask for git_url, got %q", ask)
 	}
 	// Clarification turn: supply git_url (name carried by draft).
-	reply = d5.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("", "", "https://e.com/draft.git")})
+	reply = d5.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("", "", "https://e.com/draft.git")}).Message
 	if !strings.Contains(reply, "已创建项目") {
 		t.Fatalf("draft clarification must create, got %q", reply)
 	}
@@ -982,7 +984,7 @@ func TestIntakeCreateDomain(t *testing.T) {
 func TestIntakeListDomains(t *testing.T) {
 	ctx := context.Background()
 	d, _ := newIntakeDaemon(t)
-	list := d.intakeListDomains(ctx)
+	list := d.intakeListDomains(ctx).Message
 	if !strings.Contains(list, "d1") {
 		t.Fatalf("list must show seeded domain d1, got %q", list)
 	}
@@ -1006,7 +1008,7 @@ func TestIntakeReopenGoal(t *testing.T) {
 	if _, err := d.goalSvc.Cancel(ctx, g.ID); err != nil {
 		t.Fatal(err)
 	}
-	reply := d.intakeReopenGoal(ctx, intakeAction{GoalID: g.ID[:8]})
+	reply := d.intakeReopenGoal(ctx, intakeAction{GoalID: g.ID[:8]}).Message
 	if !strings.Contains(reply, "已重开") {
 		t.Fatalf("reopen must succeed, got %q", reply)
 	}
@@ -1018,15 +1020,15 @@ func TestIntakeReopenGoal(t *testing.T) {
 		`SELECT id FROM goal WHERE title=?`, "活跃的").Scan(&activeID); err != nil {
 		t.Fatal(err)
 	}
-	if r := d.intakeReopenGoal(ctx, intakeAction{GoalID: activeID[:8]}); !strings.Contains(r, "重开失败") {
+	if r := d.intakeReopenGoal(ctx, intakeAction{GoalID: activeID[:8]}).Message; !strings.Contains(r, "重开失败") {
 		t.Fatalf("reopen active must fail, got %q", r)
 	}
 	// No id.
-	if r := d.intakeReopenGoal(ctx, intakeAction{}); !strings.Contains(r, "需要任务 id") {
+	if r := d.intakeReopenGoal(ctx, intakeAction{}).Message; !strings.Contains(r, "需要任务 id") {
 		t.Fatalf("no id must ask, got %q", r)
 	}
 	// Unknown id.
-	if r := d.intakeReopenGoal(ctx, intakeAction{GoalID: "zzzzzzzz"}); !strings.Contains(r, "找不到") {
+	if r := d.intakeReopenGoal(ctx, intakeAction{GoalID: "zzzzzzzz"}).Message; !strings.Contains(r, "找不到") {
 		t.Fatalf("unknown id must say not found, got %q", r)
 	}
 }
@@ -1042,7 +1044,7 @@ func TestIntakeDeleteGoal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reply := d.intakeDeleteGoal(ctx, g.ID[:8])
+	reply := d.intakeDeleteGoal(ctx, g.ID[:8]).Message
 	if !strings.Contains(reply, "已删除") {
 		t.Fatalf("delete must succeed, got %q", reply)
 	}
@@ -1054,11 +1056,11 @@ func TestIntakeDeleteGoal(t *testing.T) {
 		t.Fatalf("goal must be deleted, got %d rows", count)
 	}
 	// No id.
-	if r := d.intakeDeleteGoal(ctx, ""); !strings.Contains(r, "需要任务 id") {
+	if r := d.intakeDeleteGoal(ctx, "").Message; !strings.Contains(r, "需要任务 id") {
 		t.Fatalf("no id must ask, got %q", r)
 	}
 	// Unknown id.
-	if r := d.intakeDeleteGoal(ctx, "zzzzzzzz"); !strings.Contains(r, "找不到") {
+	if r := d.intakeDeleteGoal(ctx, "zzzzzzzz").Message; !strings.Contains(r, "找不到") {
 		t.Fatalf("unknown id must say not found, got %q", r)
 	}
 }
@@ -1099,7 +1101,7 @@ func TestIntakeScheduleEnable(t *testing.T) {
 		AssigneeID   string `json:"assignee_id"`
 		AssigneeType string `json:"assignee_type"`
 		DomainID     string `json:"domain_id"`
-	}{Name: "每小时巡检"}})
+	}{Name: "每小时巡检"}}).Message
 	if !strings.Contains(reply, "已启用") {
 		t.Fatalf("enable must succeed, got %q", reply)
 	}
@@ -1125,7 +1127,7 @@ func TestIntakeScheduleEnable(t *testing.T) {
 		AssigneeID   string `json:"assignee_id"`
 		AssigneeType string `json:"assignee_type"`
 		DomainID     string `json:"domain_id"`
-	}{Name: "不存在"}}); !strings.Contains(r, "没找到") {
+	}{Name: "不存在"}}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("enable non-existent must say so, got %q", r)
 	}
 }
@@ -1154,7 +1156,7 @@ func TestIntakeScheduleDelete(t *testing.T) {
 		AssigneeID   string `json:"assignee_id"`
 		AssigneeType string `json:"assignee_type"`
 		DomainID     string `json:"domain_id"`
-	}{Name: "待删除"}})
+	}{Name: "待删除"}}).Message
 	if !strings.Contains(reply, "已删除") {
 		t.Fatalf("delete must succeed, got %q", reply)
 	}
@@ -1174,7 +1176,7 @@ func TestIntakeScheduleDelete(t *testing.T) {
 		AssigneeID   string `json:"assignee_id"`
 		AssigneeType string `json:"assignee_type"`
 		DomainID     string `json:"domain_id"`
-	}{Name: "不存在"}}); !strings.Contains(r, "没找到") {
+	}{Name: "不存在"}}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("delete non-existent must say so, got %q", r)
 	}
 }
@@ -1185,7 +1187,7 @@ func TestIntakeListSkills(t *testing.T) {
 
 	// Empty.
 	d, _ := newIntakeDaemon(t)
-	if r := d.intakeListSkills(ctx); !strings.Contains(r, "没有 skill") {
+	if r := d.intakeListSkills(ctx).Message; !strings.Contains(r, "没有 skill") {
 		t.Fatalf("empty list, got %q", r)
 	}
 	// With a skill.
@@ -1194,7 +1196,7 @@ func TestIntakeListSkills(t *testing.T) {
 		time.Now().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
-	list := d.intakeListSkills(ctx)
+	list := d.intakeListSkills(ctx).Message
 	if !strings.Contains(list, "git-helper") {
 		t.Fatalf("list must show skill name, got %q", list)
 	}
@@ -1210,7 +1212,7 @@ func TestIntakeDeleteSkill(t *testing.T) {
 		time.Now().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
-	reply := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "git-helper"}})
+	reply := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "git-helper"}}).Message
 	if !strings.Contains(reply, "已删除") {
 		t.Fatalf("delete must succeed, got %q", reply)
 	}
@@ -1232,11 +1234,11 @@ func TestIntakeDeleteSkill(t *testing.T) {
 		`UPDATE agent SET skills='["sk2"]' WHERE id='a1'`); err != nil {
 		t.Fatal(err)
 	}
-	if r := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "web-scraper"}}); !strings.Contains(r, "失败") {
+	if r := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "web-scraper"}}).Message; !strings.Contains(r, "失败") {
 		t.Fatalf("skill selected by agent must fail, got %q", r)
 	}
 	// Non-existent.
-	if r := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "不存在"}}); !strings.Contains(r, "没找到") {
+	if r := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "不存在"}}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("non-existent must say so, got %q", r)
 	}
 }
@@ -1259,7 +1261,7 @@ func TestIntakeDeleteSkillBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reply := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "skill-a, skill-c, skill-b, ghost"}})
+	reply := d.intakeDeleteSkill(ctx, intakeAction{Intent: "skill_delete", Skill: skillAction{Name: "skill-a, skill-c, skill-b, ghost"}}).Message
 	if !strings.Contains(reply, "skill-a") || !strings.Contains(reply, "skill-b") {
 		t.Fatalf("must report deleted skills, got %q", reply)
 	}
@@ -1279,7 +1281,7 @@ func TestIntakeDeleteDomain(t *testing.T) {
 	// Create an extra domain (d1 is seeded and has a goal in some tests).
 	d.intakeCreateDomain(ctx, intakeAction{Intent: "domain_create", Domain: domainSub("free-repo", "repo", "https://e.com/free.git")})
 
-	reply := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("free-repo", "", "")})
+	reply := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("free-repo", "", "")}).Message
 	if !strings.Contains(reply, "已删除") {
 		t.Fatalf("delete must succeed, got %q", reply)
 	}
@@ -1294,11 +1296,11 @@ func TestIntakeDeleteDomain(t *testing.T) {
 	domID := firstID(t, ctx, d, `SELECT id FROM domain WHERE name='d1'`)
 	d.goalSvc.Create(ctx, service.Goal{
 		Title: "占用d1", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
-	if r := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("d1", "", "")}); !strings.Contains(r, "失败") {
+	if r := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("d1", "", "")}).Message; !strings.Contains(r, "失败") {
 		t.Fatalf("domain with goal must fail, got %q", r)
 	}
 	// Non-existent.
-	if r := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("不存在", "", "")}); !strings.Contains(r, "没找到") {
+	if r := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("不存在", "", "")}).Message; !strings.Contains(r, "没找到") {
 		t.Fatalf("non-existent must say so, got %q", r)
 	}
 }
@@ -1314,7 +1316,7 @@ func TestIntakeDeleteDomainBatch(t *testing.T) {
 	d.goalSvc.Create(ctx, service.Goal{
 		Title: "占用d1", DomainID: domID, AssigneeType: "agent", AssigneeID: "a1", Status: "active"})
 
-	reply := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("repo-a, d1, repo-b, ghost", "", "")})
+	reply := d.intakeDeleteDomain(ctx, intakeAction{Intent: "domain_delete", Domain: domainSub("repo-a, d1, repo-b, ghost", "", "")}).Message
 	if !strings.Contains(reply, "repo-a") || !strings.Contains(reply, "repo-b") {
 		t.Fatalf("must report deleted domains, got %q", reply)
 	}

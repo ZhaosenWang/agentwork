@@ -1,14 +1,13 @@
 package daemon
 
 // chatRelay is the daemon's half of the ACP chat relay (Phase 6): web ACP
-// clients connect to GET /agents/{id}/chat; the daemon opens a machine-side
+// clients connect to GET /agents/{id}/acp; the daemon opens a machine-side
 // chat channel and forwards ACP frames in both directions. The session
 // lifecycle (new/list/load) is the protocol's own business.
 //
-// Standard chats are pure pass-through (the daemon never reads the frames).
-// Steward chats intercept: the daemon buffers agent text, scans for the
-// intake marker on turn completion, and injects synthetic frames — see
-// chat_steward.go.
+// All chats are pure pass-through (the daemon never reads the frames) —
+// steward included (决策7-5). The steward's platform-intake capability is
+// exercised via the `agentwork` CLI, not daemon-side frame interception.
 
 import (
 	"bytes"
@@ -22,6 +21,7 @@ import (
 
 	"github.com/eushing/agentwork/internal/link"
 	"github.com/eushing/agentwork/internal/logging"
+	"github.com/eushing/agentwork/internal/service"
 )
 
 // chatRelay keeps one entry per open web chat socket.
@@ -45,30 +45,6 @@ type chatEntry struct {
 	done      chan struct{}
 	closeOnce sync.Once
 	close     func() // → the web socket
-
-	// Steward chat interception: when isSteward is true, the daemon buffers
-	// the steward's agent_message_chunk text instead of forwarding it
-	// live, scans for the <<<INTAKE_JSON>>>{...}<<<END>>> marker on turn
-	// completion, dispatches through intakeReg, and injects the cleaned
-	// reply + dispatch result as synthetic ACP frames via the inject
-	// channel. Non-steward chats are pure pass-through (unchanged).
-	isSteward          bool
-	inject             chan []byte     // synthetic frames to the web (buffered)
-	mu                 sync.Mutex      // guards steward fields below
-	pendingPromptID    json.RawMessage // JSON-RPC id of the in-flight session/prompt (raw: string OR number)
-	sessionID          string          // current ACP session id (from session/prompt params)
-	stewardFrames      []stewardFrame
-	lastDispatchResult string // last dispatch reply (injected into the next prompt so the steward can reference it)
-}
-
-// stewardFrame is one buffered agent text chunk with its machine-stamped seq
-// for ordering. The peer's readLoop dispatches each frame on its own goroutine
-// (peer.go: go dispatchRequest), so chunks arrive in random order — the seq
-// restores the stream before marker scanning, same principle as the pump's
-// re-ordering for standard chats.
-type stewardFrame struct {
-	seq  int64
-	text string
 }
 
 // queuedFrame is one machine→web frame plus its ordering stamp.
@@ -106,12 +82,17 @@ func (d *Daemon) OpenChatForAgent(ctx context.Context, agentID string) (string, 
 	// injects these into the ACP session/new frame (chat has no run token, so
 	// unlike the run path they can't ride RunDispatchParams.McpServers).
 	mcpServers := d.extraMcpServers(ctx, agentID)
-	// Chat brief: steward agents get the intake schema + marker protocol;
-	// standard agents get the regular chat-history brief.
-	isSteward := agentType == "steward"
-	chatBrief := buildChatBrief(agentName)
-	if isSteward {
-		chatBrief = d.stewardChatBrief(ctx, agentName)
+	// Chat brief: every agent gets the regular chat-history brief. The steward
+	// additionally gets the platform-fixed persona (StewardSystemPrompt) + a
+	// capabilities appendix pointing it at the `agentwork` CLI (决策7-5). The
+	// steward's persona is platform-owned — it does NOT depend on what the DB's
+	// system_prompt field holds (a manually-created steward may have an empty
+	// persona). The DB system_prompt (if the user filled it) is still staged
+	// by the machine as the AGENTS.md persona and appears BEFORE this brief —
+	// it acts as a user-supplied addendum, not a replacement.
+	chatBrief := buildChatBrief(agentName, agentType == "steward")
+	if agentType == "steward" {
+		chatBrief = service.StewardSystemPrompt + "\n\n" + chatBrief + stewardChatBriefAppendix()
 	}
 	// No artificial deadline — the spawn takes as long as it takes (the
 	// request context still bounds it by the connection's lifetime). A
@@ -139,8 +120,6 @@ func (d *Daemon) OpenChatForAgent(ctx context.Context, agentID string) (string, 
 		cwd:       res.Cwd,
 		pump:      make(chan queuedFrame, 256),
 		done:      make(chan struct{}),
-		isSteward: isSteward,
-		inject:    make(chan []byte, 16),
 	}
 	d.chat.mu.Unlock()
 	logging.Infof("chat: %s opened for agent %s on machine %s", res.ChatID, agentID, machineID)
@@ -270,14 +249,6 @@ func (d *Daemon) BindChatSink(chatID string, write func([]byte) error, closeFn f
 				if !flushThrough() {
 					return
 				}
-			case data := <-e.inject:
-				// Steward chat: synthetic frames (cleaned text, dispatch
-				// result, prompt response) injected by the completion
-				// handler. These bypass seq reordering — they're synthetic
-				// and order is controlled by the sender.
-				if !emit(data) {
-					return
-				}
 			case <-e.done:
 				gapTimer.Stop()
 				return
@@ -303,10 +274,6 @@ func (d *Daemon) ChatWrite(chatID string, frame []byte) error {
 		return fmt.Errorf("machine offline")
 	}
 	frame = normalizeChatFrame(frame, e.cwd)
-	if e.isSteward {
-		interceptStewardPrompt(e, frame)
-		frame = injectStewardRoster(d, e, frame)
-	}
 	logChatFrame("web→machine", frame)
 	// No artificial deadline: an agent turn takes as long as it takes, and
 	// the frame write only fails when the machine link itself dies (the
@@ -398,25 +365,6 @@ func (d *Daemon) MachineChatFrame(p link.ChatFrameParams) {
 		return
 	}
 	logChatFrame("machine→web", p.Frame)
-	if e.isSteward {
-		e.mu.Lock()
-		pendingID := e.pendingPromptID
-		e.mu.Unlock()
-		frameCopy := append([]byte(nil), p.Frame...)
-		switch classifyStewardFrame(frameCopy, pendingID) {
-		case "buffer":
-			e.mu.Lock()
-			e.stewardFrames = append(e.stewardFrames, stewardFrame{
-				seq:  p.Seq,
-				text: extractUpdateText(frameCopy),
-			})
-			e.mu.Unlock()
-			return
-		case "complete":
-			d.handleStewardTurnComplete(p.ChatID, e)
-			return
-		}
-	}
 	select {
 	case e.pump <- queuedFrame{seq: p.Seq, data: append([]byte(nil), p.Frame...)}:
 	case <-e.done:

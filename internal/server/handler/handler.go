@@ -119,6 +119,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /teams/import", h.listTeamImports)
 	mux.HandleFunc("GET /teams/import/{runId}", h.getTeamImport)
 	mux.HandleFunc("POST /intake", h.sendIntake)
+	mux.HandleFunc("POST /intake/dispatch", h.intakeCreate)
 	mux.HandleFunc("GET /intake/{runId}", h.getIntakeResult)
 	mux.HandleFunc("POST /domains", h.createDomain)
 	mux.HandleFunc("GET /domains/{id}", h.getDomain)
@@ -558,6 +559,7 @@ func (h *Handlers) listDomains(w http.ResponseWriter, r *http.Request) {
 	out, err := h.Domain.List(r.Context())
 	writeJSON(w, out, err)
 }
+
 // listMachines returns the registered remote machines (CLI 分支 Phase 1):
 // connection status + the agent CLIs each machine probed.
 func (h *Handlers) listMachines(w http.ResponseWriter, r *http.Request) {
@@ -699,6 +701,29 @@ func (h *Handlers) sendIntake(w http.ResponseWriter, r *http.Request) {
 	}
 	run, err := h.Intake.EnqueueWeb(r.Context(), body.Text)
 	writeJSON(w, map[string]string{"run_id": run.ID}, err)
+}
+
+// intakeCreate is the chat-as-tool entry point (决策7-5): the steward agent
+// calls `agentwork create goal` etc., which hits this endpoint. It delegates
+// to Daemon.DispatchIntake — a thin pass-through to intakeReg.dispatch. The
+// body is a full intakeAction JSON (intent + sub-struct), constructed by the
+// CLI from the agent's flags.
+func (h *Handlers) intakeCreate(w http.ResponseWriter, r *http.Request) {
+	if h.Daemon == nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("daemon not configured"))
+		return
+	}
+	var body json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid body"))
+		return
+	}
+	result, err := h.Daemon.DispatchIntake(r.Context(), body)
+	if err != nil {
+		writeJSON(w, result, err)
+		return
+	}
+	writeJSON(w, result, nil)
 }
 
 func (h *Handlers) getIntakeResult(w http.ResponseWriter, r *http.Request) {
