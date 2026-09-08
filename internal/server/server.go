@@ -393,10 +393,22 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 			_ = conn.Close()
 			return
 		}
-		s.d.BindChatSink(chatID,
+		entry := s.d.BindChatSink(chatID,
 			func(b []byte) error { return conn.WriteMessage(websocket.TextMessage, b) },
-			func() { _ = conn.Close() })
-		defer s.d.CloseChat(chatID)
+			func() {
+				// Send a WS close frame BEFORE closing the TCP socket.
+				// conn.Close() alone sends a TCP FIN — intermediaries
+				// (ELB, nginx) may buffer it, so the browser doesn't
+				// learn the connection died until their idle timeout
+				// (300s) fires. A WS close frame is protocol-level data
+				// that MUST be forwarded, triggering the browser's
+				// onclose immediately → prompt reconnect.
+				_ = conn.WriteControl(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseGoingAway, "machine offline"),
+					time.Now().Add(chatWriteWait))
+				_ = conn.Close()
+			})
+		defer s.d.CloseChat(chatID, entry)
 		// Web → machine: one ACP frame per text message.
 		for {
 			_, msg, err := conn.ReadMessage()

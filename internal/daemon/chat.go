@@ -131,12 +131,17 @@ func (d *Daemon) OpenChatForAgent(ctx context.Context, agentID string) (string, 
 // the frame queue in seq order. A failed write means the socket is gone
 // (or half-dead) — close it so the handler's read wakes up and tears the
 // chat down, matching the link's close-on-write-failure contract.
-func (d *Daemon) BindChatSink(chatID string, write func([]byte) error, closeFn func()) {
+//
+// Returns the bound chatEntry so the caller can pass it to CloseChat for
+// identity-checked cleanup — the machine's chatID counter resets on
+// reconnect, so a stale handler's defer CloseChat must not delete a newer
+// entry that reused the same chatID.
+func (d *Daemon) BindChatSink(chatID string, write func([]byte) error, closeFn func()) *chatEntry {
 	d.chat.mu.Lock()
 	e, ok := d.chat.chats[chatID]
 	if !ok {
 		d.chat.mu.Unlock()
-		return
+		return nil
 	}
 	e.close = closeFn
 	d.chat.mu.Unlock()
@@ -255,6 +260,7 @@ func (d *Daemon) BindChatSink(chatID string, write func([]byte) error, closeFn f
 			}
 		}
 	}()
+	return e
 }
 
 // ChatWrite forwards one web frame to the machine's chat channel, with
@@ -388,16 +394,22 @@ func (d *Daemon) MachineChatClosed(p link.ChatClosedParams) {
 }
 
 // CloseChat tears the machine chat down (the web socket disconnected).
-func (d *Daemon) CloseChat(chatID string) {
+// The expect parameter is the chatEntry returned by BindChatSink — if the
+// entry in the map is a DIFFERENT pointer (the machine's chatID counter
+// reset on reconnect and a newer handler reused the same chatID), the
+// stale handler's defer is a no-op, mirroring UnregisterMachinePeer's
+// identity check.
+func (d *Daemon) CloseChat(chatID string, expect *chatEntry) {
 	d.chat.mu.Lock()
-	e := d.chat.chats[chatID]
-	delete(d.chat.chats, chatID)
-	d.chat.mu.Unlock()
-	if e == nil {
+	cur, ok := d.chat.chats[chatID]
+	if !ok || cur != expect {
+		d.chat.mu.Unlock()
 		return
 	}
-	e.closeOnce.Do(func() { close(e.done) })
-	if peer := d.MachinePeer(e.machineID); peer != nil {
+	delete(d.chat.chats, chatID)
+	d.chat.mu.Unlock()
+	expect.closeOnce.Do(func() { close(expect.done) })
+	if peer := d.MachinePeer(expect.machineID); peer != nil {
 		_ = peer.Notify(context.Background(), link.MethodChatClose, link.ChatCloseParams{ChatID: chatID})
 	}
 	logging.Infof("chat: %s closed (web-side)", chatID)
