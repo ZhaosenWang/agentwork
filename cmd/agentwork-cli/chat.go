@@ -32,6 +32,11 @@ type chatBridge struct {
 	// process (the runtime's Close tears down the transport + child).
 	writer  map[string]io.Writer
 	closeFn map[string]func() error
+	// writeMu maps chatID → a per-chat write mutex. stdin writes happen from
+	// two goroutines: handleChatFrame (web→machine) and maybeAutoApprove
+	// (stdout pump's permission auto-reply). Without a per-chat lock the two
+	// writes interleave and corrupt the JSON-RPC stream.
+	writeMu map[string]*sync.Mutex
 	// mcpServers maps chatID → the agent's extra MCP servers (from
 	// ChatOpenParams.McpServers, same source as the run path's). The
 	// handleChatFrame rewriter injects them into the web client's session/new
@@ -50,6 +55,7 @@ func newChatBridge() *chatBridge {
 	return &chatBridge{
 		writer:     map[string]io.Writer{},
 		closeFn:    map[string]func() error{},
+		writeMu:    map[string]*sync.Mutex{},
 		mcpServers: map[string][]acp.McpServer{},
 	}
 }
@@ -70,6 +76,67 @@ func (b *chatBridge) shutdown() {
 	for _, id := range ids {
 		b.cleanup(id)
 	}
+}
+
+// maybeAutoApprove checks if a stdout frame is a session/request_permission
+// JSON-RPC request. If so, it auto-approves the strongest allow option
+// (allow_always > allow_once) by writing the outcome response to the CLI's
+// stdin, and returns true (the frame is NOT relayed to the web — the web
+// never sees a permission popup). Returns false for all other frames (normal
+// relay). Same trust boundary as the run path's autopermit.
+func (b *chatBridge) maybeAutoApprove(line []byte, chatID string) bool {
+	var probe struct {
+		Method string          `json:"method"`
+		ID     json.RawMessage `json:"id,omitempty"`
+		Params json.RawMessage `json:"params,omitempty"`
+	}
+	if err := json.Unmarshal(line, &probe); err != nil || probe.Method != "session/request_permission" {
+		return false
+	}
+	if len(probe.ID) == 0 {
+		return false
+	}
+	var params struct {
+		Options []struct {
+			OptionID string `json:"optionId"`
+			Kind     string `json:"kind"`
+		} `json:"options"`
+	}
+	_ = json.Unmarshal(probe.Params, &params)
+	// Pick allow_always > allow_once (strongest first).
+	var chosen string
+	for _, o := range params.Options {
+		if o.Kind == "allow_always" {
+			chosen = o.OptionID
+			break
+		}
+		if o.Kind == "allow_once" && chosen == "" {
+			chosen = o.OptionID
+		}
+	}
+	if chosen == "" {
+		// No allow option — cancel (same as autopermit's fallback).
+		chosen = ""
+	}
+	outcome := map[string]any{"outcome": "selected", "optionId": chosen}
+	if chosen == "" {
+		outcome = map[string]any{"outcome": "cancelled"}
+	}
+	resp, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      probe.ID,
+		"result":  map[string]any{"outcome": outcome},
+	})
+	b.mu.Lock()
+	w := b.writer[chatID]
+	wmu := b.writeMu[chatID]
+	b.mu.Unlock()
+	if w != nil && wmu != nil {
+		wmu.Lock()
+		_, _ = w.Write(append(resp, '\n'))
+		wmu.Unlock()
+	}
+	return true
 }
 
 // handleChatOpen spawns the agent's CLI, stages persona + skills into the
@@ -144,6 +211,7 @@ func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, pe
 	b.mu.Lock()
 	b.writer[chatID] = conn.W
 	b.closeFn[chatID] = conn.Close
+	b.writeMu[chatID] = &sync.Mutex{}
 	if len(p.McpServers) > 0 {
 		b.mcpServers[chatID] = p.McpServers
 	}
@@ -153,6 +221,12 @@ func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, pe
 	// stamped with a per-chat monotonic seq — the daemon's relay dispatch
 	// races concurrent frames, and the seq lets its writer pump re-order
 	// them (a reply flood must not read scrambled).
+	//
+	// session/request_permission frames are intercepted and auto-approved
+	// (allow_always > allow_once) — same trust boundary as the run path's
+	// autopermit. Chat is conversational, not a permission gate: IM (Feishu/
+	// WeChat) has no UI to approve, and the popup on every bash call is noise.
+	// The tool_call itself still streams via session/update (a separate frame).
 	go func() {
 		scanner := bufio.NewScanner(conn.R)
 		scanner.Buffer(make([]byte, 64*1024), 4<<20)
@@ -160,6 +234,9 @@ func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, pe
 		for scanner.Scan() {
 			line := bytes.TrimSpace(scanner.Bytes())
 			if len(line) == 0 {
+				continue
+			}
+			if b.maybeAutoApprove(line, chatID) {
 				continue
 			}
 			seq++
@@ -195,6 +272,7 @@ func (b *chatBridge) handleChatFrame(ctx context.Context, raw json.RawMessage) (
 	b.mu.Lock()
 	w := b.writer[p.ChatID]
 	mcp := b.mcpServers[p.ChatID]
+	wmu := b.writeMu[p.ChatID]
 	b.mu.Unlock()
 	if w == nil {
 		return nil, &link.RPCError{Code: link.CodeInvalidParams, Message: "unknown chat " + p.ChatID}
@@ -206,7 +284,10 @@ func (b *chatBridge) handleChatFrame(ctx context.Context, raw json.RawMessage) (
 			cliLogf("chat: %s session/new injected %d mcp server(s)", p.ChatID, len(mcp))
 		}
 	}
-	if _, err := w.Write(append(frame, '\n')); err != nil {
+	wmu.Lock()
+	_, err := w.Write(append(frame, '\n'))
+	wmu.Unlock()
+	if err != nil {
 		return nil, &link.RPCError{Code: link.CodeInternal, Message: err.Error()}
 	}
 	return map[string]bool{"ok": true}, nil
@@ -288,6 +369,7 @@ func (b *chatBridge) cleanup(chatID string) {
 	delete(b.writer, chatID)
 	delete(b.closeFn, chatID)
 	delete(b.mcpServers, chatID)
+	delete(b.writeMu, chatID)
 	b.mu.Unlock()
 	if closeFn == nil {
 		return
