@@ -736,6 +736,19 @@ func (d *Daemon) onMachineOffline(_ context.Context, e events.Event) {
 	if err := d.agentSvc.EnsureStewardRuntime(context.Background()); err != nil {
 		logging.Warnf("daemon: machine offline — ensure steward: %v", err)
 	}
+	m, _ := e.Payload.(map[string]string)
+	machineID := m["machine_id"]
+	// The /connect readLoop has no read deadline — a frozen (not killed)
+	// sandbox keeps the TCP connection alive while the stale sweep (90s)
+	// publishes machine:offline. UnregisterMachinePeer never fires in
+	// that scenario, so close the chats here. The MachinePeer check
+	// guards against a late machine.offline notification racing a
+	// reconnect (detached context + MarkOffline flips any 'connected'
+	// machine — the next heartbeat restores DB status, but chat teardown
+	// is irreversible).
+	if machineID != "" && d.MachinePeer(machineID) == nil {
+		d.closeChatsForMachine(machineID)
+	}
 }
 
 func (d *Daemon) onGoalDeleted(_ context.Context, e events.Event) {
