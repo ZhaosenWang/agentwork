@@ -29,7 +29,6 @@ import (
 // frames double-report.
 func (d *Daemon) RegisterMachinePeer(machineID string, p *link.Peer) {
 	d.machineMu.Lock()
-	defer d.machineMu.Unlock()
 	if d.machinePeers == nil {
 		d.machinePeers = map[string]*link.Peer{}
 	}
@@ -37,18 +36,61 @@ func (d *Daemon) RegisterMachinePeer(machineID string, p *link.Peer) {
 		old.Close() // stale link — its unregister will no-op (peer identity)
 	}
 	d.machinePeers[machineID] = p
+	d.machineMu.Unlock()
+	// A reconnecting machine replaces its peer — but the old link's chats are
+	// still bound to the dead peer (the old chatBridge process is gone). Tear
+	// them down so pending ACP requests reject instead of hanging. The web can
+	// reopen the chat (it reconnects to the same agent → new chat.open over the
+	// new peer). This runs on EVERY register (including first connect, which
+	// has no chats — the loop is a no-op).
+	d.closeChatsForMachine(machineID)
+}
+
+// closeChatsForMachine tears down all chats bound to a machine — the
+// machine-side chatBridge is dead (link dropped or replaced), so pending
+// ACP requests will never get a response. Closing done unblocks the writer
+// pump, which closes the web socket — the web's onclose rejects every
+// in-flight request. e.close() (which closes the web socket) is called
+// AFTER releasing chat.mu — it may block on a write deadline, and holding
+// the lock would stall ChatWrite/MachineChatFrame (same pattern as
+// MachineChatClosed/CloseChat).
+func (d *Daemon) closeChatsForMachine(machineID string) {
+	var toClose []*chatEntry
+	d.chat.mu.Lock()
+	for id, e := range d.chat.chats {
+		if e.machineID == machineID {
+			delete(d.chat.chats, id)
+			e.closeOnce.Do(func() { close(e.done) })
+			toClose = append(toClose, e)
+		}
+	}
+	d.chat.mu.Unlock()
+	for _, e := range toClose {
+		if e.close != nil {
+			e.close()
+		}
+	}
 }
 
 // UnregisterMachinePeer drops a machine's peer — ONLY if it is still the
 // registered one. The peer identity check keeps a dying stale connection
 // from evicting the live replacement (the same machine_id reconnecting
-// while the old link is still draining).
+// while the old link is still draining). Chat cleanup runs ONLY when the
+// peer is actually evicted (not on a stale drain) — a reconnecting machine's
+// chats are cleaned by RegisterMachinePeer, not here.
 func (d *Daemon) UnregisterMachinePeer(machineID string, p *link.Peer) {
 	d.machineMu.Lock()
-	defer d.machineMu.Unlock()
-	if cur, ok := d.machinePeers[machineID]; ok && cur == p {
+	cur, ok := d.machinePeers[machineID]
+	if ok && cur == p {
 		delete(d.machinePeers, machineID)
 	}
+	d.machineMu.Unlock()
+	if ok && cur == p {
+		// This IS the live peer dropping — tear down its chats.
+		d.closeChatsForMachine(machineID)
+	}
+	// else: stale drain (a reconnect already replaced this peer) — the new
+	// peer's chats were cleaned by RegisterMachinePeer; do nothing here.
 }
 
 // MachinePeer returns the machine's live link peer (nil = offline).
@@ -476,16 +518,16 @@ func (d *Daemon) ingestProcessorFinished(ctx context.Context, p link.RunFinished
 
 func (d *Daemon) notifyTeamImportComplete(ctx context.Context, ti *service.TeamImport, squadName string) {
 	var result struct {
-		Agents   int    `json:"agents"`
-		Skills   int    `json:"skills"`
-		HasSquad bool   `json:"has_squad"`
+		Agents   int  `json:"agents"`
+		Skills   int  `json:"skills"`
+		HasSquad bool `json:"has_squad"`
 	}
 	_ = json.Unmarshal([]byte(ti.Result), &result)
 	summary := fmt.Sprintf("✅ 团队导入完成：%d 个 agent、%d 个 skill", result.Agents, result.Skills)
 	if result.HasSquad {
 		summary += "、1 个 squad"
 	}
-		body := summary
+	body := summary
 	if squadName != "" {
 		sq, err := d.resolveSquadByName(ctx, squadName)
 		if err == nil {
@@ -763,7 +805,7 @@ func (d *Daemon) processMachineRunCompletion(ctx context.Context, runID, agentSu
 	return ""
 }
 
-// mustGit runs git in dir and returns the output, trimmed ('' on error) —
+// mustGit runs git in dir and returns the output, trimmed (” on error) —
 // judgment paths must not crash on a missing ref.
 func mustGit(ctx context.Context, dir string, args ...string) string {
 	out, err := gitRun(ctx, dir, args...)
@@ -860,7 +902,7 @@ func (d *Daemon) PushAgentSkills(ctx context.Context, agentID string) {
 
 // projectSkillsDirFor resolves a run's CLI's project-level skills
 // directory from the machine's probe report (the CLI knowledge lives in
-// the CLI's probe table; the daemon reads it back). '' = not probed —
+// the CLI's probe table; the daemon reads it back). ” = not probed —
 // the executor falls back to its own mapping.
 func (d *Daemon) projectSkillsDirFor(ctx context.Context, machineID string, spawn []string) string {
 	if machineID == "" || len(spawn) == 0 {
@@ -884,7 +926,7 @@ func (d *Daemon) projectSkillsDirFor(ctx context.Context, machineID string, spaw
 	return ""
 }
 
-// AgentMachineID resolves the machine an agent's runtime lives on ('' for
+// AgentMachineID resolves the machine an agent's runtime lives on (” for
 // local/legacy or unknown agents).
 func (d *Daemon) AgentMachineID(ctx context.Context, agentID string) string {
 	var machineID string

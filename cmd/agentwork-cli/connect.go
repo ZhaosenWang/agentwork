@@ -49,10 +49,10 @@ func defaultAgentsConfigPath() string {
 }
 
 type cliState struct {
-	MachineID   string    `json:"machine_id"`
-	Name        string    `json:"name"`
-	Server      string    `json:"server"`
-	ConnectedAt time.Time `json:"connected_at,omitempty"`
+	MachineID   string          `json:"machine_id"`
+	Name        string          `json:"name"`
+	Server      string          `json:"server"`
+	ConnectedAt time.Time       `json:"connected_at,omitempty"`
 	ProbedCLIs  []link.ProbeCLI `json:"probed_clis,omitempty"`
 }
 
@@ -187,6 +187,7 @@ func runLink(ctx context.Context, wsURL string, st cliState, name, hostname stri
 	// Chat relay (Phase 6): transport-only ACP bridge for the web chat —
 	// frames flow unparsed in both directions.
 	chat := newChatBridge()
+	defer chat.shutdown() // kill all chat CLI processes when the link drops
 	peer.Handle(link.MethodChatOpen, func(ctx context.Context, raw json.RawMessage) (any, *link.RPCError) {
 		return chat.handleChatOpen(ctx, raw, peer)
 	})

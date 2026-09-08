@@ -54,6 +54,24 @@ func newChatBridge() *chatBridge {
 	}
 }
 
+// shutdown kills all live chat processes — called when the machine link
+// drops (runLink's defer). Without this, agent CLI processes orphan: the
+// link is dead so daemon cannot deliver chat.close, and the stdout pumps
+// spin on Notify failures until the CLI exits on its own (which may be
+// never — the agent waits for session/prompt). Each cleanup closes stdin
+// (graceful) then force-kills after gracefulExitWait.
+func (b *chatBridge) shutdown() {
+	b.mu.Lock()
+	ids := make([]string, 0, len(b.closeFn))
+	for id := range b.closeFn {
+		ids = append(ids, id)
+	}
+	b.mu.Unlock()
+	for _, id := range ids {
+		b.cleanup(id)
+	}
+}
+
 // handleChatOpen spawns the agent's CLI, stages persona + skills into the
 // chat cwd, and starts the stdout→/connect frame pump.
 func (b *chatBridge) handleChatOpen(ctx context.Context, raw json.RawMessage, peer *link.Peer) (any, *link.RPCError) {

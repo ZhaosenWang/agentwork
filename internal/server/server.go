@@ -386,7 +386,10 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		defer close(pingDone)
 		chatID, err := s.d.OpenChatForAgent(r.Context(), agentID)
 		if err != nil {
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","error":{"code":-32000,"message":"`+err.Error()+`"}}`))
+			// The machine is offline or the agent is unknown — the ACP
+			// handshake never started (no pending JSON-RPC request to reject).
+			// Just close the socket; the web's connect() promise rejects.
+			logging.Infof("chat: agent %s: %v", agentID, err)
 			_ = conn.Close()
 			return
 		}
@@ -407,6 +410,19 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 				return
 			}
 			if err := s.d.ChatWrite(chatID, msg); err != nil {
+				// The machine link is dead (e.g. machine disconnected mid-chat).
+				// Reply with a standard JSON-RPC error to the web's pending
+				// request so its promise rejects with the real cause instead of
+				// hanging until the socket closes. Parse the id from the frame
+				// the web sent — it is a JSON-RPC request (session/prompt, etc.).
+				if id := extractJSONRPCID(msg); id != nil {
+					errMsg, _ := json.Marshal(map[string]any{
+						"jsonrpc": "2.0",
+						"id":      id,
+						"error":   map[string]any{"code": -32000, "message": err.Error()},
+					})
+					_ = conn.WriteMessage(websocket.TextMessage, errMsg)
+				}
 				logging.Infof("chat: %s web→machine: %v", chatID, err)
 				return
 			}
@@ -801,6 +817,23 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 		return err
 	}
 	return nil
+}
+
+// extractJSONRPCID parses the "id" field from a JSON-RPC 2.0 request frame.
+// Used when ChatWrite fails (machine dead) to reply with a standard error
+// response matching the web's pending request id. Returns nil if the frame
+// has no id (a notification — no response expected, nothing to reject).
+func extractJSONRPCID(frame []byte) json.RawMessage {
+	var probe struct {
+		ID json.RawMessage `json:"id,omitempty"`
+	}
+	if err := json.Unmarshal(frame, &probe); err != nil {
+		return nil
+	}
+	if len(probe.ID) == 0 || string(probe.ID) == "null" {
+		return nil
+	}
+	return probe.ID
 }
 
 // corsMiddleware allows the Next.js dev server (localhost:3000) to call the
