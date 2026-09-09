@@ -74,7 +74,7 @@ func TestSeedDigestScheduleCreatesAndIsIdempotent(t *testing.T) {
 	}
 	// 首次创建即先跑一次: the fresh schedule's next_run_at was stamped to
 	// "now" (FireNow) so the daemon's tick fires it within seconds — the
-	// user does not wait six hours for the first digest batch.
+	// user does not wait for the next 09:00 boundary for the first batch.
 	first, err := time.Parse(time.RFC3339Nano, sch.NextRunAt)
 	if err != nil {
 		t.Fatalf("next_run_at %q unparseable: %v", sch.NextRunAt, err)
@@ -109,7 +109,7 @@ func TestSeedDigestScheduleCreatesAndIsIdempotent(t *testing.T) {
 	}
 	// Idempotent reseed must NOT re-fire-now or otherwise touch next_run_at
 	// (a restart would otherwise run the digest at every daemon boot,
-	// six-hourly schedule or not).
+	// daily schedule or not).
 	if schs2[0].NextRunAt != before {
 		t.Fatalf("reseed moved next_run_at: %s → %s — idempotent seed must not re-fire", before, schs2[0].NextRunAt)
 	}

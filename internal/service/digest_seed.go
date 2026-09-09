@@ -1,12 +1,12 @@
 package service
 
 // The built-in "每日AI知识精选" digest schedule: seeded at daemon startup,
-// fires every 6 hours, and collects fresh AI-community news into md articles
-// plus an articles.json index (the machine uploads them via run.finished
-// artifacts; the daemon writes ~/.agentwork/digest/). Seeding is idempotent
-// and self-healing: the marker lives in app_settings so the schedule can be
-// recognized (built_in flag / edit-delete guards) across restarts, and
-// dangling markers rebuild the row.
+// fires daily at 09:00 (Asia/Shanghai), and collects fresh AI-community news
+// into md articles plus an articles.json index (the machine uploads them via
+// run.finished artifacts; the daemon writes ~/.agentwork/digest/). Seeding is
+// idempotent and self-healing: the marker lives in app_settings so the
+// schedule can be recognized (built_in flag / edit-delete guards) across
+// restarts, and dangling markers rebuild the row.
 
 import (
 	"context"
@@ -25,7 +25,7 @@ const (
 	// directory IS the deliverable — exactly what a doc-producing task needs.
 	digestDomainName   = "AI知识精选"
 	digestScheduleName = "每日AI知识精选"
-	digestCron         = "0 */6 * * *" // every 6 hours
+	digestCron         = "0 9 * * *" // daily at 09:00
 	digestTimezone     = "Asia/Shanghai"
 	digestTitleTpl     = "每日 AI 知识精选（自动收集）"
 	// app_settings marker keys — the builtin.* prefix keeps them clear of
@@ -46,9 +46,9 @@ const (
 // run.finished. Fixed names — the executor's prompt mandates them.
 var DigestArtifactFiles = []string{"manifest.json", "1.md", "2.md", "3.md", "4.md", "5.md"}
 
-// DigestMaxArticles caps the collected-articles index so six-hourly batches
-// do not grow it without bound (oldest entries drop off).
-const DigestMaxArticles = 200
+// DigestMaxArticles caps the collected-articles index so daily batches do
+// not grow it without bound (oldest entries drop off).
+const DigestMaxArticles = 50
 
 // DigestArticle is one entry of the collected-articles index
 // (~/.agentwork/digest/articles.json) — the schema the reading frontend
@@ -185,8 +185,8 @@ func SeedDigestSchedule(ctx context.Context, st *store.Store, agentSvc *AgentSer
 	setDigestMarker(ctx, st, digestKeySchedule, sch.ID)
 	// 首次创建即先跑一次：stamp next_run_at to now so the daemon's schedule
 	// tick fires the digest within seconds of the seed — the user does not
-	// wait six hours for the first batch. fireSchedule re-derives the
-	// next_run_at from the cron afterwards, so the 6-hour cadence is intact.
+	// wait for the next 09:00 boundary. fireSchedule re-derives the
+	// next_run_at from the cron afterwards, so the daily cadence is intact.
 	if err := schedSvc.FireNow(ctx, sch.ID); err != nil {
 		// Best-effort: the schedule still fires at its first cron boundary.
 		logging.Warnf("seed digest: fire-now %s: %v", sch.ID, err)

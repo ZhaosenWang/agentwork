@@ -101,7 +101,8 @@ const digestAgentAvailability = `
 // pickDigestExecutor chooses who runs this digest firing: the steward
 // (AI SHELL) when its runtime+machine are available, else the first
 // standard agent that is. ok=false = nothing available this tick — the
-// firing is skipped (next_run_at still advances; six hours later we retry).
+// firing is skipped (next_run_at still advances; the next cron boundary
+// retries).
 func (d *Daemon) pickDigestExecutor(ctx context.Context) (agentID string, steward bool, ok bool) {
 	// Steward first.
 	if err := d.st.DB().QueryRowContext(ctx,
