@@ -63,6 +63,12 @@ func main() {
 		agentCmd(os.Args[2:])
 	case "squad":
 		squadCmd(os.Args[2:])
+	case "schedule":
+		scheduleCmd(os.Args[2:])
+	case "domain":
+		domainCmd(os.Args[2:])
+	case "skill":
+		skillCmd(os.Args[2:])
 	case "stats":
 		statsCmd(os.Args[2:])
 	case "subgoal":
@@ -137,7 +143,13 @@ Subcommands:
   goal list [--limit N] [--status S] [--json]  list goals (JSON — the default format; --json requests
                                              it explicitly); --limit caps to N most recent (default all);
                                              --status keeps only goals whose status equals S (exact match)
-  goal assign <to-agent-id> [--note N]       hand off the current goal to another agent
+  goal status <id>                           show a goal's status and last run outcome
+  goal assign --to <id> [--note N] [--goal G] [--assignee_type T]  hand off a goal to an agent or squad
+                                             (--goal G for chat path; run path uses AGENTWORK_GOAL_ID;
+                                             --assignee_type: agent (default) | squad)
+  goal cancel <id>                           cancel a goal
+  goal reopen --goal <id> [--reason R]       reopen a finished/cancelled goal
+  goal delete <id>                           delete a goal (comma-separated batch)
   goal create --title T [--description D] [--assignee A] [--status S]
                                              create a goal
   goal comment --text T [--role R]           post a comment on the current goal; --text may
@@ -147,7 +159,23 @@ Subcommands:
   agent list                                 list all agents (JSON)
   agent history [--limit N] [--status S]    your recent runs joined to their goals
                                              [--agent ID]                 (JSON; default agent = AGENTWORK_AGENT_ID)
+  agent delete <name>                        delete an agent (comma-separated batch)
+  agent update --name <name> [--description D] [--system_prompt P] [--runtime R]
+                                             update an agent's persona-level fields
   squad list                                 list all squads (JSON)
+  squad detail <name>                        show squad detail (JSON)
+  squad delete <name>                        delete a squad (comma-separated batch)
+  squad update --squad <name> [--leader L] [--description D] [--instructions I]
+  squad add-member --squad <name> --agent <id>       add member(s) to a squad
+  squad remove-member --squad <name> --agent <id>    remove member(s) from a squad
+  schedule list                              list all schedules (JSON)
+  schedule stop <name>                       stop (disable) a schedule
+  schedule enable <name>                     re-enable a stopped schedule
+  schedule delete <name>                     delete a schedule (comma-separated batch)
+  domain list                                list all domains (JSON)
+  domain delete <name>                       delete a domain (comma-separated batch)
+  skill list                                 list all skills (JSON)
+  skill delete <name>                        delete a skill (comma-separated batch)
   subgoal list|get <id>|create --title T --assignee A [--description D] [--verifier V]
                                              list/create/read work items (the owner splits)
   subgoal cancel <id>                        cancel a work item
@@ -178,14 +206,22 @@ Environment (injected by daemon):
 
 func goalCmd(goalID, agentID string, args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork-cli goal <list|assign|create|comment|wait>")
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli goal <list|status|assign|cancel|reopen|delete|create|comment|comments|wait>")
 		os.Exit(2)
 	}
 	switch args[0] {
 	case "list":
 		goalList(args[1:])
+	case "status":
+		goalStatus(args[1:])
 	case "assign":
 		goalAssign(goalID, args[1:])
+	case "cancel":
+		goalCancel(args[1:])
+	case "reopen":
+		goalReopen(args[1:])
+	case "delete":
+		goalDelete(args[1:])
 	case "create":
 		goalCreate(goalID, agentID, args[1:])
 	case "comment":
@@ -263,29 +299,42 @@ func goalListURL(limit int) string {
 	return url
 }
 
-// goalAssign hands the current goal off to another agent via /rpc — the
-// per-run token (env AGENTWORK_TOKEN) is the identity, resolved server-side
-// to the actor. The HTTP /goals/{id}/assign surface carries no agent
-// identity (it is the human's action), so an agent handoff over HTTP lost
-// its actor and the service-layer owner check was skipped (any agent could
-// grab any goal). Over /rpc the token anchors the actor and Assign enforces
-// "only the current owner can hand off".
+// goalAssign hands a goal off to another agent or squad. Two paths:
+//   - Run path (no --goal flag): uses AGENTWORK_GOAL_ID env, goes through /rpc
+//     with the per-run token (the daemon resolves actor=agent + owner-check).
+//   - Chat path (--goal flag): goes through POST /intake/dispatch →
+//     intakeAssignGoal handler (actor=human). The steward
+//     in chat has no run token, so /rpc is not an option.
 func goalAssign(goalID string, args []string) {
 	fs := flag.NewFlagSet("goal assign", flag.ExitOnError)
 	note := fs.String("note", "", "handoff note for the next agent")
+	goalIDFlag := fs.String("goal", "", "goal id (chat path; run path uses AGENTWORK_GOAL_ID)")
+	toAgent := fs.String("to", "", "assignee agent or squad id (required)")
+	assigneeType := fs.String("assignee_type", "", "agent (default) | squad")
 	fs.Parse(args)
-	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork-cli goal assign <to-agent-id> [--note N]")
-		os.Exit(2)
+	if *toAgent == "" {
+		fail("usage: agentwork-cli goal assign --to <id> [--note N] [--goal G] [--assignee_type T]")
+	}
+	at := *assigneeType
+	if at == "" {
+		at = "agent"
+	}
+	if *goalIDFlag != "" {
+		post(serverURL()+"/intake/dispatch", map[string]any{
+			"intent":  "goal_assign",
+			"goal_id": *goalIDFlag,
+			"goal":    map[string]any{"assignee_id": *toAgent, "assignee_type": at, "description": *note},
+		})
+		return
 	}
 	if goalID == "" {
-		fail("AGENTWORK_GOAL_ID not set")
+		fail("AGENTWORK_GOAL_ID not set — pass --goal for chat path")
 	}
 	var out map[string]any
 	if err := rpcCall(link.MethodGoalAssign, link.GoalAssignParams{
 		RPCToken:     rpcToken(),
-		AssigneeType: "agent",
-		AssigneeID:   fs.Arg(0),
+		AssigneeType: at,
+		AssigneeID:   *toAgent,
 		HandoffNote:  *note,
 	}, &out); err != nil {
 		fail("%v", err)
@@ -381,11 +430,60 @@ func goalWait(goalID string, args []string) {
 	rpcPrintJSON(states)
 }
 
+// goalStatus queries a goal's status and last run outcome via dispatch.
+func goalStatus(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli goal status <id>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent":  "goal_status",
+		"goal_id": args[0],
+	})
+}
+
+// goalCancel cancels a goal via dispatch.
+func goalCancel(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli goal cancel <id>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent":  "goal_cancel",
+		"goal_id": args[0],
+	})
+}
+
+// goalReopen reopens a finished/cancelled goal via dispatch.
+func goalReopen(args []string) {
+	fs := flag.NewFlagSet("goal reopen", flag.ExitOnError)
+	goalID := fs.String("goal", "", "goal id (required)")
+	reason := fs.String("reason", "", "reopen reason")
+	fs.Parse(args)
+	if *goalID == "" {
+		fail("usage: agentwork-cli goal reopen --goal <id> [--reason R]")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent":  "goal_reopen",
+		"goal_id": *goalID,
+		"goal":    map[string]any{"description": *reason},
+	})
+}
+
+// goalDelete deletes a goal (supports comma-separated batch) via dispatch.
+func goalDelete(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli goal delete <id>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent":  "goal_delete",
+		"goal_id": args[0],
+	})
+}
+
 // ── agent / squad ──
 
 func agentCmd(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork-cli agent <list|history>")
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli agent <list|history|delete|update>")
 		os.Exit(2)
 	}
 	switch args[0] {
@@ -393,6 +491,10 @@ func agentCmd(args []string) {
 		get(serverURL() + "/agents")
 	case "history":
 		agentHistory(args[1:])
+	case "delete":
+		agentDelete(args[1:])
+	case "update":
+		agentUpdate(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown agent subcommand %q\n", args[0])
 		os.Exit(2)
@@ -425,18 +527,239 @@ func agentHistory(args []string) {
 	get(u)
 }
 
+// agentDelete deletes an agent (supports comma-separated batch) via dispatch.
+func agentDelete(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli agent delete <name>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent": "agent_delete",
+		"agent":  map[string]any{"name": args[0]},
+	})
+}
+
+// agentUpdate updates an agent's persona-level fields via dispatch.
+func agentUpdate(args []string) {
+	fs := flag.NewFlagSet("agent update", flag.ExitOnError)
+	name := fs.String("name", "", "agent name (required)")
+	description := fs.String("description", "", "new description")
+	systemPrompt := fs.String("system_prompt", "", "new system prompt / persona")
+	runtime := fs.String("runtime", "", "new runtime id or name")
+	fs.Parse(args)
+	if *name == "" {
+		fail("usage: agentwork-cli agent update --name <name> [--description D] [--system_prompt P] [--runtime R]")
+	}
+	agentFields := map[string]any{"name": *name}
+	if *description != "" {
+		agentFields["description"] = *description
+	}
+	if *systemPrompt != "" {
+		agentFields["system_prompt"] = *systemPrompt
+	}
+	if *runtime != "" {
+		agentFields["runtime_id"] = *runtime
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent": "agent_update",
+		"agent":  agentFields,
+	})
+}
+
 func squadCmd(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: agentwork-cli squad <list>")
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli squad <list|detail|delete|update|add-member|remove-member>")
 		os.Exit(2)
 	}
 	switch args[0] {
 	case "list":
 		get(serverURL() + "/squads")
+	case "detail":
+		squadDetail(args[1:])
+	case "delete":
+		squadDelete(args[1:])
+	case "update":
+		squadUpdate(args[1:])
+	case "add-member":
+		squadMember(true, args[1:])
+	case "remove-member":
+		squadMember(false, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown squad subcommand %q\n", args[0])
 		os.Exit(2)
 	}
+}
+
+// squadDetail queries a squad's detail via dispatch.
+func squadDetail(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli squad detail <name>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent": "squad_detail",
+		"squad":  map[string]any{"name": args[0]},
+	})
+}
+
+// squadDelete deletes a squad (supports comma-separated batch) via dispatch.
+func squadDelete(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli squad delete <name>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent": "squad_delete",
+		"squad":  map[string]any{"name": args[0]},
+	})
+}
+
+// squadUpdate updates a squad's leader/description/instructions via dispatch.
+func squadUpdate(args []string) {
+	fs := flag.NewFlagSet("squad update", flag.ExitOnError)
+	squadName := fs.String("squad", "", "squad name (required)")
+	leader := fs.String("leader", "", "new leader agent id or name")
+	description := fs.String("description", "", "new description")
+	instructions := fs.String("instructions", "", "new collaboration instructions")
+	fs.Parse(args)
+	if *squadName == "" {
+		fail("usage: agentwork-cli squad update --squad <name> [--leader L] [--description D] [--instructions I]")
+	}
+	squadFields := map[string]any{"name": *squadName}
+	if *leader != "" {
+		squadFields["leader_id"] = *leader
+	}
+	if *description != "" {
+		squadFields["description"] = *description
+	}
+	if *instructions != "" {
+		squadFields["instructions"] = *instructions
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent": "squad_update",
+		"squad":  squadFields,
+	})
+}
+
+// squadMember adds or removes members from a squad via dispatch.
+// --agent accepts comma-separated ids for batch operation.
+func squadMember(add bool, args []string) {
+	fs := flag.NewFlagSet("squad member", flag.ExitOnError)
+	squadName := fs.String("squad", "", "squad name (required)")
+	agentFlag := fs.String("agent", "", "agent id(s), comma-separated (required)")
+	fs.Parse(args)
+	action := "add-member"
+	if !add {
+		action = "remove-member"
+	}
+	if *squadName == "" || *agentFlag == "" {
+		fail("usage: agentwork-cli squad %s --squad <name> --agent <id>", action)
+	}
+	var memberIDs []string
+	for _, s := range strings.Split(*agentFlag, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			memberIDs = append(memberIDs, s)
+		}
+	}
+	intent := "squad_add_member"
+	if !add {
+		intent = "squad_remove_member"
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent": intent,
+		"squad":  map[string]any{"name": *squadName, "member_ids": memberIDs},
+	})
+}
+
+// ── schedule / domain / skill ──
+
+func scheduleCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli schedule <list|stop|enable|delete>")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "list":
+		get(serverURL() + "/schedules")
+	case "stop":
+		scheduleToggle("schedule_stop", args[1:])
+	case "enable":
+		scheduleToggle("schedule_enable", args[1:])
+	case "delete":
+		scheduleDelete(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown schedule subcommand %q\n", args[0])
+		os.Exit(2)
+	}
+}
+
+func scheduleToggle(intent string, args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli schedule <stop|enable> <name>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent":   intent,
+		"schedule": map[string]any{"name": args[0]},
+	})
+}
+
+func scheduleDelete(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli schedule delete <name>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent":   "schedule_delete",
+		"schedule": map[string]any{"name": args[0]},
+	})
+}
+
+func domainCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli domain <list|delete>")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "list":
+		get(serverURL() + "/domains")
+	case "delete":
+		domainDelete(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown domain subcommand %q\n", args[0])
+		os.Exit(2)
+	}
+}
+
+func domainDelete(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli domain delete <name>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent": "domain_delete",
+		"domain": map[string]any{"name": args[0]},
+	})
+}
+
+func skillCmd(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: agentwork-cli skill <list|delete>")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "list":
+		get(serverURL() + "/skills")
+	case "delete":
+		skillDelete(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown skill subcommand %q\n", args[0])
+		os.Exit(2)
+	}
+}
+
+func skillDelete(args []string) {
+	if len(args) < 1 {
+		fail("usage: agentwork-cli skill delete <name>")
+	}
+	post(serverURL()+"/intake/dispatch", map[string]any{
+		"intent": "skill_delete",
+		"skill":  map[string]any{"name": args[0]},
+	})
 }
 
 // ── stats ──
