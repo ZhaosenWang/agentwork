@@ -790,9 +790,15 @@ func (d *Daemon) intakeCreateSquad(ctx context.Context, parsed intakeAction) int
 // which is already squad.leader_id). Hallucinated members surface as a
 // partial-success reply.
 func (d *Daemon) doCreateSquad(ctx context.Context, sq squadAction) intakeResult {
+	leaderID := sq.LeaderID
+	if leaderID != "" {
+		if agent, err := d.resolveAgentByName(ctx, leaderID); err == nil && agent != nil {
+			leaderID = agent.ID
+		}
+	}
 	createdSquad, err := d.squadSvc.Create(ctx, service.Squad{
 		Name:         sq.Name,
-		LeaderID:     sq.LeaderID,
+		LeaderID:     leaderID,
 		Description:  sq.Description,
 		Instructions: sq.Instructions,
 	})
@@ -1012,6 +1018,9 @@ func (d *Daemon) intakeSquadUpdate(ctx context.Context, parsed intakeAction) int
 	changed := false
 	if strings.TrimSpace(parsed.Squad.LeaderID) != "" {
 		leaderID = parsed.Squad.LeaderID
+		if agent, err := d.resolveAgentByName(ctx, leaderID); err == nil && agent != nil {
+			leaderID = agent.ID
+		}
 		changed = true
 	}
 	if strings.TrimSpace(parsed.Squad.Description) != "" {
@@ -1053,6 +1062,9 @@ func (d *Daemon) intakeSquadAddMember(ctx context.Context, parsed intakeAction) 
 		if mid == "" || mid == sq.LeaderID {
 			continue
 		}
+		if agent, err := d.resolveAgentByName(ctx, mid); err == nil && agent != nil {
+			mid = agent.ID
+		}
 		if _, err := d.squadSvc.AddMember(ctx, sq.ID, "agent", mid, "member"); err != nil {
 			failed = append(failed, mid)
 		}
@@ -1087,6 +1099,9 @@ func (d *Daemon) intakeSquadRemoveMember(ctx context.Context, parsed intakeActio
 		mid = strings.TrimSpace(mid)
 		if mid == "" {
 			continue
+		}
+		if agent, err := d.resolveAgentByName(ctx, mid); err == nil && agent != nil {
+			mid = agent.ID
 		}
 		if !memberSet[mid] {
 			notIn = append(notIn, mid)
@@ -1215,6 +1230,7 @@ func (d *Daemon) intakeAssignGoal(ctx context.Context, parsed intakeAction) inta
 	if strings.TrimSpace(assigneeType) == "" {
 		assigneeType = "agent"
 	}
+	assigneeID = d.resolveAssigneeID(ctx, assigneeType, assigneeID)
 	if _, err := d.goalSvc.Assign(ctx, v.GoalID, assigneeType, assigneeID,
 		parsed.Goal.Description, "human", ""); err != nil {
 		return reply("转交失败：" + err.Error())
@@ -1300,7 +1316,13 @@ func (d *Daemon) intakeUpdateAgent(ctx context.Context, parsed intakeAction) int
 		changed = true
 	}
 	if strings.TrimSpace(parsed.Agent.RuntimeID) != "" {
-		updated.RuntimeID = parsed.Agent.RuntimeID
+		rtID := parsed.Agent.RuntimeID
+		if !d.runtimeIDExists(ctx, rtID) {
+			if resolved, err := d.resolveRuntimeByName(ctx, rtID); err == nil {
+				rtID = resolved
+			}
+		}
+		updated.RuntimeID = rtID
 		changed = true
 	}
 	if !changed {
