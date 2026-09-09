@@ -440,10 +440,10 @@ func TestConsultAutoResume(t *testing.T) {
 	if resumeTrigger != "" || resumeAgent != owner {
 		t.Fatalf("resume run must carry no trigger and belong to the requester: trigger=%q agent=%q", resumeTrigger, resumeAgent)
 	}
-	if err := st.DB().QueryRowContext(ctx,
-		`SELECT response_comment_id FROM consult_request WHERE guest_run_id=?`, guestID).Scan(&response); err != nil || response == "" {
-		t.Fatalf("response_comment_id not back-filled: %q err=%v", response, err)
-	}
+	// response_comment_id is no longer back-filled (决策 4-4 revised):
+	// insertRunResultComment was removed. The guest's answer is the agent's
+	// own `goal comment` (carrying run_id=guest_run_id); consultStatus joins
+	// on comment.run_id, not response_comment_id.
 	// The resume must not count toward the mention cycle (决策 4-2 counter
 	// only counts agent-TRIGGERED runs).
 	if n, _ := cs.MentionCycleCount(ctx, g.ID); n != 1 {

@@ -2427,19 +2427,29 @@ func (d *Daemon) agentTriggeredRunCount(ctx context.Context, goalID string) (int
 
 // consultStatus renders the owner's resolved consults since its last turn —
 // the causal answer to "did my question come back?" (P1-3, 决策 6-15⑨). The
-// query is CAUSAL: consult_request links requester → guest → response comment
-// (response_comment_id is back-filled at guest run end); the finished_at
-// comparison is only the "since your last turn" scope filter. An owner
-// waking mid-consult cannot happen — the finalization guard holds the goal
-// active until its OWN consults resolve (P0-6) — so every row here is
-// resolved.
+// query is CAUSAL: consult_request links requester → guest run; the guest's
+// answer is its own `goal comment` (carrying run_id=guest_run_id, joined
+// here); the finished_at comparison is only the "since your last turn" scope
+// filter. An owner waking mid-consult cannot happen — the finalization
+// guard holds the goal active until its OWN consults resolve (P0-6) — so
+// every row here is resolved.
+//
+// The guest's answer is the LAST agent comment on that run (an agent may post
+// several — a discussion aside, then the final answer); a bare LEFT JOIN on
+// run_id would produce one row per comment (cartesian product → duplicate
+// consult entries in the prompt). The subquery picks the single latest by
+// created_at, so each consult renders exactly once.
 func (d *Daemon) consultStatus(ctx context.Context, goalID, agentID, runID string) string {
 	rows, err := d.st.DB().QueryContext(ctx, `
 		SELECT COALESCE(a.name, cr.target_agent_id), COALESCE(c.content, ''), COALESCE(rc.content, ''), r.status
 		FROM consult_request cr
 		JOIN run r ON r.id = cr.guest_run_id
 		LEFT JOIN comment c ON c.id = cr.trigger_comment_id
-		LEFT JOIN comment rc ON rc.id = cr.response_comment_id
+		LEFT JOIN comment rc ON rc.id = (
+		  SELECT id FROM comment
+		   WHERE run_id = cr.guest_run_id AND author_type = 'agent'
+		   ORDER BY created_at DESC LIMIT 1
+		)
 		LEFT JOIN agent a ON a.id = cr.target_agent_id
 		WHERE cr.goal_id=? AND cr.requester_agent_id=?
 		  AND r.status IN ('completed','failed','cancelled')
@@ -2864,62 +2874,14 @@ func (d *Daemon) assemblePrompt(ctx context.Context, q *service.ClaimedRow, in p
 			in.subGoalID).Scan(&chStatus); err == nil && chStatus == "conflict" {
 			extras.WriteString("\nYour previous Change CONFLICTED at integration — resolve it against the new integration base; your new Revision replaces the old one.\n")
 		}
-		if q.Attempt > 1 && !strings.Contains(extras.String(), "REJECTED") {
-			var lastFail string
-			if err := d.st.DB().QueryRowContext(ctx,
-				`SELECT result_summary FROM run WHERE sub_goal_id=? AND status='failed' ORDER BY finished_at DESC LIMIT 1`,
-				in.subGoalID).Scan(&lastFail); err == nil && strings.TrimSpace(lastFail) != "" {
-				extras.WriteString("\nYour previous round FAILED machine verification (fix the existing code, do NOT start over):\n" + truncateIn(lastFail, 1500) + "\n")
-			}
-		}
 	}
-	// Handoff memory (the cross-agent gap): a new owner's ACP session cannot
-	// load the previous owner's session (different persona, different
-	// persistent workdir keyed by (goal, agent) — the workdir-mismatch branch
-	// in the executor drops the pointer). The previous owner's last run report
-	// is the only memory that travels across the handoff, so inject it as
-	// context — without it the new owner starts blind ("像没有记忆一样").
-	// Only a COMPLETED run's report is real work context: a cancelled run's
-	// summary is "cancelled by platform" (platform noise, not the agent's
-	// words) and a failed run's summary is a verification trace — neither is
-	// the "continue from this" handoff the new owner needs, and a cancelled
-	// run ordered latest would mask the real completed report below it.
-	if in.runRole == "owner" && in.handoff != "" {
-		var prevSummary, prevAgentName string
-		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT r.result_summary, COALESCE(a.name, '')
-			   FROM run r LEFT JOIN agent a ON a.id = r.agent_id
-			  WHERE r.goal_id=? AND r.role='owner' AND r.status='completed' AND r.result_summary != ''
-			  ORDER BY r.finished_at DESC LIMIT 1`,
-			q.GoalID).Scan(&prevSummary, &prevAgentName); err == nil {
-			if s := strings.TrimSpace(prevSummary); s != "" {
-				who := "the previous owner"
-				if prevAgentName != "" {
-					who = prevAgentName
-				}
-				extras.WriteString("\nPrevious owner's last report (" + who + ", do NOT start over — continue from this):\n" + truncateIn(s, 2000) + "\n")
-			}
-		}
-	} else if isReject {
-		// Reject memory (决策 7-2): the owner's OWN previous round was
-		// rejected — inject that round's report so the owner fixes from it
-		// rather than restarting. The label is "Your previous round was
-		// REJECTED" (NOT "Previous owner" — the owner was never changed,
-		// only paused for review; the handoff label would mislead the owner
-		// into thinking a different agent owned the goal before them).
-		// Same query as handoff memory: the latest owner completed run's
-		// result_summary is the work context to continue from.
-		var prevSummary string
-		if err := d.st.DB().QueryRowContext(ctx,
-			`SELECT r.result_summary FROM run r
-			  WHERE r.goal_id=? AND r.role='owner' AND r.status='completed' AND r.result_summary != ''
-			  ORDER BY r.finished_at DESC LIMIT 1`,
-			q.GoalID).Scan(&prevSummary); err == nil {
-			if s := strings.TrimSpace(prevSummary); s != "" {
-				extras.WriteString("\nYour previous round was REJECTED (fix from this — do NOT start over):\n" + truncateIn(s, 2000) + "\n")
-			}
-		}
-	} else if in.runRole == "owner" && in.triggerAuthor == "human" && in.triggerCommentID != "" {
+	// Handoff/reject memory no longer injects result_summary text (决策 4-4
+	// revised): the platform no longer extracts agent output into
+	// result_summary. Cross-agent memory relies on ACP session resume
+	// (same agent) + the agent pulling the comment feed (`goal comments`)
+	// for cross-agent context. The wake line still carries the handoff note
+	// / reject reason (queried from comments, not result_summary).
+	if in.runRole == "owner" && in.triggerAuthor == "human" && in.triggerCommentID != "" {
 		// Ask-reply memory (决策 7-3 延伸): the user replied to the owner's
 		// previous comment (parent_id → an agent comment — the --ask question
 		// or a plain report). The wake line carries the user's reply, but

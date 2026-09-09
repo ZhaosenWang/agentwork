@@ -6,7 +6,6 @@ package acpbackend
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 	"time"
 
@@ -124,10 +123,12 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			results <- proto.Result{Status: status, Output: proto.AppendStderr("prompt: "+err.Error(), conn.Stderr), Err: err, SessionID: string(newResp.SessionID)}
 			return
 		}
-		// Carry the assistant's text (the final answer) as Result.Output so the
-		// goal layer can fold it into a child-summary / run-detail without
-		// requiring the daemon to replay the event stream. Collected by the
-		// eventForwarder during the turn.
+		// Result.Output is empty for a completed agent run — the run's output
+		// stream is internal (persisted in chat_message for the run detail
+		// view). The agent communicates results to the team via `goal comment`
+		// (its own CLI call), not via platform-extracted output. The platform
+		// only writes a comment on FAILURE (a system comment — the agent had
+		// no chance to post itself). See DESIGN.md 决策 4-4 revised.
 		// Zero-event guard: Prompt succeeding only proves the subprocess sent a
 		// success response for session/prompt, not that the agent did any work.
 		// Zero session/update notifications means the agent exited silently
@@ -144,19 +145,18 @@ func (b *Backend) Execute(ctx context.Context, spec proto.ExecuteSpec) (*proto.R
 			}
 			return
 		}
-		results <- proto.Result{Status: proto.StatusCompleted, Output: fwd.lastAssistantText(), SessionID: string(newResp.SessionID)}
+		results <- proto.Result{Status: proto.StatusCompleted, Output: "", SessionID: string(newResp.SessionID)}
 		fwd.close()
 	}()
 
 	return &proto.Run{Events: events, Result: results}, nil
 }
 
-// eventForwarder adapts acp.EventHandler → proto.Event channel. It also
-// accumulates the assistant's message text so the Result can carry the final
-// answer as Output (for a child-summary / run-detail) without replaying the
-// stream. Accumulation is append-only; lastAssistantText returns the full text
-// once the turn is done. Guarded because the drain reader goroutine invokes the
-// callbacks concurrently with the Execute goroutine reading the result.
+// eventForwarder adapts acp.EventHandler → proto.Event channel. It forwards
+// session/update notifications to the daemon's event stream (persisted in
+// chat_message by persistEvent). It no longer accumulates assistant text —
+// the run's output stream is internal; the agent communicates results via
+// `goal comment`, and the platform only writes a comment on failure.
 //
 // Delivery: ACP callbacks push into a mutex-guarded queue (non-blocking,
 // never drops), and a pump goroutine forwards the queue to the events
@@ -170,12 +170,8 @@ type eventForwarder struct {
 	mu         sync.Mutex
 	queue      []proto.Event
 	closed     bool
-	msg        strings.Builder
-	truncate   int
 	eventCount int // total events received this turn (monotonic, never reset by pump draining)
 }
-
-const assistantOutputCap = 8 * 1024 // keep Result.Output from growing unbounded
 
 // push enqueues an event. Non-blocking and lossless (bounded by memory, not
 // by the consumer's speed). After close, pushes are dropped.
@@ -234,25 +230,8 @@ func (f *eventForwarder) pump() {
 	}
 }
 
-func (f *eventForwarder) lastAssistantText() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return strings.TrimSpace(f.msg.String())
-}
-
 func (f *eventForwarder) OnAgentMessage(text string) {
 	f.push(proto.Event{Type: proto.EventMessage, Text: text})
-	f.mu.Lock()
-	if f.truncate >= 0 {
-		if f.truncate+len(text) > assistantOutputCap {
-			// Cap reached: stop accumulating to bound memory.
-			f.truncate = -1
-		} else {
-			f.msg.WriteString(text)
-			f.truncate += len(text)
-		}
-	}
-	f.mu.Unlock()
 }
 func (f *eventForwarder) OnAgentThought(text string) {
 	f.push(proto.Event{Type: proto.EventThought, Text: text})

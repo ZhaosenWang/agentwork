@@ -136,8 +136,10 @@ func TestSessionBackendMultiPrompt(t *testing.T) {
 	if res1.Status != proto.StatusCompleted {
 		t.Fatalf("first wake: %v (err %v)", res1.Status, res1.Err)
 	}
-	if !strings.Contains(res1.Output, "first wake") {
-		t.Fatalf("first wake output: %q", res1.Output)
+	// Result.Output is empty for completed runs (决策 4-4 revised) — the
+	// run's output stream is internal; the agent communicates via goal comment.
+	if res1.Output != "" {
+		t.Fatalf("first wake output should be empty, got %q", res1.Output)
 	}
 
 	run2, err := s.Prompt(ctx, "second wake")
@@ -145,8 +147,8 @@ func TestSessionBackendMultiPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	res2 := <-run2.Result
-	if res2.Status != proto.StatusCompleted || !strings.Contains(res2.Output, "second wake") {
-		t.Fatalf("second wake: %v %q (err %v)", res2.Status, res2.Output, res2.Err)
+	if res2.Status != proto.StatusCompleted {
+		t.Fatalf("second wake: %v (err %v)", res2.Status, res2.Err)
 	}
 
 	f.mu.Lock()

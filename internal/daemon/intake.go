@@ -576,7 +576,9 @@ func (d *Daemon) intakeReviewList(ctx context.Context) intakeResult {
 }
 
 // intakeGoalStatus answers "状态 <id>" (id or short id) with the goal's
-// state and its last run's outcome.
+// state and its latest agent comment (or failed run's error summary as
+// fallback — 决策 4-4 revised: completed runs no longer carry a platform-
+// extracted result_summary; the agent communicates results via goal comment).
 func (d *Daemon) intakeGoalStatus(ctx context.Context, id string) intakeResult {
 	if d.qs == nil {
 		return reply("平台未就绪（store 未接线）")

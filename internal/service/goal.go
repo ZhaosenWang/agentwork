@@ -923,79 +923,11 @@ func (s *GoalService) ownRunByGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 //	run failed, attempts exhausted → goal → failed
 //	run cancelled → the goal stays where it is (timeout/handoff — 决策 2-6/6-6)
 //
-// insertRunResultComment lands a completed run's report in the feed as the
-// agent's comment — the delivery summary is what the human rejects/approves
-// against, and "review is a platform mechanism, not agent self-discipline"
-// (decision 4-4): the platform writes the run's report regardless of what
-// the agent said. Covers EVERY completed run — guest and assignee alike (a
-// live remote run surfaced the gap: the agent had no client tools and never
-// commented, so the feed showed only the human's reject with no context of
-// what was rejected — "我驳回了空气"). The report is kept in FULL: it is the
-// agent's words; an 800-char cut loses exactly the context a reject
-// decision needs. NO dedupe: the report is the run's delivery record (a
-// platform guarantee), and an agent's own voluntary comment is additional
-// conversation — they do not exclude each other (an agent saying "搞定" must
-// not hide the full report, nor a report hide its words).
-//
-// The report THREADS to the run's trigger comment when one exists — the
-// mention → run → answer chain (Collaboration.md §12: the guest's answer
-// goes back to the requester; the frontend renders parent_id as a quote
-// block). Owner runs (no trigger comment) land flat. Returns the inserted
-// comment's id ("" when nothing was written) — the consult chain (决策 5-8)
-// back-fills it as the response_comment_id.
-func insertRunResultComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) (string, error) {
-	if rc.Status != "completed" || strings.TrimSpace(rc.Summary) == "" {
-		return "", nil
-	}
-	// Dispatch-only turns leave NO flat report (决策 4-6/6-22 revised): an
-	// owner run that CREATED sub-goals and was triggered by nothing (no
-	// trigger comment — it is neither a mention nor a reply) produced only
-	// the dispatches, which the platform already announced as dispatch
-	// comments. Posting its report is a bare announcement — the feed noise
-	// the live runs showed ("已派发子任务给 coder…" flat, next to the
-	// dispatch comment itself). The human still sees the run in the run
-	// detail; the approval card carries the evidence. Sub-goal/consult/
-	// review reports are threaded replies to their triggers and stay.
-	if rc.TriggerCommentID == "" {
-		var created int
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM sub_goal sg
-			WHERE sg.goal_id=? AND sg.created_at >= (SELECT COALESCE(started_at, created_at) FROM run WHERE id=?)
-			  AND sg.created_at <= (SELECT COALESCE(finished_at, created_at) FROM run WHERE id=?)`,
-			rc.GoalID, rc.RunID, rc.RunID).Scan(&created); err == nil && created > 0 {
-			return "", nil
-		}
-	}
-	id := newID()
-	var parentID any
-	if rc.TriggerCommentID != "" {
-		parentID = rc.TriggerCommentID
-	} else {
-		// No trigger comment (an attention-woken owner): the report is the
-		// COMPLETION DECLARATION — it replies to the goal's ROOT comment
-		// (the creation words that started the goal, usually the human's
-		// first mention). A plain reply, never a mention: mentioning the
-		// reviewer would dispatch a consult that collides with the
-		// platform's review machinery, and mentioning the human would imply
-		// a consult the approval card already answers. Fallbacks: the wake
-		// anchor (the sub-goal report that woke the run), then flat.
-		var root string
-		if err := tx.QueryRowContext(ctx, `SELECT id FROM comment WHERE goal_id=? ORDER BY created_at ASC LIMIT 1`, rc.GoalID).Scan(&root); err == nil && root != "" {
-			parentID = root
-		} else if rc.RunID != "" {
-			var anchor string
-			if err := tx.QueryRowContext(ctx, `SELECT wake_anchor FROM run WHERE id=?`, rc.RunID).Scan(&anchor); err == nil && anchor != "" {
-				parentID = anchor
-			}
-		}
-	}
-	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,?,?,?,?)`,
-		id, rc.GoalID, "agent", rc.AgentID, parentID, strings.TrimSpace(rc.Summary), now(), rc.RunID); err != nil {
-		return "", fmt.Errorf("insert run-result comment: %w", err)
-	}
-	return id, nil
-}
+// insertRunResultComment was RETIRED (决策 4-4 revised): the platform no
+// longer extracts and posts the agent's final message as a comment. The
+// agent communicates results via `goal comment` (its own CLI call); the
+// run's output stream lives in chat_message. The platform only writes a
+// comment on FAILURE (system comment — the agent had no chance to post).
 
 // cancelReasonDescription maps a structured cancel_reason code to a short
 // human-readable phrase (English — platform text stays fixed per 决策 6-18).
@@ -1024,9 +956,10 @@ func cancelReasonDescription(code string) string {
 // insertCancelledRunComment posts a SYSTEM comment for a cancelled run — the
 // platform's voice (author_type='system'), not the agent's. A cancelled run's
 // summary is "cancelled by platform" (platform noise, not the agent's words),
-// so it must NOT be authored as the agent. The comment threads to the same
-// parent as insertRunResultComment (trigger comment / goal root / wake anchor).
-// Returns early when there is no structured cancel_reason to report.
+// so it must NOT be authored as the agent. The comment threads to the run's
+// trigger comment (or goal root / wake anchor fallback — same threading logic
+// the retired insertRunResultComment used). Returns early when there is no
+// structured cancel_reason to report.
 func insertCancelledRunComment(ctx context.Context, tx *sql.Tx, rc goalRunContext) (string, error) {
 	if rc.CancelReason == "" {
 		return "", nil
@@ -1122,36 +1055,25 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 				return fmt.Errorf("insert guest-failure comment: %w", err)
 			}
 		}
-		// A COMPLETED run's report lands in the feed here (orphaned/guest
-		// branch). Owned runs get the same fallback in the completed case
-		// below — see insertRunResultComment.
-		reportID, err := insertRunResultComment(ctx, tx, rc)
-		if err != nil {
-			return err
-		}
+		// A COMPLETED run's report is NOT posted by the platform — the agent
+		// communicates results via `goal comment` (its own CLI call). The run's
+		// output stream lives in chat_message (run detail view). Only failures
+		// leave a platform comment (the guest-failure comment above).
 		// Consult closure (决策 5-8): a completed GUEST run answers a consult —
-		// back-fill the response link, and auto-resume the requester (a fresh
-		// run, attempt 1, no trigger comment — the resume must not stack the
-		// mention-cycle counter) when the requester still owns an active goal.
-		// A FAILED/CANCELLED guest is itself the answer ("your consult did not
-		// come back"; the feed carries the guest-failure comment) — the
-		// requester resumes on ANY terminal guest outcome, or its plan
-		// silently dies (live: the leader waited for an introduction that a
-		// crashed consult never delivered, and the goal went to the gate with
-		// an empty diff).
+		// the guest's answer is the agent's own `goal comment` (carrying
+		// run_id=guest_run_id, consultStatus joins on it). Auto-resume the
+		// requester (a fresh run, attempt 1, no trigger comment — the resume
+		// must not stack the mention-cycle counter) when the requester still
+		// owns an active goal. A FAILED/CANCELLED guest is itself the answer
+		// ("your consult did not come back"; the feed carries the guest-failure
+		// comment) — the requester resumes on ANY terminal guest outcome, or
+		// its plan silently dies.
 		if rc.Status == "completed" || rc.Status == "failed" || rc.Status == "cancelled" {
 			var requesterAgent, requesterRunID string
 			err := tx.QueryRowContext(ctx,
 				`SELECT requester_agent_id, requester_run_id FROM consult_request WHERE guest_run_id=?`,
 				rc.RunID).Scan(&requesterAgent, &requesterRunID)
 			if err == nil && requesterAgent != "" {
-				if rc.Status == "completed" && reportID != "" {
-					if _, uerr := tx.ExecContext(ctx,
-						`UPDATE consult_request SET response_comment_id=? WHERE guest_run_id=?`,
-						reportID, rc.RunID); uerr != nil {
-						return fmt.Errorf("back-fill consult response: %w", uerr)
-					}
-				}
 				owns, oerr := s.AgentOwnsGoal(ctx, &g, requesterAgent)
 				if oerr != nil {
 					return oerr
@@ -1213,13 +1135,9 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 
 	switch rc.Status {
 	case "completed":
-		// The run's report lands in the feed as the agent's comment — the
-		// human's reject/approve reads it (the reject context the feed
-		// lacked. Fallback only: a self-commenting agent
-		// gets no duplicate.
-		if _, err := insertRunResultComment(ctx, tx, rc); err != nil {
-			return err
-		}
+		// The run's report is NOT posted by the platform — the agent
+		// communicates results via `goal comment`. The run's output stream
+		// lives in chat_message (run detail view).
 		// v2 finalization guard (决策 6-1/6-8): the owner run only REACHES
 		// the acceptance judgment when nothing is pending — non-terminal
 		// sub-goals (still working), ready/conflicted changes (not yet
@@ -1364,8 +1282,17 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 		// goal:finished fires ONLY when the goal actually reached a terminal
 		// state (决策 5-10): review-parked / cancelled run ends emit no
 		// goal-level event.
+		// The summary for the done card is the agent's latest comment (its
+		// result/answer — 决策 4-4 revised: completed runs no longer carry a
+		// platform-extracted result_summary; the agent communicates via goal
+		// comment). The notify layer renders this as the Feishu completion
+		// card's body (lark_md).
+		doneSummary := ""
+		_ = tx.QueryRowContext(ctx,
+			`SELECT content FROM comment WHERE goal_id=? AND author_type='agent' ORDER BY created_at DESC LIMIT 1`,
+			rc.GoalID).Scan(&doneSummary)
 		pendingEvents = append(pendingEvents, events.Event{Topic: "goal:finished", Payload: map[string]any{
-			"goal_id": rc.GoalID, "status": "done", "summary": rc.Summary,
+			"goal_id": rc.GoalID, "status": "done", "summary": doneSummary,
 		}})
 
 	case "failed":
@@ -2274,10 +2201,11 @@ func (s *GoalService) enqueueSquadReviewTx(ctx context.Context, tx *sql.Tx, goal
 		return err
 	}
 
-	// The trigger anchor (决策 6-19): the parking run's report comment — its
-	// completion declaration. Inserted earlier in THIS transaction
-	// (insertRunResultComment), so the tx query sees it; falls back to the
-	// goal's latest run report when the run left none.
+	// The trigger anchor (决策 6-19): the parking run's completion comment —
+	// the agent's own `goal comment` posted during the run (决策 4-4 revised:
+	// the platform no longer posts insertRunResultComment; the agent comments
+	// itself). Falls back to the goal's latest run-associated comment when
+	// the parking run's agent left none.
 	trigger := ""
 	if parkRunID != "" {
 		_ = tx.QueryRowContext(ctx,

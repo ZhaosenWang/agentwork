@@ -75,7 +75,7 @@ func TestFixedBlockRoleContracts(t *testing.T) {
 	d, _, goalID, agentID := seedCtx(t)
 	ctx := context.Background()
 	owner := d.buildFixedBlock(ctx, goalID, agentID, "B", "owner", "g", "", "repo", "")
-	for _, want := range []string{"final message becomes your run's report", "never write ids", "JUDGED, not declared", "agentwork subgoal create --title T --assignee <agent-id>"} {
+	for _, want := range []string{"only what you post as a", "never write ids", "JUDGED, not declared", "agentwork subgoal create --title T --assignee <agent-id>"} {
 		if !strings.Contains(owner, want) {
 			t.Fatalf("the owner contract must carry %q", want)
 		}
@@ -85,8 +85,8 @@ func TestFixedBlockRoleContracts(t *testing.T) {
 		t.Fatalf("the reviewer contract must be review-only, got:\n%s", reviewer)
 	}
 	sub := d.buildFixedBlock(ctx, goalID, agentID, "B", "subgoal", "g", "", "repo", "")
-	if !strings.Contains(sub, "NEVER post your conclusions with `agentwork goal comment`") {
-		t.Fatalf("the subgoal contract must ban the double report, got:\n%s", sub)
+	if !strings.Contains(sub, "To communicate results, use") {
+		t.Fatalf("the subgoal contract must direct results to goal comment, got:\n%s", sub)
 	}
 }
 
@@ -159,11 +159,11 @@ func TestWakeLineShapes(t *testing.T) {
 // TestHandoffPromptCarriesPreviousOwnerReport is the regression for the
 // "agent 像没有记忆一样" handoff bug — the cross-agent memory gap. A new owner's
 // ACP session cannot load the previous owner's session (different persona +
-// agent-keyed persistent workdir), so the ONLY memory that travels across a
-// handoff is the previous owner's last run report. assemblePrompt's handoff
-// branch must inject it; without it the new owner starts blind and repeats
-// the previous owner's exploration.
-func TestHandoffPromptCarriesPreviousOwnerReport(t *testing.T) {
+// agent-keyed persistent workdir). Cross-agent memory relies on ACP session
+// resume + the agent pulling the feed (`goal comments`), NOT on the platform
+// injecting result_summary text (决策 4-4 revised). The handoff branch must
+// carry the handoff note but must NOT inject the previous owner's report.
+func TestHandoffPromptDoesNotInjectPreviousOwnerReport(t *testing.T) {
 	d, st, goalID, agentID := seedCtx(t)
 	ctx := context.Background()
 
@@ -189,8 +189,9 @@ func TestHandoffPromptCarriesPreviousOwnerReport(t *testing.T) {
 		t.Fatalf("insert prev run: %v", err)
 	}
 
-	// A handoff wake: the new owner's prompt carries the handoff note + the
-	// previous owner's report as context.
+	// A handoff wake: the new owner's prompt carries the handoff note. The
+	// previous owner's report is NOT injected (决策 4-4 revised) — cross-agent
+	// memory relies on ACP session resume + the agent pulling the feed.
 	q := &service.ClaimedRow{RunID: "run-new", GoalID: goalID, AgentID: agentID, Attempt: 1}
 	prompt := d.assemblePrompt(ctx, q, promptInputs{
 		runRole: "owner", goalTitle: "g",
@@ -199,17 +200,8 @@ func TestHandoffPromptCarriesPreviousOwnerReport(t *testing.T) {
 	if !strings.Contains(prompt, "你来接手注册页") {
 		t.Fatalf("handoff prompt must carry the handoff note, got:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "Previous owner's last report") {
-		t.Fatalf("handoff prompt must label the previous owner's report, got:\n%s", prompt)
-	}
-	if !strings.Contains(prompt, "已经把登录页改好了") {
-		t.Fatalf("handoff prompt must carry the previous owner's report text — without it the new owner starts with no memory, got:\n%s", prompt)
-	}
-	if !strings.Contains(prompt, "PrevOwner") {
-		t.Fatalf("handoff prompt must name the previous owner (not just 'the previous owner'), got:\n%s", prompt)
-	}
-	if !strings.Contains(prompt, "do NOT start over") {
-		t.Fatalf("handoff prompt must tell the new owner to continue, not restart, got:\n%s", prompt)
+	if strings.Contains(prompt, "Previous owner's last report") {
+		t.Fatalf("handoff prompt must NOT inject result_summary text (决策 4-4 revised), got:\n%s", prompt)
 	}
 }
 
@@ -233,12 +225,11 @@ func TestHandoffPromptNoReportWhenNoPriorRun(t *testing.T) {
 	}
 }
 
-// TestHandoffPromptSkipsCancelledRunSummary: a cancelled run's summary is
-// platform noise ("cancelled by platform"), not the agent's work report. When
-// a cancelled owner run is the LATEST by finished_at but an older completed
-// run carries the real report, the handoff memory must pick the completed
-// report — never the cancelled noise (which would mask the real context and
-// tell the new owner to "continue from" a cancellation message).
+// TestHandoffPromptSkipsCancelledRunSummary: result_summary injection was
+// RETIRED (决策 4-4 revised). The handoff prompt must NOT inject any
+// result_summary — neither the cancelled run's platform noise nor the older
+// completed run's report. Cross-agent memory relies on ACP session resume +
+// the agent pulling the feed.
 func TestHandoffPromptSkipsCancelledRunSummary(t *testing.T) {
 	d, st, goalID, agentID := seedCtx(t)
 	ctx := context.Background()
@@ -274,8 +265,8 @@ func TestHandoffPromptSkipsCancelledRunSummary(t *testing.T) {
 	if strings.Contains(prompt, "cancelled by platform") {
 		t.Fatalf("handoff prompt must NOT inject the cancelled run's platform-noise summary, got:\n%s", prompt)
 	}
-	if !strings.Contains(prompt, "登录页已完成，注册页待做") {
-		t.Fatalf("handoff prompt must carry the older completed run's real report (the cancelled run must not mask it), got:\n%s", prompt)
+	if strings.Contains(prompt, "登录页已完成，注册页待做") {
+		t.Fatalf("handoff prompt must NOT inject result_summary text (决策 4-4 revised), got:\n%s", prompt)
 	}
 }
 
@@ -332,17 +323,17 @@ func TestRejectPromptWakeIsNotHandoff(t *testing.T) {
 	if !strings.Contains(prompt, "驳回：方向不对，把 X 改成 Y 再看") {
 		t.Fatalf("reject prompt must carry the reject reason in the wake line, got:\n%s", prompt)
 	}
-	// The memory label is "Your previous round was REJECTED" — NOT the
-	// handoff label "Previous owner's last report".
-	if !strings.Contains(prompt, "Your previous round was REJECTED") {
-		t.Fatalf("reject prompt must use the REJECTED memory label (decision 7-2), got:\n%s", prompt)
+	// result_summary injection was RETIRED (决策 4-4 revised) — the reject
+	// prompt must NOT inject the previous run's report text. Cross-round
+	// memory relies on ACP session resume + the agent pulling the feed.
+	if strings.Contains(prompt, "Your previous round was REJECTED") {
+		t.Fatalf("reject prompt must NOT inject result_summary text (决策 4-4 revised), got:\n%s", prompt)
 	}
 	if strings.Contains(prompt, "Previous owner's last report") {
 		t.Fatalf("reject prompt must NOT use the handoff memory label — the owner was never changed, got:\n%s", prompt)
 	}
-	// The owner's own previous report must be injected (continue from it).
-	if !strings.Contains(prompt, "登录页改了一半，注册页还没动") {
-		t.Fatalf("reject prompt must inject the owner's previous completed run report, got:\n%s", prompt)
+	if strings.Contains(prompt, "登录页改了一半，注册页还没动") {
+		t.Fatalf("reject prompt must NOT inject the owner's previous result_summary, got:\n%s", prompt)
 	}
 }
 
@@ -394,10 +385,96 @@ func TestHandoffPromptUnaffectedByRejectChange(t *testing.T) {
 		runRole: "owner", goalTitle: "g",
 		handoff: "你来接手",
 	})
-	if !strings.Contains(prompt, "Previous owner's last report") {
-		t.Fatalf("handoff prompt must still use the handoff memory label, got:\n%s", prompt)
+	if strings.Contains(prompt, "Previous owner's last report") {
+		t.Fatalf("handoff prompt must NOT inject result_summary text (决策 4-4 revised), got:\n%s", prompt)
 	}
 	if strings.Contains(prompt, "Your previous round was REJECTED") {
 		t.Fatalf("handoff prompt must NOT take the reject branch, got:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "你来接手") {
+		t.Fatalf("handoff prompt must carry the handoff note, got:\n%s", prompt)
+	}
+}
+
+// TestConsultStatusPicksAgentCommentByRunID (决策 4-4 revised + 5-8): the
+// guest's consult answer is the agent's own `goal comment` (carrying
+// run_id=guest_run_id). consultStatus must join on comment.run_id (not the
+// retired response_comment_id) and pick the LAST agent comment when several
+// exist on the same run — a bare LEFT JOIN would produce a cartesian product
+// (one row per comment → duplicate consult entries in the prompt).
+func TestConsultStatusPicksAgentCommentByRunID(t *testing.T) {
+	d, st, goalID, ownerID := seedCtx(t)
+	ctx := context.Background()
+
+	// Seed a second agent (the consult target).
+	rt, _ := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt2", MachineID: "m2"})
+	expert, _ := service.NewAgentService(st, events.NewBus()).Create(ctx, service.Agent{Name: "Expert", RuntimeID: rt.ID})
+
+	// The owner's consult trigger comment.
+	triggerID := "cmt-trigger"
+	now := "2026-09-09T10:00:00Z"
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,content,created_at) VALUES (?,?,?,?,?,?)`,
+		triggerID, goalID, "agent", ownerID, "[@Expert](mention://agent/"+expert.ID+") how?", now); err != nil {
+		t.Fatal(err)
+	}
+
+	// The guest consult run (role=consult, completed).
+	guestRunID := "run-guest"
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,status,role,attempt,trigger_comment_id,finished_at,queued_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		guestRunID, goalID, expert.ID, "worker", "worker", "completed", "consult", 1, triggerID, "2026-09-09T10:05:00Z", "2026-09-09T10:01:00Z", "2026-09-09T10:01:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The consult_request row (requester=owner, guest=expert's run).
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO consult_request (id,goal_id,requester_agent_id,requester_run_id,target_agent_id,trigger_comment_id,guest_run_id,created_at) VALUES (?,?,?,?,?,?,?,?)`,
+		"cr-1", goalID, ownerID, "owner-run-1", expert.ID, triggerID, guestRunID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// The owner's previous run (the "since your last turn" scope filter).
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,status,role,attempt,finished_at,queued_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		"owner-run-1", goalID, ownerID, "worker", "worker", "completed", "owner", 1, "2026-09-09T09:00:00Z", "2026-09-09T08:00:00Z", "2026-09-09T08:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Agent posts TWO comments on the guest run — a discussion aside, then
+	// the final answer. Both carry run_id=guest_run_id (as the RPC handler
+	// fills from the token).
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,?,?,?,?)`,
+		"cmt-aside", goalID, "agent", expert.ID, triggerID, "let me think about this", "2026-09-09T10:02:00Z", guestRunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at,run_id) VALUES (?,?,?,?,?,?,?,?)`,
+		"cmt-answer", goalID, "agent", expert.ID, triggerID, "the answer is 42", "2026-09-09T10:04:00Z", guestRunID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The current owner run (the one calling consultStatus).
+	ownerRunID := "owner-run-2"
+	if _, err := st.DB().ExecContext(ctx,
+		`INSERT INTO run (id,goal_id,agent_id,run_kind,run_type,status,role,attempt,finished_at,queued_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		ownerRunID, goalID, ownerID, "worker", "worker", "completed", "owner", 1, "2026-09-09T10:10:00Z", "2026-09-09T10:06:00Z", "2026-09-09T10:06:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	// consultStatus must return exactly ONE consult entry (not two from the
+	// two comments), and the answer must be the LAST comment ("the answer is
+	// 42"), not the aside ("let me think about this").
+	status := d.consultStatus(ctx, goalID, ownerID, ownerRunID)
+	if !strings.Contains(status, "the answer is 42") {
+		t.Fatalf("consultStatus must carry the guest's final answer, got:\n%s", status)
+	}
+	if strings.Contains(status, "let me think about this") {
+		t.Fatalf("consultStatus must pick the LAST agent comment, not the aside, got:\n%s", status)
+	}
+	// The consult entry must appear exactly once (no cartesian-product dup).
+	if c := strings.Count(status, "how?"); c != 1 {
+		t.Fatalf("consultStatus must render the consult once, got %d occurrences in:\n%s", c, status)
 	}
 }

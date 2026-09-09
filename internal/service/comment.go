@@ -24,10 +24,11 @@ type Comment struct {
 	Content    string `json:"content"`
 	CreatedAt  string `json:"created_at"`
 	// RunID is the run whose product this comment is (AGENTWORK_RUN_ID for
-	// agent comments; insertRunResultComment stamps the run). Persisted —
-	// the approval panel distinguishes worker reports from review opinions
-	// by run ownership (DESIGN.md 决策 4-4). Also used to thread an agent
-	// comment as a REPLY to its run's trigger comment.
+	// agent comments — the RPC handler stamps it from the run token).
+	// Persisted — the approval panel distinguishes worker reports from
+	// review opinions by run ownership (DESIGN.md 决策 4-4), and
+	// consultStatus joins on it to find the guest's answer (决策 5-8).
+	// Also used to thread an agent comment as a REPLY to its run's trigger.
 	RunID string `json:"run_id,omitempty"`
 	// AskHuman (决策 7-3): true when the agent posted this comment via
 	// `goal comment --ask` — an explicit question to the goal creator. The
@@ -429,8 +430,10 @@ func (s *CommentService) forceMentionCycleFailed(ctx context.Context, goalID str
 // recordConsult appends a consult_request row (决策 5-8, Collaboration.md
 // §12): the full chain — requester (the owner run that asked) → trigger
 // comment → guest run — so the reconcile step can auto-resume the requester
-// when the guest's answer lands. response_comment_id is back-filled at guest
-// run end.
+// when the guest's answer lands. response_comment_id is no longer back-filled
+// (决策 4-4 revised): the guest's answer is its own `goal comment` (carrying
+// run_id=guest_run_id); consultStatus joins on comment.run_id instead. The
+// column is retained for schema compatibility but stays empty.
 func (s *CommentService) recordConsult(ctx context.Context, c Comment, targetAgentID, guestRunID string) error {
 	ts := now()
 	_, err := s.st.DB().ExecContext(ctx,

@@ -419,6 +419,10 @@ loop:
 		}
 		headSHA = sha
 	}
+	// result.Output is empty for a completed agent run (the output stream is
+	// internal — chat_message; the agent communicates via goal comment). For
+	// a failed/cancelled run it carries the error/stderr (the platform stamps
+	// it into result_summary + writes a system failure comment).
 	// Processor runs upload their FILE results (the platform reads
 	// structured side effects, never agent stdout).
 	finishParams := link.RunFinishedParams{RunID: p.RunID, Status: status, Summary: result.Output, Token: p.Token, HeadSHA: headSHA, SessionID: sessionID, WorkDir: workdir}
@@ -531,7 +535,7 @@ func agentProfileDir(agentID string) string {
 }
 
 // writeAgentProfile persists the pushed system prompt as AGENTS.md
-// ('' removes the file — an empty prompt leaves no profile).
+// ((empty) removes the file — an empty prompt leaves no profile).
 func writeAgentProfile(agentID, systemPrompt string) error {
 	dir := agentProfileDir(agentID)
 	if err := os.MkdirAll(dir, 0o755); err != nil {

@@ -176,16 +176,6 @@ function ReviewPanel({ goal }: { goal: Goal }) {
           </div>
         )}
 
-        {/* Agent 汇报（折叠，默认收起——长文不占审批视线） */}
-        {lastRun?.result_summary && (
-          <details className="text-xs" open={agentComments.length === 0}>
-            <summary className="cursor-pointer font-medium text-amber-900">Agent 汇报</summary>
-            <div className="mt-1.5 max-h-56 overflow-y-auto">
-              <Markdown content={lastRun.result_summary.slice(0, 500)} agentName={agentName} className="text-amber-800" />
-            </div>
-          </details>
-        )}
-
         {/* 证据包（折叠）——diff 统计 + 机器验证输出 + 结构化约束 + agent 自述 */}
         {evidence && (
           <details className="text-xs">

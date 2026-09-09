@@ -269,10 +269,8 @@ func (s *GoalService) reconcileSubGoalRunOnce(ctx context.Context, rc goalRunCon
 	var evs []events.Event
 	switch rc.Status {
 	case "completed":
-		// The run's report lands in the goal's feed (owner context).
-		if _, err := insertRunResultComment(ctx, tx, rc); err != nil {
-			return err
-		}
+		// The run's report is NOT posted by the platform — the agent
+		// communicates results via `goal comment`.
 		// An agent verifier was named (决策 6-5): machine checks passed, now
 		// the QUALITY gate — park in verifying and enqueue the verifier run.
 		// The verdict tool (verify_sub_goal) makes the verified/rejected
@@ -618,17 +616,15 @@ func (s *GoalService) MarkChangeIntegrated(ctx context.Context, changeID string,
 }
 
 // ReconcileVerifyRun closes a verify run (决策 6-5): the verdict tool already
-// made the sub-goal transition — the run itself just lands its report in the
-// feed and is discarded (verify runs have no goal authority).
+// made the sub-goal transition — the run itself is discarded (verify runs
+// have no goal authority). The verifier's verdict lives in verification_result
+// (structured) + the agent's own `goal comment` if it has an opinion.
 func (s *GoalService) ReconcileVerifyRun(ctx context.Context, rc goalRunContext) error {
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := insertRunResultComment(ctx, tx, rc); err != nil {
-		return err
-	}
 	// Same P0-1 stamp as the other reconcile paths (决策 6-11).
 	if _, err := tx.ExecContext(ctx, `UPDATE run SET reconciled_at=? WHERE id=?`, now(), rc.RunID); err != nil {
 		return fmt.Errorf("stamp reconciled_at: %w", err)

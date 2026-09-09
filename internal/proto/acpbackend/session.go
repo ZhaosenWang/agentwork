@@ -176,7 +176,9 @@ func (s *session) Prompt(ctx context.Context, prompt string) (*proto.Run, error)
 			}
 			return
 		}
-		results <- proto.Result{Status: proto.StatusCompleted, Output: fwd.lastAssistantText(), SessionID: s.sessionID}
+		// Result.Output is empty — the run's output stream is internal
+		// (chat_message); the agent communicates results via goal comment.
+		results <- proto.Result{Status: proto.StatusCompleted, Output: "", SessionID: s.sessionID}
 	}()
 
 	return &proto.Run{Events: events, Result: results}, nil

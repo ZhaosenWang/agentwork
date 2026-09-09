@@ -351,24 +351,24 @@ func (c *Closer) OnDelivered(ctx context.Context, goalID, note string, commits [
 // OnTerminal is the bus handler for goal:finished status=failed where the
 // failing run actually ran an agent session (agent_ran=true). Unlike
 // OnDelivered it does NOT close the issue — the work was not delivered, so
-// the issue stays open for the human. It posts the agent's own terminal
-// summary verbatim as the issue comment: the author hears from the agent
-// that tried, not a branded system notice (the bot account's display name is
-// the identity on the host, the way a developer replies on an issue). The
-// comment carries NO goal id / platform branding. summary is the agent's
-// result_summary from the run; an empty one is silently dropped (the caller
-// already gated on agent_ran, but a run that started yet produced no text
-// still has nothing worth saying).
+// the issue stays open for the human. It posts the run's terminal summary
+// as the issue comment so the author sees what went wrong. The summary is
+// the platform-generated error/stderr from the failed run's result_summary
+// (决策 4-4: a failed run's agent had no chance to comment, so the platform
+// supplies the failure reason — not the agent's own words). The comment
+// carries NO goal id / platform branding. An empty summary is silently
+// dropped (the caller already gated on agent_ran, but a run that started
+// yet produced no error text still has nothing worth saying).
 func (c *Closer) OnTerminal(ctx context.Context, goalID, summary string) {
-	agentSaid := strings.TrimSpace(summary)
-	if agentSaid == "" {
+	text := strings.TrimSpace(summary)
+	if text == "" {
 		return
 	}
 	t, ok := c.resolveIssueTarget(ctx, goalID)
 	if !ok {
 		return
 	}
-	if err := t.client.CreateComment(ctx, t.repo, t.number, agentSaid); err != nil {
+	if err := t.client.CreateComment(ctx, t.repo, t.number, text); err != nil {
 		fmt.Printf("issue: terminal comment %s:%s#%d: %v\n", t.provider, t.repo, t.number, err)
 	}
 }

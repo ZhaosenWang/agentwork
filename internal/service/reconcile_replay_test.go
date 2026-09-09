@@ -80,8 +80,8 @@ func TestReconcilePendingTerminalReplays(t *testing.T) {
 		t.Fatalf("replay must materialize exactly 1 change, got %d (err %v)", changes, err)
 	}
 	if err := st.DB().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM comment WHERE run_id=?`, sgRun).Scan(&comments); err != nil || comments != 1 {
-		t.Fatalf("replay must land the report comment once, got %d (err %v)", comments, err)
+		`SELECT COUNT(*) FROM comment WHERE run_id=?`, sgRun).Scan(&comments); err != nil || comments != 0 {
+		t.Fatalf("replay must NOT land a platform report comment (决策 4-4 revised — agent uses goal comment), got %d (err %v)", comments, err)
 	}
 	var reconciledAt string
 	if err := st.DB().QueryRowContext(ctx,
@@ -99,8 +99,8 @@ func TestReconcilePendingTerminalReplays(t *testing.T) {
 		t.Fatalf("second replay must not duplicate changes, got %d (err %v)", changes, err)
 	}
 	if err := st.DB().QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM comment WHERE run_id=?`, sgRun).Scan(&comments); err != nil || comments != 1 {
-		t.Fatalf("second replay must not duplicate the report, got %d (err %v)", comments, err)
+		`SELECT COUNT(*) FROM comment WHERE run_id=?`, sgRun).Scan(&comments); err != nil || comments != 0 {
+		t.Fatalf("second replay must not land a report comment (决策 4-4 revised), got %d (err %v)", comments, err)
 	}
 }
 

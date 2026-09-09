@@ -33,8 +33,9 @@ type GoalBrief struct {
 	Status string
 }
 
-// GoalStatusView is the intake "goal status" answer: the goal plus its last
-// run's outcome summary.
+// GoalStatusView is the intake "goal status" answer: the goal plus its latest
+// agent comment (the agent's result/answer — 决策 4-4 revised), or the latest
+// failed run's error summary as fallback.
 type GoalStatusView struct {
 	GoalID        string
 	Title         string
@@ -176,10 +177,19 @@ func (q *SQLQueryStore) AgentName(ctx context.Context, agentID string) (string, 
 
 func (q *SQLQueryStore) GoalStatus(ctx context.Context, idPrefix string) (*GoalStatusView, error) {
 	var v GoalStatusView
+	// Summary: the agent's latest comment on the goal (its result/answer —
+	// the platform no longer extracts result_summary from completed runs,
+	// 决策 4-4 revised). Falls back to the latest failed run's error
+	// summary (a platform string, for runs where the agent never commented).
 	err := q.st.DB().QueryRowContext(ctx,
 		`SELECT g.id, g.title, g.status, g.review_request,
-		        COALESCE((SELECT r.result_summary FROM run r WHERE r.goal_id=g.id
-		                  AND r.status IN ('completed','failed') ORDER BY r.finished_at DESC LIMIT 1), '')
+		        COALESCE(
+		          (SELECT c.content FROM comment c WHERE c.goal_id=g.id AND c.author_type='agent'
+		           ORDER BY c.created_at DESC LIMIT 1),
+		          (SELECT r.result_summary FROM run r WHERE r.goal_id=g.id
+		           AND r.status='failed' AND r.result_summary != ''
+		           ORDER BY r.finished_at DESC LIMIT 1),
+		          '')
 		 FROM goal g WHERE g.id LIKE ? || '%' ORDER BY g.created_at DESC LIMIT 1`, idPrefix).
 		Scan(&v.GoalID, &v.Title, &v.Status, &v.ReviewRequest, &v.Summary)
 	return &v, err

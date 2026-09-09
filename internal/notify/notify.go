@@ -460,9 +460,11 @@ func (n *Notifier) onGoalFinished(_ context.Context, e events.Event) {
 	}
 	switch status {
 	case "completed", "done":
-		// The agent's full report (markdown) travels with the completion —
-		// the card renders it (lark_md), so Feishu shows what the web
-		// comment feed shows, not a bare title.
+		// The agent's latest goal comment (its result/answer) travels with
+		// the completion — the card renders it (lark_md), so Feishu shows
+		// what the web comment feed shows, not a bare title. 决策 4-4
+		// revised: the summary is the agent's own comment, not a platform-
+		// extracted result_summary.
 		body := fmt.Sprintf("**%s**", title)
 		if s := strings.TrimSpace(summary); s != "" {
 			body += "  \n\n" + truncate(s, 2000)

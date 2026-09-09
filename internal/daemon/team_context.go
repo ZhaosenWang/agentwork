@@ -117,7 +117,7 @@ func (d *Daemon) buildRunProfile(ctx context.Context, goalID, agentID, agentName
 // playbook, and (for the leader) the operating protocol. It rides the
 // workdir's AGENTS.md (shipped in the dispatch payload, merged by the
 // executor at spawn), NOT the prompt: team structure is persona material,
-// stable across a goal's turns. '' = solo run.
+// stable across a goal's turns. (empty) = solo run.
 func (d *Daemon) buildTeamProfile(ctx context.Context, goalID, agentID string) string {
 	var squadID string
 	if err := d.st.DB().QueryRowContext(ctx,
@@ -198,7 +198,7 @@ func (d *Daemon) writeTeamBlock(ctx context.Context, b *strings.Builder, squadID
 }
 
 // agentSkillLine renders an agent's selected skill names for the roster
-// ('' = none) — the leader divides work by what members can actually do.
+// ((none) — the leader divides work by what members can actually do.
 func (d *Daemon) agentSkillLine(ctx context.Context, agentID string) string {
 	var raw string
 	if err := d.st.DB().QueryRowContext(ctx, `SELECT skills FROM agent WHERE id=?`, agentID).Scan(&raw); err != nil || raw == "" || raw == "[]" {
@@ -240,13 +240,10 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 			"your session and worktree persist across the round-trip. Use --ask\n" +
 			"only when you genuinely need the user's input to proceed.\n" +
 			"Transfer ownership with `agentwork goal assign <agent-id>`. Members\n" +
-			"are NOT auto-dispatched — you delegate explicitly. Your final message becomes your run's report in the feed (the platform posts it). NEVER\n" +
-			"post your conclusions with `agentwork goal comment` and then\n" +
-			"summarize them again in the final message — the report double-posts\n" +
-			"(feed noise;\n" +
-			"a live failure: the delegation was announced three times). After a\n" +
-			"dispatch-only turn keep the final message MINIMAL (one short\n" +
-			"sentence) — never repeat the dispatch, never write ids\n" +
+			"are NOT auto-dispatched — you delegate explicitly. To communicate\n" +
+			"results or conclusions to the team, use `agentwork goal comment` —\n" +
+			"your run's output stream is internal, only what you post as a\n" +
+			"comment reaches the feed. never write ids in comments\n" +
 			"(goal/sub-goal/agent/squad ids are system handles, the feed is\n" +
 			"read by the user). Completion is JUDGED, not declared: the\n" +
 			"platform's machine verification + gates + the user's approval\n" +
@@ -259,20 +256,17 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 		}
 		return s
 	case "subgoal":
-		return "You implement this work item. When the work is DONE, end your turn\n" +
-			"with your final message — the platform posts it to the feed as your\n" +
-			"report. NEVER post your conclusions with `agentwork goal comment`\n" +
-			"and then summarize them again in the final message (the report\n" +
-			"double-posts — feed noise). The platform machine-verifies your\n" +
-			"branch and produces a Change; the OWNER integrates it. You do not\n" +
-			"create sub-goals, hand off, or integrate — those are the owner's\n" +
-			"tools.\n"
+		return "You implement this work item. To communicate results, use\n" +
+			"`agentwork goal comment` — your run's output stream is internal,\n" +
+			"only what you post as a comment reaches the feed. The platform\n" +
+			"machine-verifies your branch and produces a Change; the OWNER\n" +
+			"integrates it. You do not create sub-goals, hand off, or\n" +
+			"integrate — those are the owner's tools.\n"
 	case "consult":
-		return "You are consulted (READ-ONLY): answer the question in your final\n" +
-			"message — the platform posts it to the feed as your answer (do NOT\n" +
-			"post a duplicate with `agentwork goal comment`). Do not modify\n" +
-			"files, do not commit, do not execute the task itself — your edits\n" +
-			"are discarded by the platform.\n"
+		return "You are consulted (READ-ONLY): answer the question with\n" +
+			"`agentwork goal comment` — that is how your answer reaches the\n" +
+			"feed. Do not modify files, do not commit, do not execute the task\n" +
+			"itself — your edits are discarded by the platform.\n"
 	case "review":
 		return "You REVIEW ONLY — give your opinion, never do the work.\n" +
 			"BEFORE you form an opinion, pull the goal's comment feed with\n" +
@@ -289,12 +283,10 @@ func roleContract(runRole string, isLeader bool, squadID string) string {
 			"and say so explicitly; never report a missing diff as the answer\n" +
 			"itself. If information is still insufficient after pulling the\n" +
 			"feed (e.g. sub-goal or change state unclear), use the `agentwork`\n" +
-			"CLI to fetch more before opining — do not guess. End your turn\n" +
-			"with your opinion as the final message — the platform posts it to\n" +
-			"the feed (the approver reads it there; do NOT post a duplicate\n" +
-			"with `agentwork goal comment`). Do not modify files, do not\n" +
-			"commit, do not execute the task itself — your edits are discarded\n" +
-			"by the platform.\n"
+			"CLI to fetch more before opining — do not guess. Post your\n" +
+			"opinion with `agentwork goal comment` — that is how the approver\n" +
+			"reads it. Do not modify files, do not commit, do not execute the\n" +
+			"task itself — your edits are discarded by the platform.\n"
 	case "verify":
 		return "You are the verifier for a work item: judge it, then issue\n" +
 			"`agentwork subgoal verify <id> --verdict passed|rejected [--summary S]\n" +

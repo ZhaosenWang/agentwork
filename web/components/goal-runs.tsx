@@ -6,7 +6,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import { stopRun } from "@/lib/api";
 import { useWSEvent } from "@/lib/ws";
 import { Badge, Empty } from "@/components/ui";
-import { Markdown } from "@/components/markdown";
 import type { Run } from "@/lib/types";
 import type { ChatMessage } from "@/lib/api";
 import { groupMessages, StreamCards } from "@/lib/run-messages";
@@ -173,14 +172,6 @@ function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentNa
         {(run.status === "running" || run.status === "queued") && <StoppingRun goalId={goalId} runId={run.id} />}
       </div>
 
-      {!open && run.result_summary && (
-        <div className="px-4 pb-3.5">
-          <div className="max-h-24 overflow-hidden text-xs text-zinc-500">
-            <Markdown content={run.result_summary} agentName={agentName} />
-          </div>
-        </div>
-      )}
-
       {open && (
         <div className="border-t border-zinc-100 bg-zinc-50/60 p-4 space-y-3">
           {run.prompt && (
@@ -189,12 +180,6 @@ function RunCard({ run, goalId, agentName }: { run: Run; goalId: string; agentNa
               <div className="max-h-72 overflow-y-auto whitespace-pre-wrap font-mono text-zinc-600 bg-white rounded-lg border border-zinc-200/60 p-2.5">
                 {run.prompt}
               </div>
-            </div>
-          )}
-          {run.result_summary && (
-            <div className="text-xs text-zinc-700">
-              <div className="text-[11px] font-medium text-zinc-400 uppercase tracking-wide mb-1">结果</div>
-              <Markdown content={run.result_summary} agentName={agentName} />
             </div>
           )}
           {run.status === "running" && (

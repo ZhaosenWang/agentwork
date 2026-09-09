@@ -467,15 +467,6 @@ function RunDetail({ goalId, runId, agentName }: {
         <code className="text-[9px] text-zinc-400">{runId.slice(0, 8)}</code>
       </div>
 
-      {full?.result_summary && (
-        <details open>
-          <summary className="text-[10px] font-medium text-zinc-500 cursor-pointer">Agent 汇报</summary>
-          <div className="mt-1 text-[10.5px] text-zinc-700 whitespace-pre-wrap max-h-40 overflow-y-auto leading-relaxed">
-            {full.result_summary.slice(0, 800)}
-          </div>
-        </details>
-      )}
-
       {evidence && !!(evidence.diff_stat || evidence.verify) && (
         <details>
           <summary className="text-[10px] font-medium text-zinc-500 cursor-pointer">证据包</summary>
