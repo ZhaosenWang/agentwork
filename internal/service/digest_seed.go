@@ -78,7 +78,7 @@ type DigestManifestItem struct {
 const digestDescription = `你是本次「每日 AI 知识精选」的 AI 知识编辑，必须亲自完成收集，不要委派给其他 agent（不要用 handoff，不要创建子目标）。
 
 任务：
-1. 用你可用的联网检索工具，搜集最近 6 小时 AI 领域的重要动态（大模型发布与更新、重要产品与开源项目、行业政策与融资、有影响力的研究与技术进展）。
+1. 用你可用的联网检索工具，搜集最近 24 小时 AI 领域的重要动态（大模型发布与更新、重要产品与开源项目、行业政策与融资、有影响力的研究与技术进展）。
 2. 从结果中精选最多 5 条，宁缺毋滥：只收录有真实来源、值得关注的动态。
 3. 在当前项目目录下，为每条动态写一篇文章，文件名固定为 1.md、2.md、3.md、4.md、5.md（有几条写几个文件）。每篇结构：
    # <动态标题>
@@ -93,7 +93,12 @@ const digestDescription = `你是本次「每日 AI 知识精选」的 AI 知识
      {"title": "动态标题", "summary": "一句话摘要", "file": "1.md"},
      ...
    ]
-要求：全部用中文；内容只能来自检索到的真实信息，必须附来源链接；不要编造；不要改动以上文件名。`
+要求：全部用中文；内容只能来自检索到的真实信息，必须附来源链接；不要编造；不要改动以上文件名。
+
+manifest.json 是严格 JSON，平台会程序化解析，必须一次写对：
+- title 和 summary 里不要出现英文双引号 " —— 需要引用时用中文引号「」或“”；
+- 不要输出 markdown 代码块围栏，文件内容以 [ 开头、以 ] 结尾；
+- 写完后可用工具校验一次 JSON 合法性。`
 
 // digestMarkerValue reads one builtin.digest.* app_settings value. The value
 // is JSON-encoded ("\"<id>\"") to stay compatible with SettingsService

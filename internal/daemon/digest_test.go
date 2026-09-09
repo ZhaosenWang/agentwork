@@ -330,3 +330,65 @@ func TestCollectDigestBatchWithoutManifestFallsBack(t *testing.T) {
 		t.Fatalf("fallback file missing: %v", err)
 	}
 }
+
+func TestParseDigestManifestRepairsUnescapedQuotes(t *testing.T) {
+	// The production failure: titles carrying unescaped double quotes make
+	// strict unmarshal fail; the repair pass must recover all metadata.
+	raw := `[
+      {"title": "OpenAI 发布 GPT-6 Astra：首个跨越网络安全"关键阈值"的模型", "summary": "一句话"摘要"", "file": "1.md"},
+      {"title": "普通标题", "summary": "普通摘要", "file": "2.md"}
+    ]`
+	entries := parseDigestManifest(raw)
+	if len(entries) != 2 {
+		t.Fatalf("repaired entries = %d, want 2", len(entries))
+	}
+	if entries[0].Title != "OpenAI 发布 GPT-6 Astra：首个跨越网络安全\"关键阈值\"的模型" {
+		t.Fatalf("title not recovered verbatim: %q", entries[0].Title)
+	}
+	if entries[0].Summary != "一句话\"摘要\"" {
+		t.Fatalf("summary not recovered: %q", entries[0].Summary)
+	}
+	if entries[1].Title != "普通标题" || entries[1].File != "2.md" {
+		t.Fatalf("plain entry damaged: %+v", entries[1])
+	}
+}
+
+func TestParseDigestManifestStillRejectsHopelessJson(t *testing.T) {
+	// Broken beyond quote repair (missing colon) → no entries, no panic.
+	if entries := parseDigestManifest(`[{"title" "x" "file" "1.md"}]`); entries != nil {
+		t.Fatalf("hopeless json parsed: %+v", entries)
+	}
+	if entries := parseDigestManifest(""); entries != nil {
+		t.Fatalf("empty raw parsed: %+v", entries)
+	}
+}
+
+func TestCollectDigestBatchBadManifestKeepsMetadatalessButNoManifestEntry(t *testing.T) {
+	// An UNPARSEABLE manifest (the production incident) must not be treated
+	// as an article: fallback collects only the fixed md names, titles
+	// recovered from each md's H1.
+	t.Setenv("HOME", t.TempDir())
+	d, _ := digestDaemonFixture(t, "sched-1")
+	d.collectDigestBatch(context.Background(), "g-1", map[string]string{
+		"manifest.json": `[{"title":"broken" "file":"1.md"}]`, // missing colon
+		"1.md":          "# 从H1恢复的标题\n正文",
+		"2.md":          "无H1正文",
+	})
+	b, err := os.ReadFile(filepath.Join(digestRoot(), "articles.json"))
+	if err != nil {
+		t.Fatalf("articles.json missing: %v", err)
+	}
+	var articles []service.DigestArticle
+	if err := json.Unmarshal(b, &articles); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(articles) != 2 {
+		t.Fatalf("articles = %d, want 2 (manifest.json excluded)", len(articles))
+	}
+	if articles[0].Title != "从H1恢复的标题" {
+		t.Fatalf("H1 title not recovered: %+v", articles[0])
+	}
+	if articles[1].Title != "" {
+		t.Fatalf("md without H1 should have empty title: %+v", articles[1])
+	}
+}

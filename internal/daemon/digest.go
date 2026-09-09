@@ -8,8 +8,10 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -158,15 +160,21 @@ func (d *Daemon) collectDigestBatch(ctx context.Context, goalID string, artifact
 
 	root := digestRoot()
 	entries := parseDigestManifest(artifacts["manifest.json"])
-	// No manifest → nothing indexable, but the md files may still be there.
-	// Fall back to whatever artifacts arrived under the fixed names so the
-	// batch is not lost entirely (titles degrade to the filename).
+	// No parseable manifest → nothing indexable, but the md files may still
+	// be there. Fall back to whatever artifacts arrived under the fixed
+	// article names (manifest.json itself is never an article) so the batch
+	// is not lost entirely; titles are recovered from each md's H1 line.
 	if len(entries) == 0 {
-		logging.Warnf("digest: goal %s: no manifest.json artifact — collecting files without metadata", goalID)
+		logging.Warnf("digest: goal %s: manifest.json missing or unparseable — collecting files without metadata", goalID)
 		for _, name := range service.DigestArtifactFiles {
-			if _, ok := artifacts[name]; ok {
-				entries = append(entries, service.DigestManifestItem{File: name})
+			if name == "manifest.json" {
+				continue
 			}
+			content, ok := artifacts[name]
+			if !ok || content == "" {
+				continue
+			}
+			entries = append(entries, service.DigestManifestItem{File: name, Title: digestH1Title(content)})
 		}
 		if len(entries) == 0 {
 			logging.Warnf("digest: goal %s: no artifacts to collect", goalID)
@@ -245,15 +253,26 @@ func (d *Daemon) collectDigestBatch(ctx context.Context, goalID string, artifact
 }
 
 // parseDigestManifest decodes the executor's manifest.json. A malformed
-// manifest yields no entries (the caller falls back / warns).
+// manifest first goes through repairDigestJson (unescaped quotes inside
+// string values — the one mistake the executor model actually makes) and is
+// retried before giving up; a still-unparseable manifest yields no entries
+// (the caller falls back / warns).
 func parseDigestManifest(raw string) []service.DigestManifestItem {
 	if raw == "" {
 		return nil
 	}
 	var metas []service.DigestManifestItem
 	if err := json.Unmarshal([]byte(raw), &metas); err != nil {
-		logging.Warnf("digest: manifest.json unparseable: %v", err)
-		return nil
+		// Agent-written manifests occasionally carry unescaped double quotes
+		// inside titles (中文引号习惯漂移成英文引号) — one repair pass
+		// before falling back to the metadata-less collection path.
+		repaired, rerr := repairDigestJson(raw)
+		if rerr == nil && json.Unmarshal(repaired, &metas) == nil {
+			logging.Infof("digest: manifest.json parsed after quote repair (%d item(s))", len(metas))
+		} else {
+			logging.Warnf("digest: manifest.json unparseable: %v", err)
+			return nil
+		}
 	}
 	out := metas[:0]
 	for _, m := range metas {
@@ -263,6 +282,82 @@ func parseDigestManifest(raw string) []service.DigestManifestItem {
 		out = append(out, m)
 	}
 	return out
+}
+
+// repairDigestJson re-escapes double quotes that appear INSIDE string values
+// (after a value has started, before its structural closing quote) and that
+// are not already escaped. Walks the raw bytes as a state machine so
+// structural quotes are left untouched; the first structural error wins —
+// anything the pass can't make valid is returned unchanged. E.g.
+//   {"title":"跨越"关键阈值"的模型","file":"1.md"}
+// becomes
+//   {"title":"跨越\"关键阈值\"的模型","file":"1.md"}
+func repairDigestJson(raw string) ([]byte, error) {
+	// Breakpoints between structural tokens: quote ends a string, colon
+	// follows an object key, comma/brackets separate items. A quote preceded
+	// by one of these OPENED a value (structural); a quote followed by one
+	// of these CLOSED it (structural); anything else is an interior quote
+	// needing an escape.
+	const breaks = `,:[]{}`
+	var b strings.Builder
+	b.Grow(len(raw) + 8)
+	inStr := false
+	esc := false
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if !inStr {
+			b.WriteByte(c)
+			if c == '"' {
+				inStr = true
+				esc = false
+			}
+			continue
+		}
+		// Inside a string.
+		if esc {
+			b.WriteByte(c)
+			esc = false
+			continue
+		}
+		switch c {
+		case '\\':
+			b.WriteByte(c)
+			esc = true
+		case '"':
+			// Structural close iff the next significant byte is a break —
+			// anything else is interior (escape it).
+			j := i + 1
+			for j < len(raw) && (raw[j] == ' ' || raw[j] == '\t' || raw[j] == '\n' || raw[j] == '\r') {
+				j++
+			}
+			if j < len(raw) && strings.IndexByte(breaks, raw[j]) >= 0 {
+				inStr = false
+				b.WriteByte(c)
+			} else {
+				b.WriteByte('\\')
+				b.WriteByte('"')
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	out := []byte(b.String())
+	if !json.Valid(out) {
+		return nil, errors.New("repair left invalid json")
+	}
+	return out, nil
+}
+
+// digestH1Title extracts the first markdown H1 line ("# 标题") from an
+// article body for the metadata-less fallback path; '' when there is none.
+func digestH1Title(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "# ") {
+			return strings.TrimSpace(strings.TrimPrefix(t, "# "))
+		}
+	}
+	return ""
 }
 
 // readDigestArticles loads articles.json; a missing file is a fresh start.
