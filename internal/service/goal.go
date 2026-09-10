@@ -1401,19 +1401,19 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 	// the deliverable is a subjective artifact the machine cannot judge. The
 	// human checkpoint is unconditional here (regardless of strength or
 	// configured gates): zero-checkpoint scratch goals must not auto-done.
-	// The reason is HUMAN words — the person reading the card never wrote a
-	// policy and must not see platform jargon.
+	// No review_request text — the approval panel itself communicates "your
+	// decision is needed"; the internal reason (no git / no policy / weak
+	// strength) is platform jargon the user does not need.
 	if domainType == "scratch" {
-		return true, "人工验收（无 Git 仓库项目）", nil
+		return true, "", nil
 	}
 	// The confirmation gate (决策 2-4/2-5): an UNFROZEN acceptance policy is
 	// no acceptance policy — nothing was run against it (the daemon skips
 	// verification for unfrozen domains), so no machine judgment exists and
 	// the goal must NOT promote unattended. The human checkpoint is the
-	// only safe default: "define by the human" is enforced here, not hoped
-	// for.
+	// only safe default.
 	if compiledAt == "" {
-		return true, "人工验收（未配置验收策略）", nil
+		return true, "", nil
 	}
 	var checks Checks
 	if err := json.Unmarshal([]byte(checksJSON), &checks); err != nil {
@@ -1423,7 +1423,7 @@ func (s *GoalService) gatesForGoal(ctx context.Context, tx *sql.Tx, rc goalRunCo
 		return false, "", nil // gates configured but none fired for this run
 	}
 	if strength == "weak" {
-		return true, "人工验收（自动判定不可靠）", nil
+		return true, "", nil
 	}
 	return false, "", nil
 }
@@ -2298,9 +2298,11 @@ func (s *GoalService) compileWakeNoteTx(ctx context.Context, tx *sql.Tx, goalID,
 			}
 		}
 	}
-	// The wake anchor (决策 6-22): the latest sub-goal report comment — the
-	// comment the wake refers to. Recovery-only wakes (failed runs produce no
-	// report) get no anchor.
+	// The wake anchor (决策 6-22): the latest agent comment on a sub-goal run
+	// — the agent's own `goal comment` (its result/answer, 决策 4-4 revised).
+	// If the sub-goal's agent did not comment, there is no anchor (the owner
+	// relies on the wake note bullets + pulling the feed). Recovery-only wakes
+	// (failed runs produce no agent comment) get no anchor.
 	var anchor string
 	_ = tx.QueryRowContext(ctx,
 		`SELECT c.id FROM comment c JOIN run r ON r.id = c.run_id

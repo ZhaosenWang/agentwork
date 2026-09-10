@@ -98,8 +98,11 @@ func TestUnfrozenPolicyForcesReview(t *testing.T) {
 	if after.Status != "review" {
 		t.Fatalf("unfrozen policy must park in review, got %q", after.Status)
 	}
-	if !strings.Contains(after.ReviewRequest, "未配置") {
-		t.Fatalf("review_request should name the unfrozen policy, got: %q", after.ReviewRequest)
+	// review_request is empty for human-checkpoint reasons (scratch / unfrozen
+	// / weak strength) — the internal reason is platform jargon the user does
+	// not need; the approval panel itself communicates "your decision is needed".
+	if after.ReviewRequest != "" {
+		t.Fatalf("review_request should be empty for human-checkpoint reasons, got: %q", after.ReviewRequest)
 	}
 }
 
