@@ -38,4 +38,5 @@ const (
 	CodeSquadHasGoals       = "AW.10000022"
 	CodeSquadHasSchedules   = "AW.10000023"
 	CodeSquadHandlesIssues  = "AW.10000024"
+	CodeScheduleBuiltIn     = "AW.10000025"
 )

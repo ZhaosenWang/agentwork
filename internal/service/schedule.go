@@ -27,9 +27,14 @@ type Schedule struct {
 	CronExpression string `json:"cron_expression"`
 	Timezone       string `json:"timezone"`
 	Enabled        bool   `json:"enabled"`
-	NextRunAt      string `json:"next_run_at"`
-	LastRunAt      string `json:"last_run_at"`
-	CreatedAt      string `json:"created_at"`
+	// BuiltIn marks the system-seeded schedule (每日AI知识精选): the API
+	// guards reject delete and identity edits on it, but its execution time
+	// (cron_expression + timezone) stays user-editable. Computed per read
+	// from the app_settings marker — not a column (no migration tooling).
+	BuiltIn   bool   `json:"built_in"`
+	NextRunAt string `json:"next_run_at"`
+	LastRunAt string `json:"last_run_at"`
+	CreatedAt string `json:"created_at"`
 }
 
 type ScheduleService struct {
@@ -135,6 +140,43 @@ func (s *ScheduleService) Update(ctx context.Context, id string, sch Schedule) (
 	if err != nil {
 		return nil, err // ErrNotFound propagates
 	}
+	// Built-in guard: the seeded digest schedule's identity (name, prompt,
+	// assignee, domain) is fixed, but the execution time stays editable —
+	// the one field users legitimately tune (e.g. 每天9点 → 每晚11点). Empty
+	// identity fields carry forward (a partial body with just
+	// cron_expression edits the time); a NON-empty field that differs from
+	// the row is an identity edit → rejected. Timezone carries forward too:
+	// the seeded row is Asia/Shanghai and validate's UTC default must not
+	// silently move the 9点 firing.
+	if s.builtInMarkerID(ctx) == id {
+		if sch.Name == "" {
+			sch.Name = existing.Name
+		}
+		if sch.TitleTemplate == "" {
+			sch.TitleTemplate = existing.TitleTemplate
+		}
+		if sch.Description == "" {
+			sch.Description = existing.Description
+		}
+		if sch.AssigneeType == "" {
+			sch.AssigneeType = existing.AssigneeType
+		}
+		if sch.AssigneeID == "" {
+			sch.AssigneeID = existing.AssigneeID
+		}
+		if sch.DomainID == "" {
+			sch.DomainID = existing.DomainID
+		}
+		if sch.Timezone == "" {
+			sch.Timezone = existing.Timezone
+		}
+		if sch.Name != existing.Name || sch.TitleTemplate != existing.TitleTemplate ||
+			sch.Description != existing.Description ||
+			sch.AssigneeType != existing.AssigneeType || sch.AssigneeID != existing.AssigneeID ||
+			sch.DomainID != existing.DomainID {
+			return nil, NewCodedError(CodeScheduleBuiltIn, "内置自动化任务仅可修改执行时间")
+		}
+	}
 	// Carry the immutable fields forward from the existing row.
 	sch.ID = existing.ID
 	sch.CreatedAt = existing.CreatedAt
@@ -153,6 +195,11 @@ func (s *ScheduleService) Update(ctx context.Context, id string, sch Schedule) (
 }
 
 func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
+	// The marker read MUST come before the main query: the returned rows
+	// hold their pooled connection until Close, and an in-memory test store
+	// pools exactly one connection — a second query inside the open rows
+	// deadlocks. The marker is set at daemon startup (static for the call).
+	marker := s.builtInMarkerID(ctx)
 	rows, err := s.st.DB().QueryContext(ctx,
 		`SELECT id,name,title_template,description,assignee_type,assignee_id,domain_id,cron_expression,timezone,enabled,next_run_at,last_run_at,created_at
 		 FROM schedule ORDER BY created_at DESC`)
@@ -160,6 +207,7 @@ func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	// BuiltIn is per-row computed from the marker read above.
 	out := []Schedule{}
 	for rows.Next() {
 		var sch Schedule
@@ -168,6 +216,7 @@ func (s *ScheduleService) List(ctx context.Context) ([]Schedule, error) {
 			return nil, err
 		}
 		sch.Enabled = enabled != 0
+		sch.BuiltIn = marker != "" && sch.ID == marker
 		out = append(out, sch)
 	}
 	return out, rows.Err()
@@ -187,6 +236,7 @@ func (s *ScheduleService) Get(ctx context.Context, id string) (*Schedule, error)
 		return nil, err
 	}
 	sch.Enabled = enabled != 0
+	sch.BuiltIn = s.builtInMarkerID(ctx) == sch.ID
 	return &sch, nil
 }
 
@@ -243,7 +293,31 @@ func (s *ScheduleService) SetEnabled(ctx context.Context, id string, enabled boo
 	return s.Get(ctx, id)
 }
 
+// FireNow stamps a schedule's next_run_at to the current instant so the
+// daemon's schedule tick fires it within seconds. This is a FIRST-RUN
+// convenience ("创建即先跑一次"), not a general reschedule: the daemon's
+// fireSchedule re-derives next_run_at from the cron after firing, so the
+// normal cadence is untouched. The dispatchSchedules miss-grace (1 min)
+// covers a daemon down between this stamp and its restart; the
+// uq_schedule_run_planned unique index dedupes a stamp that raced a firing.
+func (s *ScheduleService) FireNow(ctx context.Context, id string) error {
+	res, err := s.st.DB().ExecContext(ctx,
+		`UPDATE schedule SET next_run_at=? WHERE id=?`,
+		time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return fmt.Errorf("fire-now schedule %s: %w", id, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *ScheduleService) Delete(ctx context.Context, id string) error {
+	// Built-in guard: the seeded digest schedule is not user-deletable.
+	if s.builtInMarkerID(ctx) == id {
+		return NewCodedError(CodeScheduleBuiltIn, "内置自动化任务不可删除")
+	}
 	tx, err := s.st.DB().BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -258,4 +332,13 @@ func (s *ScheduleService) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("delete schedule: %w", err)
 	}
 	return tx.Commit()
+}
+
+// builtInMarkerID returns the seeded built-in schedule's id ('' = none).
+// The marker lives in app_settings (key builtin.digest.schedule_id, written
+// by SeedDigestSchedule) — bare SQL here, matching the daemon's settings
+// reads. Update/Delete consult it for the built-in guard; List/Get for the
+// computed built_in flag.
+func (s *ScheduleService) builtInMarkerID(ctx context.Context) string {
+	return digestMarkerValue(ctx, s.st, digestKeySchedule)
 }

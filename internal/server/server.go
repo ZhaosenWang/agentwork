@@ -87,11 +87,20 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 
 	// seedStewardIfCLI scans probed CLIs for a StewardSeedCLIName entry and seeds
 	// the steward agent on its runtime. Shared by register and probe_update.
+	// After the steward lands, the built-in digest schedule is seeded too —
+	// the daemon startup seed skips when no runtime exists yet, and machine
+	// registration is the retry.
 	seedStewardIfCLI := func(ctx context.Context, machineName string, clis []link.ProbeCLI) {
 		for _, c := range clis {
 			if c.Name == service.StewardSeedCLIName {
 				if err := h.Agent.SeedStewardForRuntime(ctx, service.StewardSeedCLIName+"@"+machineName); err != nil {
 					logging.Warnf("connect: seed steward for %s: %v", service.StewardSeedCLIName, err)
+				}
+				if err := service.SeedDigestSchedule(ctx, s.st,
+					service.NewAgentService(s.st, s.bus),
+					service.NewDomainService(s.st, s.bus),
+					service.NewScheduleService(s.st, s.bus)); err != nil {
+					logging.Warnf("connect: seed digest schedule for %s: %v", machineName, err)
 				}
 				return
 			}
