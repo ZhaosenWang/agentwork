@@ -1743,9 +1743,11 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		d.failRun(ctx, q, fmt.Sprintf("load config: %v", err))
 		return
 	}
-	// The GOAL title survives the sub-goal override below — the fixed
-	// context block always names the goal; the wake line names the work item.
+	// The GOAL title/description survive the sub-goal override below — the
+	// fixed context block always names the goal; the wake line names the work
+	// item.
 	goalTitle := title
+	goalDesc := desc
 	// A sub-goal run's task is the WORK ITEM, not the goal (the goal's
 	// description would re-execute the whole goal).
 	if subGoalRun || verifyRun {
@@ -1881,7 +1883,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 			DefaultBranch: defaultBranch, GitIdentity: gitIdentity,
 			ACPSpawn: args, Env: dispatchEnv,
 			ProjectSkillsDir: d.projectSkillsDirFor(ctx, runtimeMachineID, args),
-			RunProfile:       d.buildRunProfile(ctx, q.GoalID, q.AgentID, agentName, runRole, goalTitle, policyText, domainType, domainName, issueSection),
+			RunProfile:       d.buildRunProfile(ctx, q.GoalID, q.AgentID, agentName, runRole, goalTitle, goalDesc, policyText, domainType, domainName, issueSection),
 			PriorSessionID:   priorSession,
 			PriorWorkDir:     priorWorkdir,
 			McpServers:       d.extraMcpServers(ctx, q.AgentID),

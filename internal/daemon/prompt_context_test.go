@@ -51,12 +51,13 @@ func seedCtx(t *testing.T) (*Daemon, *store.Store, string, string) {
 func TestFixedBlockShape(t *testing.T) {
 	d, st, goalID, agentID := seedCtx(t)
 	ctx := context.Background()
-	block := d.buildFixedBlock(ctx, goalID, agentID, "B", "owner", "g", "测试能过", "repo", "")
+	block := d.buildFixedBlock(ctx, goalID, agentID, "B", "owner", "g", "goal desc", "测试能过", "repo", "")
 
 	for _, want := range []string{
 		"# Background & Requirements", "# Goal", "# Who You Are", "# Tools",
-		"- Title: g", "- Acceptance policy: 测试能过",
+		"- Title: g", "- Description: goal desc", "- Acceptance policy: 测试能过",
 		"agentwork goal comments", "agentwork help",
+		"goal status", "subgoal list", "change list", // progress tools
 		"WITHOUT --after", // the no-memory contract
 	} {
 		if !strings.Contains(block, want) {
@@ -74,17 +75,17 @@ func TestFixedBlockShape(t *testing.T) {
 func TestFixedBlockRoleContracts(t *testing.T) {
 	d, _, goalID, agentID := seedCtx(t)
 	ctx := context.Background()
-	owner := d.buildFixedBlock(ctx, goalID, agentID, "B", "owner", "g", "", "repo", "")
+	owner := d.buildFixedBlock(ctx, goalID, agentID, "B", "owner", "g", "", "", "repo", "")
 	for _, want := range []string{"only what you post as a", "never write ids", "JUDGED, not declared", "agentwork subgoal create --title T --assignee <agent-id>"} {
 		if !strings.Contains(owner, want) {
 			t.Fatalf("the owner contract must carry %q", want)
 		}
 	}
-	reviewer := d.buildFixedBlock(ctx, goalID, agentID, "B", "review", "g", "", "repo", "")
+	reviewer := d.buildFixedBlock(ctx, goalID, agentID, "B", "review", "g", "", "", "repo", "")
 	if !strings.Contains(reviewer, "REVIEW ONLY") || !strings.Contains(reviewer, "never do the work") {
 		t.Fatalf("the reviewer contract must be review-only, got:\n%s", reviewer)
 	}
-	sub := d.buildFixedBlock(ctx, goalID, agentID, "B", "subgoal", "g", "", "repo", "")
+	sub := d.buildFixedBlock(ctx, goalID, agentID, "B", "subgoal", "g", "", "", "repo", "")
 	if !strings.Contains(sub, "To communicate results, use") {
 		t.Fatalf("the subgoal contract must direct results to goal comment, got:\n%s", sub)
 	}

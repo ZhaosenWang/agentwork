@@ -28,8 +28,8 @@ import (
 // intro, goal, the agent's own identity + role contract, and the CLI tool
 // surface. Written in English (platform text is English, 决策 6-18); the
 // MATERIALS (titles, instructions, names) keep their own language.
-func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName string) string {
-	// The team comes from the goal's own squad assignment ('' = solo). The
+func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName, runRole, goalTitle, goalDesc, policyText, domainType, domainName string) string {
+	// The team comes from the goal's own squad assignment (empty = solo). The
 	// leader flag drives the owner contract's reviewer-only rule.
 	var squadID string
 	var leaderID string
@@ -55,6 +55,9 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 
 	b.WriteString("\n# Goal\n")
 	b.WriteString("- Title: " + goalTitle + "\n")
+	if s := strings.TrimSpace(goalDesc); s != "" {
+		b.WriteString("- Description: " + s + "\n")
+	}
 	if s := strings.TrimSpace(policyText); s != "" {
 		b.WriteString("- Acceptance policy: " + s + "\n")
 	}
@@ -87,9 +90,15 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 	b.WriteString("  `agentwork help`) — comments, consults, sub-goals, waiting, and\n")
 	b.WriteString("  verdicts are structured side effects through it. NEVER use file\n")
 	b.WriteString("  edits to communicate intent.\n")
+	b.WriteString("- Task progress: `agentwork goal status` shows the goal's state and\n")
+	b.WriteString("  last run outcome; `agentwork subgoal list` shows work items and\n")
+	b.WriteString("  their verification state; `agentwork change list` shows pending\n")
+	b.WriteString("  Changes. Check these before acting when you are unsure where\n")
+	b.WriteString("  things stand.\n")
 	b.WriteString("- Feed: `agentwork goal comments [--after <id>]` — the comment feed\n")
-	b.WriteString("  is the SHARED context. Pull it before acting when you lack\n")
-	b.WriteString("  background; pass the last comment id you saw as --after for\n")
+	b.WriteString("  is the SHARED context (the owner's reports, consult answers, prior\n")
+	b.WriteString("  review opinions, handoff history). Pull it before acting when you\n")
+	b.WriteString("  lack background; pass the last comment id you saw as --after for\n")
 	b.WriteString("  incremental reads; if you do NOT remember what you have seen,\n")
 	b.WriteString("  pull WITHOUT --after (full feed) — never guess an --after.\n")
 	return b.String()
@@ -99,8 +108,8 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 // block (platform background, goal, role contract, tool surface) plus the
 // team profile. Shipped in the dispatch payload and merged into the
 // workdir's AGENTS.md at spawn — the user message carries the task only.
-func (d *Daemon) buildRunProfile(ctx context.Context, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName, issueSection string) string {
-	block := d.buildFixedBlock(ctx, goalID, agentID, agentName, runRole, goalTitle, policyText, domainType, domainName)
+func (d *Daemon) buildRunProfile(ctx context.Context, goalID, agentID, agentName, runRole, goalTitle, goalDesc, policyText, domainType, domainName, issueSection string) string {
+	block := d.buildFixedBlock(ctx, goalID, agentID, agentName, runRole, goalTitle, goalDesc, policyText, domainType, domainName)
 	// The public-issue contract + the remote conversation snapshot are
 	// CONTEXT (standing rules for this run), not the task — they ride
 	// AGENTS.md like the rest of the profile.
