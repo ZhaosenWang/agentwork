@@ -28,8 +28,9 @@ type Schedule struct {
 	Timezone       string `json:"timezone"`
 	Enabled        bool   `json:"enabled"`
 	// BuiltIn marks the system-seeded schedule (每日AI知识精选): the API
-	// guards reject edit/delete on it. Computed per read from the
-	// app_settings marker — not a column (no migration tooling).
+	// guards reject delete and identity edits on it, but its execution time
+	// (cron_expression + timezone) stays user-editable. Computed per read
+	// from the app_settings marker — not a column (no migration tooling).
 	BuiltIn   bool   `json:"built_in"`
 	NextRunAt string `json:"next_run_at"`
 	LastRunAt string `json:"last_run_at"`
@@ -135,14 +136,46 @@ func (s *ScheduleService) Create(ctx context.Context, sch Schedule) (*Schedule, 
 // (empty string) are still subject to the required-field checks, so the
 // caller must send the full intended value set, not a partial patch.
 func (s *ScheduleService) Update(ctx context.Context, id string, sch Schedule) (*Schedule, error) {
-	// Built-in guard first: the seeded digest schedule is not user-editable
-	// (a coded 4xx, the handler maps CodedError → 400 + body.code).
-	if s.builtInMarkerID(ctx) == id {
-		return nil, NewCodedError(CodeScheduleBuiltIn, "内置自动化任务不可编辑")
-	}
 	existing, err := s.Get(ctx, id)
 	if err != nil {
 		return nil, err // ErrNotFound propagates
+	}
+	// Built-in guard: the seeded digest schedule's identity (name, prompt,
+	// assignee, domain) is fixed, but the execution time stays editable —
+	// the one field users legitimately tune (e.g. 每天9点 → 每晚11点). Empty
+	// identity fields carry forward (a partial body with just
+	// cron_expression edits the time); a NON-empty field that differs from
+	// the row is an identity edit → rejected. Timezone carries forward too:
+	// the seeded row is Asia/Shanghai and validate's UTC default must not
+	// silently move the 9点 firing.
+	if s.builtInMarkerID(ctx) == id {
+		if sch.Name == "" {
+			sch.Name = existing.Name
+		}
+		if sch.TitleTemplate == "" {
+			sch.TitleTemplate = existing.TitleTemplate
+		}
+		if sch.Description == "" {
+			sch.Description = existing.Description
+		}
+		if sch.AssigneeType == "" {
+			sch.AssigneeType = existing.AssigneeType
+		}
+		if sch.AssigneeID == "" {
+			sch.AssigneeID = existing.AssigneeID
+		}
+		if sch.DomainID == "" {
+			sch.DomainID = existing.DomainID
+		}
+		if sch.Timezone == "" {
+			sch.Timezone = existing.Timezone
+		}
+		if sch.Name != existing.Name || sch.TitleTemplate != existing.TitleTemplate ||
+			sch.Description != existing.Description ||
+			sch.AssigneeType != existing.AssigneeType || sch.AssigneeID != existing.AssigneeID ||
+			sch.DomainID != existing.DomainID {
+			return nil, NewCodedError(CodeScheduleBuiltIn, "内置自动化任务仅可修改执行时间")
+		}
 	}
 	// Carry the immutable fields forward from the existing row.
 	sch.ID = existing.ID

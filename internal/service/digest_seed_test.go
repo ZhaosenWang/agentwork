@@ -187,12 +187,37 @@ func TestBuiltInGuardsBlockUpdateAndDelete(t *testing.T) {
 	schs, _ := schedSvc.List(context.Background())
 	id := schs[0].ID
 
+	// Identity edits stay rejected: a renamed or reassigned body is refused
+	// even when it echoes the rest of the row.
 	if _, err := schedSvc.Update(context.Background(), id, Schedule{Name: "renamed", TitleTemplate: "x", AssigneeID: id, DomainID: schs[0].DomainID, CronExpression: "* * * * *"}); err == nil {
 		t.Fatalf("Update on built-in schedule was not rejected")
 	}
 	if err := schedSvc.Delete(context.Background(), id); err == nil {
 		t.Fatalf("Delete on built-in schedule was not rejected")
 	}
+
+	// The execution time IS editable: a body that carries the row's identity
+	// fields (empty = carry-forward also works) with a new cron passes, and
+	// next_run_at is recomputed from the new cron.
+	newCron := "0 23 * * *"
+	updated, err := schedSvc.Update(context.Background(), id, Schedule{
+		CronExpression: newCron,
+		Timezone:       "Asia/Shanghai",
+	})
+	if err != nil {
+		t.Fatalf("built-in cron edit rejected: %v", err)
+	}
+	if updated.CronExpression != newCron || updated.Name != digestScheduleName {
+		t.Fatalf("cron edit mangled the row: %+v", updated)
+	}
+	next, err := time.Parse(time.RFC3339Nano, updated.NextRunAt)
+	if err != nil {
+		t.Fatalf("next_run_at %q unparseable: %v", updated.NextRunAt, err)
+	}
+	if time.Until(next) <= 0 {
+		t.Fatalf("next_run_at %s not in the future — cron change did not recompute it", updated.NextRunAt)
+	}
+
 	// A non-built-in schedule is unaffected by the guard.
 	other, err := schedSvc.Create(context.Background(), Schedule{
 		Name: "user-task", TitleTemplate: "t", AssigneeType: "agent", AssigneeID: id,
