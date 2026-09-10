@@ -395,8 +395,10 @@ func TestSubGoalRetryThenFail(t *testing.T) {
 
 // TestConsultAutoResume: an owner's consult of another agent creates a guest
 // run; when the guest completes, the platform auto-resumes the requester
-// (attempt 1, trigger empty — must not stack the mention-cycle counter) and
-// back-fills the response comment (决策 5-8).
+// (attempt 1, trigger empty — must not stack the mention-cycle counter). The
+// guest's answer is its own `goal comment` (carrying run_id=guest_run_id);
+// consultStatus joins on comment.run_id — response_comment_id is no longer
+// back-filled (决策 4-4 revised).
 func TestConsultAutoResume(t *testing.T) {
 	gs, rs, cs, st := newTestCluster(t)
 	ctx := context.Background()
@@ -426,10 +428,21 @@ func TestConsultAutoResume(t *testing.T) {
 		t.Fatalf("consult run must be role=consult, got %q err=%v", guestRole, err)
 	}
 
-	// The guest completes with a report → requester auto-resumed + response
-	// back-filled + the resume run carries NO trigger comment.
+	// The guest completes → requester auto-resumed (coalesced onto the
+	// pending owner run, no new run created) and the resume run carries NO
+	// trigger comment. response_comment_id stays empty (决策 4-4 revised).
+	// Capture the run count BEFORE finish so the coalesce assertion is exact.
+	var runsBefore int
+	_ = st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM run WHERE goal_id=?`, g.ID).Scan(&runsBefore)
 	if err := rs.Finish(ctx, guestID, "completed", "the answer is X"); err != nil {
 		t.Fatalf("finish guest: %v", err)
+	}
+	var runsAfter int
+	if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM run WHERE goal_id=?`, g.ID).Scan(&runsAfter); err != nil {
+		t.Fatalf("run count after finish: %v", err)
+	}
+	if runsAfter != runsBefore {
+		t.Fatalf("consult closure must coalesce, not create a new run: runs %d → %d", runsBefore, runsAfter)
 	}
 	var resumeTrigger, resumeAttempt, resumeAgent string
 	if err := st.DB().QueryRowContext(ctx,

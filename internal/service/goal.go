@@ -261,12 +261,22 @@ func (s *GoalService) Create(ctx context.Context, g Goal) (*Goal, error) {
 	// dispatch-triggers: the assignee's run is born in THIS transaction
 	// (below), and a description that mentions other agents must not
 	// double-trigger at creation.
-	if g.Description != "" && (g.AssigneeType == "agent" || g.AssigneeType == "squad") {
+	//
+	// title is the always-present task statement (Create validates it non-empty
+	// at the top); description, when present, carries the fuller instruction.
+	// Both land in the comment so the feed has a task statement even when the
+	// creator only wrote a title — without it the default wake anchor branch
+	// (assemblePrompt: first comment ASC) finds nothing and the agent starts
+	// blind with no (comment <id>) handle to pull history.
+	if g.AssigneeType == "agent" || g.AssigneeType == "squad" {
 		label, err := s.assigneeLabel(ctx, tx, g.AssigneeType, g.AssigneeID)
 		if err != nil {
 			return nil, fmt.Errorf("resolve assignee label: %w", err)
 		}
-		content := "[@" + label + "](mention://" + g.AssigneeType + "/" + g.AssigneeID + ") " + g.Description
+		content := "[@" + label + "](mention://" + g.AssigneeType + "/" + g.AssigneeID + ") " + g.Title
+		if g.Description != "" {
+			content += "\n" + g.Description
+		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
 			newID(), g.ID, g.CreatedByType, g.CreatedByID, content, g.CreatedAt); err != nil {

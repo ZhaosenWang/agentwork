@@ -2698,6 +2698,42 @@ func (d *Daemon) fireSchedule(ctx context.Context, r scheduleDueRow) {
 		logging.Infof("daemon: schedule %s insert goal: %v", r.ScheduleID, err)
 		return
 	}
+	// Creation comment: the @assignee mention + title (+description), same as
+	// GoalService.Create — the schedule-fired goal must land in the feed with
+	// the assignee mentioned, or the agent has no wake anchor (default branch
+	// queries goal's first comment) and the feed shows no task statement.
+	// title is the always-present statement; description, when present, is the
+	// fuller instruction. author_type='system'. NOT set as trigger_comment_id
+	// (owner runs have no trigger — agent replies use --parent explicitly or
+	// land flat; platform threading is for consult/review/subgoal runs only).
+	if r.AssigneeType == "agent" || r.AssigneeType == "squad" {
+		var label string
+		switch r.AssigneeType {
+		case "agent":
+			_ = tx.QueryRowContext(ctx, `SELECT name FROM agent WHERE id=?`, r.AssigneeID).Scan(&label)
+		case "squad":
+			_ = tx.QueryRowContext(ctx, `SELECT name FROM squad WHERE id=?`, r.AssigneeID).Scan(&label)
+		}
+		if label != "" {
+			content := "[@" + label + "](mention://" + r.AssigneeType + "/" + r.AssigneeID + ") " + r.TitleTemplate
+			if r.Description != "" {
+				content += "\n" + r.Description
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO comment (id,goal_id,author_type,author_id,parent_id,content,created_at) VALUES (?,?,?,?,NULL,?,?)`,
+				uuid.NewString(), goalID, "system", r.ScheduleID, content, ts); err != nil {
+				logging.Infof("daemon: schedule %s insert creation comment: %v", r.ScheduleID, err)
+			}
+		} else {
+			// assignee vanished (deleted after the schedule was created) — the
+			// goal and run still go through (resolveLeader will fail at claim,
+			// which is the correct fate), but the creation comment is skipped:
+			// no label → no mention chip. Logged so ops can see why a fired
+			// goal landed without a task statement / wake anchor in the feed.
+			logging.Infof("daemon: schedule %s skip creation comment: %s %s label not found",
+				r.ScheduleID, r.AssigneeType, r.AssigneeID)
+		}
+	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO schedule_run (id,schedule_id,goal_id,planned_at,status,created_at) VALUES (?,?,?,?,'dispatched',?)`,
 		uuid.NewString(), r.ScheduleID, goalID, plannedAt, ts); err != nil {

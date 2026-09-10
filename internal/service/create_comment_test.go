@@ -107,16 +107,18 @@ func TestCreateCommentDoesNotDispatchMentions(t *testing.T) {
 	}
 }
 
-// TestCreateNoCommentWithoutDescription: a goal without an instruction gets
-// no creation comment (nothing to record).
-func TestCreateNoCommentWithoutDescription(t *testing.T) {
+// TestCreateCommentWithTitleOnly: a goal with a title but no description still
+// gets a creation comment — the title is the task statement. Without it the
+// default wake anchor branch (assemblePrompt: first comment ASC) finds nothing
+// and the agent starts blind with no (comment <id>) handle to pull history.
+func TestCreateCommentWithTitleOnly(t *testing.T) {
 	gs, _, _, st := newTestCluster(t)
 	ctx := context.Background()
 	agentA := seedAgent(t, st, "writer")
 	domID := seedDomain(t, st)
 
 	g, err := gs.Create(ctx, Goal{
-		Title:        "no instruction",
+		Title:        "just a title",
 		DomainID:     domID,
 		AssigneeType: "agent",
 		AssigneeID:   agentA,
@@ -129,8 +131,11 @@ func TestCreateNoCommentWithoutDescription(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list comments: %v", err)
 	}
-	if len(comments) != 0 {
-		t.Fatalf("no description → no creation comment, got %d", len(comments))
+	if len(comments) != 1 {
+		t.Fatalf("title-only → 1 creation comment, got %d", len(comments))
+	}
+	if !strings.Contains(comments[0].Content, "just a title") {
+		t.Fatalf("creation comment should contain the title, got %q", comments[0].Content)
 	}
 }
 

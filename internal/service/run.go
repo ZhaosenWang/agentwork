@@ -19,7 +19,7 @@ import (
 // See DESIGN.md §9.
 
 // goalTitleForLog resolves a goal's title for log lines — ids are system
-// handles, humans read logs. '' when the goal is gone (or processor runs).
+// handles, humans read logs. (empty) when the goal is gone (or processor runs).
 func (s *RunService) goalTitleForLog(ctx context.Context, goalID string) string {
 	if goalID == "" {
 		return ""
@@ -40,6 +40,7 @@ func trimLog(s string, n int) string {
 	}
 	return s[:n] + "…"
 }
+
 type Run struct {
 	ID        string `json:"id"`
 	GoalID    string `json:"goal_id"`
@@ -56,11 +57,11 @@ type Run struct {
 	// runs panel badges it so a dropped intent's fate is visible.
 	CancelReason string `json:"cancel_reason,omitempty"`
 	// Role is the run's collaboration role stamped at enqueue (决策 5-4):
-	// owner|subgoal|consult|review|verify ('' for processor runs).
+	// owner|subgoal|consult|review|verify (empty for processor runs).
 	// Informational snapshot — goal authority is judged DYNAMICALLY at
 	// reconcile (ownRunByGoal), never from this column.
 	Role string `json:"role"`
-	// SubGoalID is the sub-goal this run executes ('' for goal-level runs).
+	// SubGoalID is the sub-goal this run executes (empty for goal-level runs).
 	SubGoalID string `json:"sub_goal_id"`
 	// BaseRef/HeadRef are the Change revision refs the daemon stamps at a
 	// sub-goal run's end (merge-base of goal branch and the sub-goal branch,
@@ -75,7 +76,7 @@ type Run struct {
 	// goal.attention — a later reconcile must not erase "why you were woken".
 	WakeNote string `json:"wake_note,omitempty"`
 	// WakeAnchor is the comment the wake refers to (决策 6-22: the
-	// get_comments(after=) handle; '' = no comment anchor).
+	// get_comments(after=) handle; empty = no comment anchor).
 	WakeAnchor       string `json:"wake_anchor,omitempty"`
 	TriggerCommentID string `json:"trigger_comment_id"`
 	IsLeaderRun      bool   `json:"is_leader_run"`
@@ -404,7 +405,7 @@ func (s *RunService) EnqueueSubGoalRun(ctx context.Context, subGoalID string) (*
 
 // enqueueSubGoalRunTx inserts a sub-goal execution run under the caller's
 // transaction (P0-2: CreateSubGoal uses it so the sub_goal row and its first
-// run are born atomically). triggerCommentID (” for retry/rework rounds)
+// run are born atomically). triggerCommentID (empty for retry/rework rounds)
 // links the FIRST round to the dispatch comment (P2-1, 决策 6-15⑩): the
 // run's report threads to it, closing the leader→assignee causal chain. The
 // run event is RETURNED — the caller publishes after its commit (invariant 13).
@@ -651,7 +652,7 @@ type ClaimedRow struct {
 // goals admit nothing. The freeze therefore protects the branch under the
 // human's judgment while intents queue durably (决策 2-3 revised).
 //
-// Processor runs (goal_id=”) are unaffected.
+// Processor runs (goal_id empty) are unaffected.
 func (s *RunService) Claim(ctx context.Context, readyAgents []string) (*ClaimedRow, error) {
 	if len(readyAgents) == 0 {
 		return nil, nil
@@ -855,7 +856,7 @@ func (s *RunService) Finish(ctx context.Context, runID, status, summary string) 
 	if rc.Status == "cancelled" && rc.CancelReason != "" && rc.GoalID != "" {
 		s.bus.Publish(ctx, events.Event{Topic: "run:cancelled", Payload: map[string]any{
 			"run_id": rc.RunID, "goal_id": rc.GoalID,
-			"reason": cancelReasonDescription(rc.CancelReason),
+			"reason":      cancelReasonDescription(rc.CancelReason),
 			"reason_code": rc.CancelReason,
 		}})
 	}
@@ -1067,7 +1068,7 @@ type AgentHistoryItem struct {
 }
 
 // HistoryByAgent returns the agent's recent runs joined to their goals, newest
-// finished first. limit<=0 defaults to 20; status filters by run.status ('' =
+// finished first. limit<=0 defaults to 20; status filters by run.status (empty =
 // all). Processor runs (run_kind='processor', no goal) are excluded — they are
 // platform-internal, not the agent's own work. Runs still queued/running carry
 // an empty finished_at and sort after finished ones (NULLs last in DESC).
