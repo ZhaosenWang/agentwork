@@ -44,10 +44,21 @@ type Server struct {
 	teamImportSvc *service.TeamImportService
 	skillSvc      *service.SkillService
 	intakeSvc     *notify.IntakeService
+	// templates/templateApply: the GitCode YAML template library (optional —
+	// nil = the endpoints report "not configured").
+	templates     *service.TemplateService
+	templateApply *service.TemplateApplyService
 }
 
 func New(st *store.Store, bus *events.Bus, d *daemon.Daemon, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, domainSvc *service.DomainService, imConn *notify.Connector, teamImportSvc *service.TeamImportService, skillSvc *service.SkillService, intakeSvc *notify.IntakeService) *Server {
 	return &Server{st: st, bus: bus, d: d, hub: ws.NewHub(bus), goalSvc: goalSvc, runSvc: runSvc, commentSvc: commentSvc, squadSvc: squadSvc, schedSvc: schedSvc, domainSvc: domainSvc, imConn: imConn, teamImportSvc: teamImportSvc, skillSvc: skillSvc, intakeSvc: intakeSvc}
+}
+
+// SetTemplates wires the template library + apply service (kept out of New's
+// already-long parameter list — the setter matches the daemon wiring style).
+func (s *Server) SetTemplates(templates *service.TemplateService, templateApply *service.TemplateApplyService) {
+	s.templates = templates
+	s.templateApply = templateApply
 }
 
 // ListenAndServe mounts routes and serves until ctx is cancelled.
@@ -96,6 +107,14 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 				return
 			}
 		}
+	}
+
+	// Templates: the GitCode YAML template library + its apply path (wired
+	// here where the shared services already exist). nil-safe handlers —
+	// templates stay unavailable when the wiring is skipped.
+	if s.templates != nil {
+		h.Templates = s.templates
+		h.TemplateApply = s.templateApply
 	}
 
 	mux := http.NewServeMux()

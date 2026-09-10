@@ -51,6 +51,11 @@ type Handlers struct {
 	AgentPin *service.AgentPinService
 	// TeamImport is the team-definition-repo import processor-run lifecycle.
 	TeamImport *service.TeamImportService
+	// Templates serves the GitCode YAML template library (list/get/refresh).
+	Templates *service.TemplateService
+	// TemplateApply orchestrates a template apply through the existing
+	// services (agents/squad/domain/goal/schedule).
+	TemplateApply *service.TemplateApplyService
 	// Intake is the NL intake pipeline (Feishu IM + Web assistant).
 	Intake *notify.IntakeService
 }
@@ -118,6 +123,12 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /teams/import", h.importTeam)
 	mux.HandleFunc("GET /teams/import", h.listTeamImports)
 	mux.HandleFunc("GET /teams/import/{runId}", h.getTeamImport)
+	// Templates: the GitCode YAML template library + its apply paths.
+	mux.HandleFunc("GET /templates", h.listTemplates)
+	mux.HandleFunc("GET /templates/{kind}/{id}", h.getTemplate)
+	mux.HandleFunc("POST /templates/refresh", h.refreshTemplates)
+	mux.HandleFunc("POST /templates/squads/{id}/apply", h.applySquadTemplate)
+	mux.HandleFunc("POST /templates/projects/{id}/apply", h.applyProjectTemplate)
 	mux.HandleFunc("POST /intake", h.sendIntake)
 	mux.HandleFunc("POST /intake/dispatch", h.intakeCreate)
 	mux.HandleFunc("GET /intake/{runId}", h.getIntakeResult)

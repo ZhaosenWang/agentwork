@@ -41,6 +41,11 @@ var allCodes = []string{
 	CodeSquadHasGoals,
 	CodeSquadHasSchedules,
 	CodeSquadHandlesIssues,
+	CodeTemplateSourceUnset,
+	CodeTemplateFetchFailed,
+	CodeTemplateInvalid,
+	CodeTemplateNotFound,
+	CodeRepoCreateFailed,
 }
 
 func TestErrorCodesExported(t *testing.T) {

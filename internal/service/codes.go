@@ -38,4 +38,9 @@ const (
 	CodeSquadHasGoals       = "AW.10000022"
 	CodeSquadHasSchedules   = "AW.10000023"
 	CodeSquadHandlesIssues  = "AW.10000024"
+	CodeTemplateSourceUnset = "AW.10000025" // template repo not configured (platform.template_repo)
+	CodeTemplateFetchFailed = "AW.10000026" // GitCode fetch failed (network/404/token)
+	CodeTemplateInvalid     = "AW.10000027" // template schema/validation failed (detail carries field path)
+	CodeTemplateNotFound    = "AW.10000028"
+	CodeRepoCreateFailed    = "AW.10000029" // GitCode repo creation failed (detail carries the API response)
 )
