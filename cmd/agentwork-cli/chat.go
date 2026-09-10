@@ -103,14 +103,14 @@ func (b *chatBridge) maybeAutoApprove(line []byte, chatID string) bool {
 		} `json:"options"`
 	}
 	_ = json.Unmarshal(probe.Params, &params)
-	// Pick allow_always > allow_once (strongest first).
+	// Pick allow_once > allow_always (narrowest first).
 	var chosen string
 	for _, o := range params.Options {
-		if o.Kind == "allow_always" {
+		if o.Kind == "allow_once" {
 			chosen = o.OptionID
 			break
 		}
-		if o.Kind == "allow_once" && chosen == "" {
+		if o.Kind == "allow_always" && chosen == "" {
 			chosen = o.OptionID
 		}
 	}

@@ -37,8 +37,8 @@ func newAutopermit(cwd string) *autopermit {
 	return &autopermit{terms: map[string]*autoTerm{}, cwd: cwd}
 }
 
-// HandleRequestPermission approves with the strongest allow option the
-// CLI offered (allow_always > allow_once); only-reject menus cancel the
+// HandleRequestPermission approves with the narrowest allow option the
+// CLI offered (allow_once > allow_always); only-reject menus cancel the
 // request so the tool call fails visibly instead of hanging.
 func (a *autopermit) HandleRequestPermission(ctx context.Context, req acp.RequestPermissionRequest) (*acp.RequestPermissionResponse, error) {
 	var opts []string
@@ -46,25 +46,25 @@ func (a *autopermit) HandleRequestPermission(ctx context.Context, req acp.Reques
 		opts = append(opts, string(o.Kind)+":"+o.OptionID)
 	}
 	cliLogf("autopermit: permission request tool=%q title=%q kind=%s options=%v", req.ToolCall.Title, req.ToolCall.Kind, req.ToolCall.Status, opts)
-	var allowOnce string
+	var allowAlways string
 	for _, o := range req.Options {
 		switch o.Kind {
-		case acp.PermissionAllowAlways:
+		case acp.PermissionAllowOnce:
 			id := o.OptionID
-			cliLogf("autopermit: approved allow_always (%s)", id)
+			cliLogf("autopermit: approved allow_once (%s)", id)
 			return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
 				Outcome:  acp.PermissionOutcomeSelected,
 				OptionID: &id,
 			}}, nil
-		case acp.PermissionAllowOnce:
-			allowOnce = o.OptionID
+		case acp.PermissionAllowAlways:
+			allowAlways = o.OptionID
 		}
 	}
-	if allowOnce != "" {
-		cliLogf("autopermit: approved allow_once (%s)", allowOnce)
+	if allowAlways != "" {
+		cliLogf("autopermit: approved allow_always (%s)", allowAlways)
 		return &acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{
 			Outcome:  acp.PermissionOutcomeSelected,
-			OptionID: &allowOnce,
+			OptionID: &allowAlways,
 		}}, nil
 	}
 	cliLogf("autopermit: no allow option offered — cancelling")
