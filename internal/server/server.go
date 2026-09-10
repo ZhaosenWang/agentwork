@@ -4,8 +4,11 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -41,18 +44,6 @@ type Server struct {
 	teamImportSvc *service.TeamImportService
 	skillSvc      *service.SkillService
 	intakeSvc     *notify.IntakeService
-}
-
-// statusWriter captures the response status for request logging (the MCP
-// handshake's health is only visible through which requests return what).
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (w *statusWriter) WriteHeader(code int) {
-	w.status = code
-	w.ResponseWriter.WriteHeader(code)
 }
 
 func New(st *store.Store, bus *events.Bus, d *daemon.Daemon, goalSvc *service.GoalService, runSvc *service.RunService, commentSvc *service.CommentService, squadSvc *service.SquadService, schedSvc *service.ScheduleService, domainSvc *service.DomainService, imConn *notify.Connector, teamImportSvc *service.TeamImportService, skillSvc *service.SkillService, intakeSvc *notify.IntakeService) *Server {
@@ -173,16 +164,17 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 	// The agentwork CLI's link (CLI 分支 Phase 1): a JSON-RPC 2.0 over
 	// WebSocket connection carrying machine registration, heartbeats, and
 	// probe reports (run dispatch/config push land in later phases).
-	// Optional token: app_settings platform.worker_token — empty = no
-	// auth (single-user local default).
+	// /connect auth is handled by authMiddleware on non-loopback (the machine
+	// connect CLI passes ?token=worker_token). On loopback authMiddleware is
+	// not installed — no check needed.
 	connectUpgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true }, // single-user local
 	}
 	mux.HandleFunc("GET /connect", func(w http.ResponseWriter, r *http.Request) {
-		if want, err := settingsSvc.Get(r.Context(), "platform.worker_token"); err == nil && want != "" && r.URL.Query().Get("token") != want {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
+		// /connect auth is handled by authMiddleware on non-loopback (the
+		// machine connect CLI passes ?token=worker_token, connect.go:431).
+		// On loopback authMiddleware is not installed — no check needed.
+		// No internal check here (was redundant + fail-open).
 		conn, err := connectUpgrader.Upgrade(w, r, nil)
 		if err != nil {
 			logging.Infof("connect: upgrade: %v", err)
@@ -818,7 +810,26 @@ func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
 
 	go s.hub.Run(ctx)
 
-	srv := &http.Server{Addr: addr, Handler: corsMiddleware(mux)}
+	// Security gate: a non-loopback listen address (0.0.0.0, :7373, a LAN
+	// IP) exposes the platform to the network. The single-user no-auth default
+	// is ONLY safe on loopback — any other address REQUIRES a worker_token
+	// (app_settings platform.worker_token) and every request is gated on it.
+	// The token is checked as a query param (?token=…) or Authorization
+	// header (Bearer …). The frontend (web/) assumes same-origin deployment
+	// (Next.js rewrite / reverse proxy to the daemon) and does NOT pass a
+	// token — non-loopback direct browser access requires a proxy that
+	// injects the token, or a future frontend change to pass it.
+	handler := corsMiddleware(mux)
+	if !isLoopbackAddr(addr) {
+		want, err := settingsSvc.Get(ctx, "platform.worker_token")
+		if err != nil || strings.TrimSpace(want) == "" {
+			return fmt.Errorf("refusing to listen on %s without platform.worker_token: a non-loopback address requires authentication (set the token in app_settings or bind to 127.0.0.1)", addr)
+		}
+		logging.Infof("server: non-loopback listen %s — auth required (worker_token)", addr)
+		handler = authMiddleware(settingsSvc, handler)
+	}
+
+	srv := &http.Server{Addr: addr, Handler: handler}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Shutdown(context.Background())
@@ -858,6 +869,81 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackAddr reports whether the listen address binds to a loopback
+// interface only (127.0.0.1, localhost, ::1). A bare ":port" (all
+// interfaces), "0.0.0.0:port", or a LAN IP all return false — those expose
+// the platform to the network and require authentication.
+func isLoopbackAddr(addr string) bool {
+	host := addr
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		host = h
+	}
+	if host == "" {
+		return false // ":port" → all interfaces
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	switch host {
+	case "localhost", "127.0.0.1", "::1", "0:0:0:0:0:0:0:1":
+		return true
+	}
+	// 127.x.x.x range
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+// authMiddleware gates browser/HTTP requests on a shared secret
+// (worker_token, read from app_settings on EVERY request — so rotation
+// takes effect immediately). The token is accepted as a query parameter
+// (?token=…) or an Authorization header (Bearer …). fail-closed: DB error
+// or empty token → reject (not fall open).
+//
+// /rpc is EXEMPT: it is the agent/link channel with its own application-layer
+// auth (per-run token in JSON-RPC params via ResolveRunToken). The executor
+// env injects AGENTWORK_SERVER_URL but not worker_token — agent CLI's rpcCall
+// dials /rpc with no HTTP-layer token. /connect is NOT exempt: the machine
+// connect CLI passes ?token=worker_token explicitly (connect.go:431).
+func authMiddleware(settingsSvc *service.SettingsService, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Agent RPC channel: auth at the application layer, not here.
+		if r.URL.Path == "/rpc" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// CORS preflight: browsers send OPTIONS without token (preflight
+		// cannot carry custom headers/query). Let corsMiddleware handle it.
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		want, err := settingsSvc.Get(r.Context(), "platform.worker_token")
+		if err != nil {
+			// DB故障时 fail-closed：拒绝请求，不降级为无认证。
+			http.Error(w, "auth unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if want == "" {
+			// Token was removed at runtime — fail-closed (the startup guard
+			// refused to listen without a token on non-loopback; clearing it
+			// at runtime must not open the door).
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		got := r.URL.Query().Get("token")
+		if got == "" {
+			if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
+				got = strings.TrimPrefix(h, "Bearer ")
+			}
+		}
+		if subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
