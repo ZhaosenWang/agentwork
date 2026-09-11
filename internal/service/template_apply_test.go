@@ -394,6 +394,54 @@ func TestApplyProjectFullFlow(t *testing.T) {
 	}
 }
 
+// A create-type template (spec.repo.create=true) applied with an explicit
+// git_url must skip repo creation and bind the supplied repo instead — the
+// existing-repo override. Without this the backend demands repo_token even
+// when the user chose "use existing repo" (AW.10000001), which is the
+// design mismatch the frontend's existing-mode choice exposed.
+func TestApplyProjectRepoCreateWithGitURLSkipsCreation(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.putTemplate(t, TemplateKindProject, "go-service-repo-create", repoCreateTemplateYAML)
+
+	res, err := c.apply.ApplyProject(ctx, "go-service-repo-create", ApplyProjectOverrides{
+		Name:           "已有仓项目",
+		GitURL:         "https://gitcode.com/acme/existing.git",
+		GitCredentials: "tok",
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.Domain == nil || res.Domain.GitURL != "https://gitcode.com/acme/existing.git" {
+		t.Fatalf("domain not bound to supplied git_url: %+v", res.Domain)
+	}
+	if res.RepoURL != "" {
+		t.Fatalf("repo must not be created when git_url supplied, got RepoURL=%q", res.RepoURL)
+	}
+	// No repo-creation item; the probe ran against the supplied URL.
+	for _, it := range res.Items {
+		if it.Kind == "repo" {
+			t.Fatalf("unexpected repo creation item: %+v", it)
+		}
+	}
+	if c.gitProbe.lastURL != "https://gitcode.com/acme/existing.git" {
+		t.Fatalf("probe should run on supplied git_url, got %q", c.gitProbe.lastURL)
+	}
+}
+
+// A create-type template applied with neither git_url nor repo_token still
+// demands repo_token — the create path is the default and remains required.
+func TestApplyProjectRepoCreateMissingToken(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.putTemplate(t, TemplateKindProject, "go-service-repo-create", repoCreateTemplateYAML)
+
+	_, err := c.apply.ApplyProject(ctx, "go-service-repo-create", ApplyProjectOverrides{Name: "建仓项目"})
+	if err == nil || !strings.Contains(err.Error(), "repo_token") {
+		t.Fatalf("expected repo_token error, got %v", err)
+	}
+}
+
 func TestApplyProjectGoalStartOverlay(t *testing.T) {
 	c := newTemplateCluster(t)
 	ctx := context.Background()
@@ -762,4 +810,15 @@ spec:
     agents:
       - name: owner-a
       - name: dev-a
+    squad:
+      name: go-squad
+      leader: owner-a
+      members:
+        - name: dev-a
+          role: member
+  goals:
+    - title: 初始化
+      assignee: owner-a
+      assignee_type: agent
+      start: true
 `

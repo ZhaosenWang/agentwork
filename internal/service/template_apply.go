@@ -541,9 +541,19 @@ func (s *TemplateApplyService) ApplySquad(ctx context.Context, templateID string
 // applyRepo creates the project repo when spec.repo.create (the token comes
 // from the apply request; auto_init defaults true — an empty repo cannot
 // pass the domain git probe). Returns the clone URL.
+//
+// Override: when the request carries an explicit git_url, the user chose to
+// attach an existing repo instead of creating one — skip creation and let the
+// caller bind git_url as the domain's repo (field-level override wins, the
+// same rename-overrides-agent-name semantics). Without this a create-type
+// template could never be applied against an existing repo, even though the
+// frontend offers that choice.
 func (s *TemplateApplyService) applyRepo(ctx context.Context, spec *projectSpec, ov *ApplyProjectOverrides, items *[]ApplyItem) (string, error) {
 	if spec.Repo == nil || !spec.Repo.Create {
 		return "", nil
+	}
+	if strings.TrimSpace(ov.GitURL) != "" {
+		return "", nil // existing-repo override: skip creation, bind git_url
 	}
 	if s.repoProv == nil {
 		return "", NewCodedError(CodeRepoCreateFailed, "仓库创建服务不可用")
