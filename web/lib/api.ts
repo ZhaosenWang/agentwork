@@ -1,4 +1,4 @@
-import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem, TeamImportResponse } from "./types";
+import type { Runtime, Agent, Goal, Run, Comment, Squad, SquadMember, Schedule, Domain, Checks, TimelineItem, TeamImportResponse, TemplateSummary, TemplateDetail, ApplySquadOverrides, ApplySquadResult, ApplyProjectOverrides, ApplyProjectResult, TemplateFetchResult } from "./types";
 
 // 默认走同源 /backend/*（Next rewrites 转发到本机 daemon 7373）——反代出
 // 去时浏览器无需直连 daemon。本地直连场景可显式设置 NEXT_PUBLIC_API_URL。
@@ -322,4 +322,24 @@ export const importTeam = (body: {
   git_credentials?: string;
   default_branch?: string;
 }) => api<TeamImportResponse>("/teams/import", { method: "POST", body: JSON.stringify(body) });
+
+// ── Templates (GitCode YAML template library: list / detail / refresh / apply) ──
+// ?type=squad|project filters (full kind strings also accepted; "" = all).
+export const listTemplates = (type?: string) =>
+  api<TemplateSummary[]>(`/templates${type ? `?type=${type}` : ""}`);
+// kind is the path segment: "squad" | "project" (full "squad-template" also
+// accepted by the backend's normalizeKindFilter).
+export const getTemplate = (kind: string, id: string) =>
+  api<TemplateDetail>(`/templates/${kind}/${id}`);
+// Force-refetch the template repo. Private template repos pass a token;
+// public repos pass nothing.
+export const refreshTemplates = (token?: string) =>
+  api<TemplateFetchResult>("/templates/refresh", {
+    method: "POST",
+    body: JSON.stringify(token ? { token } : {}),
+  });
+export const applySquadTemplate = (id: string, body: ApplySquadOverrides) =>
+  api<ApplySquadResult>(`/templates/squads/${id}/apply`, { method: "POST", body: JSON.stringify(body) });
+export const applyProjectTemplate = (id: string, body: ApplyProjectOverrides) =>
+  api<ApplyProjectResult>(`/templates/projects/${id}/apply`, { method: "POST", body: JSON.stringify(body) });
 
