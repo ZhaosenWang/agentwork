@@ -26,7 +26,7 @@ const (
 	templateCacheKey = "platform.template_cache"
 	// defaultTemplateRepo is the built-in official template repository —
 	// used when platform.template_repo is unset.
-	defaultTemplateRepo = "https://gitcode.com/agentwork-official/agentwork-templates.git"
+	defaultTemplateRepo = "https://gitcode.com/Wing-Jason/agentwork-templates.git"
 )
 
 // TemplateRepoConfig is the platform.template_repo value.

@@ -1,6 +1,6 @@
-// templates-repo 验证器：用与服务层完全相同的严格解析器（parseTemplate）
-// 解析 templates-repo/ 全部登记模板，并在内存库上实际跑一遍两个 apply 路径。
-// 用法：go run ./cmd/validate-templates（在仓库根目录）
+// 模板仓验证器：用与服务层完全相同的严格解析器（parseTemplate）
+// 解析 ../agentwork-templates/ 全部登记模板，并在内存库上实际跑一遍两个 apply 路径。
+// 用法：go run ./cmd/validate-templates（在仓库根目录；模板仓在同级 ../agentwork-templates）
 package main
 
 import (
@@ -24,7 +24,7 @@ func (localTester) TestDomainGit(context.Context, string, string, string) *servi
 }
 
 func main() {
-	root := "templates-repo"
+	root := "../agentwork-templates"
 	st, err := store.Open(":memory:")
 	if err != nil {
 		panic(err)
