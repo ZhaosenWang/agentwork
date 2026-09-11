@@ -442,6 +442,36 @@ func TestApplyProjectRepoCreateMissingToken(t *testing.T) {
 	}
 }
 
+// repoSlug derives a GitCode-acceptable repo slug from a domain name that may
+// contain Chinese — the GitCode create-repo API rejects non-ASCII in the name
+// field (422), but the domain name (human-facing) allows it. The slug strips
+// non-ASCII to '-' and falls back to the template id when nothing ASCII
+// remains, so a Chinese-only name still produces a valid slug.
+func TestRepoSlug(t *testing.T) {
+	cases := []struct {
+		name, in, fallback, want string
+	}{
+		{"ascii", "go-service", "tpl", "go-service"},
+		{"mixed case lowercased", "GoService", "tpl", "goservice"},
+		{"chinese stripped", "Go 微服务项目12", "tpl", "go-12"},
+		{"chinese only falls back", "微服务", "go-svc", "go-svc"},
+		{"leading trailing sep trimmed", "  hi  ", "tpl", "hi"},
+		{"dots preserved", "my.repo.v2", "tpl", "my.repo.v2"},
+		{"underscores preserved", "my_repo", "tpl", "my_repo"},
+		{"punctuation to dash", "a/b:c", "tpl", "a-b-c"},
+		{"empty falls back", "", "tpl", "tpl"},
+		{"collapse runs", "a--b:::c", "tpl", "a-b-c"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := repoSlug(tc.in, tc.fallback)
+			if got != tc.want {
+				t.Fatalf("repoSlug(%q, %q) = %q, want %q", tc.in, tc.fallback, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestApplyProjectGoalStartOverlay(t *testing.T) {
 	c := newTemplateCluster(t)
 	ctx := context.Background()

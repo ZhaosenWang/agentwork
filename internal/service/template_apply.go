@@ -548,7 +548,13 @@ func (s *TemplateApplyService) ApplySquad(ctx context.Context, templateID string
 // same rename-overrides-agent-name semantics). Without this a create-type
 // template could never be applied against an existing repo, even though the
 // frontend offers that choice.
-func (s *TemplateApplyService) applyRepo(ctx context.Context, spec *projectSpec, ov *ApplyProjectOverrides, items *[]ApplyItem) (string, error) {
+//
+// Repo name: ov.Name is the domain name (platform allows Chinese), but the
+// GitCode repo slug accepts only letters/digits/_/-/. — Chinese and other
+// non-ASCII are stripped to a '-' separator. A name like "Go 微服务项目12"
+// becomes "go-12"; a fully non-ASCII name falls back to the template id so
+// the slug is never empty. The domain name is untouched.
+func (s *TemplateApplyService) applyRepo(ctx context.Context, spec *projectSpec, templateID string, ov *ApplyProjectOverrides, items *[]ApplyItem) (string, error) {
 	if spec.Repo == nil || !spec.Repo.Create {
 		return "", nil
 	}
@@ -578,8 +584,8 @@ func (s *TemplateApplyService) applyRepo(ctx context.Context, spec *projectSpec,
 	if in.AutoInit == nil {
 		in.AutoInit = boolPtr(true)
 	}
-	in.Name = ov.Name // the repo name follows the (required) domain name
-	in.Description = ""
+	in.Name = repoSlug(ov.Name, templateID)
+	in.Description = ov.Name // the human-facing description keeps the full (Chinese) name
 	cloneURL, err := s.repoProv.CreateRepo(ctx, token, gitcodeapi.CreateRepoInput{
 		Org: in.Org, Name: in.Name, Description: in.Description,
 		Private: in.Visibility != "public", AutoInit: *in.AutoInit,
@@ -636,11 +642,19 @@ func (s *TemplateApplyService) ApplyProject(ctx context.Context, templateID stri
 	}
 	// 1. Repo (optional).
 	gitURL := strings.TrimSpace(ov.GitURL)
-	if created, err := s.applyRepo(ctx, spec, &ov, &res.Items); err != nil {
+	if created, err := s.applyRepo(ctx, spec, templateID, &ov, &res.Items); err != nil {
 		return res, err
 	} else if created != "" {
 		gitURL = created
 		res.RepoURL = created
+		// The repo-creation token IS the project's git credential going
+		// forward (read/push) — when the user supplied no separate
+		// git_credentials, reuse repo_token so the probe + domain bind and
+		// later runs can authenticate. Otherwise the freshly-created repo
+		// fails the probe with "could not read Username".
+		if strings.TrimSpace(ov.GitCredentials) == "" && ov.RepoToken != "" {
+			ov.GitCredentials = ov.RepoToken
+		}
 	}
 	// 2. Domain config.
 	dType := spec.Domain.Type
@@ -822,6 +836,44 @@ func localTimezone() string {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// repoSlug turns a domain name (which may contain Chinese and other
+// non-ASCII) into a GitCode-acceptable repo slug: letters/digits/_/-/.
+// only, lowercased, non-ASCII and other separators → '-', runs collapsed,
+// trimmed. "Go 微服务项目12" → "go-12". A name that yields an empty slug
+// (fully non-ASCII) falls back to the template id so creation never fails on
+// the slug alone.
+func repoSlug(name, fallback string) string {
+	var b strings.Builder
+	for _, r := range name {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r - 'A' + 'a')
+		case r == '_' || r == '-' || r == '.':
+			b.WriteRune(r)
+		default: // spaces, Chinese, punctuation, etc.
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-_.")
+	// collapse runs of separators produced by stripped characters
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	for strings.Contains(out, "..") {
+		out = strings.ReplaceAll(out, "..", ".")
+	}
+	if len(out) > 63 {
+		out = out[:63]
+	}
+	out = strings.Trim(out, "-_.")
+	if out == "" {
+		out = fallback
+	}
+	return out
+}
 
 // ParseTemplateForTest exposes parseTemplate to the validation harness
 // (cmd-level tooling lives in package main and cannot reach internal
