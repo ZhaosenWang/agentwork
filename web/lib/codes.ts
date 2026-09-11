@@ -28,6 +28,13 @@ export const CodeDomainHasSchedules = "AW.10000021" as const;
 export const CodeSquadHasGoals = "AW.10000022" as const;
 export const CodeSquadHasSchedules = "AW.10000023" as const;
 export const CodeSquadHandlesIssues = "AW.10000024" as const;
+// Templates (GitCode YAML library): 25 = repo not configured, 26 = fetch failed,
+// 27 = template invalid, 28 = not found, 29 = repo creation failed.
+export const CodeTemplateSourceUnset = "AW.10000025" as const;
+export const CodeTemplateFetchFailed = "AW.10000026" as const;
+export const CodeTemplateInvalid = "AW.10000027" as const;
+export const CodeTemplateNotFound = "AW.10000028" as const;
+export const CodeRepoCreateFailed = "AW.10000029" as const;
 
 // The complete set — hand-mirrored from internal/service/codes.go.
 export const ALL_CODES = [
@@ -55,4 +62,9 @@ export const ALL_CODES = [
   CodeSquadHasGoals,
   CodeSquadHasSchedules,
   CodeSquadHandlesIssues,
+  CodeTemplateSourceUnset,
+  CodeTemplateFetchFailed,
+  CodeTemplateInvalid,
+  CodeTemplateNotFound,
+  CodeRepoCreateFailed,
 ] as const;
