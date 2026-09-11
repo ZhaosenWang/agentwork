@@ -763,3 +763,30 @@ spec:
       - name: owner-a
       - name: dev-a
 `
+
+// ── regression: Refresh had no independent timeout — refreshTimeout was
+// declared but never applied, so a hanging git clone blocked the caller
+// until the HTTP client timed out (and List's auto-refresh inherits it) ──
+
+func TestRefreshAppliesIndependentTimeout(t *testing.T) {
+	c := newTemplateCluster(t)
+
+	orig := fetchTemplateFiles
+	// The stub asserts the ctx Refresh passes in carries its OWN deadline —
+	// i.e. Refresh wrapped it with WithTimeout(refreshTimeout). Before the
+	// fix, the ctx had no deadline (unless the caller supplied one) and a
+	// hanging clone blocked indefinitely.
+	fetchTemplateFiles = func(ctx context.Context, _ TemplateRepoConfig, _ string) (map[string]string, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Errorf("ctx passed to fetch has no deadline — Refresh did not apply an independent timeout")
+		}
+		return map[string]string{"registry.yaml": "templates: []"}, nil
+	}
+	defer func() { fetchTemplateFiles = orig }()
+
+	// context.Background() has no deadline — any deadline the fetch sees must
+	// have been added by Refresh itself.
+	if _, err := c.templates.Refresh(context.Background(), ""); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+}

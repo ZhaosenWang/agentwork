@@ -166,6 +166,12 @@ func (s *TemplateService) Refresh(ctx context.Context, token string) (*TemplateF
 	if err != nil {
 		return nil, err
 	}
+	// Bound the clone independently of the request ctx — a dead GitCode host
+	// must not wedge the caller. refreshTimeout was previously declared but
+	// never applied, so a hanging clone blocked until the HTTP client timed
+	// out (and List's auto-refresh path inherits the same gate).
+	ctx, cancel := context.WithTimeout(ctx, refreshTimeout)
+	defer cancel()
 	files, err := fetchTemplateFiles(ctx, cfg, token)
 	if err != nil {
 		return nil, NewCodedErrorDetail(CodeTemplateFetchFailed,
