@@ -177,6 +177,10 @@ func (s *TemplateService) Refresh(ctx context.Context, token string) (*TemplateF
 	cache.FetchedAt = now()
 	cache.Repo = cfg
 	// Keep embedded skill packages on the snapshot (skills/<name>/<file>).
+	// SkillFiles is nil unless initialized — assigning into a nil map panics.
+	if cache.SkillFiles == nil {
+		cache.SkillFiles = map[string]string{}
+	}
 	for path, content := range files {
 		if strings.HasPrefix(path, "skills/") {
 			cache.SkillFiles[path] = content
@@ -191,10 +195,13 @@ func (s *TemplateService) Refresh(ctx context.Context, token string) (*TemplateF
 	return &TemplateFetchResult{Fetched: len(cache.Templates), Errors: cache.Errors, FetchedAt: cache.FetchedAt}, nil
 }
 
-// fetchTemplateFiles shallow-clones the repo and returns {relative path: content}
+// fetchTemplateFiles is a var so tests can stub the git clone without network.
+var fetchTemplateFiles = fetchTemplateFilesFromGit
+
+// fetchTemplateFilesFromGit shallow-clones the repo and returns {relative path: content}
 // for registry.yaml and every template/skill file it references. A token,
 // when given, is embedded via gitCloneURL and never logged.
-func fetchTemplateFiles(ctx context.Context, cfg TemplateRepoConfig, token string) (map[string]string, error) {
+func fetchTemplateFilesFromGit(ctx context.Context, cfg TemplateRepoConfig, token string) (map[string]string, error) {
 	dir, err := os.MkdirTemp("", "agentwork-templates-*")
 	if err != nil {
 		return nil, fmt.Errorf("mkdir temp: %w", err)
@@ -271,7 +278,7 @@ func parseTemplateFiles(files map[string]string) (*templateCache, error) {
 	if err := yaml.Unmarshal([]byte(files["registry.yaml"]), &reg); err != nil {
 		return nil, fmt.Errorf("parse registry.yaml: %w", err)
 	}
-	cache := &templateCache{}
+	cache := &templateCache{SkillFiles: map[string]string{}}
 	for _, entry := range reg.Templates {
 		content := files[entry.Path]
 		var meta TemplateMeta

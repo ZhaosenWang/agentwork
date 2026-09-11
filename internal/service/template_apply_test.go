@@ -98,16 +98,16 @@ spec:
 // templateTestCluster wires the template services over a fresh store with a
 // runtime + agent-capable environment (no daemon — git tests use a stub).
 type templateTestCluster struct {
-	st         *store.Store
-	templates  *TemplateService
-	apply      *TemplateApplyService
-	agentSvc   *AgentService
-	skillSvc   *SkillService
-	squadSvc   *SquadService
-	domainSvc  *DomainService
-	goalSvc    *GoalService
-	schedSvc   *ScheduleService
-	gitProbe   *stubGitTester
+	st        *store.Store
+	templates *TemplateService
+	apply     *TemplateApplyService
+	agentSvc  *AgentService
+	skillSvc  *SkillService
+	squadSvc  *SquadService
+	domainSvc *DomainService
+	goalSvc   *GoalService
+	schedSvc  *ScheduleService
+	gitProbe  *stubGitTester
 }
 
 // stubGitTester records the last probe input and returns canned results.
@@ -529,5 +529,61 @@ func TestNormalizeKindFilter(t *testing.T) {
 		if got := normalizeKindFilter(in); got != want {
 			t.Errorf("normalizeKindFilter(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// ── regression: Refresh wrote into a nil SkillFiles map (skills/ in the
+// template repo → panic → nginx 502 on every /templates request) ──
+
+func TestRefreshWritesSkillFilesWithoutPanic(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+
+	orig := fetchTemplateFiles
+	fetchTemplateFiles = func(ctx context.Context, cfg TemplateRepoConfig, token string) (map[string]string, error) {
+		return map[string]string{
+			"registry.yaml":                     `templates: []`,
+			"skills/daily-report/SKILL.md":      "# daily report skill\n",
+			"skills/daily-report/pkg/extra.txt": "x\n",
+		}, nil
+	}
+	defer func() { fetchTemplateFiles = orig }()
+
+	res, err := c.templates.Refresh(ctx, "")
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if res.Fetched != 0 {
+		t.Fatalf("expected 0 templates, got %d", res.Fetched)
+	}
+	snap, err := c.templates.cached(ctx)
+	if err != nil {
+		t.Fatalf("cached: %v", err)
+	}
+	if len(snap.SkillFiles) != 2 {
+		t.Fatalf("expected 2 skill files in snapshot, got %d: %v", len(snap.SkillFiles), snap.SkillFiles)
+	}
+	if snap.SkillFiles["skills/daily-report/SKILL.md"] == "" || snap.SkillFiles["skills/daily-report/pkg/extra.txt"] == "" {
+		t.Fatalf("skill file contents lost: %v", snap.SkillFiles)
+	}
+	// SkillPackage strips the skills/<name>/ prefix at read time.
+	pkg, ok, err := c.templates.SkillPackage(ctx, "daily-report")
+	if err != nil || !ok {
+		t.Fatalf("SkillPackage: ok=%v err=%v", ok, err)
+	}
+	if len(pkg) != 2 || pkg["SKILL.md"] == "" {
+		t.Fatalf("SkillPackage mismatch: %v", pkg)
+	}
+}
+
+func TestParseTemplateFilesInitializesSkillFiles(t *testing.T) {
+	c, err := parseTemplateFiles(map[string]string{
+		"registry.yaml": `templates: []`,
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.SkillFiles == nil {
+		t.Fatal("parseTemplateFiles must return a non-nil SkillFiles map")
 	}
 }
