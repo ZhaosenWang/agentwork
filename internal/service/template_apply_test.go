@@ -587,3 +587,88 @@ func TestParseTemplateFilesInitializesSkillFiles(t *testing.T) {
 		t.Fatal("parseTemplateFiles must return a non-nil SkillFiles map")
 	}
 }
+
+// ── regression: Get returned the WHOLE YAML document as spec (metadata
+// siblings included) — the frontend read spec.repo?.create off the detail and
+// got undefined, so repo-create templates showed the git_url form and
+// repo_token was never sent (AW.10000001) ──
+
+func TestGetSpecIsInnerNodeOnly(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.putTemplate(t, TemplateKindProject, "go-service-repo-create", repoCreateTemplateYAML)
+
+	detail, err := c.templates.Get(ctx, "project", "go-service-repo-create")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// The frontend contract: spec.repo / spec.domain etc. at the TOP level.
+	var spec struct {
+		Domain *struct {
+			Type string `json:"type"`
+		} `json:"domain"`
+		Repo *struct {
+			Create bool `json:"create"`
+		} `json:"repo"`
+		Team *struct {
+			Agents []map[string]any `json:"agents"`
+		} `json:"team"`
+		Spec     *map[string]any `json:"spec"`     // must be absent
+		Metadata *map[string]any `json:"metadata"` // must be absent
+	}
+	if err := json.Unmarshal(detail.Spec, &spec); err != nil {
+		t.Fatalf("spec is not a JSON object: %v (%s)", err, detail.Spec)
+	}
+	if spec.Domain == nil || spec.Domain.Type != "repo" {
+		t.Fatalf("spec.domain missing/wrong: %+v", spec)
+	}
+	if spec.Repo == nil || !spec.Repo.Create {
+		t.Fatalf("spec.repo.create missing — frontend repo_token detection would break")
+	}
+	if spec.Spec != nil || spec.Metadata != nil {
+		t.Fatalf("spec must not nest the document (spec/metadata leaked): %s", detail.Spec)
+	}
+	if len(spec.Team.Agents) != 2 {
+		t.Fatalf("spec.team.agents missing: %+v", spec.Team)
+	}
+	if len(detail.SpecYAML) == 0 || !strings.Contains(detail.SpecYAML, "api_version") {
+		t.Fatal("spec_yaml must stay the full document")
+	}
+}
+
+func TestTemplateSpecJSONEdgeCases(t *testing.T) {
+	cases := map[string]string{ // doc → expected raw spec JSON
+		"api_version: agentwork/v1\nspec:\n  domain:\n    type: scratch\n": `{"domain":{"type":"scratch"}}`,
+		"api_version: agentwork/v1\nmetadata:\n  id: x\n":                  `null`, // no spec section
+		"": `null`,
+	}
+	for doc, want := range cases {
+		got, err := templateSpecJSON(doc)
+		if err != nil {
+			t.Fatalf("templateSpecJSON(%q): %v", doc, err)
+		}
+		if string(got) != want {
+			t.Fatalf("templateSpecJSON(%q) = %s, want %s", doc, got, want)
+		}
+	}
+}
+
+// repoCreateTemplateYAML mirrors the real go-service template (repo.create section).
+const repoCreateTemplateYAML = `api_version: agentwork/v1
+kind: project-template
+metadata:
+  id: go-service-repo-create
+  name: Go 服务（建仓）
+  description: 测试建仓检测
+  version: 1.0.0
+spec:
+  repo:
+    create: true
+    visibility: private
+  domain:
+    type: repo
+  team:
+    agents:
+      - name: owner-a
+      - name: dev-a
+`

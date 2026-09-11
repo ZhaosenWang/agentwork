@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,7 +61,7 @@ type TemplateDetail struct {
 	TemplateMeta
 	Path     string          `json:"path"`
 	SpecYAML string          `json:"spec_yaml"`
-	Spec     json.RawMessage `json:"spec"` // spec re-encoded as JSON for direct frontend consumption
+	Spec     json.RawMessage `json:"spec"` // the inner spec node only (repo/domain/team/…), re-encoded as JSON
 }
 
 // templateRegistry is the registry.yaml contract.
@@ -388,7 +390,7 @@ func (s *TemplateService) Get(ctx context.Context, kind, id string) (*TemplateDe
 		if t.ID != id || (filter != "" && t.Kind != filter) {
 			continue
 		}
-		specJSON, err := yamlToJSON(t.SpecYAML)
+		specJSON, err := templateSpecJSON(t.SpecYAML)
 		if err != nil {
 			return nil, NewCodedErrorDetail(CodeTemplateInvalid,
 				fmt.Sprintf("模板 %s 的 spec 无法解析：%v", id, err), nil)
@@ -437,19 +439,30 @@ func (s *TemplateService) SkillPackage(ctx context.Context, name string) (map[st
 	return files, true, nil
 }
 
-// yamlToJSON converts a template YAML document to JSON (raw message) so the
-// frontend can consume the decoded spec directly.
-func yamlToJSON(doc string) (json.RawMessage, error) {
+// templateSpecJSON extracts the inner spec node of a template YAML document
+// and re-encodes it as JSON so the frontend can consume it directly —
+// TemplateDetail.Spec is the spec section only (repo/domain/team/goals/
+// schedules), never the whole document (metadata siblings would force the
+// frontend into spec.spec paths and broke repo_token detection).
+func templateSpecJSON(doc string) (json.RawMessage, error) {
 	var v any
 	dec := yaml.NewDecoder(strings.NewReader(doc))
 	dec.KnownFields(false)
 	if err := dec.Decode(&v); err != nil {
+		if errors.Is(err, io.EOF) {
+			return json.RawMessage("null"), nil // empty document = no spec section
+		}
 		return nil, err
 	}
-	if v == nil {
+	m, ok := v.(map[string]any)
+	if !ok {
 		return json.RawMessage("null"), nil
 	}
-	out, err := json.Marshal(v)
+	spec := m["spec"]
+	if spec == nil {
+		return json.RawMessage("null"), nil
+	}
+	out, err := json.Marshal(spec)
 	if err != nil {
 		return nil, err
 	}
