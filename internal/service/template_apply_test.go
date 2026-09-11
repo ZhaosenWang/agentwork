@@ -493,6 +493,97 @@ func TestApplyProjectDuplicateDomainNameFails(t *testing.T) {
 	}
 }
 
+// forwardRefAssigneeYAML mirrors the real existing-repo template: the domain's
+// issue_assignee names a team agent that does NOT exist until step 5 creates
+// it. Before the fix, DomainService.Create → validateIssueTracking ran
+// mustExist(...WHERE id=?) against the raw NAME and aborted the whole apply
+// before the team section ever ran (AW.10000001 "issue assignee ... does not
+// exist").
+const forwardRefAssigneeYAML = `api_version: agentwork/v1
+kind: project-template
+metadata:
+  id: existing-repo
+  name: 已有仓库项目
+  version: 1.0.0
+spec:
+  domain:
+    type: repo
+    default_branch: main
+    issue_assignee_type: agent
+    issue_assignee: repo-issue-handler
+    policy_text: |
+      验收要求。
+  team:
+    strategy: upsert
+    agents:
+      - name: repo-issue-handler
+        description: 值班工程师
+        system_prompt: |
+          你是值班工程师。
+        runtime: test-rt
+      - name: repo-reviewer
+        description: 审查员
+        system_prompt: |
+          你是审查员。
+        runtime: test-rt
+    squad:
+      name: repo-crew
+      leader: repo-issue-handler
+      instructions: 处理 issue。
+      members:
+        - name: repo-reviewer
+          role: reviewer
+  goals:
+    - title: 建立基线
+      assignee: repo-issue-handler
+      assignee_type: agent
+      start: true
+`
+
+func TestApplyProjectForwardRefIssueAssignee(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.putTemplate(t, TemplateKindProject, "existing-repo", forwardRefAssigneeYAML)
+
+	res, err := c.apply.ApplyProject(ctx, "existing-repo", ApplyProjectOverrides{
+		Name:           "已有仓库",
+		GitURL:         "https://gitcode.com/acme/existing.git",
+		GitCredentials: "tok",
+	})
+	if err != nil {
+		t.Fatalf("forward-ref apply must succeed, got: %v", err)
+	}
+	// The team agent named by domain.issue_assignee was created.
+	var handlerID string
+	for _, a := range res.Agents {
+		if a.Name == "repo-issue-handler" {
+			handlerID = a.ID
+		}
+	}
+	if handlerID == "" {
+		t.Fatalf("repo-issue-handler agent not created: %+v", res.Agents)
+	}
+	// The domain's issue_assignee was patched to the agent's id (not left as
+	// the raw name, not left empty).
+	if res.Domain.IssueAssignee != handlerID {
+		t.Fatalf("issue_assignee not resolved to handler id: got %q want %q",
+			res.Domain.IssueAssignee, handlerID)
+	}
+	if res.Domain.IssueAssigneeType != "agent" {
+		t.Fatalf("issue_assignee_type wrong: %q", res.Domain.IssueAssigneeType)
+	}
+	// The per-item trace records the deferred patch.
+	var patched bool
+	for _, it := range res.Items {
+		if it.Kind == "domain.issue_assignee" && it.Action == "updated" && it.ID == handlerID {
+			patched = true
+		}
+	}
+	if !patched {
+		t.Fatalf("issue_assignee patch item missing: %+v", res.Items)
+	}
+}
+
 // ── template service tests (registry parse / cache) ──
 
 func TestParseTemplateFilesMixedValidity(t *testing.T) {

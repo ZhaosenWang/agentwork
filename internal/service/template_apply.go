@@ -655,14 +655,18 @@ func (s *TemplateApplyService) ApplyProject(ctx context.Context, templateID stri
 	}
 	// 4. Domain. Domain names are UNIQUE by design (no upsert variant
 	// exists) — the existing AW.10000010 surfaces on a repeat apply.
+	// IssueAssignee is intentionally left blank here: the template's value is
+	// a NAME (forward-referencing a team agent created in step 5), but
+	// DomainService.Create → validateIssueTracking validates it as an id via
+	// mustExist(...WHERE id=?), which rejects the name before the team is
+	// built. The resolved id is patched in by the post-team Update (step 5b).
 	domain := Domain{
 		Type: dType, Name: ov.Name, GitURL: gitURL,
 		DefaultBranch: branch, GitIdentity: spec.Domain.GitIdentity,
 		GitCredentials: ov.GitCredentials, PolicyText: spec.Domain.PolicyText,
-		IssueAssignee: spec.Domain.IssueAssignee, IssueAssigneeType: spec.Domain.IssueAssigneeType,
 	}
-	// Issue-assignee names resolve AFTER the team section — defer by storing
-	// the raw name and resolving post-team (the service validates ids).
+	// IssueAssignee is NOT set on Create (see above) — the assignee name
+	// resolves to an id only after the team section builds its agents.
 	createdDomain, err := s.domainSvc.Create(ctx, domain)
 	if err != nil {
 		res.Items = append(res.Items, ApplyItem{Kind: "domain", Name: ov.Name, Action: "failed", Error: err.Error()})
