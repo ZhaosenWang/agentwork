@@ -1,0 +1,54 @@
+# 项目模板：每周周报（scratch 无仓库型）
+# apply 时必填：name（项目名）。无 git_url / token——任务产物是项目目录里的文件与汇报。
+api_version: agentwork/v1
+kind: project-template
+metadata:
+  id: weekly-report
+  name: 每周周报项目
+  description: 无仓库（scratch）项目：定时产周报，汇报交付 + 人工卡点
+  version: 1.0.0
+  tags: [办公, 自动化]
+spec:
+  # scratch 域：repo 节与 git 相关字段全部无效（平台会忽略/拒绝）
+  domain:
+    type: scratch
+    policy_text: |
+      周报验收要求（初稿）：
+      1. 周报写入项目目录 weekly/<年份>-W<周号>.md；
+      2. 内容含：本周完成 / 进行中 / 下周计划 / 风险四节，每节至少一条；
+      3. 事实性内容必须来自平台任务记录，不得编造。
+  team:
+    strategy: upsert
+    agents:
+      - name: report-writer
+        description: 周报撰写员，汇总平台任务记录成文
+        system_prompt: |
+          你是一名周报撰写员。写作原则：
+          1. 只写可追溯的事实：从任务列表、评论与运行记录中取材；
+          2. 结构固定：本周完成 / 进行中 / 下周计划 / 风险；
+          3. 语言精炼，每条一行为主，重要事项加粗；
+          4. 拿不准的内容标注（待确认），绝不编造。
+        skills: []
+        runtime: auto
+    squad:
+      name: report-crew
+      description: 周报产出小队
+      leader: report-writer
+      instructions: |
+        每期周报先列出信息来源（任务 id），再成文；信息不足时在"风险"节说明。
+      members: []
+  goals:
+    - title: 撰写本期周报
+      description: |
+        汇总平台全部任务的当前状态，按模板四节结构写成
+        weekly/<年份>-W<周号>.md 并汇报文件路径。
+      assignee: report-writer
+      assignee_type: agent
+      start: false
+  schedules:               # ── scratch 项目也可配定时任务（任务落在本项目上）──
+    - name: 每周五周报
+      title: 撰写本周周报
+      description: 按周报模板汇总本周全部任务进展，写入 weekly/ 目录。
+      cron: "0 17 * * 5"   # 每周五 17:00（daemon 本地时区）
+      assignee: report-writer
+      assignee_type: agent

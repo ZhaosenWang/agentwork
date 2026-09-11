@@ -1,0 +1,41 @@
+# agentwork 官方模板索引。平台只展示这里登记的模板；
+# 正文 metadata.id/kind 必须与本文件的 id/kind 一致（不一致的模板被跳过并记录错误）。
+templates:
+  # ── 小队模板 ──
+  - id: backend-dev
+    kind: squad-template
+    path: squads/backend-dev.yaml
+    name: 后端开发小队
+    description: 技术负责人 + 两名开发 + 一名审查的标准后端小队
+    version: 1.0.0
+    tags: [研发, 后端]
+  - id: code-review
+    kind: squad-template
+    path: squads/code-review.yaml
+    name: 代码评审小队
+    description: 单人评审：一名严格审查者，挂到任意项目上做 MR 把关
+    version: 1.0.0
+    tags: [质量, 审查]
+
+  # ── 项目模板 ──
+  - id: go-service
+    kind: project-template
+    path: projects/go-service.yaml
+    name: Go 微服务项目
+    description: 在 GitCode 新建仓库 + 配套 Go 开发小队 + 首批任务
+    version: 1.0.0
+    tags: [研发, Go]
+  - id: existing-repo
+    kind: project-template
+    path: projects/existing-repo.yaml
+    name: 已有仓库项目
+    description: 挂接已有 Git 仓库，配评审员与首批任务
+    version: 1.0.0
+    tags: [研发, 通用]
+  - id: weekly-report
+    kind: project-template
+    path: projects/weekly-report.yaml
+    name: 每周周报项目
+    description: 无仓库（scratch）项目：定时产周报，汇报交付 + 人工卡点
+    version: 1.0.0
+    tags: [办公, 自动化]

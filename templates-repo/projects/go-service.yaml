@@ -1,0 +1,75 @@
+# 项目模板：Go 微服务项目（GitCode 新建仓库型）
+# apply 时必填：name（项目/仓库名）、repo_token（建仓 token，即用即弃）
+# apply 时可选：git_credentials（项目平台凭据）、rename（agent 改名）、goal_start（任务立即执行）
+api_version: agentwork/v1
+kind: project-template
+metadata:
+  id: go-service
+  name: Go 微服务项目
+  description: 在 GitCode 新建仓库 + 配套 Go 开发小队 + 首批任务
+  version: 1.0.0
+  tags: [研发, Go]
+spec:
+  repo:                    # ── 建仓配置（本节存在且 create: true = 平台代建仓库）──
+    create: true
+    visibility: private    # private | public
+    auto_init: true        # 必须 true：空仓无法通过平台 git 连接测试
+    gitignore_template: Go # GitCode 预置 .gitignore 模板（可省略）
+    # org: my-org          # 省略 = 建到 token 用户名下
+  domain:
+    type: repo
+    default_branch: main
+    # git_identity: "agentwork-bot <bot@example.com>"   # 可选：提交作者
+    issue_assignee_type: squad   # 仓库 Issue 自动转任务的处理方类型（agent|squad）
+    issue_assignee: go-dev-squad # 按名解析（本模板 team 段创建后即可解析到）
+    policy_text: |
+      Go 微服务项目验收要求（初稿，创建后可在项目卡片上调整并生成正式验收规则）：
+      1. go build ./... 通过；
+      2. go vet ./... 无告警；
+      3. go test ./... 全部通过，新增逻辑有对应单元测试；
+      4. 对外接口变更必须同步更新 README 或接口文档。
+  team:                    # ── 随项目创建的团队（结构 = 小队模板的 agents + squad）──
+    strategy: upsert
+    agents:
+      - name: go-owner
+        description: Go 项目负责人，负责拆解、委派与整合
+        system_prompt: |
+          你是一名资深 Go 后端负责人。职责：理解目标 → 拆解为可独立验收的子任务 →
+          按成员专长委派 → 审查成员变更 → 整合并向主人汇报。
+          技术基线：go build / go vet / go test 全绿才算完成；接口变更同步文档。
+          需求不清先在评论区提问，绝不擅自假设。
+        skills: []
+        runtime: auto
+      - name: go-dev
+        description: Go 开发，负责功能实现
+        system_prompt: |
+          你是一名严谨的 Go 开发工程师。遵循仓库现有风格；每个功能配套单元测试；
+          提交前保证 go build ./... 与 go test ./... 通过；提交信息写清动机与影响面。
+          只做自己被委派的子任务，完成后如实汇报实现方式与遗留问题。
+        skills: []
+        runtime: auto
+    squad:
+      name: go-dev-squad
+      description: go-service 的开发小队
+      leader: go-owner
+      instructions: |
+        先拆解再委派；成员完成并自测通过后你再审；全部通过后整合并向主人汇报。
+      members:
+        - name: go-dev
+          role: member
+  goals:                   # ── 初始任务（assignee 按名解析：先 team 段，再平台已有）──
+    - title: 初始化项目骨架
+      description: |
+        在仓库初始化 Go module 与标准目录布局（cmd/ internal/ pkg/ api/），
+        落地 go.mod、Makefile（build/test/lint 目标）、README 项目简介。
+      assignee: go-owner
+      assignee_type: agent
+      start: true          # apply 后立即执行（可用 goal_start 覆盖统一关掉）
+    - title: 实现 /healthz 健康检查接口
+      description: |
+        提供 HTTP /healthz：返回 200 与 {"status":"ok","version":"<版本>"}；
+        配套单元测试（httptest）。
+      assignee: go-dev
+      assignee_type: agent
+      start: false         # 默认进入待办
+  schedules: []            # ── 初始定时任务（本模板暂无；字段见 README）──

@@ -1,0 +1,59 @@
+# 项目模板：已有仓库项目（不建仓，apply 时用户填已有 git_url）
+# apply 时必填：name（项目名）、git_url（已有仓库）；推荐提供 git_credentials（需要 push）
+api_version: agentwork/v1
+kind: project-template
+metadata:
+  id: existing-repo
+  name: 已有仓库项目
+  description: 挂接已有 Git 仓库，配评审员与首批任务
+  version: 1.0.0
+  tags: [研发, 通用]
+spec:
+  # 无 repo 节 = 平台不建仓，apply 请求必须携带 git_url
+  domain:
+    type: repo
+    default_branch: main   # apply 时平台会探测仓库默认分支并校验
+    issue_assignee_type: agent
+    issue_assignee: repo-issue-handler
+    policy_text: |
+      已有仓库项目验收要求（初稿）：
+      1. 仓库现有构建/测试命令全部通过（以仓库 CI/Makefile 为准）；
+      2. 变更最小必要，不顺手重构；
+      3. 破坏性变更必须提前在评论区说明并获得确认。
+  team:
+    strategy: upsert
+    agents:
+      - name: repo-issue-handler
+        description: 仓库值班工程师，接手 Issue 转来的任务
+        system_prompt: |
+          你是本仓库的值班工程师。接到 Issue 转来的任务后：
+          1. 先复现/确认问题，明确验收口径；
+          2. 最小改动修复或实现，补对应测试；
+          3. 汇报修复方式与验证证据（测试输出/截图路径）。
+        skills: []
+        runtime: auto
+      - name: repo-reviewer
+        description: 变更审查员
+        system_prompt: |
+          你是本仓库的审查员，只审查不实施。关注正确性、测试覆盖、
+          与仓库既有风格一致性；输出【必须修改】【建议】【通过】三档意见。
+        skills: []
+        runtime: auto
+    squad:
+      name: repo-crew
+      description: 已有仓库的值班小队
+      leader: repo-issue-handler
+      instructions: |
+        Issue 类任务直接处理；实现完成后交 repo-reviewer 审查，再整合汇报。
+      members:
+        - name: repo-reviewer
+          role: reviewer
+  goals:
+    - title: 建立项目认知基线
+      description: |
+        通读仓库结构与构建方式，在项目评论区沉淀一份简报：
+        技术栈、构建/测试入口、目录职责、当前已知问题清单。
+      assignee: repo-issue-handler
+      assignee_type: agent
+      start: true
+  schedules: []

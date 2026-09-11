@@ -21,10 +21,12 @@ type templateSpec struct {
 	APIVersion string `yaml:"api_version"`
 	Kind       string `yaml:"kind"`
 	Metadata   struct {
-		ID          string `yaml:"id"`
-		Name        string `yaml:"name"`
-		Description string `yaml:"description"`
-		Version     string `yaml:"version"`
+		ID          string   `yaml:"id"`
+		Name        string   `yaml:"name"`
+		Description string   `yaml:"description"`
+		Version     string   `yaml:"version"`
+		Tags        []string `yaml:"tags"`
+		Icon        string   `yaml:"icon"`
 	} `yaml:"metadata"`
 	Spec yaml.Node `yaml:"spec"`
 }
@@ -806,3 +808,10 @@ func localTimezone() string {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// ParseTemplateForTest exposes parseTemplate to the validation harness
+// (cmd-level tooling lives in package main and cannot reach internal
+// unexported symbols otherwise).
+func ParseTemplateForTest(raw string) (TemplateMeta, any, error) {
+	return parseTemplate(raw)
+}
