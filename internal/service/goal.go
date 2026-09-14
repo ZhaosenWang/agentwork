@@ -1313,11 +1313,12 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 	case "failed":
 		// Team-import goals are one-shot: a retry run gets a new run_id, but
 		// team_import.run_id was back-filled with only the first run's id, so
-		// the retry cannot resolve git config (GitConfigForRun keys on run_id)
-		// and would re-fail on clone — burning the whole retry budget in
-		// guaranteed re-failures. Skip retry: go straight to goal-failed.
-		// (A repo import has no "resume from prior progress" semantics anyway;
-		// the agent re-clones from scratch each attempt.)
+		// the retry cannot resolve git config (GitConfigForGoal keys on
+		// goal_id now, but the retry still re-clones from scratch with no
+		// progress to resume) — burning the retry budget for no benefit.
+		// Skip retry: go straight to goal-failed. (A repo import has no
+		// "resume from prior progress" semantics; the agent re-clones each
+		// attempt anyway.)
 		isImportGoal := g.CreatedByType == "system" && g.CreatedByID == ImportCreatedByID
 		if rc.Attempt < maxAttempts && !isImportGoal {
 			// Retry: enqueue a fresh run at attempt+1 on the same agent so

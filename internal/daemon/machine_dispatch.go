@@ -471,7 +471,7 @@ func (d *Daemon) finishMachineRun(ctx context.Context, p link.RunFinishedParams,
 		importGoalID = gid
 		if p.Status == "completed" {
 			if d.teamImportSvc != nil {
-				ti, squadName, err := d.teamImportSvc.IngestImport(ctx, p.RunID, p.Artifacts, p.Summary)
+				ti, squadName, err := d.teamImportSvc.IngestImport(ctx, importGoalID, p.Artifacts, p.Summary)
 				if err != nil {
 					logging.Errorf("daemon: team import %s failed: %v", p.RunID, err)
 					p.Status = "failed"
@@ -487,7 +487,7 @@ func (d *Daemon) finishMachineRun(ctx context.Context, p link.RunFinishedParams,
 			// publish team:import_failed (the worker path does not go
 			// through failProcessorRun's import self-routing).
 			if d.teamImportSvc != nil {
-				if err := d.teamImportSvc.FailImportByRun(ctx, p.RunID, p.Summary); err != nil {
+				if err := d.teamImportSvc.FailImportByGoal(ctx, importGoalID, p.Summary); err != nil {
 					logging.Errorf("daemon: fail import run %s: %v", p.RunID, err)
 				}
 			}
