@@ -245,3 +245,72 @@ func TestScheduleMissedOccurrencesSkipped(t *testing.T) {
 		t.Fatalf("within-grace firing must fire, got %d firing(s) (err %v)", firings, err)
 	}
 }
+
+// TestFireNowRunsOnNextTick covers the built-in digest's "首次创建即先跑一次"
+// seeding: FireNow stamps next_run_at to the current instant, the schedule
+// tick picks it up within the miss grace (a fresh stamp is 0s old, not a
+// miss), the goal is born, and the daemon re-derives next_run_at onto the
+// cron's next boundary — the 6-hour cadence resumes untouched.
+func TestFireNowRunsOnNextTick(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	bus := events.NewBus()
+
+	rt, err := service.NewRuntimeService(st).Create(ctx, service.Runtime{Name: "rt", MachineID: "m1"})
+	if err != nil {
+		t.Fatalf("runtime: %v", err)
+	}
+	agent, err := service.NewAgentService(st, bus).Create(ctx, service.Agent{Name: "maintainer", RuntimeID: rt.ID})
+	if err != nil {
+		t.Fatalf("agent: %v", err)
+	}
+	domain, err := service.NewDomainService(st, bus).Create(ctx, service.Domain{Name: "d", GitURL: "https://example.com/d.git"})
+	if err != nil {
+		t.Fatalf("domain: %v", err)
+	}
+	schedSvc := service.NewScheduleService(st, bus)
+	sched, err := schedSvc.Create(ctx, service.Schedule{
+		Name: "s", TitleTemplate: "t", Description: "d",
+		AssigneeType: "agent", AssigneeID: agent.ID, DomainID: domain.ID,
+		CronExpression: "0 */6 * * *", Timezone: "UTC",
+	})
+	if err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+	if err := schedSvc.FireNow(ctx, sched.ID); err != nil {
+		t.Fatalf("fire now: %v", err)
+	}
+	goalSvc := service.NewGoalService(st, bus)
+	runSvc := service.NewRunService(st, bus)
+	goalSvc.SetRunService(runSvc)
+	runSvc.SetGoalService(goalSvc)
+	d := &Daemon{st: st, bus: bus, goalSvc: goalSvc, runSvc: runSvc}
+
+	d.dispatchSchedules(ctx)
+
+	// The immediate run fired: one goal born from the stamped-now occurrence.
+	var goals int
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM goal WHERE created_by_id=?`, sched.ID).Scan(&goals); err != nil || goals != 1 {
+		t.Fatalf("fire-now must fire on the next tick, got %d goal(s) (err %v)", goals, err)
+	}
+	// The cadence resumes: next_run_at is back on a FUTURE cron boundary.
+	var nextStr string
+	if err := st.DB().QueryRowContext(ctx, `SELECT next_run_at FROM schedule WHERE id=?`, sched.ID).Scan(&nextStr); err != nil {
+		t.Fatalf("read next_run_at: %v", err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, nextStr)
+	if err != nil || !next.After(time.Now().UTC()) {
+		t.Fatalf("next_run_at must resume on a future cron boundary, got %q (err %v)", nextStr, err)
+	}
+	// A second tick does NOT fire again (the stamp was consumed).
+	d.dispatchSchedules(ctx)
+	if err := st.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM goal WHERE created_by_id=?`, sched.ID).Scan(&goals); err != nil || goals != 1 {
+		t.Fatalf("second tick must not re-fire, got %d goal(s) (err %v)", goals, err)
+	}
+}

@@ -58,6 +58,7 @@ func TestFixedBlockShape(t *testing.T) {
 		"- Title: g", "- Description: goal desc", "- Acceptance policy: 测试能过",
 		"agentwork goal comments", "agentwork help",
 		"goal status", "subgoal list", "change list", // progress tools
+		"SECURITY", "never attempt to extract", "internal or external systems", // the security rule
 		"WITHOUT --after", // the no-memory contract
 	} {
 		if !strings.Contains(block, want) {

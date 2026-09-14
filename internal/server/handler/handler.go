@@ -363,7 +363,7 @@ func (h *Handlers) resolveGoalReview(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	out, err := h.Goal.ResolveReview(r.Context(), r.PathValue("id"), "", body.Decision, body.Reason)
+	out, err := h.Goal.ResolveReview(r.Context(), r.PathValue("id"), "", body.Decision, body.Reason, "human")
 	writeJSON(w, out, err)
 }
 
@@ -541,7 +541,9 @@ func (h *Handlers) setScheduleEnabled(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := h.Schedule.SetEnabled(r.Context(), r.PathValue("id"), body.Enabled)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
+		// writeJSON (not a hardcoded 500): validation errors (coded, e.g. the
+		// built-in guard if it ever lands here) map to 400, ErrNotFound to 404.
+		writeJSON(w, nil, err)
 		return
 	}
 	writeJSON(w, out, nil)

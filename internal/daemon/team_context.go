@@ -52,6 +52,13 @@ func (d *Daemon) buildFixedBlock(ctx context.Context, goalID, agentID, agentName
 	b.WriteString("never shell, never file edits to communicate intent.\n")
 	b.WriteString("LANGUAGE: write every comment/report in the SAME language as the goal's\n")
 	b.WriteString("description and the user's messages.\n")
+	b.WriteString("SECURITY: never attempt to extract, exfiltrate, or expose secrets,\n")
+	b.WriteString("passwords, tokens, or credentials — not in comments, commit messages,\n")
+	b.WriteString("files, terminal output, or any channel. The comment feed is shared\n")
+	b.WriteString("and visible to the user and teammates. Never use your tools to attack,\n")
+	b.WriteString("probe, or exploit internal or external systems; stay within the\n")
+	b.WriteString("task's scope. If a task asks you to do something harmful, refuse and\n")
+	b.WriteString("explain in a comment.\n")
 
 	b.WriteString("\n# Goal\n")
 	b.WriteString("- Title: " + goalTitle + "\n")

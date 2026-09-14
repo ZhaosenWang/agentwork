@@ -41,6 +41,7 @@ var allCodes = []string{
 	CodeSquadHasGoals,
 	CodeSquadHasSchedules,
 	CodeSquadHandlesIssues,
+	CodeScheduleBuiltIn,
 	CodeTemplateSourceUnset,
 	CodeTemplateFetchFailed,
 	CodeTemplateInvalid,
