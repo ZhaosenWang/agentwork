@@ -49,11 +49,18 @@ func (d *Daemon) importGoalIDForRun(ctx context.Context, runID string) string {
 }
 
 // isAutoApproveGoal reports whether the goal's review checkpoint is
-// auto-approved (never reaches a human). Digest and import goals both skip the
-// review-ready card and auto-approve after Finish. maybeFireReviewReady calls
-// this instead of isDigestGoal so both built-in auto-approve flows are covered.
+// auto-approved (never reaches a human). Delegates to the shared
+// service.IsAutoApproveGoal so the recognition logic lives in one place.
+// maybeFireReviewReady calls this to skip the review-ready card.
 func (d *Daemon) isAutoApproveGoal(ctx context.Context, goalID string) bool {
-	return d.isDigestGoal(ctx, goalID) || d.isImportGoal(ctx, goalID)
+	var createdByType, createdByID string
+	err := d.st.DB().QueryRowContext(ctx,
+		`SELECT created_by_type, COALESCE(created_by_id,'') FROM goal WHERE id=?`, goalID).
+		Scan(&createdByType, &createdByID)
+	if err != nil {
+		return false
+	}
+	return service.IsAutoApproveGoal(ctx, d.st.DB(), createdByType, createdByID)
 }
 
 // approveImportGoal closes the import goal's mandatory review checkpoint.

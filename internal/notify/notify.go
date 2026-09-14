@@ -224,6 +224,9 @@ func (n *Notifier) onGoalReviewing(_ context.Context, e events.Event) {
 	m, _ := e.Payload.(map[string]any)
 	goalID, _ := m["goal_id"].(string)
 	reason, _ := m["reason"].(string)
+	if v, _ := m["auto_approve"].(bool); v {
+		return
+	}
 	// M3 approval card: the evidence comes from the store (the event only
 	// carries the reason). Match the goal's ReviewGoal to carry its run_id —
 	// the button callback lands the gate_decision on that exact run.
