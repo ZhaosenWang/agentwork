@@ -72,8 +72,13 @@ func Open(path string) (*Store, error) {
 	// Migrations: ALTER TABLE ADD COLUMN has no IF NOT EXISTS in SQLite, so a
 	// repeated Open on an existing DB errors on "duplicate column." Each
 	// migration is best-effort — ignore the duplicate error, execute the rest.
+	// The goal_id column and its index are in the migration (not schema.sql)
+	// because CREATE TABLE IF NOT EXISTS does not alter an existing table —
+	// an index on the missing column would fail on the old DB before the
+	// ALTER runs.
 	for _, mig := range []string{
 		`ALTER TABLE team_import ADD COLUMN goal_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS idx_team_import_goal ON team_import(goal_id)`,
 	} {
 		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			db.Close()

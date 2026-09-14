@@ -465,7 +465,6 @@ CREATE TABLE IF NOT EXISTS team_import (
 );
 
 CREATE INDEX IF NOT EXISTS idx_team_import_run ON team_import(run_id);
-CREATE INDEX IF NOT EXISTS idx_team_import_goal ON team_import(goal_id);
 
 -- settings: key-value daemon configuration (e.g. the Feishu connection
 -- credentials + receive target captured by the IM connect flow, M1). The
