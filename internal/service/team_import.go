@@ -183,8 +183,8 @@ func (s *TeamImportService) ImportTeam(ctx context.Context, req ImportRequest) (
 		CreatedAt:      now(),
 	}
 	if _, err := s.st.DB().ExecContext(ctx,
-		`INSERT INTO team_import (id,run_id,git_url,git_credentials,default_branch,status,result,created_at) VALUES (?,?,?,?,?,?,?,?)`,
-		ti.ID, "", ti.GitURL, ti.GitCredentials, ti.DefaultBranch, ti.Status, ti.Result, ti.CreatedAt); err != nil {
+		`INSERT INTO team_import (id,run_id,goal_id,git_url,git_credentials,default_branch,status,result,created_at) VALUES (?,?,?,?,?,?,?,?,?)`,
+		ti.ID, "", "", ti.GitURL, ti.GitCredentials, ti.DefaultBranch, ti.Status, ti.Result, ti.CreatedAt); err != nil {
 		return nil, nil, fmt.Errorf("insert team_import: %w", err)
 	}
 
@@ -232,8 +232,8 @@ func (s *TeamImportService) ImportTeam(ctx context.Context, req ImportRequest) (
 		return nil, nil, fmt.Errorf("locate import goal's first run: %w", err)
 	}
 	if _, err := s.st.DB().ExecContext(ctx,
-		`UPDATE team_import SET run_id=? WHERE id=?`, runID, ti.ID); err != nil {
-		return nil, nil, fmt.Errorf("backfill team_import run_id: %w", err)
+		`UPDATE team_import SET run_id=?, goal_id=? WHERE id=?`, runID, goal.ID, ti.ID); err != nil {
+		return nil, nil, fmt.Errorf("backfill team_import run_id/goal_id: %w", err)
 	}
 	ti.RunID = runID
 	s.bus.Publish(ctx, events.Event{Topic: "team:import_enqueued", Payload: ti})
@@ -328,16 +328,17 @@ func clearImportMarker(ctx context.Context, st *store.Store, key string) {
 	}
 }
 
-// GitConfigForRun returns the git config stored on the team_import row for a
-// given run ID. Called by the daemon's runProcessorTask at dispatch time —
-// the git config was persisted at enqueue (HTTP request) time and survives
-// the queued interval.
-func (s *TeamImportService) GitConfigForRun(ctx context.Context, runID string) (gitURL, gitCredentials, defaultBranch string, ok bool) {
+// GitConfigForGoal returns the git config stored on the team_import row for a
+// given import goal ID. Called by the daemon's runTask import branch at
+// dispatch time. goal_id is the stable key (run_id lags on reopen/retry — a
+// new run's id is never written to team_import.run_id, but goal_id is set once
+// at ImportTeam and never changes).
+func (s *TeamImportService) GitConfigForGoal(ctx context.Context, goalID string) (gitURL, gitCredentials, defaultBranch string, ok bool) {
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT git_url, git_credentials, default_branch FROM team_import WHERE run_id=?`, runID).
+		`SELECT git_url, git_credentials, default_branch FROM team_import WHERE goal_id=?`, goalID).
 		Scan(&gitURL, &gitCredentials, &defaultBranch)
 	if err != nil {
-		logging.Warnf("team-import: no team_import row for run %s — git config unavailable", runID)
+		logging.Warnf("team-import: no team_import row for goal %s — git config unavailable", goalID)
 		return "", "", "", false
 	}
 	return gitURL, gitCredentials, defaultBranch, true
@@ -415,13 +416,13 @@ func importPrompt(runtimeNames []string) string {
 // runSvc.Finish owns the run terminal stamp (calling this after Finish would
 // double-stamp). On error it marks team_import failed (failImport) and
 // returns the error so the caller can flip the run to failed.
-func (s *TeamImportService) IngestImport(ctx context.Context, runID string, artifacts map[string]string, summary string) (*TeamImport, string, error) {
+func (s *TeamImportService) IngestImport(ctx context.Context, goalID string, artifacts map[string]string, summary string) (*TeamImport, string, error) {
 	var ti TeamImport
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id, run_id, status FROM team_import WHERE run_id=?`, runID).
+		`SELECT id, run_id, status FROM team_import WHERE goal_id=?`, goalID).
 		Scan(&ti.ID, &ti.RunID, &ti.Status)
 	if err != nil {
-		return nil, "", fmt.Errorf("team_import row for run %s: %w", runID, err)
+		return nil, "", fmt.Errorf("team_import row for goal %s: %w", goalID, err)
 	}
 
 	var tj teamJSON
@@ -597,21 +598,22 @@ func (s *TeamImportService) completeImport(ctx context.Context, ti *TeamImport, 
 	return nil
 }
 
-// FailImportByRun marks a team-import run failed by its run ID. Called by the
-// daemon's failImportRun when a machine-dispatched import run fails. If the
-// row is still pending, it delegates to failImport (UPDATE + publish
+// FailImportByGoal marks a team-import goal failed. Called by the daemon when
+// an import run fails (worker path: failRun/finishMachineRun). If the row is
+// still pending, it delegates to failImport (UPDATE + publish
 // team:import_failed); an already-terminal row is a no-op — a late failure
 // must not overwrite a completed import (symmetric with completeImport's guard).
-func (s *TeamImportService) FailImportByRun(ctx context.Context, runID, reason string) error {
+// goal_id is the stable key (run_id lags on reopen/retry).
+func (s *TeamImportService) FailImportByGoal(ctx context.Context, goalID, reason string) error {
 	var ti TeamImport
 	err := s.st.DB().QueryRowContext(ctx,
-		`SELECT id, run_id, status FROM team_import WHERE run_id=?`, runID).
+		`SELECT id, run_id, status FROM team_import WHERE goal_id=?`, goalID).
 		Scan(&ti.ID, &ti.RunID, &ti.Status)
 	if err != nil {
-		return fmt.Errorf("team_import row for run %s: %w", runID, err)
+		return fmt.Errorf("team_import row for goal %s: %w", goalID, err)
 	}
 	if ti.Status != "pending" {
-		logging.Infof("team-import: run %s already %s — dropping late failure", runID, ti.Status)
+		logging.Infof("team-import: goal %s already %s — dropping late failure", goalID, ti.Status)
 		return nil
 	}
 	return s.failImport(ctx, &ti, reason)

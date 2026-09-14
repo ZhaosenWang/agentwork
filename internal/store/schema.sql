@@ -454,7 +454,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_schedule_run_planned ON schedule_run(schedu
 -- pending|completed|failed.
 CREATE TABLE IF NOT EXISTS team_import (
     id              TEXT PRIMARY KEY,
-    run_id          TEXT NOT NULL DEFAULT '',         -- the processor run (back-filled after enqueue)
+    run_id          TEXT NOT NULL DEFAULT '',         -- the import run (back-filled after enqueue; may lag on reopen — use goal_id for lookups)
+    goal_id         TEXT NOT NULL DEFAULT '',         -- the import goal (stable across reopen/retry — the authoritative key)
     git_url         TEXT NOT NULL DEFAULT '',         -- team repo URL (read at dispatch time)
     git_credentials TEXT NOT NULL DEFAULT '',         -- team repo token
     default_branch  TEXT NOT NULL DEFAULT '',         -- team repo branch
@@ -464,6 +465,7 @@ CREATE TABLE IF NOT EXISTS team_import (
 );
 
 CREATE INDEX IF NOT EXISTS idx_team_import_run ON team_import(run_id);
+CREATE INDEX IF NOT EXISTS idx_team_import_goal ON team_import(goal_id);
 
 -- settings: key-value daemon configuration (e.g. the Feishu connection
 -- credentials + receive target captured by the IM connect flow, M1). The

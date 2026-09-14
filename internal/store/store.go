@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -66,6 +67,18 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
+	}
+
+	// Migrations: ALTER TABLE ADD COLUMN has no IF NOT EXISTS in SQLite, so a
+	// repeated Open on an existing DB errors on "duplicate column." Each
+	// migration is best-effort — ignore the duplicate error, execute the rest.
+	for _, mig := range []string{
+		`ALTER TABLE team_import ADD COLUMN goal_id TEXT NOT NULL DEFAULT ''`,
+	} {
+		if _, err := db.Exec(mig); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migration %q: %w", mig, err)
+		}
 	}
 
 	return &Store{db: db}, nil

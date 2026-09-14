@@ -1897,7 +1897,7 @@ func (d *Daemon) runTask(ctx context.Context, q *service.ClaimedRow) {
 		if d.isImportGoal(ctx, q.GoalID) {
 			artifactFiles = []string{"team.json"}
 			if d.teamImportSvc != nil {
-				if impGitURL, impCreds, impBranch, ok := d.teamImportSvc.GitConfigForRun(ctx, q.RunID); ok {
+				if impGitURL, impCreds, impBranch, ok := d.teamImportSvc.GitConfigForGoal(ctx, q.GoalID); ok {
 					dispatchEnv["AGENTWORK_GIT_URL"] = impGitURL
 					if impCreds != "" {
 						dispatchEnv["AGENTWORK_GIT_CREDENTIALS"] = impCreds
@@ -2370,7 +2370,7 @@ func (d *Daemon) failRun(ctx context.Context, q *service.ClaimedRow, summary str
 	// failure event. The run stamp + goal reconcile happen in finishRun below.
 	if q.GoalID != "" && d.isImportGoal(ctx, q.GoalID) {
 		if d.teamImportSvc != nil {
-			if err := d.teamImportSvc.FailImportByRun(ctx, q.RunID, summary); err != nil {
+			if err := d.teamImportSvc.FailImportByGoal(ctx, q.GoalID, summary); err != nil {
 				logging.Errorf("daemon: fail import run %s: %v", q.RunID, err)
 			}
 		}
