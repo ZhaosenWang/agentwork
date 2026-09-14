@@ -129,6 +129,33 @@ func TestReviewCardCarriesPendingHint(t *testing.T) {
 	}
 }
 
+// TestAutoApproveGoalSkipsCard: when goal:reviewing carries auto_approve=true
+// (digest / team-import goals), the notifier must NOT push an approval card —
+// the checkpoint is auto-approved and the human never sees it.
+func TestAutoApproveGoalSkipsCard(t *testing.T) {
+	sent := make(chan string, 4)
+	n := New("app", "secret", "chat_id", "oc_mock")
+	n.send = func(text string) error { sent <- text; return nil }
+	n.SetQueryStore(&fakeQS{
+		goals: []ReviewGoal{{GoalID: "abc123456789", Title: "digest", Reason: "merge"}},
+	})
+	bus := events.NewBus()
+	n.Subscribe(bus)
+	bus.Publish(context.Background(), events.Event{
+		Topic: "goal:reviewing",
+		Payload: map[string]any{
+			"goal_id":      "abc123456789",
+			"reason":       "merge",
+			"auto_approve": true,
+		},
+	})
+	select {
+	case <-sent:
+		t.Fatal("auto-approve goal must not push an approval card")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 // TestReviewReadyPatchesRecordedCard (Option B): goal:review_ready rebuilds
 // the card with the opinions and PATCHES the SAME message (the hint is gone).
 func TestReviewReadyPatchesRecordedCard(t *testing.T) {

@@ -643,7 +643,9 @@ func (s *GoalService) Assign(ctx context.Context, goalID, assigneeType, assignee
 			// the card fires with no reviewer hint. No run_id: no run parked
 			// this goal, the handoff chain did.
 			handoffLoopEvs = append(handoffLoopEvs, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
-				"goal_id": goalID, "reason": reason,
+				"goal_id":      goalID,
+				"reason":       reason,
+				"auto_approve": IsAutoApproveGoal(ctx, tx, g.CreatedByType, g.CreatedByID),
 			}})
 		}
 	}
@@ -1267,7 +1269,10 @@ func (s *GoalService) reconcileOnRunEndOnce(ctx context.Context, rc goalRunConte
 			}
 			logging.Infof("review: goal %q parked (gate hit: %q)", g.Title, trimLog(reason, 80))
 			pendingEvents = append(pendingEvents, events.Event{Topic: "goal:reviewing", Payload: map[string]any{
-				"goal_id": rc.GoalID, "run_id": rc.RunID, "reason": reason,
+				"goal_id":      rc.GoalID,
+				"run_id":       rc.RunID,
+				"reason":       reason,
+				"auto_approve": IsAutoApproveGoal(ctx, tx, g.CreatedByType, g.CreatedByID),
 			}})
 			break
 		}
