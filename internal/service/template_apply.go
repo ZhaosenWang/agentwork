@@ -357,26 +357,56 @@ func (s *TemplateApplyService) resolveAgentSkillIDs(ctx context.Context, skills 
 	return ids, nil
 }
 
-// activeRuntimeIDs lists active runtime ids (the agent-creation fallback).
-func (s *TemplateApplyService) activeRuntimeIDs(ctx context.Context) ([]string, error) {
-	return s.agentSvc.ListActiveRuntimeIDs(ctx)
+// usableRuntimeIDs lists runtime ids whose owning machine is online — the
+// same availability test the claim gate uses (run.go Claim: runtime not
+// absent AND machine connected). A runtime whose machine went offline is
+// still status='active' in the DB (offline is machine-side, read-derived),
+// so filtering only on runtime.status would bind agents to dead machines
+// that Claim then refuses to dispatch. Legacy/local runtimes (machine_id='')
+// are always usable.
+func (s *TemplateApplyService) usableRuntimeIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.st.DB().QueryContext(ctx,
+		`SELECT r.id FROM runtime r
+		 LEFT JOIN machine m ON m.id = r.machine_id
+		 WHERE r.status='active' AND (r.machine_id='' OR m.status='connected')
+		 ORDER BY r.created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
-// resolveRuntime maps a template runtime name to an id; unmatched/empty falls
-// back to the first active runtime (team-import semantics). Requires at
-// least one active runtime — there is nowhere to run otherwise.
-func (s *TemplateApplyService) resolveRuntime(ctx context.Context, name string, activeIDs []string) (string, error) {
+// resolveRuntime maps a template runtime name to an id. The name lookup
+// applies the same availability test as the claim gate (runtime not absent
+// AND machine connected) — a name that resolves to an offline machine's
+// runtime is treated as unmatched, falling through to the first usable
+// runtime instead of binding the agent to a dead machine. Empty/unmatched/
+// offline-name all fall back to usableIDs[0]. Requires at least one usable
+// runtime — there is nowhere to run otherwise.
+func (s *TemplateApplyService) resolveRuntime(ctx context.Context, name string, usableIDs []string) (string, error) {
 	if name != "" {
 		var id string
 		if err := s.st.DB().QueryRowContext(ctx,
-			`SELECT id FROM runtime WHERE name=? AND status='active'`, name).Scan(&id); err == nil && id != "" {
+			`SELECT r.id FROM runtime r
+			 LEFT JOIN machine m ON m.id = r.machine_id
+			 WHERE r.name=? AND r.status='active'
+			   AND (r.machine_id='' OR m.status='connected')`, name).Scan(&id); err == nil && id != "" {
 			return id, nil
 		}
 	}
-	if len(activeIDs) == 0 {
-		return "", NewValidationError("没有可用的 active runtime——先连接一台机器（agentwork connect）")
+	if len(usableIDs) == 0 {
+		return "", NewValidationError("没有可用的 runtime——所有机器离线或未连接，请先 agentwork connect")
 	}
-	return activeIDs[0], nil
+	return usableIDs[0], nil
 }
 
 // agentIDByName resolves a platform agent id by exact name (” = not found).
@@ -407,12 +437,12 @@ func (s *TemplateApplyService) squadByName(ctx context.Context, name string) (*S
 // template's env/model/mcp_servers/max_concurrent land in the DB the same way
 // a manually-created agent's do. The upsert path does NOT use UpsertByName
 // (that team-import method's narrow signature drops those four fields).
-func (s *TemplateApplyService) upsertAgent(ctx context.Context, strategy string, a tplAgent, finalName string, activeIDs []string) (*Agent, string, error) {
+func (s *TemplateApplyService) upsertAgent(ctx context.Context, strategy string, a tplAgent, finalName string, usableIDs []string) (*Agent, string, error) {
 	skillIDs, err := s.resolveAgentSkillIDs(ctx, a.Skills)
 	if err != nil {
 		return nil, "", err
 	}
-	runtimeID, err := s.resolveRuntime(ctx, a.Runtime, activeIDs)
+	runtimeID, err := s.resolveRuntime(ctx, a.Runtime, usableIDs)
 	if err != nil {
 		return nil, "", err
 	}
@@ -475,9 +505,9 @@ func (s *TemplateApplyService) applySquadSpec(ctx context.Context, spec *squadSp
 		return nil, NewValidationError("模板 spec.agents 不能为空")
 	}
 	res := &ApplySquadResult{}
-	activeIDs, err := s.activeRuntimeIDs(ctx)
+	usableIDs, err := s.usableRuntimeIDs(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("列出 active runtime：%v", err)
+		return nil, fmt.Errorf("列出可用 runtime：%v", err)
 	}
 	// Skill packages ride first so agent skill resolution sees fresh ids.
 	agentIDs := map[string]string{}
@@ -489,7 +519,7 @@ func (s *TemplateApplyService) applySquadSpec(ctx context.Context, spec *squadSp
 			continue
 		}
 		agentNameSet[finalName] = true
-		out, action, err := s.upsertAgent(ctx, strategy, a, finalName, activeIDs)
+		out, action, err := s.upsertAgent(ctx, strategy, a, finalName, usableIDs)
 		if err != nil {
 			res.Items = append(res.Items, ApplyItem{Kind: "agent", Name: finalName, Action: "failed", Error: err.Error()})
 			continue

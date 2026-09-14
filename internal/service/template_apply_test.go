@@ -557,6 +557,134 @@ func TestApplySquadNoRuntimeFails(t *testing.T) {
 	}
 }
 
+// TestApplySquadOfflineMachineSkipped verifies apply's runtime selection uses
+// the claim gate's availability test (runtime not absent AND machine
+// connected), not runtime.status alone. A runtime whose owning machine is
+// offline is still status='active' in the DB, but must NOT be selected —
+// neither by name match nor by fallback. The fixture seeds two runtimes on
+// two machines: m-up (connected) hosts rt-up, m-down (offline) hosts rt-down.
+// The template names rt-down; the offline name must fall through to rt-up.
+func TestApplySquadOfflineMachineSkipped(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.seedSkill(t, "test-skill")
+	// newTemplateCluster seeded rt-1 (machine_id='' — always usable). Drop it
+	// so the only usable runtime is the connected-machine one we add below.
+	if _, err := c.st.DB().Exec(`DELETE FROM runtime WHERE id='rt-1'`); err != nil {
+		t.Fatal(err)
+	}
+	machines := []struct{ id, name, status string }{
+		{"m-up", "up-host", "connected"},
+		{"m-down", "down-host", "offline"},
+	}
+	for _, m := range machines {
+		if _, err := c.st.DB().Exec(
+			`INSERT INTO machine (id,name,hostname,version,probed_clis,last_seen_at,status,created_at)
+			 VALUES (?,?,?, '', '[]', '', ?, '2026-01-01T00:00:00Z')`,
+			m.id, m.name, m.name, m.status); err != nil {
+			t.Fatalf("seed machine %s: %v", m.id, err)
+		}
+	}
+	runTimes := []struct{ id, name, machineID, created string }{
+		{"rt-up", "up-rt@m-up", "m-up", "2026-01-01T00:00:00Z"},
+		{"rt-down", "down-rt@m-down", "m-down", "2026-01-02T00:00:00Z"}, // newer → would win ORDER BY created_at
+	}
+	for _, r := range runTimes {
+		if _, err := c.st.DB().Exec(
+			`INSERT INTO runtime (id,name,machine_id,args,env,status,created_at)
+			 VALUES (?,? ,? ,'[]','{}','active',?)`,
+			r.id, r.name, r.machineID, r.created); err != nil {
+			t.Fatalf("seed runtime %s: %v", r.id, err)
+		}
+	}
+
+	// Template names the offline machine's runtime — must fall through to rt-up.
+	offlineNameYAML := strings.Replace(squadTemplateYAML, "runtime: test-rt", "runtime: down-rt@m-down", 1)
+	offlineNameYAML = strings.ReplaceAll(offlineNameYAML, "backend-leader", "offline-leader")
+	offlineNameYAML = strings.ReplaceAll(offlineNameYAML, "backend-worker", "offline-worker")
+	c.putTemplate(t, TemplateKindSquad, "offline-name", offlineNameYAML)
+	res, err := c.apply.ApplySquad(ctx, "offline-name", ApplySquadOverrides{})
+	if err != nil {
+		t.Fatalf("apply should succeed by falling back to the connected runtime: %v", err)
+	}
+	if len(res.Agents) != 2 {
+		t.Fatalf("expected 2 agents, got %d", len(res.Agents))
+	}
+	for _, a := range res.Agents {
+		if a.RuntimeID != "rt-up" {
+			t.Fatalf("agent %s bound to %s, expected rt-up (the only connected runtime)", a.Name, a.RuntimeID)
+		}
+	}
+}
+
+// TestApplySquadAllMachinesOfflineFails verifies that when every runtime's
+// machine is offline, apply refuses to create agents — matching what Claim
+// would reject — rather than binding them to dead runtimes.
+func TestApplySquadAllMachinesOfflineFails(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.seedSkill(t, "test-skill")
+	if _, err := c.st.DB().Exec(`DELETE FROM runtime WHERE id='rt-1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.st.DB().Exec(
+		`INSERT INTO machine (id,name,hostname,version,probed_clis,last_seen_at,status,created_at)
+		 VALUES ('m-down','down-host','down-host','','[]','','offline','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.st.DB().Exec(
+		`INSERT INTO runtime (id,name,machine_id,args,env,status,created_at)
+		 VALUES ('rt-down','down-rt@m-down','m-down','[]','{}','active','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	c.putTemplate(t, TemplateKindSquad, "backend-dev", squadTemplateYAML)
+	_, err := c.apply.ApplySquad(ctx, "backend-dev", ApplySquadOverrides{})
+	if err == nil {
+		t.Fatal("expected apply to fail when all machines are offline")
+	}
+	agents, _ := c.agentSvc.List(ctx)
+	if len(agents) != 0 {
+		t.Fatalf("no agent should be created when all machines are offline, got %d", len(agents))
+	}
+}
+
+// TestUsableRuntimeIDsExcludesOffline verifies the usable-runtime list itself
+// filters out offline-machine runtimes, so the fallback pool only contains
+// runtimes Claim would actually dispatch.
+func TestUsableRuntimeIDsExcludesOffline(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	if _, err := c.st.DB().Exec(`DELETE FROM runtime WHERE id='rt-1'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []struct{ id, status string }{
+		{"m-up", "connected"},
+		{"m-down", "offline"},
+	} {
+		if _, err := c.st.DB().Exec(
+			`INSERT INTO machine (id,name,hostname,version,probed_clis,last_seen_at,status,created_at)
+			 VALUES (?, ?, ?, '', '[]', '', ?, '2026-01-01T00:00:00Z')`,
+			m.id, m.id, m.id, m.status); err != nil {
+			t.Fatalf("seed machine %s: %v", m.id, err)
+		}
+	}
+	if _, err := c.st.DB().Exec(
+		`INSERT INTO runtime (id,name,machine_id,args,env,status,created_at) VALUES ('rt-up','up-rt@m-up','m-up','[]','{}','active','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.st.DB().Exec(
+		`INSERT INTO runtime (id,name,machine_id,args,env,status,created_at) VALUES ('rt-down','down-rt@m-down','m-down','[]','{}','active','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := c.apply.usableRuntimeIDs(ctx)
+	if err != nil {
+		t.Fatalf("usableRuntimeIDs: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "rt-up" {
+		t.Fatalf("expected only [rt-up], got %v", ids)
+	}
+}
+
 // ── project apply ──
 
 func TestApplyProjectFullFlow(t *testing.T) {
