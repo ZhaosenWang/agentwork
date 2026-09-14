@@ -388,10 +388,12 @@ func (s *TemplateApplyService) usableRuntimeIDs(ctx context.Context) ([]string, 
 // resolveRuntime maps a template runtime name to an id. The name lookup
 // applies the same availability test as the claim gate (runtime not absent
 // AND machine connected) — a name that resolves to an offline machine's
-// runtime is treated as unmatched, falling through to the first usable
-// runtime instead of binding the agent to a dead machine. Empty/unmatched/
-// offline-name all fall back to usableIDs[0]. Requires at least one usable
-// runtime — there is nowhere to run otherwise.
+// runtime is treated as unmatched, falling through to a usable runtime
+// instead of binding the agent to a dead machine. Empty/unmatched/
+// offline-name all fall back to a RANDOM pick from the usable pool (spread
+// load across connected machines instead of concentrating on the
+// earliest-created runtime). Requires at least one usable runtime — there
+// is nowhere to run otherwise.
 func (s *TemplateApplyService) resolveRuntime(ctx context.Context, name string, usableIDs []string) (string, error) {
 	if name != "" {
 		var id string
@@ -406,7 +408,7 @@ func (s *TemplateApplyService) resolveRuntime(ctx context.Context, name string, 
 	if len(usableIDs) == 0 {
 		return "", NewValidationError("没有可用的 runtime——所有机器离线或未连接，请先 agentwork connect")
 	}
-	return usableIDs[0], nil
+	return pickRandom(usableIDs), nil
 }
 
 // agentIDByName resolves a platform agent id by exact name (” = not found).

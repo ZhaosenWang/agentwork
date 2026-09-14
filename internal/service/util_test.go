@@ -153,3 +153,55 @@ func TestNowMonotonic(t *testing.T) {
 		t.Errorf("now() went backwards: %q then %q", a, b)
 	}
 }
+
+// TestPickRandomEmpty: an empty pool returns "" (the caller treats this as
+// "no runtime" rather than panicking on an index).
+func TestPickRandomEmpty(t *testing.T) {
+	t.Parallel()
+	if got := pickRandom(nil); got != "" {
+		t.Fatalf("pickRandom(nil) = %q, want %q", got, "")
+	}
+	if got := pickRandom([]string{}); got != "" {
+		t.Fatalf("pickRandom([]) = %q, want %q", got, "")
+	}
+}
+
+// TestPickRandomSingle: a one-element pool always returns that element —
+// the modulo path must never miss when len==1.
+func TestPickRandomSingle(t *testing.T) {
+	t.Parallel()
+	for i := 0; i < 100; i++ {
+		if got := pickRandom([]string{"only"}); got != "only" {
+			t.Fatalf("pickRandom([only]) = %q, want only", got)
+		}
+	}
+}
+
+// TestPickRandomInPool: every draw must come from the pool (never an
+// out-of-range or fabricated value).
+func TestPickRandomInPool(t *testing.T) {
+	t.Parallel()
+	pool := []string{"a", "b", "c", "d"}
+	set := map[string]bool{"a": true, "b": true, "c": true, "d": true}
+	for i := 0; i < 1000; i++ {
+		got := pickRandom(pool)
+		if !set[got] {
+			t.Fatalf("pickRandom returned %q, not in pool %v", got, pool)
+		}
+	}
+}
+
+// TestPickRandomSpreads: over many draws from a 2-element pool, both values
+// must appear — a fixed-index (always-[0]) bug would leave one value unseen.
+// This is the load-spreading property the fallback exists for.
+func TestPickRandomSpreads(t *testing.T) {
+	t.Parallel()
+	pool := []string{"rt-a", "rt-b"}
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		seen[pickRandom(pool)] = true
+	}
+	if len(seen) != 2 {
+		t.Fatalf("pickRandom did not spread over %v: only saw %v after 200 draws", pool, seen)
+	}
+}
