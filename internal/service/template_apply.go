@@ -3,10 +3,12 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/gitcodeapi"
 	"github.com/eushing/agentwork/internal/logging"
 	"github.com/eushing/agentwork/internal/store"
@@ -182,16 +184,17 @@ type ApplyProjectResult struct {
 // Failure policy: best-effort sequence with per-item results; the domain/repo
 // step (the apply's root) is terminal — failing it aborts the rest.
 type TemplateApplyService struct {
-	st        *store.Store
-	templates *TemplateService
-	agentSvc  *AgentService
-	skillSvc  *SkillService
-	squadSvc  *SquadService
-	domainSvc *DomainService
-	goalSvc   *GoalService
-	schedSvc  *ScheduleService
-	gitTester GitTester
-	repoProv  gitcodeapi.RepoProvider
+	st         *store.Store
+	templates  *TemplateService
+	agentSvc   *AgentService
+	skillSvc   *SkillService
+	squadSvc   *SquadService
+	domainSvc  *DomainService
+	goalSvc    *GoalService
+	schedSvc   *ScheduleService
+	gitTester  GitTester
+	repoProv   gitcodeapi.RepoProvider
+	pushSkills func(agentID string) // ships persona+skills to the machine (the daemon's PushAgentSkills); nil in tests
 }
 
 // GitTester abstracts the daemon's TestDomainGit probe (the create-domain
@@ -236,6 +239,12 @@ func NewTemplateApplyService(
 // is created after the services in main.go — same late-wiring pattern as
 // SetDependencies). nil = the probe is skipped (tests).
 func (s *TemplateApplyService) SetGitTester(t GitTester) { s.gitTester = t }
+
+// SetSkillPusher wires the daemon's PushAgentSkills so apply can ship persona
+// + skills to the machine right after creating/updating an agent — the same
+// step the HTTP CRUD handlers do (go h.Daemon.PushAgentSkills(...)). nil
+// (tests) = no immediate push; the next machine register back-fills.
+func (s *TemplateApplyService) SetSkillPusher(p func(agentID string)) { s.pushSkills = p }
 
 // ── parsing helpers ──
 
@@ -392,7 +401,12 @@ func (s *TemplateApplyService) squadByName(ctx context.Context, name string) (*S
 }
 
 // upsertAgent creates or updates one agent per strategy; returns the agent
-// and the action label.
+// and the action label. It builds the full Agent{} (every tplAgent field
+// carried through, mcp_servers converted to []acp.McpServer) and calls the
+// same AgentService.Create / Update the HTTP CRUD handlers use — so the
+// template's env/model/mcp_servers/max_concurrent land in the DB the same way
+// a manually-created agent's do. The upsert path does NOT use UpsertByName
+// (that team-import method's narrow signature drops those four fields).
 func (s *TemplateApplyService) upsertAgent(ctx context.Context, strategy string, a tplAgent, finalName string, activeIDs []string) (*Agent, string, error) {
 	skillIDs, err := s.resolveAgentSkillIDs(ctx, a.Skills)
 	if err != nil {
@@ -402,28 +416,56 @@ func (s *TemplateApplyService) upsertAgent(ctx context.Context, strategy string,
 	if err != nil {
 		return nil, "", err
 	}
+	desired := Agent{
+		Name: finalName, Description: a.Description, RuntimeID: runtimeID,
+		SystemPrompt: a.SystemPrompt, Model: a.Model, Env: a.Env,
+		McpServers: tplMcpServersToAcp(a.McpServers),
+		Skills: skillIDs, MaxConcurrent: a.MaxConcurrent,
+	}
 	if strategy == conflictCreate {
-		out, err := s.agentSvc.Create(ctx, Agent{
-			Name: finalName, Description: a.Description, RuntimeID: runtimeID,
-			SystemPrompt: a.SystemPrompt, Model: a.Model, Env: a.Env,
-			Skills: skillIDs, MaxConcurrent: a.MaxConcurrent,
-		})
+		out, err := s.agentSvc.Create(ctx, desired)
 		if err != nil {
 			return nil, "", err
 		}
 		return out, "created", nil
 	}
-	// Upsert: check existence BEFORE the call — UpsertByName does not
-	// distinguish created from updated.
-	action := "created"
+	// Upsert by name: existing → Update (writes all 10 mutable columns); new
+	// → Create. Both carry the template's full field set, same as the handlers.
 	if existing := s.agentIDByName(ctx, finalName); existing != "" {
-		action = "updated"
+		out, err := s.agentSvc.Update(ctx, existing, desired)
+		if err != nil {
+			return nil, "", err
+		}
+		return out, "updated", nil
 	}
-	out, err := s.agentSvc.UpsertByName(ctx, finalName, a.Description, a.SystemPrompt, runtimeID, skillIDs)
+	out, err := s.agentSvc.Create(ctx, desired)
 	if err != nil {
 		return nil, "", err
 	}
-	return out, action, nil
+	return out, "created", nil
+}
+
+// tplMcpServersToAcp converts the loose YAML shape ([]map[string]any, as
+// decoded from tplAgent.mcp_servers) into the strongly-typed []acp.McpServer
+// the Agent model stores. The two share field names (name/type/command/args/
+// url/env/headers), so a marshal→unmarshal round-trip does the conversion
+// without hand-mapping each field. Malformed entries are dropped (a config
+// typo is logged and skipped at run time already — never fatal to the apply).
+func tplMcpServersToAcp(raw []map[string]any) []acp.McpServer {
+	if len(raw) == 0 {
+		return nil
+	}
+	buf, err := json.Marshal(raw)
+	if err != nil {
+		logging.Infof("template-apply: marshal mcp_servers: %v", err)
+		return nil
+	}
+	var out []acp.McpServer
+	if err := json.Unmarshal(buf, &out); err != nil {
+		logging.Infof("template-apply: parse mcp_servers: %v", err)
+		return nil
+	}
+	return out
 }
 
 // applySquadSpec is the shared squad/team section (used by both apply kinds).
@@ -455,6 +497,13 @@ func (s *TemplateApplyService) applySquadSpec(ctx context.Context, spec *squadSp
 		agentIDs[a.Name] = out.ID // roster references use TEMPLATE names
 		res.Items = append(res.Items, ApplyItem{Kind: "agent", Name: finalName, ID: out.ID, Action: action})
 		res.Agents = append(res.Agents, out)
+		// Ship persona + skills to the machine now — the HTTP CRUD handlers
+		// do the same (go h.Daemon.PushAgentSkills(...)). Without this an
+		// apply-triggered goal run can start before the machine has the
+		// AGENTS.md / skill dirs. Detached + best-effort; nil in tests.
+		if s.pushSkills != nil {
+			go s.pushSkills(out.ID)
+		}
 	}
 	if len(agentIDs) == 0 {
 		return res, NewValidationError("模板中没有任何 agent 创建成功，小队不创建")

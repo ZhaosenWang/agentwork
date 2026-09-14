@@ -147,9 +147,14 @@ func main() {
 	d.SetTeamImportService(teamImportSvc)
 	d.SetDomainService(domainSvc)
 	d.SetSkillService(skillSvc)
-	// Templates need the daemon's git probe (the create-domain gate) — wire
-	// it now that the daemon exists.
+	// Templates need the daemon's git probe (the create-domain gate) and the
+	// skill/config pusher (so apply ships persona + tools to the machine
+	// immediately, like the HTTP CRUD handlers) — wire both now that the daemon
+	// exists.
 	templateApplySvc.SetGitTester(gitTesterFunc(d.TestDomainGit))
+	templateApplySvc.SetSkillPusher(func(agentID string) {
+		d.PushAgentSkills(context.Background(), agentID)
+	})
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			logging.Errorf("daemon: %v", err)

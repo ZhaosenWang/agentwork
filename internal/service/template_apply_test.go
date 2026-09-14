@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/eushing/agentwork/internal/acp"
 	"github.com/eushing/agentwork/internal/events"
 	"github.com/eushing/agentwork/internal/store"
 )
@@ -43,6 +46,49 @@ spec:
     members:
       - name: backend-worker
         role: member
+`
+
+// fullAgentFieldsYAML exercises every tplAgent field the apply path must carry
+// through to the DB: mcp_servers (stdio + http), env, model, max_concurrent.
+const fullAgentFieldsYAML = `api_version: agentwork/v1
+kind: squad-template
+metadata:
+  id: full-fields
+  name: 全字段小队
+  description: 覆盖 env/mcp/model/max_concurrent 落库
+  version: 1.0.0
+spec:
+  strategy: upsert
+  agents:
+    - name: full-agent
+      description: 携带全部 agent 定义属性
+      system_prompt: |
+        你是全字段 agent。
+      skills: []
+      runtime: test-rt
+      model: glm-4.6
+      max_concurrent: 5
+      env:
+        LOG_LEVEL: debug
+        REGION: cn-east
+      mcp_servers:
+        - name: browser
+          type: stdio
+          command: npx
+          args: ["-y", "@modelcontextprotocol/server-puppeteer"]
+        - name: api
+          type: http
+          url: https://api.example.com/mcp
+          headers:
+            - name: Authorization
+              value: Bearer test-token
+  squad:
+    name: 全字段小队
+    description: 测试小队
+    leader: full-agent
+    instructions: |
+      测试。
+    members: []
 `
 
 const projectTemplateYAML = `api_version: agentwork/v1
@@ -98,22 +144,62 @@ spec:
 // templateTestCluster wires the template services over a fresh store with a
 // runtime + agent-capable environment (no daemon — git tests use a stub).
 type templateTestCluster struct {
-	st        *store.Store
-	templates *TemplateService
-	apply     *TemplateApplyService
-	agentSvc  *AgentService
-	skillSvc  *SkillService
-	squadSvc  *SquadService
-	domainSvc *DomainService
-	goalSvc   *GoalService
-	schedSvc  *ScheduleService
-	gitProbe  *stubGitTester
+	st          *store.Store
+	templates   *TemplateService
+	apply       *TemplateApplyService
+	agentSvc    *AgentService
+	skillSvc    *SkillService
+	squadSvc    *SquadService
+	domainSvc   *DomainService
+	goalSvc     *GoalService
+	schedSvc    *ScheduleService
+	gitProbe    *stubGitTester
+	skillPusher *stubSkillPusher
 }
 
 // stubGitTester records the last probe input and returns canned results.
 type stubGitTester struct {
 	lastURL, lastBranch, lastCred string
 	result                        *DomainGitProbeResult
+}
+
+// stubSkillPusher records every PushAgentSkills call so a test can assert the
+// apply path shipped persona+skills to the machine (the HTTP handlers do the
+// same). The apply path fires it on a detached goroutine, so waitForPush polls.
+type stubSkillPusher struct {
+	mu     sync.Mutex
+	pushed []string
+}
+
+func (s *stubSkillPusher) push(agentID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pushed = append(s.pushed, agentID)
+}
+
+func (s *stubSkillPusher) waitForPush(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		got := len(s.pushed)
+		s.mu.Unlock()
+		if got >= n {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t.Fatalf("PushAgentSkills not called %d time(s); got %v", n, s.pushed)
+}
+
+func (s *stubSkillPusher) snapshot() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.pushed))
+	copy(out, s.pushed)
+	return out
 }
 
 func (s *stubGitTester) TestDomainGit(_ context.Context, gitURL, defaultBranch, credentials string) *DomainGitProbeResult {
@@ -134,11 +220,14 @@ func newTemplateCluster(t *testing.T) *templateTestCluster {
 	goalSvc := NewGoalService(st, bus)
 	schedSvc := NewScheduleService(st, bus)
 	probe := &stubGitTester{result: &DomainGitProbeResult{OK: true, BranchExists: true, ResolvedBranch: "main"}}
+	pusher := &stubSkillPusher{}
 	apply := NewTemplateApplyService(st, tpl, agentSvc, skillSvc, squadSvc, domainSvc, goalSvc, schedSvc, probe)
+	apply.SetSkillPusher(pusher.push)
 	c := &templateTestCluster{
 		st: st, templates: tpl, apply: apply, agentSvc: agentSvc,
 		skillSvc: skillSvc, squadSvc: squadSvc, domainSvc: domainSvc,
 		goalSvc: goalSvc, schedSvc: schedSvc, gitProbe: probe,
+		skillPusher: pusher,
 	}
 	c.seedRuntime(t)
 	return c
@@ -241,6 +330,129 @@ func TestApplySquadCreatesAgentsAndSquad(t *testing.T) {
 	if actions["agent/backend-leader"] != "created" || actions["squad/后端开发小队"] != "created" {
 		t.Fatalf("unexpected item actions: %v", actions)
 	}
+}
+
+// TestApplySquadFullAgentFields asserts every tplAgent field (mcp_servers,
+// env, model, max_concurrent) lands in the DB via the same AgentService.Create
+// a manual agent uses, and that apply ships persona+skills to the machine
+// (the HTTP handlers do the same). Before the fix, mcp_servers was dropped on
+// every path and the other three on the upsert path.
+func TestApplySquadFullAgentFields(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.putTemplate(t, TemplateKindSquad, "full-fields", fullAgentFieldsYAML)
+
+	res, err := c.apply.ApplySquad(ctx, "full-fields", ApplySquadOverrides{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(res.Agents) != 1 {
+		t.Fatalf("expected 1 agent, got %d", len(res.Agents))
+	}
+	a := res.Agents[0]
+	if a.Model != "glm-4.6" {
+		t.Errorf("model: got %q want glm-4.6", a.Model)
+	}
+	if a.MaxConcurrent != 5 {
+		t.Errorf("max_concurrent: got %d want 5", a.MaxConcurrent)
+	}
+	if len(a.Env) != 2 || a.Env["LOG_LEVEL"] != "debug" || a.Env["REGION"] != "cn-east" {
+		t.Errorf("env: got %v want {LOG_LEVEL:debug, REGION:cn-east}", a.Env)
+	}
+	if len(a.McpServers) != 2 {
+		t.Fatalf("mcp_servers: got %d want 2 (was dropped before the fix)", len(a.McpServers))
+	}
+	if a.McpServers[0].Name != "browser" || a.McpServers[0].Type != "stdio" || a.McpServers[0].Command != "npx" || len(a.McpServers[0].Args) != 2 {
+		t.Errorf("stdio mcp: %+v", a.McpServers[0])
+	}
+	if a.McpServers[1].Name != "api" || a.McpServers[1].Type != "http" || a.McpServers[1].URL != "https://api.example.com/mcp" {
+		t.Errorf("http mcp: %+v", a.McpServers[1])
+	}
+	if len(a.McpServers[1].Headers) != 1 || a.McpServers[1].Headers[0].Name != "Authorization" || a.McpServers[1].Headers[0].Value != "Bearer test-token" {
+		t.Errorf("http mcp headers: %+v", a.McpServers[1].Headers)
+	}
+	// apply ships persona+skills to the machine right after create.
+	c.skillPusher.waitForPush(t, 1)
+	if c.skillPusher.snapshot()[0] != a.ID {
+		t.Errorf("PushAgentSkills: got %v want [%s]", c.skillPusher.snapshot(), a.ID)
+	}
+}
+
+// TestApplySquadUpsertUpdatesAllFields asserts the upsert (default) strategy
+// rewrites env/model/mcp_servers/max_concurrent on an EXISTING agent via
+// AgentService.Update (all 10 columns), not just description/system_prompt/
+// skills. Before the fix, UpsertByName's narrow UPDATE left these untouched.
+func TestApplySquadUpsertUpdatesAllFields(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.putTemplate(t, TemplateKindSquad, "full-fields", fullAgentFieldsYAML)
+
+	// First apply creates the agent with the full field set.
+	if _, err := c.apply.ApplySquad(ctx, "full-fields", ApplySquadOverrides{}); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+	c.skillPusher.waitForPush(t, 1)
+	agentID := c.skillPusher.snapshot()[0]
+
+	// Tamper: wipe the four fields to prove the second apply rewrites them.
+	if _, err := c.st.DB().ExecContext(ctx,
+		`UPDATE agent SET model='', max_concurrent=1, env='{}', mcp_servers='[]' WHERE id=?`, agentID); err != nil {
+		t.Fatalf("tamper: %v", err)
+	}
+
+	// Second apply: upsert hits the existing agent → Update writes all fields.
+	res, err := c.apply.ApplySquad(ctx, "full-fields", ApplySquadOverrides{})
+	if err != nil {
+		t.Fatalf("second apply: %v", err)
+	}
+	if len(res.Agents) != 1 || res.Agents[0].ID != agentID {
+		t.Fatalf("upsert should reuse the same agent: got %+v", res.Agents)
+	}
+	if res.Items[0].Action != "updated" {
+		t.Errorf("action: got %q want updated", res.Items[0].Action)
+	}
+	c.skillPusher.waitForPush(t, 2) // second push from the update path
+
+	// Re-read from DB: the four fields were rewritten, not left empty.
+	got, err := c.agentSvc.Get(ctx, agentID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Model != "glm-4.6" {
+		t.Errorf("model after upsert: got %q want glm-4.6", got.Model)
+	}
+	if got.MaxConcurrent != 5 {
+		t.Errorf("max_concurrent after upsert: got %d want 5", got.MaxConcurrent)
+	}
+	if len(got.Env) != 2 || got.Env["LOG_LEVEL"] != "debug" {
+		t.Errorf("env after upsert: %v", got.Env)
+	}
+	if len(got.McpServers) != 2 {
+		t.Errorf("mcp_servers after upsert: got %d want 2", len(got.McpServers))
+	}
+}
+
+// TestTplMcpServersToAcp unit-covers the loose-YAML → typed conversion,
+// including the empty-input short-circuit.
+func TestTplMcpServersToAcp(t *testing.T) {
+	if got := tplMcpServersToAcp(nil); got != nil {
+		t.Errorf("nil input: got %+v want nil", got)
+	}
+	in := []map[string]any{
+		{"name": "stdio-srv", "type": "stdio", "command": "npx", "args": []any{"-y", "srv"}},
+		{"name": "http-srv", "type": "http", "url": "https://x/mcp"},
+	}
+	out := tplMcpServersToAcp(in)
+	if len(out) != 2 {
+		t.Fatalf("got %d want 2", len(out))
+	}
+	if out[0].Command != "npx" || len(out[0].Args) != 2 || out[0].Args[0] != "-y" {
+		t.Errorf("stdio: %+v", out[0])
+	}
+	if out[1].Type != "http" || out[1].URL != "https://x/mcp" {
+		t.Errorf("http: %+v", out[1])
+	}
+	_ = acp.McpServer{} // keep the acp import used if the assertions above ever move
 }
 
 func TestApplySquadRenameAndOverride(t *testing.T) {
