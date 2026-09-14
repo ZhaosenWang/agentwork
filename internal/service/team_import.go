@@ -397,6 +397,7 @@ func importPrompt(runtimeNames []string) string {
   }
 }`)
 	b.WriteString("\n\n规则：\n")
+	b.WriteString("- 直接用写文件工具把 team.json 写到工作目录根（不要用脚本生成 JSON——脚本容易因缩进/编码出错，直接写最可靠）。\n")
 	b.WriteString("- system_prompt = 角色定义文件的完整原始内容（不要改写或翻译）。\n")
 	b.WriteString("- skills = 该 agent 可使用的技能名列表（从 team.md 或角色定义推断；不确定就留空数组）。\n")
 	b.WriteString("- role=\"leader\" → squad.leader；role=\"reviewer\" → 平台在审查环节自动拉取；role=\"member\" → 普通成员。\n")
