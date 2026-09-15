@@ -146,18 +146,6 @@ func (s *TemplateService) RepoConfig(ctx context.Context) (TemplateRepoConfig, e
 	return cfg, nil
 }
 
-// SetRepoConfig stores the template repo override (the settings PUT path).
-func (s *TemplateService) SetRepoConfig(ctx context.Context, cfg TemplateRepoConfig) error {
-	if strings.TrimSpace(cfg.GitURL) == "" {
-		return NewFieldRequiredError("git_url")
-	}
-	if strings.TrimSpace(cfg.Branch) == "" {
-		cfg.Branch = "main"
-	}
-	raw, _ := json.Marshal(cfg)
-	return s.settings.Set(ctx, templateRepoKey, string(raw))
-}
-
 // Refresh re-fetches the template repository: shallow-clone to a temp dir,
 // parse registry.yaml, load every listed template file, validate, and store
 // the snapshot in app_settings. On fetch failure the error is returned AND

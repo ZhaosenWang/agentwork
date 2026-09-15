@@ -45,9 +45,9 @@ const (
 // ── squad-template spec ──
 
 type squadSpec struct {
-	Strategy     string             `yaml:"strategy"` // create | upsert (default upsert)
-	Agents       []tplAgent         `yaml:"agents"`
-	Squad        tplSquad           `yaml:"squad"`
+	Strategy      string            `yaml:"strategy"` // create | upsert (default upsert)
+	Agents        []tplAgent        `yaml:"agents"`
+	Squad         tplSquad          `yaml:"squad"`
 	SuggestedGoal *tplSuggestedGoal `yaml:"suggested_goal"` // optional: pre-fill the goal create dialog after apply
 }
 
@@ -65,9 +65,9 @@ type tplSuggestedGoal struct {
 // apply creates the agent + a same-named scratch domain (the goal default
 // project) and returns the suggested goal prompt.
 type agentSpec struct {
-	Strategy      string             `yaml:"strategy"` // create | upsert (default upsert)
-	Agent         tplAgent           `yaml:"agent"`
-	SuggestedGoal *tplSuggestedGoal  `yaml:"suggested_goal"`
+	Strategy      string            `yaml:"strategy"` // create | upsert (default upsert)
+	Agent         tplAgent          `yaml:"agent"`
+	SuggestedGoal *tplSuggestedGoal `yaml:"suggested_goal"`
 }
 
 // tplAgent is one agent to create/update. Runtime names the runtime
@@ -165,9 +165,8 @@ type ApplyProjectOverrides struct {
 	Name           string            `json:"name"`              // required: the domain name
 	GitURL         string            `json:"git_url,omitempty"` // required unless spec.repo.create
 	GitCredentials string            `json:"git_credentials,omitempty"`
-	RepoToken      string            `json:"repo_token,omitempty"`     // the repo-creation token (gitcode)
-	TemplateToken  string            `json:"template_token,omitempty"` // unused by apply (list phase); kept for symmetry
-	Repo           *tplRepoCreate    `json:"repo,omitempty"`           // overlay on spec.repo
+	RepoToken      string            `json:"repo_token,omitempty"` // the repo-creation token (gitcode)
+	Repo           *tplRepoCreate    `json:"repo,omitempty"`       // overlay on spec.repo
 	Rename         map[string]string `json:"rename,omitempty"`
 	Strategy       string            `json:"strategy,omitempty"`
 	GoalStart      *bool             `json:"goal_start,omitempty"` // overlay on every goal's start
@@ -185,7 +184,7 @@ type ApplyItem struct {
 // ApplyResult is the apply response: the created roots + every step.
 type ApplySquadResult struct {
 	Squad         *Squad            `json:"squad,omitempty"`
-	Domain        *Domain           `json:"domain,omitempty"`        // auto-created scratch domain (goal default project)
+	Domain        *Domain           `json:"domain,omitempty"` // auto-created scratch domain (goal default project)
 	Agents        []*Agent          `json:"agents,omitempty"`
 	Skills        []*Skill          `json:"skills,omitempty"`
 	SuggestedGoal *tplSuggestedGoal `json:"suggested_goal,omitempty"` // pre-fill the goal create dialog after apply
@@ -214,11 +213,11 @@ type ApplyAgentOverrides struct {
 // auto-created scratch domain (the goal default project) + the suggested goal
 // prompt the frontend pre-fills.
 type ApplyAgentResult struct {
-	Domain        *Domain            `json:"domain,omitempty"`
-	Agent         *Agent             `json:"agent,omitempty"`
-	Skills        []*Skill           `json:"skills,omitempty"`
-	SuggestedGoal *tplSuggestedGoal  `json:"suggested_goal,omitempty"`
-	Items         []ApplyItem        `json:"items"`
+	Domain        *Domain           `json:"domain,omitempty"`
+	Agent         *Agent            `json:"agent,omitempty"`
+	Skills        []*Skill          `json:"skills,omitempty"`
+	SuggestedGoal *tplSuggestedGoal `json:"suggested_goal,omitempty"`
+	Items         []ApplyItem       `json:"items"`
 }
 
 // TemplateApplyService orchestrates a template apply through the existing
@@ -500,7 +499,7 @@ func (s *TemplateApplyService) upsertAgent(ctx context.Context, strategy string,
 		Name: finalName, Description: a.Description, RuntimeID: runtimeID,
 		SystemPrompt: a.SystemPrompt, Model: a.Model, Env: a.Env,
 		McpServers: tplMcpServersToAcp(a.McpServers),
-		Skills: skillIDs, MaxConcurrent: a.MaxConcurrent,
+		Skills:     skillIDs, MaxConcurrent: a.MaxConcurrent,
 	}
 	if strategy == conflictCreate {
 		out, err := s.agentSvc.Create(ctx, desired)
