@@ -110,6 +110,7 @@ var templateIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,63}$`)
 const (
 	TemplateKindSquad   = "squad-template"
 	TemplateKindProject = "project-template"
+	TemplateKindAgent   = "agent-template"
 )
 
 // TemplateService owns the template source lifecycle: fetching the GitCode
@@ -338,8 +339,8 @@ func parseTemplateFiles(files map[string]string) (*templateCache, error) {
 		if len(meta.Tags) == 0 {
 			meta.Tags = entry.Tags
 		}
-		if meta.Kind != TemplateKindSquad && meta.Kind != TemplateKindProject {
-			cache.Errors = append(cache.Errors, fmt.Sprintf("template %s: kind must be squad-template or project-template, got %q", entry.Path, meta.Kind))
+		if meta.Kind != TemplateKindSquad && meta.Kind != TemplateKindProject && meta.Kind != TemplateKindAgent {
+			cache.Errors = append(cache.Errors, fmt.Sprintf("template %s: kind must be squad-template, project-template or agent-template, got %q", entry.Path, meta.Kind))
 			continue
 		}
 		cache.Templates = append(cache.Templates, cachedTemplate{TemplateMeta: meta, Path: entry.Path, SpecYAML: content})
@@ -475,15 +476,17 @@ func templateSpecJSON(doc string) (json.RawMessage, error) {
 	return json.RawMessage(out), nil
 }
 
-// normalizeKindFilter maps the query filter ("squad" | "project" | full kind)
-// to a full kind; ” = unfiltered.
+// normalizeKindFilter maps the query filter ("squad" | "project" | "agent" |
+// full kind) to a full kind; "" = unfiltered.
 func normalizeKindFilter(kind string) string {
 	switch strings.TrimSpace(kind) {
 	case "squad":
 		return TemplateKindSquad
 	case "project":
 		return TemplateKindProject
-	case TemplateKindSquad, TemplateKindProject:
+	case "agent":
+		return TemplateKindAgent
+	case TemplateKindSquad, TemplateKindProject, TemplateKindAgent:
 		return strings.TrimSpace(kind)
 	default:
 		return ""

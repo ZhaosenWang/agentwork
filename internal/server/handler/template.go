@@ -76,3 +76,19 @@ func (h *Handlers) applyProjectTemplate(w http.ResponseWriter, r *http.Request) 
 	out, err := h.TemplateApply.ApplyProject(r.Context(), r.PathValue("id"), ov)
 	writeJSON(w, out, err)
 }
+
+// applyAgentTemplate applies an agent template: agent → same-named scratch
+// domain → suggested goal prompt.
+func (h *Handlers) applyAgentTemplate(w http.ResponseWriter, r *http.Request) {
+	if h.TemplateApply == nil {
+		writeErr(w, http.StatusInternalServerError, errors.New("template apply service not configured"))
+		return
+	}
+	var ov service.ApplyAgentOverrides
+	if err := json.NewDecoder(r.Body).Decode(&ov); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := h.TemplateApply.ApplyAgent(r.Context(), r.PathValue("id"), ov)
+	writeJSON(w, out, err)
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -44,9 +45,29 @@ const (
 // ── squad-template spec ──
 
 type squadSpec struct {
-	Strategy string     `yaml:"strategy"` // create | upsert (default upsert)
-	Agents   []tplAgent `yaml:"agents"`
-	Squad    tplSquad   `yaml:"squad"`
+	Strategy     string             `yaml:"strategy"` // create | upsert (default upsert)
+	Agents       []tplAgent         `yaml:"agents"`
+	Squad        tplSquad           `yaml:"squad"`
+	SuggestedGoal *tplSuggestedGoal `yaml:"suggested_goal"` // optional: pre-fill the goal create dialog after apply
+}
+
+// tplSuggestedGoal is the suggested first-goal prompt a template carries —
+// after applying an agent/squad template the frontend jumps to the goal create
+// page with this title+description pre-filled (user edits then confirms).
+type tplSuggestedGoal struct {
+	Title       string `yaml:"title"`
+	Description string `yaml:"description"`
+}
+
+// ── agent-template spec ──
+
+// agentSpec defines a standalone single-agent template (no squad, no project).
+// apply creates the agent + a same-named scratch domain (the goal default
+// project) and returns the suggested goal prompt.
+type agentSpec struct {
+	Strategy      string             `yaml:"strategy"` // create | upsert (default upsert)
+	Agent         tplAgent           `yaml:"agent"`
+	SuggestedGoal *tplSuggestedGoal  `yaml:"suggested_goal"`
 }
 
 // tplAgent is one agent to create/update. Runtime names the runtime
@@ -163,10 +184,12 @@ type ApplyItem struct {
 
 // ApplyResult is the apply response: the created roots + every step.
 type ApplySquadResult struct {
-	Squad  *Squad      `json:"squad,omitempty"`
-	Agents []*Agent    `json:"agents,omitempty"`
-	Skills []*Skill    `json:"skills,omitempty"`
-	Items  []ApplyItem `json:"items"`
+	Squad         *Squad            `json:"squad,omitempty"`
+	Domain        *Domain           `json:"domain,omitempty"`        // auto-created scratch domain (goal default project)
+	Agents        []*Agent          `json:"agents,omitempty"`
+	Skills        []*Skill          `json:"skills,omitempty"`
+	SuggestedGoal *tplSuggestedGoal `json:"suggested_goal,omitempty"` // pre-fill the goal create dialog after apply
+	Items         []ApplyItem       `json:"items"`
 }
 
 type ApplyProjectResult struct {
@@ -177,6 +200,25 @@ type ApplyProjectResult struct {
 	Goals     []*Goal     `json:"goals,omitempty"`
 	Schedules []*Schedule `json:"schedules,omitempty"`
 	Items     []ApplyItem `json:"items"`
+}
+
+// ApplyAgentOverrides are the user's per-apply inputs for an agent template.
+type ApplyAgentOverrides struct {
+	// AgentName overrides spec.agent.name ('' = template value).
+	AgentName string `json:"agent_name,omitempty"`
+	// Strategy overrides spec.strategy.
+	Strategy string `json:"strategy,omitempty"`
+}
+
+// ApplyAgentResult is the apply-agent response: the created agent + the
+// auto-created scratch domain (the goal default project) + the suggested goal
+// prompt the frontend pre-fills.
+type ApplyAgentResult struct {
+	Domain        *Domain            `json:"domain,omitempty"`
+	Agent         *Agent             `json:"agent,omitempty"`
+	Skills        []*Skill           `json:"skills,omitempty"`
+	SuggestedGoal *tplSuggestedGoal  `json:"suggested_goal,omitempty"`
+	Items         []ApplyItem        `json:"items"`
 }
 
 // TemplateApplyService orchestrates a template apply through the existing
@@ -289,6 +331,12 @@ func parseTemplate(raw string) (TemplateMeta, any, error) {
 			return TemplateMeta{}, nil, fmt.Errorf("spec 校验失败：%v", err)
 		}
 		out = pr
+	case TemplateKindAgent:
+		ag := &agentSpec{}
+		if err := strictSpec(spec.Spec, ag); err != nil {
+			return TemplateMeta{}, nil, fmt.Errorf("spec 校验失败：%v", err)
+		}
+		out = ag
 	default:
 		return TemplateMeta{}, nil, fmt.Errorf("模板 kind %q 不受支持", spec.Kind)
 	}
@@ -600,8 +648,10 @@ func (s *TemplateApplyService) applySquadSpec(ctx context.Context, spec *squadSp
 }
 
 // ApplySquad applies a squad template: agents (+embedded skills) → squad →
-// members. Best-effort: per-agent failures are reported and skipped; the
-// squad is created when its leader (and the roster) resolved.
+// members, then auto-creates a same-named scratch domain (the goal default
+// project — agent/squad goals require a domain) and surfaces the template's
+// suggested goal prompt. Best-effort: per-agent failures are reported and
+// skipped; the squad is created when its leader (and the roster) resolved.
 func (s *TemplateApplyService) ApplySquad(ctx context.Context, templateID string, ov ApplySquadOverrides) (*ApplySquadResult, error) {
 	raw, err := s.templates.LoadRaw(ctx, TemplateKindSquad, templateID)
 	if err != nil {
@@ -616,7 +666,137 @@ func (s *TemplateApplyService) ApplySquad(ctx context.Context, templateID string
 		return nil, NewCodedErrorDetail(CodeTemplateInvalid, "模板不是 squad-template", map[string]any{"id": templateID})
 	}
 	strategy := applyStrategy(spec.Strategy, ov.Strategy)
-	return s.applySquadSpec(ctx, spec, strategy, ov.Rename, ov.SquadName)
+	res, err := s.applySquadSpec(ctx, spec, strategy, ov.Rename, ov.SquadName)
+	if err != nil && res == nil {
+		return nil, err
+	}
+	// A scratch domain is the goal default project — agent/squad goals require
+	// a domain_id. Created only when the squad resolved (res.Squad != nil); a
+	// failed apply leaves the domain uncreated so the user isn't left with a
+	// phantom project. The domain rides the squad's final name.
+	if res.Squad != nil {
+		dom, derr := s.ensureScratchDomain(ctx, res.Squad.Name)
+		if derr != nil {
+			res.Items = append(res.Items, ApplyItem{Kind: "domain", Name: res.Squad.Name, Action: "failed", Error: derr.Error()})
+		} else {
+			res.Domain = dom
+			res.Items = append(res.Items, ApplyItem{Kind: "domain", Name: dom.Name, ID: dom.ID, Action: "created"})
+		}
+	}
+	res.SuggestedGoal = spec.SuggestedGoal
+	return res, err
+}
+
+// ensureScratchDomain returns a scratch domain named `name`, creating it if
+// missing. A same-named domain (any type) is reused as-is — the quick-start
+// flow only needs SOME domain to bind the goal to; re-applying a template
+// should not fail on the domain nor create a duplicate. On a name collision
+// during Create (a concurrent apply won the race), the name is suffixed
+// "-2", "-3", ... up to 20 attempts — the domain is the apply's convenience
+// default, not a user-named artifact, so a disambiguating suffix is fine.
+//
+// Only the public ApplyAgent/ApplySquad call this. The shared applySquadSpec
+// (also ApplyProject's team section) does NOT, so a project template never
+// builds a second domain alongside the repo domain it already created.
+func (s *TemplateApplyService) ensureScratchDomain(ctx context.Context, name string) (*Domain, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, NewValidationError("scratch domain 名不能为空")
+	}
+	// Reuse an existing same-named domain of any type.
+	if id := s.domainIDByName(ctx, name); id != "" {
+		if d, err := s.domainSvc.Get(ctx, id); err == nil && d != nil {
+			return d, nil
+		}
+	}
+	candidate := name
+	for i := 0; i < 20; i++ {
+		d, err := s.domainSvc.Create(ctx, Domain{Type: "scratch", Name: candidate})
+		if err == nil {
+			return d, nil
+		}
+		// A name collision (UNIQUE constraint) → try the next suffix. Any
+		// other error (validation, store) surfaces immediately.
+		var ce CodedError
+		if !errors.As(err, &ce) || ce.Code() != CodeDomainNameExists {
+			return nil, err
+		}
+		candidate = fmt.Sprintf("%s-%d", name, i+2)
+	}
+	return nil, NewCodedErrorDetail(CodeDomainNameExists,
+		fmt.Sprintf("scratch domain %q 的所有变体名都被占用", name),
+		map[string]any{"name": name})
+}
+
+// domainIDByName resolves a domain id by exact name ('' = not found).
+func (s *TemplateApplyService) domainIDByName(ctx context.Context, name string) string {
+	var id string
+	_ = s.st.DB().QueryRowContext(ctx, `SELECT id FROM domain WHERE name=?`, name).Scan(&id)
+	return id
+}
+
+// ApplyAgent applies an agent template: upsert the single agent, auto-create
+// a same-named scratch domain (the goal default project), and surface the
+// template's suggested goal prompt. The agent rides the same upsertAgent
+// path as squad/project agents (full field set, runtime availability gate,
+// skill resolution, persona push).
+func (s *TemplateApplyService) ApplyAgent(ctx context.Context, templateID string, ov ApplyAgentOverrides) (*ApplyAgentResult, error) {
+	raw, err := s.templates.LoadRaw(ctx, TemplateKindAgent, templateID)
+	if err != nil {
+		return nil, err
+	}
+	_, specAny, err := parseTemplate(raw)
+	if err != nil {
+		return nil, NewCodedErrorDetail(CodeTemplateInvalid, err.Error(), map[string]any{"id": templateID})
+	}
+	spec, ok := specAny.(*agentSpec)
+	if !ok {
+		return nil, NewCodedErrorDetail(CodeTemplateInvalid, "模板不是 agent-template", map[string]any{"id": templateID})
+	}
+	if strings.TrimSpace(spec.Agent.Name) == "" {
+		return nil, NewCodedErrorDetail(CodeTemplateInvalid, "agent.name 不能为空", map[string]any{"id": templateID})
+	}
+	strategy := applyStrategy(spec.Strategy, ov.Strategy)
+	finalName := strings.TrimSpace(ov.AgentName)
+	if finalName == "" {
+		finalName = spec.Agent.Name
+	}
+	res := &ApplyAgentResult{}
+	usableIDs, err := s.usableRuntimeIDs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("列出可用 runtime：%v", err)
+	}
+	out, action, err := s.upsertAgent(ctx, strategy, spec.Agent, finalName, usableIDs)
+	if err != nil {
+		res.Items = append(res.Items, ApplyItem{Kind: "agent", Name: finalName, Action: "failed", Error: err.Error()})
+		return res, NewCodedErrorDetail(CodeTemplateInvalid,
+			fmt.Sprintf("创建 agent 失败：%v", err),
+			map[string]any{"id": templateID, "name": finalName})
+	}
+	res.Items = append(res.Items, ApplyItem{Kind: "agent", Name: finalName, ID: out.ID, Action: action})
+	res.Agent = out
+	if s.pushSkills != nil {
+		go s.pushSkills(out.ID)
+	}
+	// The scratch domain is the goal default project — without it the user
+	// can't create an agent-typed goal (GoalService.Create requires domain_id).
+	dom, derr := s.ensureScratchDomain(ctx, finalName)
+	if derr != nil {
+		res.Items = append(res.Items, ApplyItem{Kind: "domain", Name: finalName, Action: "failed", Error: derr.Error()})
+		// The agent is created; the domain failure is reported but does not
+		// void the apply — the user can still pick another project at goal time.
+	} else {
+		res.Domain = dom
+		res.Items = append(res.Items, ApplyItem{Kind: "domain", Name: dom.Name, ID: dom.ID, Action: "created"})
+	}
+	res.SuggestedGoal = spec.SuggestedGoal
+	domainID := "-"
+	if res.Domain != nil {
+		domainID = res.Domain.ID
+	}
+	logging.Infof("template-apply: agent template %s applied as agent %s + domain %s (%d item(s))",
+		templateID, out.ID, domainID, len(res.Items))
+	return res, nil
 }
 
 // applyRepo creates the project repo when spec.repo.create (the token comes

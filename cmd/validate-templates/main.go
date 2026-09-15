@@ -127,7 +127,19 @@ func main() {
 		Rename:    map[string]string{"backend-leader": "验证-负责人"},
 	})
 	fatalIf("ApplySquad backend-dev", err, r1 == nil || r1.Squad == nil)
-	fmt.Printf("ApplySquad backend-dev: OK (squad=%s agents=%d items=%d)\n", r1.Squad.Name, len(r1.Agents), len(r1.Items))
+	fmt.Printf("ApplySquad backend-dev: OK (squad=%s domain=%s agents=%d items=%d suggested=%v)\n",
+		r1.Squad.Name, domainName(r1.Domain), len(r1.Agents), len(r1.Items), r1.SuggestedGoal != nil)
+
+	// 1b. agent-template apply — agent + same-named scratch domain + suggested_goal
+	rAgent, err := apply.ApplyAgent(ctx, "code-reviewer", service.ApplyAgentOverrides{})
+	fatalIf("ApplyAgent code-reviewer", err, rAgent == nil || rAgent.Agent == nil || rAgent.Domain == nil)
+	fmt.Printf("ApplyAgent code-reviewer: OK (agent=%s domain=%s/%s suggested=%v items=%d)\n",
+		rAgent.Agent.Name, rAgent.Domain.Type, rAgent.Domain.Name, rAgent.SuggestedGoal != nil, len(rAgent.Items))
+	if rAgent.Domain.Type != "scratch" || rAgent.Domain.Name != rAgent.Agent.Name {
+		fmt.Printf("FAIL: agent domain should be scratch and same-named, got type=%s name=%q agent=%q\n",
+			rAgent.Domain.Type, rAgent.Domain.Name, rAgent.Agent.Name)
+		os.Exit(1)
+	}
 
 	// 2. create-type project without token → clean repo_token error
 	_, err = apply.ApplyProject(ctx, "go-service", service.ApplyProjectOverrides{Name: "验证-新建仓"})
@@ -167,4 +179,12 @@ func fatalIf(name string, err error, cond bool) {
 		fmt.Printf("FAIL %s: %v\n", name, err)
 		os.Exit(1)
 	}
+}
+
+// domainName is a nil-safe reader for the optional auto-created scratch domain.
+func domainName(d *service.Domain) string {
+	if d == nil {
+		return "-"
+	}
+	return d.Name
 }

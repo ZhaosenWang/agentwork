@@ -129,6 +129,7 @@ func (h *Handlers) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /templates/refresh", h.refreshTemplates)
 	mux.HandleFunc("POST /templates/squads/{id}/apply", h.applySquadTemplate)
 	mux.HandleFunc("POST /templates/projects/{id}/apply", h.applyProjectTemplate)
+	mux.HandleFunc("POST /templates/agents/{id}/apply", h.applyAgentTemplate)
 	mux.HandleFunc("POST /intake", h.sendIntake)
 	mux.HandleFunc("POST /intake/dispatch", h.intakeCreate)
 	mux.HandleFunc("GET /intake/{runId}", h.getIntakeResult)

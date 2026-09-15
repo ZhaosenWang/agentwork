@@ -1219,3 +1219,208 @@ func TestRefreshAppliesIndependentTimeout(t *testing.T) {
 		t.Fatalf("Refresh: %v", err)
 	}
 }
+
+// ── agent-template fixtures + tests ──
+
+const agentTemplateYAML = `api_version: agentwork/v1
+kind: agent-template
+metadata:
+  id: code-reviewer
+  name: 代码审查员
+  description: 单 agent 代码审查
+  version: 1.0.0
+spec:
+  strategy: upsert
+  agent:
+    name: code-reviewer
+    description: 严格审查员
+    system_prompt: |
+      你是严格的代码审查员。
+    skills: [test-skill]
+    runtime: test-rt
+    model: glm-4.6
+    max_concurrent: 3
+    env:
+      LOG_LEVEL: debug
+  suggested_goal:
+    title: 审查最近的代码变更
+    description: |
+      拉取最近变更并输出审查意见。
+`
+
+const agentTemplateNoSuggestedGoalYAML = `api_version: agentwork/v1
+kind: agent-template
+metadata:
+  id: bare-agent
+  name: 裸 agent
+  description: 无 suggested_goal
+  version: 1.0.0
+spec:
+  agent:
+    name: bare-agent
+    description: 裸
+    system_prompt: 你是裸 agent。
+    runtime: test-rt
+`
+
+// TestApplyAgentCreatesAgentScratchDomainAndSuggestedGoal asserts the full
+// agent-template apply: agent created with all fields, a same-named scratch
+// domain auto-created as the goal default project, and the suggested_goal
+// prompt surfaced for the frontend to pre-fill.
+func TestApplyAgentCreatesAgentScratchDomainAndSuggestedGoal(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.seedSkill(t, "test-skill")
+	c.putTemplate(t, TemplateKindAgent, "code-reviewer", agentTemplateYAML)
+
+	res, err := c.apply.ApplyAgent(ctx, "code-reviewer", ApplyAgentOverrides{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.Agent == nil || res.Agent.Name != "code-reviewer" {
+		t.Fatalf("agent not created: %+v", res.Agent)
+	}
+	if res.Agent.Model != "glm-4.6" || res.Agent.MaxConcurrent != 3 {
+		t.Fatalf("agent fields not carried: model=%q max=%d", res.Agent.Model, res.Agent.MaxConcurrent)
+	}
+	if res.Domain == nil || res.Domain.Type != "scratch" || res.Domain.Name != "code-reviewer" {
+		t.Fatalf("scratch domain not auto-created with agent name: %+v", res.Domain)
+	}
+	if res.SuggestedGoal == nil || res.SuggestedGoal.Title != "审查最近的代码变更" {
+		t.Fatalf("suggested_goal not surfaced: %+v", res.SuggestedGoal)
+	}
+	actions := map[string]string{}
+	for _, it := range res.Items {
+		actions[it.Kind+"/"+it.Name] = it.Action
+	}
+	if actions["agent/code-reviewer"] != "created" || actions["domain/code-reviewer"] != "created" {
+		t.Fatalf("unexpected item actions: %v", actions)
+	}
+	// The skill pusher fires for an apply-created agent (same as squad path).
+	c.skillPusher.waitForPush(t, 1)
+}
+
+// TestApplyAgentNoSuggestedGoalIsOK — suggested_goal is optional; a bare
+// agent template still applies, with a nil SuggestedGoal.
+func TestApplyAgentNoSuggestedGoalIsOK(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.putTemplate(t, TemplateKindAgent, "bare-agent", agentTemplateNoSuggestedGoalYAML)
+
+	res, err := c.apply.ApplyAgent(ctx, "bare-agent", ApplyAgentOverrides{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.Agent == nil || res.Domain == nil {
+		t.Fatalf("agent/domain not created: %+v", res)
+	}
+	if res.SuggestedGoal != nil {
+		t.Fatalf("expected nil suggested_goal, got %+v", res.SuggestedGoal)
+	}
+}
+
+// TestApplyAgentEmptyNameFails — an agent-template without agent.name is
+// invalid (the apply has nothing to name the agent or the scratch domain).
+func TestApplyAgentEmptyNameFails(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	raw := strings.Replace(agentTemplateYAML, "name: code-reviewer\n    description: 严格审查员", "description: 严格审查员", 1)
+	c.putTemplate(t, TemplateKindAgent, "code-reviewer", raw)
+
+	_, err := c.apply.ApplyAgent(ctx, "code-reviewer", ApplyAgentOverrides{})
+	if err == nil {
+		t.Fatalf("expected empty-name error")
+	}
+}
+
+// TestApplyAgentRenameOverride — AgentName override renames both the agent
+// and the auto-created scratch domain (the domain rides the final name).
+func TestApplyAgentRenameOverride(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.seedSkill(t, "test-skill")
+	c.putTemplate(t, TemplateKindAgent, "code-reviewer", agentTemplateYAML)
+
+	res, err := c.apply.ApplyAgent(ctx, "code-reviewer", ApplyAgentOverrides{AgentName: "我的审查员"})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.Agent.Name != "我的审查员" {
+		t.Fatalf("agent name not overridden: %q", res.Agent.Name)
+	}
+	if res.Domain.Name != "我的审查员" {
+		t.Fatalf("domain should ride the final name, got %q", res.Domain.Name)
+	}
+}
+
+// TestApplySquadCreatesScratchDomainAndSuggestedGoal — ApplySquad now
+// auto-creates a same-named scratch domain and surfaces suggested_goal.
+func TestApplySquadCreatesScratchDomainAndSuggestedGoal(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	c.seedSkill(t, "test-skill")
+	// Add a suggested_goal to the squad fixture inline.
+	raw := squadTemplateYAML + "  suggested_goal:\n    title: 启动后端开发\n    description: 拆解首个需求并委派。\n"
+	c.putTemplate(t, TemplateKindSquad, "backend-dev", raw)
+
+	res, err := c.apply.ApplySquad(ctx, "backend-dev", ApplySquadOverrides{})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if res.Domain == nil || res.Domain.Type != "scratch" || res.Domain.Name != "后端开发小队" {
+		t.Fatalf("squad scratch domain not created: %+v", res.Domain)
+	}
+	if res.SuggestedGoal == nil || res.SuggestedGoal.Title != "启动后端开发" {
+		t.Fatalf("squad suggested_goal not surfaced: %+v", res.SuggestedGoal)
+	}
+}
+
+// TestEnsureScratchDomainReusesExisting — a same-named domain (any type) is
+// reused, not duplicated, so re-applying a template doesn't fail on the domain.
+func TestEnsureScratchDomainReusesExisting(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	existing, err := c.domainSvc.Create(ctx, Domain{Type: "scratch", Name: "code-reviewer"})
+	if err != nil {
+		t.Fatalf("seed domain: %v", err)
+	}
+	dom, err := c.apply.ensureScratchDomain(ctx, "code-reviewer")
+	if err != nil {
+		t.Fatalf("ensureScratchDomain: %v", err)
+	}
+	if dom.ID != existing.ID {
+		t.Fatalf("expected reuse of existing domain %q, got %q", existing.ID, dom.ID)
+	}
+}
+
+// TestEnsureScratchDomainCollisionSafe — re-applying the same template
+// reuses the existing same-named domain (no duplicate, no failure). The
+// "-2"/"-3" suffix path only fires for a Create-time race a single-threaded
+// test can't reproduce; the observable contract is "same name → reuse".
+func TestEnsureScratchDomainCollisionSafe(t *testing.T) {
+	c := newTemplateCluster(t)
+	ctx := context.Background()
+	first, err := c.apply.ensureScratchDomain(ctx, "dup-name")
+	if err != nil {
+		t.Fatalf("first ensure: %v", err)
+	}
+	if first.Name != "dup-name" {
+		t.Fatalf("expected dup-name, got %q", first.Name)
+	}
+	// Second call with the same name reuses the first — no duplicate, no error.
+	second, err := c.apply.ensureScratchDomain(ctx, "dup-name")
+	if err != nil {
+		t.Fatalf("second ensure: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("expected reuse of %q, got %q (duplicate created)", first.ID, second.ID)
+	}
+	// A different name creates a distinct domain.
+	other, err := c.apply.ensureScratchDomain(ctx, "other-name")
+	if err != nil {
+		t.Fatalf("other ensure: %v", err)
+	}
+	if other.ID == first.ID {
+		t.Fatalf("distinct name should create a distinct domain")
+	}
+}
