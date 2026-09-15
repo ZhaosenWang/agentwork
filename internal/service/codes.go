@@ -39,4 +39,12 @@ const (
 	CodeSquadHasSchedules   = "AW.10000023"
 	CodeSquadHandlesIssues  = "AW.10000024"
 	CodeScheduleBuiltIn     = "AW.10000025"
+	// Templates (GitCode YAML library): 26 = repo not configured, 27 = fetch
+	// failed, 28 = template invalid, 29 = not found, 30 = repo creation failed.
+	// (25 is taken by CodeScheduleBuiltIn on master — template codes follow.)
+	CodeTemplateSourceUnset = "AW.10000026" // template repo not configured (platform.template_repo)
+	CodeTemplateFetchFailed = "AW.10000027" // GitCode fetch failed (network/404/token)
+	CodeTemplateInvalid     = "AW.10000028" // template schema/validation failed (detail carries field path)
+	CodeTemplateNotFound    = "AW.10000029"
+	CodeRepoCreateFailed    = "AW.10000030" // GitCode repo creation failed (detail carries the API response)
 )

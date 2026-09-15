@@ -108,6 +108,27 @@ func newID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// pickRandom returns one element from xs chosen uniformly at random, or ""
+// when xs is empty. Used to spread fallback load across usable runtimes
+// instead of always picking the first (which concentrates load on the
+// earliest-created runtime). crypto/rand avoids the seeding/concurrency
+// concerns of math/rand and is already the package's randomness source.
+func pickRandom(xs []string) string {
+	if len(xs) == 0 {
+		return ""
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return xs[0] // unreadable entropy (should not happen) — degrade to deterministic
+	}
+	// Little-endian uint from 8 bytes, mod len — unbiased enough for load spreading.
+	var n uint64
+	for i, v := range b {
+		n |= uint64(v) << (8 * i)
+	}
+	return xs[n%uint64(len(xs))]
+}
+
 // now returns an RFC3339 timestamp.
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 

@@ -323,6 +323,170 @@ export interface TeamImportResponse {
   run: Run;
 }
 
+// ── Templates (GitCode YAML template library) ──
+// Mirror internal/service/template.go + template_apply.go. The list endpoint
+// returns TemplateSummary; the get-one endpoint returns TemplateDetail with
+// the raw YAML + the inner spec node re-encoded as JSON.
+
+// TemplateMeta is the common front matter of every template.
+export interface TemplateMeta {
+  api_version: string; // "agentwork/v1"
+  kind: string; // "squad-template" | "project-template"
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  tags?: string[];
+  icon?: string;
+}
+
+// TemplateSummary is the list-item shape (metadata only, no spec).
+export interface TemplateSummary extends TemplateMeta {
+  path: string;
+}
+
+// TemplateDetail is the get-one shape: metadata + raw YAML + decoded spec.
+// `spec` is the INNER spec node only (repo/domain/team/…), not the whole
+// document — the f9a6bb1 fix made Get return spec, not {api_version,…,spec}.
+export interface TemplateDetail extends TemplateMeta {
+  path: string;
+  spec_yaml: string;
+  spec: Record<string, unknown>;
+}
+
+// ── Template spec shapes (mirror the Go spec structs, for preview/derive) ──
+// These describe what the backend parsed; the dialog derives its form state
+// from spec.repo.create / spec.domain.type / spec.team / spec.goals.
+
+export interface TplRepoCreate {
+  create: boolean;
+  visibility: string; // "private" | "public"
+  auto_init?: boolean;
+  gitignore_template?: string;
+  org?: string;
+}
+
+export interface TplDomain {
+  type: string; // "repo" | "scratch" (default repo)
+  default_branch: string;
+  git_identity?: string;
+  issue_assignee?: string;
+  issue_assignee_type?: string; // "agent" | "squad"
+  policy_text?: string;
+}
+
+export interface TplAgent {
+  name: string;
+  description?: string;
+  system_prompt?: string;
+  skills?: string[];
+  runtime?: string;
+  max_concurrent?: number;
+  model?: string;
+  env?: Record<string, string>;
+}
+
+export interface TplMember {
+  name: string;
+  role?: string;
+}
+
+export interface TplSquad {
+  name: string;
+  description?: string;
+  leader: string;
+  instructions?: string;
+  members?: TplMember[];
+}
+
+// squad-template spec.
+export interface SquadTemplateSpec {
+  strategy?: string; // "create" | "upsert" (default upsert)
+  agents: TplAgent[];
+  squad: TplSquad;
+}
+
+// project-template spec.
+export interface ProjectTemplateSpec {
+  repo?: TplRepoCreate; // absent = user supplies git_url
+  domain: TplDomain;
+  team?: SquadTemplateSpec; // optional agents+squad riding the project
+  goals?: TplGoal[];
+  schedules?: TplSchedule[];
+}
+
+export interface TplGoal {
+  title: string;
+  description?: string;
+  assignee?: string; // agent or squad name
+  assignee_type?: string; // "agent" | "squad" (default agent)
+  start?: boolean; // true = active; false = backlog
+}
+
+export interface TplSchedule {
+  name: string;
+  title?: string;
+  description?: string;
+  cron: string;
+  assignee?: string;
+  assignee_type?: string;
+}
+
+// ── Apply requests / results ──
+
+// ApplySquadOverrides: the squad dialog's fields.
+export interface ApplySquadOverrides {
+  squad_name?: string; // overrides spec.squad.name
+  rename?: Record<string, string>; // template agent name → per-apply name
+  strategy?: string; // overrides spec.strategy
+}
+
+// ApplyProjectOverrides: the project dialog's fields.
+export interface ApplyProjectOverrides {
+  name: string; // required: the domain name
+  git_url?: string; // required unless spec.repo.create
+  git_credentials?: string;
+  repo_token?: string; // the repo-creation token (GitCode)
+  template_token?: string; // unused by apply (list phase); kept for symmetry
+  repo?: Partial<TplRepoCreate>; // overlay on spec.repo
+  rename?: Record<string, string>;
+  strategy?: string;
+  goal_start?: boolean; // overlay on every goal's start
+}
+
+// ApplyItem is one entity's per-step outcome.
+export interface ApplyItem {
+  kind: string; // skill | agent | squad | domain | repo | goal | schedule | member | domain.issue_assignee
+  name: string;
+  id?: string;
+  action: string; // created | updated | skipped | failed
+  error?: string;
+}
+
+export interface ApplySquadResult {
+  squad?: Squad;
+  agents?: Agent[];
+  skills?: Skill[];
+  items: ApplyItem[];
+}
+
+export interface ApplyProjectResult {
+  domain?: Domain;
+  repo_url?: string; // set when the repo was created
+  agents?: Agent[];
+  squad?: Squad;
+  goals?: Goal[];
+  schedules?: Schedule[];
+  items: ApplyItem[];
+}
+
+// TemplateFetchResult reports one refresh.
+export interface TemplateFetchResult {
+  fetched: number;
+  errors?: string[];
+  fetched_at: string;
+}
+
 // WS event shape from the hub: {"topic":"goal:created","payload":{...}}
 export type WSTopic =
   | "goal:created" | "goal:assigned" | "goal:finished"

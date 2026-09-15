@@ -62,9 +62,14 @@ import {
   savePlatformSettings,
   getGateStats,
   importTeam,
+  listTemplates,
+  getTemplate,
+  refreshTemplates,
+  applySquadTemplate,
+  applyProjectTemplate,
 } from "./api";
 import { useWSEvent } from "./ws";
-import type { WSEvent } from "./types";
+import type { WSEvent, ApplySquadOverrides, ApplyProjectOverrides } from "./types";
 
 // ── Query keys ──
 export const qk = {
@@ -92,6 +97,9 @@ export const qk = {
   im: ["im"] as const,
   platformSettings: ["platform-settings"] as const,
   gateStats: ["gate-stats"] as const,
+  templates: ["templates"] as const,
+  templatesByType: (type: string) => ["templates", { type }] as const,
+  template: (kind: string, id: string) => ["templates", kind, id] as const,
 };
 
 // ── Platform settings (M3) ──
@@ -547,6 +555,66 @@ export function useImportTeam() {
       qc.invalidateQueries({ queryKey: qk.squads });
       qc.invalidateQueries({ queryKey: qk.skills });
       qc.invalidateQueries({ queryKey: qk.domains });
+    },
+  });
+}
+
+// ── Template hooks (GitCode YAML template library + apply) ──
+// type filters the list: "squad" | "project" | undefined (all). The cache key
+// carries the type so switching the tab refetches independently.
+export function useTemplates(type?: string) {
+  return useQuery({
+    queryKey: type ? qk.templatesByType(type) : qk.templates,
+    queryFn: () => listTemplates(type),
+  });
+}
+// One template's full detail (metadata + raw YAML + decoded spec). Fetched
+// lazily when a template's apply dialog opens.
+export function useTemplate(kind: string, id: string, enabled = true) {
+  return useQuery({
+    queryKey: qk.template(kind, id),
+    queryFn: () => getTemplate(kind, id),
+    enabled: enabled && !!id,
+  });
+}
+// Force-refetch the template repo (private repos pass a token). On success
+// invalidate the list + any open detail so the new snapshot shows.
+export function useRefreshTemplates() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (token?: string) => refreshTemplates(token),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.templates });
+    },
+  });
+}
+// Apply a squad template: agents (+embedded skills) → squad → members.
+// On success invalidate agents/squads (the apply created platform rows).
+export function useApplySquadTemplate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body: ApplySquadOverrides }) =>
+      applySquadTemplate(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.agents });
+      qc.invalidateQueries({ queryKey: qk.squads });
+      qc.invalidateQueries({ queryKey: qk.skills });
+    },
+  });
+}
+// Apply a project template: repo → domain → team → goals → schedules. On
+// success invalidate every root the apply may have created.
+export function useApplyProjectTemplate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body: ApplyProjectOverrides }) =>
+      applyProjectTemplate(id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.domains });
+      qc.invalidateQueries({ queryKey: qk.agents });
+      qc.invalidateQueries({ queryKey: qk.squads });
+      qc.invalidateQueries({ queryKey: qk.goals });
+      qc.invalidateQueries({ queryKey: qk.schedules });
     },
   });
 }

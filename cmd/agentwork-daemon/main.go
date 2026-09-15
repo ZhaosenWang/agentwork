@@ -119,6 +119,13 @@ func main() {
 		logging.Warnf("seed digest schedule: %v", err)
 	}
 
+	// Templates: the GitCode YAML template library + its apply orchestration
+	// (P0 squad / P1 project — TEMPLATE-PLAN.md). The git tester is wired
+	// after the daemon exists (gitTester below).
+	templateSvc := service.NewTemplateService(st, settingsSvc)
+	templateApplySvc := service.NewTemplateApplyService(st, templateSvc,
+		agentSvc, skillSvc, squadSvc, domainSvc, goalSvc, schedSvc, nil)
+
 	// M3 IM: the approval-card callbacks resolve through the goal layer; the
 	// owner's inbound messages become intake parse runs on the configured
 	// global parser agent (app_settings platform.intake_agent). The ask-card
@@ -140,6 +147,14 @@ func main() {
 	d.SetTeamImportService(teamImportSvc)
 	d.SetDomainService(domainSvc)
 	d.SetSkillService(skillSvc)
+	// Templates need the daemon's git probe (the create-domain gate) and the
+	// skill/config pusher (so apply ships persona + tools to the machine
+	// immediately, like the HTTP CRUD handlers) — wire both now that the daemon
+	// exists.
+	templateApplySvc.SetGitTester(gitTesterFunc(d.TestDomainGit))
+	templateApplySvc.SetSkillPusher(func(agentID string) {
+		d.PushAgentSkills(context.Background(), agentID)
+	})
 	go func() {
 		if err := d.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			logging.Errorf("daemon: %v", err)
@@ -147,7 +162,21 @@ func main() {
 	}()
 
 	srv := server.New(st, bus, d, goalSvc, runSvc, commentSvc, squadSvc, schedSvc, domainSvc, imConn, teamImportSvc, skillSvc, intakeSvc)
+	srv.SetTemplates(templateSvc, templateApplySvc)
 	if err := srv.ListenAndServe(ctx, *addr); err != nil && !errors.Is(err, context.Canceled) {
 		logging.Fatalf("server: %v", err)
+	}
+}
+
+// gitTesterFunc adapts the daemon's TestDomainGit to the service-side
+// GitTester interface (a field-for-field mapping — the daemon package
+// imports service, so the service cannot reference the daemon type).
+type gitTesterFunc func(ctx context.Context, gitURL, defaultBranch, credentials string) *daemon.DomainGitTestResult
+
+func (f gitTesterFunc) TestDomainGit(ctx context.Context, gitURL, defaultBranch, credentials string) *service.DomainGitProbeResult {
+	r := f(ctx, gitURL, defaultBranch, credentials)
+	return &service.DomainGitProbeResult{
+		OK: r.OK, BranchExists: r.BranchExists,
+		ResolvedBranch: r.ResolvedBranch, Refs: r.Refs, Error: r.Error,
 	}
 }
